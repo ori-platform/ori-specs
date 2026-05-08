@@ -27,3 +27,11 @@ Resolved: `approval_timeout_seconds` flows into dispatcher approval wait logic.
 ## G-10 — Basic prompt interpolation + sanitization
 
 Resolved (partial scope): core placeholders are interpolated and sanitized; history-expression interpolation remains deferred.
+
+## G-07 — Skill signature verification enforcement
+
+Resolved: community skill signatures are verified at load time against the hub root trust anchor.
+
+## G-11 — Runtime health/status RPC socket
+
+Resolved: runtime exposes read-only health snapshot RPC over Unix domain socket for CLI diagnostics.

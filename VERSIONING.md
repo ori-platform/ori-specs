@@ -11,9 +11,13 @@ A version increment means a breaking change for implementers.
 | Contract       | Version | Status                                                   |
 | -------------- | ------- | -------------------------------------------------------- |
 | events         | v1      | Implemented in runtime                                   |
-| skills-package | v1      | Implemented in runtime (signature verification gap open) |
+| skills-package | v1      | Implemented in runtime                                   |
 | gateway-api    | v1      | Design target                                            |
-| cli-commands   | v1      | Derivable from runtime surfaces                          |
+| cli-commands   | v1      | Implemented baseline                                     |
+| runtime-health | v1      | Implemented                                              |
+| device-policy  | v1      | Implemented baseline                                     |
+| offline-tokens | v1      | Implemented baseline                                     |
+| runtime-config | v1      | Implemented baseline                                     |
 
 ## Compatibility
 

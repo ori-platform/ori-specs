@@ -10,16 +10,4 @@
 
 - Domain: `gateway-api/v1`
 - Status: Open
-- Summary: Runtime tier availability still needs gateway-heartbeat authoritative check.
-
-## G-07 — Skill signature verification not enforced
-
-- Domain: `skills-package/v1`
-- Status: Open
-- Summary: `signature` field exists in skill YAML but runtime load-time cryptographic verification is pending.
-
-## G-11 — Runtime health/status RPC socket absent
-
-- Domain: `cli-commands/v1`
-- Status: Open
-- Summary: CLI cannot query live structured runtime health via socket yet.
+- Summary: Runtime now tracks `ori/gateway/health` heartbeat in capability posture, but full Tier 3 gateway reasoning path is not wired end-to-end yet.
