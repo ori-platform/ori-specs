@@ -26,7 +26,7 @@ Resolved: `approval_timeout_seconds` flows into dispatcher approval wait logic.
 
 ## G-10 — Basic prompt interpolation + sanitization
 
-Resolved (partial scope): core placeholders are interpolated and sanitized; history-expression interpolation remains deferred.
+Resolved: core placeholders are interpolated and sanitized; `{history.*}` interpolation is implemented with AST-safe parsing, load-time per-template cap (`max=16`), and deterministic unresolved substitution (`null`) with `WARNING` logs.
 
 ## G-07 — Skill signature verification enforcement
 
