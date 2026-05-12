@@ -35,3 +35,7 @@ Resolved: community skill signatures are verified at load time against the hub r
 ## G-11 — Runtime health/status RPC socket
 
 Resolved: runtime exposes read-only health snapshot RPC over Unix domain socket for CLI diagnostics.
+
+## G-13 — Signing contract for community skills
+
+Resolved: `signing/v1.md` defines Ed25519 signature format, public key format, bundled sentinel semantics, verification order, and deterministic test vectors for SDK/CLI/Hub/runtime consumers.

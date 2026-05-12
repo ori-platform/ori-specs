@@ -18,6 +18,7 @@ A version increment means a breaking change for implementers.
 | device-policy  | v1      | Implemented baseline                                     |
 | offline-tokens | v1      | Implemented baseline                                     |
 | runtime-config | v1      | Implemented baseline                                     |
+| signing        | v1      | Implemented baseline                                     |
 
 ## Compatibility
 
