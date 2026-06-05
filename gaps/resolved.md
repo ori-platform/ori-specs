@@ -14,7 +14,7 @@ Resolved: poll path explicitly propagates `event.source` from reading metadata.
 
 ## G-06 — Tier 3/4 README accuracy
 
-Resolved: runtime documentation now distinguishes implemented local tiers from reserved gateway/cloud tiers.
+Resolved: runtime documentation now defines three runtime reasoning tiers: rule, local SLM, and gateway. Cloud reasoning is documented as a gateway backend, not a runtime tier.
 
 ## G-08 — `escalate_to` tier floor behavior
 
@@ -39,3 +39,21 @@ Resolved: runtime exposes read-only health snapshot RPC over Unix domain socket 
 ## G-13 — Signing contract for community skills
 
 Resolved: `signing/v1.md` defines Ed25519 signature format, public key format, bundled sentinel semantics, verification order, and deterministic test vectors for SDK/CLI/Hub/runtime consumers.
+
+## G-04 — Gateway reasoning transport
+
+Resolved: runtime now publishes Tier 3 reasoning requests over MQTT and receives
+provider-neutral responses on `ori/{device_id}/reasoning/response`. Gateway/cloud
+provider details remain outside the runtime boundary.
+
+## G-05 — Gateway availability check
+
+Resolved: runtime tracks `ori/gateway/health` heartbeat in capability posture and
+uses freshness before routing non-explicit deterministic escalation signals to
+gateway reasoning.
+
+## G-14 — Runtime export surface for gateway/reporting
+
+Resolved: runtime exposes bounded MQTT exports for `health`, `sensor_history`,
+`action_log`, `reasoning_log`, and `tier_c_decision_log`; gateway consumers do
+not read runtime SQLite directly.
