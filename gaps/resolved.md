@@ -48,12 +48,26 @@ provider details remain outside the runtime boundary.
 
 ## G-05 — Gateway availability check
 
-Resolved: runtime tracks `ori/gateway/health` heartbeat in capability posture and
-uses freshness before routing non-explicit deterministic escalation signals to
-gateway reasoning.
+Resolved: runtime `CapabilityPostureTracker` tracks `ori/gateway/health` heartbeat
+freshness and uses it before routing non-explicit deterministic escalation signals to
+gateway reasoning. Gateway heartbeat publisher is fully implemented in `ori-gateway`
+(`internal/heartbeat/publisher.go`).
+
+Note: runtime-side MQTT subscription to `ori/gateway/health` is tracked in
+`ori-platform/ori-runtime#144` — the posture tracking mechanism is correct but
+currently fed only through the in-process EventBus rather than a live MQTT subscribe.
 
 ## G-14 — Runtime export surface for gateway/reporting
 
 Resolved: runtime exposes bounded MQTT exports for `health`, `sensor_history`,
 `action_log`, `reasoning_log`, and `tier_c_decision_log`; gateway consumers do
 not read runtime SQLite directly.
+
+## G-12 — ContextEnricher device snapshot integration
+
+Resolved (2026-06-08): `ori/reasoning/context_enricher.py` implements prompt-time
+cross-sensor snapshot enrichment. Config lives under `reasoning.context_enricher`
+(`enabled`, `staleness_window_ms`, `max_entries`, `include_sources`). Disabled by
+default; fail-open. Staleness evaluated at prompt-build time, not event-emit time.
+Tier D never reaches the enricher by construction. See `ori-runtime/DECISIONS.md`
+2026-06-08 entry and `docs/CAPABILITY_MATRIX.md` for full implementation scope.
