@@ -71,3 +71,11 @@ cross-sensor snapshot enrichment. Config lives under `reasoning.context_enricher
 default; fail-open. Staleness evaluated at prompt-build time, not event-emit time.
 Tier D never reaches the enricher by construction. See `ori-runtime/DECISIONS.md`
 2026-06-08 entry and `docs/CAPABILITY_MATRIX.md` for full implementation scope.
+
+## G-17 — Gateway config surface not spec'd
+
+Resolved (2026-06-09): `gateway-config/v1.md` documents all `gateway.yaml` keys,
+types, defaults, and validation rules for all five top-level sections: `gateway`,
+`provider`, `reporting`, `sim`, `fleet`. Separation between `provider` (Tier 3
+reasoning) and `reporting.provider` (advisory/product) is made explicit. Tracked
+by `ori-platform/ori-specs#5`.
