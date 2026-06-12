@@ -53,10 +53,6 @@ freshness and uses it before routing non-explicit deterministic escalation signa
 gateway reasoning. Gateway heartbeat publisher is fully implemented in `ori-gateway`
 (`internal/heartbeat/publisher.go`).
 
-Note: runtime-side MQTT subscription to `ori/gateway/health` is tracked in
-`ori-platform/ori-runtime#144` — the posture tracking mechanism is correct but
-currently fed only through the in-process EventBus rather than a live MQTT subscribe.
-
 ## G-14 — Runtime export surface for gateway/reporting
 
 Resolved: runtime exposes bounded MQTT exports for `health`, `sensor_history`,
@@ -79,3 +75,18 @@ types, defaults, and validation rules for all five top-level sections: `gateway`
 `provider`, `reporting`, `sim`, `fleet`. Separation between `provider` (Tier 3
 reasoning) and `reporting.provider` (advisory/product) is made explicit. Tracked
 by `ori-platform/ori-specs#5`.
+
+## G-15 — Tier C enrichment MQTT transport wiring
+
+Resolved: `ori-gateway` now defines Tier C enrichment topics, subscribes per
+configured runtime device when `reporting.tier_c_enrichment.enabled=true`, and
+publishes advisory-only responses on `ori/{device_id}/tier_c/enrichment/response`.
+The gateway-side contract and handler are implemented in `internal/contracts`,
+`internal/enrichment`, and `cmd/ori-gateway/app.go`. Runtime client integration
+is a runtime-side follow-up, not a gateway contract gap.
+
+## G-16 — `reasoning_log` export missing from gateway runtimeclient
+
+Resolved: `ori-gateway` runtimeclient exposes `ReasoningLog` over the bounded
+runtime export surface. Reporting/cloud consumers can request `reasoning_log`
+without reading runtime SQLite directly.
