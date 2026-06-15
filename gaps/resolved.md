@@ -90,3 +90,30 @@ is a runtime-side follow-up, not a gateway contract gap.
 Resolved: `ori-gateway` runtimeclient exposes `ReasoningLog` over the bounded
 runtime export surface. Reporting/cloud consumers can request `reasoning_log`
 without reading runtime SQLite directly.
+
+## G-18 — Runtime/gateway MQTT hardening contract
+
+Resolved: `gateway-api/v1.md`, `runtime-config/v1.md`, and `gateway-config/v1.md`
+document runtime-gateway HMAC envelopes, verify-only previous secrets, AES-GCM
+sensitive export encryption, runtime node heartbeat auth, gateway heartbeat auth,
+and production broker posture attestation.
+
+## G-19 — SMS webhook public-ingress hardening
+
+Resolved: `runtime-config/v1.md` documents raw-body HMAC verification, nonce
+replay protection, source CIDR requirements, no query-token fallback, and sender
+allowlisting for runtime SMS webhook ingress. `gateway-config/v1.md` documents the
+gateway SMS webhook signing bridge for providers that cannot sign webhooks.
+
+## G-20 — Site health and weekly report delivery contracts
+
+Resolved: `gateway-api/v1.md` and `gateway-config/v1.md` document the gateway
+site-health HTTP projection, runtime posture enrichment, weekly report delivery
+channels (`log`, `file`, `cloud`), customer-safe report payload constraints, and
+ori-cloud identity ownership rules for report persistence.
+
+## G-21 — Runtime public integration boundary
+
+Resolved: `runtime-config/v1.md` documents the typed `ori.integration` rule
+evaluation boundary and `py.typed` package marker used by product/demo consumers
+such as `ori-energy`.
