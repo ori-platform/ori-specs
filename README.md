@@ -13,6 +13,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
 | Runtime health socket RPC | [runtime-health/v1.md](runtime-health/v1.md) | Implemented |
+| Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |
