@@ -17,6 +17,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |
+| Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | Implemented baseline |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Signing contract | [signing/v1.md](signing/v1.md) | Implemented baseline |
 
