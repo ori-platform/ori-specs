@@ -116,7 +116,7 @@ ori-cloud identity ownership rules for report persistence.
 
 Resolved: `runtime-config/v1.md` documents the typed `ori.integration` rule
 evaluation boundary and `py.typed` package marker used by product/demo consumers
-such as `ori-energy`.
+such as product/demo API consumers.
 
 ## G-22 — Signed runtime config provisioning contract
 
