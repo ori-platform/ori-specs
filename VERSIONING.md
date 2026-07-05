@@ -15,6 +15,8 @@ A version increment means a breaking change for implementers.
 | gateway-api    | v1      | Implemented baseline                                     |
 | cli-commands   | v1      | Runtime entrypoint implemented; CLI command set planned  |
 | runtime-health | v1      | Implemented                                              |
+| runtime-telemetry | v1    | Implemented baseline                                     |
+| runtime-mobile | v1      | Implemented baseline                                     |
 | device-policy  | v1      | Implemented baseline                                     |
 | offline-tokens | v1      | Implemented baseline                                     |
 | runtime-config | v1      | Implemented baseline                                     |
