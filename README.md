@@ -21,6 +21,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | Implemented baseline |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Signing contract | [signing/v1.md](signing/v1.md) | Implemented baseline |
+| Evidence chain | [evidence/v1.md](evidence/v1.md) | Implemented baseline; anchor registry and export ingestion are design targets |
 
 ## Gaps
 
