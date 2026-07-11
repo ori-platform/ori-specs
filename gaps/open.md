@@ -11,8 +11,3 @@ New implementation gaps should be added here with repo tracking links.
 - **Evidence export ingestion** ([evidence/v1.md](../evidence/v1.md)): chain
   rows are marked `exported` locally but no authenticated receiver exists;
   signed receipts are the design target.
-- **Dedicated safety-action event type** ([evidence/v1.md](../evidence/v1.md)):
-  runtime Tier C/D attestations currently use `MAINTENANCE_PERFORMED` with
-  payload `kind: runtime_action`; a dedicated `SAFETY_ACTION_EXECUTED` wire
-  name needs to land in `ori-verity` and a pinned runtime artifact bump before
-  the vocabulary section is marked implemented.

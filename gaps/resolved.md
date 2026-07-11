@@ -125,3 +125,12 @@ signing, the `ori.config_signature.v1` envelope, canonical payload rules, runtim
 trust-anchor environment handling, `ORI_CONFIG_REQUIRE_SIGNED`, and the
 `ori-config-install` verification/atomic-install boundary consumed by private APK
 and assisted Termux provisioning.
+
+## G-23 — Dedicated safety-action evidence event type
+
+Resolved: `ori-verity` artifact 0.2.0 provides `SAFETY_ACTION_EXECUTED`, and
+the runtime emits it for new Tier C/D attestations when its loaded artifact
+supports it, falling back to `MAINTENANCE_PERFORMED` on older or unparseable
+artifact versions. Verifiers must accept both forms; the per-device emission
+vocabulary is visible as `action_event_type` in runtime health and the
+heartbeat evidence block. See `evidence/v1.md`.
