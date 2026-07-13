@@ -124,7 +124,7 @@ Resolved: `runtime-config-signing/v1.md` documents backend-generated `ori.yaml`
 signing, the `ori.config_signature.v1` envelope, canonical payload rules, runtime
 trust-anchor environment handling, `ORI_CONFIG_REQUIRE_SIGNED`, and the
 `ori-config-install` verification/atomic-install boundary consumed by private APK
-and assisted Termux provisioning.
+and assisted local provisioning.
 
 ## G-23 — Dedicated safety-action evidence event type
 
