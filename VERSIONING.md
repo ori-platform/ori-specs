@@ -23,6 +23,8 @@ A version increment means a breaking change for implementers.
 | runtime-config-signing | v1 | Implemented baseline                             |
 | signing        | v1      | Implemented baseline                                     |
 | evidence       | v1      | Implemented baseline; anchoring/ingestion design targets |
+| firmware-telemetry | v1  | Contract target                                           |
+| firmware-commands  | v1  | Contract target                                           |
 
 ## Compatibility
 
