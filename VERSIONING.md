@@ -25,6 +25,7 @@ A version increment means a breaking change for implementers.
 | evidence       | v1      | Implemented baseline; anchoring/ingestion design targets |
 | firmware-telemetry | v1  | Contract target                                           |
 | firmware-commands  | v1  | Contract target                                           |
+| device-provisioning | v1 | Contract target                                          |
 
 ## Compatibility
 
