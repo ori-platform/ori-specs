@@ -24,6 +24,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Evidence chain | [evidence/v1.md](evidence/v1.md) | Implemented baseline; anchor registry and export ingestion are design targets |
 | Firmware telemetry / Verity Layer 1 | [firmware-telemetry/v1.md](firmware-telemetry/v1.md) | Contract target |
 | Firmware commands | [firmware-commands/v1.md](firmware-commands/v1.md) | Contract target |
+| Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | Contract target |
 
 ## Gaps
 
