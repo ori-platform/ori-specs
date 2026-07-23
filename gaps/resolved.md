@@ -134,3 +134,11 @@ supports it, falling back to `MAINTENANCE_PERFORMED` on older or unparseable
 artifact versions. Verifiers must accept both forms; the per-device emission
 vocabulary is visible as `action_event_type` in runtime health and the
 heartbeat evidence block. See `evidence/v1.md`.
+
+## G-24 — Public evidence protocol version projection
+
+Resolved (2026-07-23): runtime health reports the public evidence contract
+version `evidence.v1` while evidence signing is available and `''` otherwise.
+The loaded artifact's declared protocol identifier remains internal to startup
+validation and is not exposed through the public health contract. Implemented
+by `ori-runtime` #253.
