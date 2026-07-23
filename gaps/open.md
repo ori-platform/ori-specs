@@ -11,14 +11,6 @@ New implementation gaps should be added here with repo tracking links.
 - **Evidence export ingestion** ([evidence/v1.md](../evidence/v1.md)): chain
   rows are marked `exported` locally but no authenticated receiver exists;
   signed receipts are the design target.
-- **Public `protocol_version` projection**
-  ([evidence/v1.md](../evidence/v1.md),
-  [runtime-health/v1.md](../runtime-health/v1.md)): the health
-  `protocol_version` field is defined to carry the public evidence contract
-  version `evidence.v1`, but the runtime still surfaces the loaded artifact's
-  raw declared identifier. Aligning it while keeping private-artifact validation
-  internal is tracked in `ori-runtime` #252.
-
 ## firmware-telemetry/v1 proof targets
 
 - **Layer 1 real-device proof** ([firmware-telemetry/v1.md](../firmware-telemetry/v1.md)):
