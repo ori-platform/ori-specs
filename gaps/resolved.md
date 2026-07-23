@@ -128,7 +128,7 @@ and assisted local provisioning.
 
 ## G-23 — Dedicated safety-action evidence event type
 
-Resolved: `ori-verity` artifact 0.2.0 provides `SAFETY_ACTION_EXECUTED`, and
+Resolved: the private evidence artifact 0.2.0 provides `SAFETY_ACTION_EXECUTED`, and
 the runtime emits it for new Tier C/D attestations when its loaded artifact
 supports it, falling back to `MAINTENANCE_PERFORMED` on older or unparseable
 artifact versions. Verifiers must accept both forms; the per-device emission
