@@ -30,3 +30,15 @@ New implementation gaps should be added here with repo tracking links.
   the sealed firmware key/certificate lifecycle primitives exist, but the
   provisioning-authority signer, shared vectors, bounded device verifier,
   concrete USB/network adapter, and HIL proof are not yet implemented.
+
+## signing/v1 implementation targets
+
+- **Community skill artifact verification**
+  ([signing/v1.md](../signing/v1.md)): the runtime implements the embedded
+  strict canonical-manifest verifier and pins the shared vectors. The detached
+  exact-artifact profile is not yet implemented end to end. The remaining
+  adoption path is the shared SDK signing API (`ori-sdk-python` #4), author and
+  Hub artifact signing in the publish pipeline (`ori-skills-hub` #4 and #9),
+  and pre-extraction install verification (`ori-cli` #10). All implementations
+  must adopt [the shared vectors](../signing/vectors-v1.json) and keep artifact
+  and manifest verification as separate entry points.
