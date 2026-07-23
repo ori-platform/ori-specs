@@ -26,6 +26,7 @@ A version increment means a breaking change for implementers.
 | firmware-telemetry | v1  | Contract target                                           |
 | firmware-commands  | v1  | Contract target                                           |
 | device-provisioning | v1 | Contract target                                          |
+| firmware-mqtt-provisioning | v1 | Contract target                                     |
 
 ## Compatibility
 
