@@ -21,12 +21,12 @@ A version increment means a breaking change for implementers.
 | offline-tokens | v1      | Implemented baseline                                     |
 | runtime-config | v1      | Implemented baseline                                     |
 | runtime-config-signing | v1 | Implemented baseline                             |
-| signing        | v1      | Manifest profile implemented; artifact profile target    |
+| signing        | v1      | Runtime manifest and SDK profiles implemented; adoption pending |
 | evidence       | v1      | Implemented baseline; anchoring/ingestion design targets |
-| firmware-telemetry | v1  | Contract target                                           |
-| firmware-commands  | v1  | Contract target                                           |
-| device-provisioning | v1 | Contract target                                          |
-| firmware-mqtt-provisioning | v1 | Contract target                                     |
+| firmware-telemetry | v1  | Implemented baseline; HIL pending                         |
+| firmware-commands  | v1  | Implemented baseline; HIL pending                         |
+| device-provisioning | v1 | Implemented baseline; HIL pending                        |
+| firmware-mqtt-provisioning | v1 | Implemented baseline; HIL pending                   |
 
 ## Compatibility
 
