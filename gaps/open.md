@@ -46,6 +46,23 @@ New implementation gaps should be added here with repo tracking links.
   comes from a reservation ceiling, so a reboot legitimately skips a range and
   gaps are expected rather than diagnostic.
 
+- **Runtime liveness adoption**
+  ([firmware-commands/v1.md](../firmware-commands/v1.md)): the signed
+  liveness signal, its freshness rules and the runtime supervision window
+  are defined; **no producer publishes it and no consumer requires it.**
+  `ori-edge-firmware` still derives `runtime_reachable` from broker
+  connectivity, so a live broker with a dead runtime leaves the Local
+  Interlock suppressed while nothing upstream can respond.
+
+  Remaining: the runtime publisher with durable per-device `runtime_seq`,
+  device-side verification and expiry, shared golden vectors, and the
+  broker-alive/runtime-dead HIL evidence. Two questions are open rather
+  than answered — the provisional timing must be ratified against bench
+  measurement, and manifest transitions currently lapse supervision, which
+  needs an explicit safe-maintenance lifecycle before any unattended
+  physical load depends on it. Tracked in `ori-edge-firmware` #68 and
+  `ori-specs` #45.
+
 ## firmware-mqtt-provisioning/v1 implementation targets
 
 - **Signed transport-identity provisioning**
