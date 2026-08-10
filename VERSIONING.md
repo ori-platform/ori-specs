@@ -8,25 +8,26 @@ A version increment means a breaking change for implementers.
 
 ## Current Baseline
 
-| Contract       | Version | Status                                                   |
-| -------------- | ------- | -------------------------------------------------------- |
-| events         | v1      | Implemented in runtime                                   |
-| skills-package | v1      | Implemented in runtime                                   |
-| gateway-api    | v1      | Implemented baseline                                     |
-| cli-commands   | v1      | Runtime entrypoint implemented; CLI command set planned  |
-| runtime-health | v1      | Implemented                                              |
-| runtime-telemetry | v1    | Implemented baseline                                     |
-| runtime-mobile | v1      | Implemented baseline                                     |
-| device-policy  | v1      | Implemented baseline                                     |
-| offline-tokens | v1      | Implemented baseline                                     |
-| runtime-config | v1      | Implemented baseline                                     |
-| runtime-config-signing | v1 | Implemented baseline                             |
-| signing        | v1      | Runtime manifest and SDK profiles implemented; adoption pending |
-| evidence       | v1      | Implemented baseline; anchoring/ingestion design targets |
-| firmware-telemetry | v1  | Implemented baseline; HIL pending                         |
-| firmware-commands  | v1  | Implemented baseline; HIL pending                         |
-| device-provisioning | v1 | Implemented baseline; HIL pending                        |
-| firmware-mqtt-provisioning | v1 | Implemented baseline; HIL pending                   |
+| Contract                   | Version | Status                                                           |
+| -------------------------- | ------- | ---------------------------------------------------------------- |
+| events                     | v1      | Implemented in runtime                                           |
+| skills-package             | v1      | Implemented in runtime                                           |
+| gateway-api                | v1      | Implemented baseline                                             |
+| cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
+| runtime-health             | v1      | Implemented                                                      |
+| runtime-telemetry          | v1      | Implemented baseline                                             |
+| runtime-mobile             | v1      | Implemented baseline                                             |
+| device-policy              | v1      | Implemented baseline                                             |
+| offline-tokens             | v1      | Implemented baseline                                             |
+| runtime-config             | v1      | Implemented baseline                                             |
+| runtime-config-signing     | v1      | Implemented baseline                                             |
+| runtime-release-bundle     | v1      | Design target                                                    |
+| signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |
+| evidence                   | v1      | Implemented baseline; anchoring/ingestion design targets         |
+| firmware-telemetry         | v1      | Implemented baseline; HIL pending                                |
+| firmware-commands          | v1      | Implemented baseline; HIL pending                                |
+| device-provisioning        | v1      | Implemented baseline; HIL pending                                |
+| firmware-mqtt-provisioning | v1      | Implemented baseline; HIL pending                                |
 
 ## Compatibility
 
