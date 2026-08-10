@@ -7,7 +7,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 ## Contracts
 
 | Contract | File | Status |
-|---|---|---|
+| --- | --- | --- |
 | Event schema | [events/v1.md](events/v1.md) | Implemented |
 | Skill package format | [skills-package/v1.md](skills-package/v1.md) | Implemented |
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline |
@@ -19,6 +19,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |
 | Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | Implemented baseline |
+| Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | Design target |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Skill signing contract | [signing/v1.md](signing/v1.md) | Runtime manifest and SDK manifest/artifact profiles implemented; adoption pending |
 | Evidence chain | [evidence/v1.md](evidence/v1.md) | Implemented baseline; anchor registry and export ingestion are design targets |
