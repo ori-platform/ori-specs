@@ -11,7 +11,7 @@ A version increment means a breaking change for implementers.
 | Contract                   | Version | Status                                                           |
 | -------------------------- | ------- | ---------------------------------------------------------------- |
 | events                     | v1      | Implemented in runtime                                           |
-| skills-package             | v1      | Implemented in runtime                                           |
+| skills-package             | v2      | Implemented in runtime >= 2.4.0; v1 superseded, accurate < 2.4.0 |
 | skill-hook-isolation       | v1      | Design target; not implemented                                   |
 | gateway-api                | v1      | Implemented baseline                                             |
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
