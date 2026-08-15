@@ -2,6 +2,24 @@
 
 New implementation gaps should be added here with repo tracking links.
 
+## skills-package/v2 adoption targets
+
+- **Deliberate downstream repointing**
+  ([skills-package/v2.md](../skills-package/v2.md)): `ori-runtime` >= 2.4.0
+  implements v2 and does not accept all v1 packages. `ori-skills`,
+  `ori-sdk-python` and `ori-cli` still reference v1. Each must be repointed
+  deliberately: a v1 reference is **not** evidence of v2 compliance, and each
+  repo has to confirm which behaviour it actually implements — particularly the
+  build/sign path in `ori-sdk-python` and the install path in `ori-cli`, which
+  can produce packages a v2 runtime refuses.
+
+- **Community packages are YAML-only**
+  ([skills-package/v2.md](../skills-package/v2.md)): under v2 a community
+  package carrying `hooks.py` is refused entirely. Any published community skill
+  relying on hooks is unloadable on runtime >= 2.4.0 until
+  [skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md) is implemented.
+  `ori-skills` should establish whether any published package is affected.
+
 ## skill-hook-isolation/v1 design targets
 
 - **Isolated community hook execution**
