@@ -9,7 +9,8 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Contract | File | Status |
 | --- | --- | --- |
 | Event schema | [events/v1.md](events/v1.md) | Implemented |
-| Skill package format | [skills-package/v1.md](skills-package/v1.md) | Implemented |
+| Skill package format | [skills-package/v2.md](skills-package/v2.md) | Implemented in runtime >= 2.4.0 |
+| Skill package format (previous) | [skills-package/v1.md](skills-package/v1.md) | Superseded by v2; accurate for runtime < 2.4.0 |
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | Design target; community hook execution disabled until implemented |
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
