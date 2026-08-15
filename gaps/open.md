@@ -4,21 +4,39 @@ New implementation gaps should be added here with repo tracking links.
 
 ## skills-package/v2 adoption targets
 
-- **Deliberate downstream repointing**
-  ([skills-package/v2.md](../skills-package/v2.md)): `ori-runtime` >= 2.4.0
-  implements v2 and does not accept all v1 packages. `ori-skills`,
-  `ori-sdk-python` and `ori-cli` still reference v1. Each must be repointed
-  deliberately: a v1 reference is **not** evidence of v2 compliance, and each
-  repo has to confirm which behaviour it actually implements — particularly the
-  build/sign path in `ori-sdk-python` and the install path in `ori-cli`, which
-  can produce packages a v2 runtime refuses.
+Downstream repos were surveyed against v2 rather than repointed. A v1 reference
+is not evidence of v2 compliance, so references stay on v1 where v1 is the
+accurate description of what a repo implements.
 
-- **Community packages are YAML-only**
-  ([skills-package/v2.md](../skills-package/v2.md)): under v2 a community
-  package carrying `hooks.py` is refused entirely. Any published community skill
-  relying on hooks is unloadable on runtime >= 2.4.0 until
+- **`ori-skills-hub` admission does not implement v2**
+  ([skills-package/v2.md](../skills-package/v2.md)): the Hub permits community
+  `action_tier: D`, cannot detect `hooks.py` because it never opens package
+  files, and has no manifest admission limits, workload budgets, reserved
+  `config` name rejection, or identity length/character bounds. It therefore
+  admits packages that runtime >= 2.4.0 refuses — a package publishes cleanly
+  and then fails to load on device. Its duplicate-action check, Tier D action
+  reference rule and history-placeholder cap already match. Tracked in
+  `ori-skills-hub` #49.
+
+- **`ori-sdk-python` authoring does not implement v2**
+  ([skills-package/v2.md](../skills-package/v2.md)): the SDK accepts
+  `action_tier: D` with no provenance concept, and has no manifest admission
+  limits, workload budgets, reserved `config` names, identity bounds, or
+  duplicate-action check. An author can build, validate and sign a package the
+  runtime refuses. Tracked in `ori-sdk-python` #48.
+
+- **`ori-cli` — no gap found.** It references no package contract and passes
+  runtime bridge JSON through without decoding fields, so the `skills-list`
+  aggregate changes in runtime 2.4.0 (`valid` becoming conjunctive, plus
+  `activatable` and `unactivatable_count`) do not affect it. Recorded so the
+  survey is not repeated.
+
+- **Published community packages using hooks or Tier D**
+  ([skills-package/v2.md](../skills-package/v2.md)): unloadable on runtime
+  >= 2.4.0. Community packages are YAML-only until
   [skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md) is implemented.
-  `ori-skills` should establish whether any published package is affected.
+  Whether any published package is affected is unestablished; raised in
+  `ori-skills-hub` #49.
 
 ## skill-hook-isolation/v1 design targets
 
