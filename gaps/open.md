@@ -2,6 +2,39 @@
 
 New implementation gaps should be added here with repo tracking links.
 
+## skill-hook-isolation/v1 design targets
+
+- **Isolated community hook execution**
+  ([skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md)): community hook
+  execution is disabled in `ori-runtime` v2.4.0. The in-process loader was
+  removed rather than hardened — its restricted namespace left the object graph
+  reachable, and its import finder used `find_module`, removed in Python 3.12,
+  so it failed open on Ubuntu 24.04. Nothing replaces it yet: the worker model,
+  artifact digests binding `hooks.py`, environment and filesystem visibility,
+  resource/process/IPC limits, capability quotas, signer revocation and
+  anti-rollback are all defined as design targets and none is implemented.
+  Community skills are YAML-only until this lands.
+
+- **Artifact receipts binding executable bytes**
+  ([skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md)): the signature
+  in [signing/v1.md](../signing/v1.md) covers the canonicalised `skill.yaml`
+  manifest only. No receipt binds `hooks.py` or other executable content, so a
+  valid signed manifest can be paired with different hook bytes. Producer
+  (Hub, SDK build path, or installer) is undecided.
+
+- **Offline revocation and anti-rollback**
+  ([skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md)): signed skills
+  have no runtime revocation, expiry, or monotonic version policy, so an older
+  legitimately signed vulnerable package can be replayed. Distribution to
+  devices that are offline for extended periods by design is undecided.
+
+- **Transactional reload rollback**
+  ([skill-hook-isolation/v1.md](../skill-hook-isolation/v1.md)): `ori-runtime`
+  v2.4.0 validates the full registration plan before removing existing handlers
+  and accounts subscriptions by active handler count, so ordinary reloads are
+  sustainable. Rollback of a failure *during* registration is not implemented —
+  the runtime logs at CRITICAL and re-raises, leaving an incomplete graph.
+
 ## runtime-release-bundle/v1 implementation target
 
 - **Signed Linux release and installer**
