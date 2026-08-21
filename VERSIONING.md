@@ -24,7 +24,7 @@ A version increment means a breaking change for implementers.
 | runtime-config-signing     | v1      | Implemented baseline                                             |
 | runtime-release-bundle     | v1      | Design target                                                    |
 | signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |
-| evidence                   | v1      | Implemented baseline; anchoring/ingestion design targets         |
+| evidence                   | v2      | v2 design target, neutral vocabulary and public byte format; v1 is what the private producer emits |
 | firmware-telemetry         | v1      | Implemented baseline; HIL pending                                |
 | firmware-commands          | v1      | Implemented baseline; HIL pending                                |
 | device-provisioning        | v1      | Implemented baseline; HIL pending                                |
