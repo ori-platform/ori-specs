@@ -118,11 +118,20 @@ accurate description of what a repo implements.
   `ori-runtime` still emits it because it implements v1. The disclosure audit
   in `ori-runtime` #327 removed it briefly and restored it — a published
   contract is not a runtime's to change unilaterally, however thin the
-  exposure. No known consumer reads it: `ori-gateway` projects node evidence
-  from the heartbeat block, which never carried it, and `ori-cli` passes
-  bridge JSON through undecoded. Remaining: the runtime adopts v2 and drops
-  the field, after which v2 stops being a design target. Tracked in
-  `ori-runtime` #327.
+  exposure.
+
+  `ori-cli` both reads and **renders** it: `ori doctor` prints
+  `artifact: <version>` in its Evidence section, so the operator-facing
+  disclosure this closes currently lives in the CLI rather than the runtime.
+  Removal will not break it — the field is parsed optionally and the render is
+  guarded on non-empty — but the CLI should drop both deliberately, since a
+  disclosure that disappears by accident can reappear the same way.
+  `ori-gateway` does not consume it; its projection reads the heartbeat block,
+  which never carried the field.
+
+  Remaining: the runtime adopts v2 and drops the field, `ori-cli` drops the
+  field and its render, and v2 then stops being a design target. Tracked in
+  `ori-runtime` #327 and `ori-cli` #35.
 
 ## firmware-telemetry/v1 proof targets
 
