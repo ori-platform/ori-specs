@@ -73,11 +73,25 @@ accurate description of what a repo implements.
 
 ## runtime-release-bundle/v1 implementation target
 
-- **Signed Linux release and installer**
-  ([runtime-release-bundle/v1.md](../runtime-release-bundle/v1.md)): the runtime
-  has wheelhouse, config-validation, and health-snapshot primitives, but release
-  signing, safe bundle verification, systemd lifecycle, rollback, and
-  end-to-end installer evidence remain open. Tracked in `ori-runtime` #273.
+- **Rollback proof on a failing artifact**
+  ([runtime-release-bundle/v1.md](../runtime-release-bundle/v1.md)): release
+  signing, safe bundle verification, systemd lifecycle, health-gated rollback
+  and end-to-end installer evidence are **implemented and evidenced**. The
+  v2.4.0 release published four KMS-signed bundles, and installation was
+  exercised on Ubuntu 24.04 `x86_64` with stock Python 3.12 and on Raspberry Pi
+  OS Trixie `aarch64` with a trusted system-scope Python 3.12. `ori-runtime`
+  #273 is closed.
+
+  What remains is narrower than the entry it replaces: rollback is implemented
+  but has never run end to end. Proving it needs a candidate that installs,
+  activates, and *then* fails its own post-install diagnosis with exactly
+  `post_install_health_failed` — a tampered bundle cannot stand in, because
+  verification refuses it before anything is installed. The evidence harness
+  carries the claim as a distinct phase and records it BLOCKED until such an
+  artifact exists. Tracked in `ori-runtime` #335.
+
+  Stock Raspberry Pi OS Trixie ships Python 3.13 only, which no published
+  bundle targets. Tracked in `ori-runtime` #328.
 
 ## evidence/v1 design targets
 
@@ -113,9 +127,9 @@ accurate description of what a repo implements.
 
 - **`storage_degraded` producer adoption**
   ([firmware-telemetry/v1.md](../firmware-telemetry/v1.md)): the code and its
-  late-reporting semantics are defined here, and receiver acceptance is
-  provided by `ori-runtime` #270, which must precede any firmware rollout.
-  **No producer emits the code.** `ori-edge-firmware` currently discards the
+  late-reporting semantics are defined here, and receiver acceptance **landed
+  in `ori-runtime` #270**. The gap is now entirely producer-side: **no producer
+  emits the code.** `ori-edge-firmware` currently discards the
   result of appending a signed envelope to its offline buffer, so a
   measurement can consume a `(boot_id, seq)` pair and then vanish with no
   durable record.
@@ -133,21 +147,26 @@ accurate description of what a repo implements.
   gaps are expected rather than diagnostic.
 
 - **Runtime liveness adoption**
-  ([firmware-commands/v1.md](../firmware-commands/v1.md)): the signed
-  liveness signal, its freshness rules and the runtime supervision window
-  are defined; **no producer publishes it and no consumer requires it.**
-  `ori-edge-firmware` still derives `runtime_reachable` from broker
-  connectivity, so a live broker with a dead runtime leaves the Local
-  Interlock suppressed while nothing upstream can respond.
+  ([firmware-commands/v1.md](../firmware-commands/v1.md)): the contract landed
+  in `ori-specs` #45, and the producer side is **implemented**: the signing
+  path, the publisher and its scheduler, durable per-device `runtime_seq` in
+  the state store, and shared cross-language golden vectors. Firmware
+  implements the verifier, its ingress path and its broker ACL, and consumes
+  the signal as **shadow observability only**.
 
-  Remaining: the runtime publisher with durable per-device `runtime_seq`,
-  device-side verification and expiry, shared golden vectors, and the
-  broker-alive/runtime-dead HIL evidence. Two questions are open rather
-  than answered — the provisional timing must be ratified against bench
-  measurement, and manifest transitions currently lapse supervision, which
-  needs an explicit safe-maintenance lifecycle before any unattended
-  physical load depends on it. Tracked in `ori-edge-firmware` #68 and
-  `ori-specs` #45.
+  So the definition and both implementations exist; what is missing is that
+  nothing yet *acts* on it. `ori-edge-firmware` still derives
+  `runtime_reachable` from broker connectivity, so a live broker with a dead
+  runtime leaves the Local Interlock suppressed while nothing upstream can
+  respond — the supervision gap this signal exists to close remains open in
+  practice.
+
+  Remaining: the `runtime_reachable` switchover, sequenced last because it
+  changes when a physical backstop is allowed to act; hardware-in-the-loop
+  evidence for the broker-alive/runtime-dead case; and the safe-maintenance
+  lifecycle, since manifest transitions currently lapse supervision and no
+  unattended physical load should depend on it until they do not. Tracked in
+  `ori-edge-firmware` #68 and `ori-specs` #49.
 
 ## firmware-mqtt-provisioning/v1 implementation targets
 
@@ -165,7 +184,16 @@ accurate description of what a repo implements.
   ([signing/v1.md](../signing/v1.md)): the runtime implements the embedded
   strict canonical-manifest verifier and pins the shared vectors. The SDK
   implements the separate canonical-manifest and detached exact-artifact
-  profiles against those vectors. Remaining end-to-end adoption is author and
-  Hub artifact signing in the publish pipeline (`ori-skills-hub` #4 and #9)
-  and pre-extraction install verification (`ori-cli` #10). Implementations
-  must keep artifact and manifest verification as separate entry points.
+  profiles against those vectors.
+
+  The Hub now *has* an artifact verifier — `verify_artifact_signature` in
+  `hub/security/signing.py` — but **nothing in the publish pipeline calls it**;
+  every reference outside its definition is a test. `ori-skills-hub` #4 and #9
+  are closed without wiring it in, so a verifier that exists and is never
+  invoked is the current state rather than an absent one. That distinction
+  matters: the code will pass review and the property will not hold.
+
+  Remaining: invoking artifact verification in the Hub publish pipeline, author
+  signing end to end, and pre-extraction install verification (`ori-cli` #10).
+  Implementations must keep artifact and manifest verification as separate
+  entry points.
