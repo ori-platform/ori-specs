@@ -24,7 +24,8 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | Design target |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Skill signing contract | [signing/v1.md](signing/v1.md) | Runtime manifest and SDK manifest/artifact profiles implemented; adoption pending |
-| Evidence chain | [evidence/v1.md](evidence/v1.md) | Implemented baseline; anchor registry and export ingestion are design targets |
+| Evidence chain | [evidence/v1.md](evidence/v1.md) | Implemented baseline; anchor registry and export ingestion superseded by evidence-exchange/v1 |
+| Evidence exchange (off-site delivery) | [evidence-exchange/v1.md](evidence-exchange/v1.md) | Design target |
 | Firmware telemetry / evidence Layer 1 | [firmware-telemetry/v1.md](firmware-telemetry/v1.md) | Implemented baseline; HIL pending |
 | Firmware commands | [firmware-commands/v1.md](firmware-commands/v1.md) | Implemented baseline; HIL pending |
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | Implemented baseline; HIL pending |
