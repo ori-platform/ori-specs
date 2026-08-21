@@ -14,7 +14,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | Design target; community hook execution disabled until implemented |
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
-| Runtime health socket RPC | [runtime-health/v1.md](runtime-health/v1.md) | Implemented |
+| Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v1 implemented; v2 removes `evidence.artifact_version`, design target |
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | Implemented baseline |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |

@@ -111,6 +111,19 @@ accurate description of what a repo implements.
   the confirmation gate cannot be satisfied in the deployment the contract
   describes.
 
+## runtime-health/v2 adoption target
+
+- **`evidence.artifact_version` still reported**
+  ([runtime-health/v2.md](../runtime-health/v2.md)): v2 removes the field, and
+  `ori-runtime` still emits it because it implements v1. The disclosure audit
+  in `ori-runtime` #327 removed it briefly and restored it — a published
+  contract is not a runtime's to change unilaterally, however thin the
+  exposure. No known consumer reads it: `ori-gateway` projects node evidence
+  from the heartbeat block, which never carried it, and `ori-cli` passes
+  bridge JSON through undecoded. Remaining: the runtime adopts v2 and drops
+  the field, after which v2 stops being a design target. Tracked in
+  `ori-runtime` #327.
+
 ## firmware-telemetry/v1 proof targets
 
 - **Layer 1 real-device proof** ([firmware-telemetry/v1.md](../firmware-telemetry/v1.md)):
