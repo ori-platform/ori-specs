@@ -81,13 +81,21 @@ accurate description of what a repo implements.
 
 ## evidence/v1 design targets
 
-- **Anchor registry** ([evidence/v1.md](../evidence/v1.md)): no off-device
-  store binds `device_id` to `initial_pubkey_hex`; the anchor is only logged at
-  first provisioning. Owner/store undecided (likely ori-cloud or a site-local
-  signed file; the gateway has no persistent store).
-- **Evidence export ingestion** ([evidence/v1.md](../evidence/v1.md)): chain
-  rows are marked `exported` locally but no authenticated receiver exists;
-  signed receipts are the design target.
+- **Anchor registry** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+  no off-device store binds `device_id` to `initial_pubkey_hex`; the anchor is
+  only logged at first provisioning. The exchange contract now places
+  registration over the gateway rather than a manual provisioning step, and
+  requires the evidence authority to retain the verification binding
+  independently. What remains open is the implementation, not the ownership.
+- **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+  chain rows are marked `exported` locally but no authenticated receiver
+  exists. The exchange contract specifies the artifacts — envelope, custody
+  acknowledgement, receipt, epoch confirmation — and none is implemented.
+- **On-device evidence topology** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+  the runtime confirms epochs against a chain loaded in its own process, which
+  the exchange topology rules out. Nothing yet crosses the device boundary, so
+  the confirmation gate cannot be satisfied in the deployment the contract
+  describes.
 
 ## firmware-telemetry/v1 proof targets
 
