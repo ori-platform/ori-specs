@@ -15,7 +15,7 @@ A version increment means a breaking change for implementers.
 | skill-hook-isolation       | v1      | Design target; not implemented                                   |
 | gateway-api                | v1      | Implemented baseline                                             |
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
-| runtime-health             | v2      | v1 implemented in runtime; v2 removes `evidence.artifact_version`, design target |
+| runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
 | runtime-telemetry          | v1      | Implemented baseline                                             |
 | runtime-mobile             | v1      | Implemented baseline                                             |
 | device-policy              | v1      | Implemented baseline                                             |
