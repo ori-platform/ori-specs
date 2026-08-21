@@ -142,3 +142,17 @@ version `evidence.v1` while evidence signing is available and `''` otherwise.
 The loaded artifact's declared protocol identifier remains internal to startup
 validation and is not exposed through the public health contract. Implemented
 by `ori-runtime` #253.
+
+## G-25 — `evidence.artifact_version` reported to operators
+
+Resolved: `runtime-health/v2` is implemented on both sides. `ori-runtime`
+stopped emitting the field in the release following `2.4.0`; `ori-cli` removed
+it from the RPC struct, the doctor report projection, the text render, and —
+the part the migration analysis originally missed — the raw envelope
+passthrough behind `ori doctor runtime-health --json` and `ori --json doctor
+runtime-health`, which no typed removal reaches. Released runtimes at `2.4.x`
+and earlier still send the field and are accepted rather than rejected.
+`ori-gateway` never consumed it.
+
+Tracked in `ori-runtime` #327 and `ori-cli` #35.
+
