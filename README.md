@@ -24,6 +24,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | Design target |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Skill signing contract | [signing/v1.md](signing/v1.md) | Runtime manifest and SDK manifest/artifact profiles implemented; adoption pending |
+| Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | Implemented baseline; cross-language vectors for runtime, gateway and Verity |
 | Evidence chain | [evidence/v2.md](evidence/v2.md) | Design target; neutral vocabulary and the first public byte-level specification |
 | Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | Implemented baseline; format specified only in the private producer; anchor registry and export ingestion superseded by evidence-exchange/v1 |
 | Evidence exchange (off-site delivery) | [evidence-exchange/v1.md](evidence-exchange/v1.md) | Design target |
