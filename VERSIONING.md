@@ -25,6 +25,7 @@ A version increment means a breaking change for implementers.
 | runtime-release-bundle     | v1      | Design target                                                    |
 | signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |
 | evidence                   | v2      | v2 design target, neutral vocabulary and public byte format; v1 is what the private producer emits |
+| evidence-exchange          | v1      | Design target, pre-ratification; no shipped conforming consumer |
 | firmware-telemetry         | v1      | Implemented baseline; HIL pending                                |
 | firmware-commands          | v1      | Implemented baseline; HIL pending                                |
 | device-provisioning        | v1      | Implemented baseline; HIL pending                                |
@@ -35,6 +36,25 @@ A version increment means a breaking change for implementers.
 - Additive optional fields are backward-compatible.
 - Unknown fields should be ignored by consumers unless explicitly forbidden.
 - Breaking changes require a new version directory.
+
+### Pre-ratification exception
+
+A contract whose status is **Design Target** MAY be amended in place, including
+in ways that break semantics, until it has a shipped consumer claiming
+conformance. Such a contract has no deployed implementation to break, and
+issuing a new major version for it would publish a compatibility generation
+that never existed.
+
+**Once any implementation ships claiming conformance, the exception is spent**
+and the ordinary rule applies: a breaking semantic change requires a new
+version directory. Conformance tests in a repository that has not shipped the
+behaviour do not spend it; a released artifact whose documentation or capability
+matrix claims the contract does.
+
+A contract amended under this exception MUST record in the baseline table above
+that it is pre-ratification and has no shipped conforming consumer, so the
+exception's availability is a stated fact rather than an assumption a later
+change can quietly inherit.
 
 ## Deprecation
 
