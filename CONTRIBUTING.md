@@ -39,6 +39,13 @@ Same-version updates are allowed for:
 - clarifications that do not change behavior
 - marking already-implemented gaps as resolved
 
+**Pre-ratification exception.** A contract whose status is `Design Target` may
+be amended in place, including in the breaking ways listed above, until it has
+a shipped consumer claiming conformance. The rule and its limits are in
+[VERSIONING.md](VERSIONING.md#pre-ratification-exception) — read it there
+rather than restating it, so the two documents cannot drift. A contract amended
+this way must be recorded in the versioning baseline as pre-ratification.
+
 ## Writing Rules
 
 - Do not describe planned behavior as implemented.
