@@ -104,7 +104,11 @@ accurate description of what a repo implements.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies the artifacts — envelope, custody
-  acknowledgement, receipt, epoch confirmation — and none is implemented.
+  acknowledgement, receipt, epoch confirmation. The runtime now verifies and
+  applies the three inbound ones and routes them from the transport specified
+  in [gateway-api/v1.md](../gateway-api/v1.md); the gateway does not yet
+  publish to it, and no release ships an authority-key registry, so receipts
+  and epoch confirmations are refused as unknown-key.
 - **On-device evidence topology** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   the runtime confirms epochs against a chain loaded in its own process, which
   the exchange topology rules out. Nothing yet crosses the device boundary, so
