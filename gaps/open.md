@@ -117,12 +117,12 @@ accurate description of what a repo implements.
   checkpoint scheduling/reporting remains implementation work. The authority
   implementation must not be treated as complete merely because the schema
   names a state that no path can establish.
-- **Evidence auditor access** ([evidence-transport/v1.md](../evidence-transport/v1.md)):
+- **Evidence auditor access** ([evidence-audit/v1.md](../evidence-audit/v1.md)):
   Gateway ingest credentials are intentionally write-only and cannot enumerate
-  or read devices. Insurer/auditor batch reads require a separate caller,
-  authority and threat model, tracked as `ori-specs#102`; they must not be
-  grafted onto the courier credential merely to claim the deployment work is
-  complete.
+  or read devices. The separate contract now fixes the insurer/auditor caller,
+  credential, authorisation, pagination and neutral refusal boundary. What
+  remains open is its implementation and deployment proof; it must not be
+  grafted onto the courier credential merely to claim that work is complete.
 - **On-device evidence topology** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   the runtime confirms epochs against a chain loaded in its own process, which
   the exchange topology rules out. Nothing yet crosses the device boundary, so
