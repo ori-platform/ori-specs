@@ -103,12 +103,26 @@ accurate description of what a repo implements.
   independently. What remains open is the implementation, not the ownership.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
-  exists. The exchange contract specifies the artifacts — envelope, custody
-  acknowledgement, receipt, epoch confirmation. The runtime now verifies and
-  applies the three inbound ones and routes them from the transport specified
-  in [gateway-api/v1.md](../gateway-api/v1.md); the gateway does not yet
-  publish to it, and no release ships an authority-key registry, so receipts
-  and epoch confirmations are refused as unknown-key.
+  exists. The exchange contract specifies all seven artifacts. The runtime now
+  verifies and applies the three inbound ones and routes them from the transport
+  specified in [gateway-api/v1.md](../gateway-api/v1.md); that contract now also
+  specifies byte-literal runtime-to-gateway carriage. The separate
+  [evidence-transport/v1.md](../evidence-transport/v1.md) fixes authenticated
+  gateway-to-authority ingest. The gateway courier and independent evidence
+  authority implementations remain open, and no runtime release ships an
+  authority-key registry, so receipts and epoch confirmations are still refused
+  as unknown-key.
+  The current carriage also gives the authority no custody observation;
+  `custodied, unreceipted` is therefore runtime-observed, while authority-side
+  checkpoint scheduling/reporting remains implementation work. The authority
+  implementation must not be treated as complete merely because the schema
+  names a state that no path can establish.
+- **Evidence auditor access** ([evidence-transport/v1.md](../evidence-transport/v1.md)):
+  Gateway ingest credentials are intentionally write-only and cannot enumerate
+  or read devices. Insurer/auditor batch reads require a separate caller,
+  authority and threat model, tracked as `ori-specs#102`; they must not be
+  grafted onto the courier credential merely to claim the deployment work is
+  complete.
 - **On-device evidence topology** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   the runtime confirms epochs against a chain loaded in its own process, which
   the exchange topology rules out. Nothing yet crosses the device boundary, so
