@@ -14,6 +14,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | Design target; community hook execution disabled until implemented |
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline; evidence carriage pending |
 | Evidence Transport | [evidence-transport/v1.md](evidence-transport/v1.md) | Design target |
+| Evidence Audit | [evidence-audit/v1.md](evidence-audit/v1.md) | Design target |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |
