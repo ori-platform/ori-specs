@@ -32,6 +32,7 @@ A version increment means a breaking change for implementers.
 | firmware-commands          | v1      | Implemented baseline; HIL pending                                |
 | device-provisioning        | v1      | Implemented baseline; HIL pending                                |
 | firmware-mqtt-provisioning | v1      | Implemented baseline; HIL pending                                |
+| commissioned-safety-binding | v1    | Design target, pre-ratification; no shipped conforming consumer |
 
 ## Compatibility
 

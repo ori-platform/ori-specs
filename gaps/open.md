@@ -215,3 +215,54 @@ accurate description of what a repo implements.
   signing end to end, and pre-extraction install verification (`ori-cli` #10).
   Implementations must keep artifact and manifest verification as separate
   entry points.
+
+## commissioned-safety-binding/v1 implementation targets
+
+- **No producer, no consumer**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  the contract is a pre-ratification design target. `ori-cli` #34 is the
+  intended producer and is itself blocked on this contract; `ori-runtime` #324
+  is the intended consumer. Until both exist, no device can activate an
+  actuating safety profile under this contract's rules.
+
+- **The unsafe NC rule survives in governing documents**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  the contract's "contact type is not an input" rule supersedes the
+  normally-closed sentence in ori-specs#71, but that issue text and the
+  operator-facing wiring instructions in `ori-runtime` (`CLAUDE.md`,
+  `docs/RASPBERRY_PI_SUPPORT.md`) still instruct NC wiring as proof of fail-safe
+  behaviour. Correcting the contract without correcting the documents an
+  installer actually reads leaves the unsafe rule in force where it does damage.
+
+- **Runtime actuation does not route through a commissioned mapping**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  in `ori-runtime`, semantic relay actions (`trip_relay`, `release_relay`,
+  `close_gas_valve`) select a coil state directly rather than resolving an
+  outcome through a binding. Accepting a mapping at connect time without
+  routing actuation through it proves configuration transport, not physical
+  use. Tracked in `ori-runtime` #397.
+
+- **The shipped runtime example describes a cutoff that cannot fire**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  `ori-runtime/ori.yaml.example` declares `rated_capacity_amps: 10.0`, the
+  electrical overcurrent profile in ori-specs#71 multiplies capacity by 5.0, and
+  the clamp the runtime documentation recommends reads to 30 A. The trip point
+  is 50 A on a sensor that saturates at 30 A, so the hazard arrives as a merely
+  high reading and the Tier D condition never fires. Surfaced while authoring
+  the binding vectors, and the reason this contract bounds the trip point rather
+  than only the capacity.
+
+- **Cross-language independence of the vector corpus is unproven**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  the generator and the verifier are both Python and were written from the
+  contract rather than from each other. That demonstrates internal consistency,
+  not the cross-language byte agreement the canonical-JSON rules exist for. The
+  Go producer in `ori-cli` #34 is the intended second implementation.
+
+- **Firmware board profiles are literals, not commissioned artifacts**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  `ori-edge-firmware` honours D-021 structurally — the relay driver has no
+  default mapping — but the ESP32 build supplies that mapping as a compile-time
+  literal in `device/main/app_main.c`, and both `boards/` profile directories
+  are empty. The bench value is annotated as unconfirmed by a terminal-state
+  table, which is honest and is not a substitute for one.
