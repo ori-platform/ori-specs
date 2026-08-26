@@ -252,6 +252,13 @@ accurate description of what a repo implements.
   the binding vectors, and the reason this contract bounds the trip point rather
   than only the capacity.
 
+- **The closed grammar has no non-Python enforcement**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  the grammar is now normative and carries vectors, so a conforming verifier in
+  any language is held to it. Nothing outside the reference Python verifier
+  enforces it yet, which is the same gap as cross-language reproduction and
+  closes with it.
+
 - **Cross-language independence of the vector corpus is unproven**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
   the generator and the verifier are both Python and were written from the
