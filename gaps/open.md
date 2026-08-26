@@ -259,6 +259,14 @@ accurate description of what a repo implements.
   not the cross-language byte agreement the canonical-JSON rules exist for. The
   Go producer in `ori-cli` #34 is the intended second implementation.
 
+- **No device-side verification of a commissioned mapping**
+  ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
+  the contract requires a firmware device to hold the mapping in a
+  commissioning-signed object it verifies itself, because a manifest
+  `binding_ref` proves only that the firmware claims a relationship to a
+  binding. Nothing on the device verifies anything of the kind today. Tracked
+  in `ori-edge-firmware` #79.
+
 - **Firmware board profiles are literals, not commissioned artifacts**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
   `ori-edge-firmware` honours D-021 structurally — the relay driver has no
