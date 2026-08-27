@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+#
+# Install Ori agent skills from this repository into a local agent tool.
+#
+# The canonical source is agent-skills/, which is tool-neutral: one copy,
+# reviewed in PRs, versioned with the contracts it reviews. Installing copies
+# rather than symlinks. A symlink is invisible to the tool that reads it and
+# silently follows a branch checkout, so a teammate on a feature branch would be
+# running whatever that branch happens to say. A copy is inert until reinstalled,
+# and --check reports when it has fallen behind.
+#
+# Usage:
+#   scripts/install-agent-skills --codex            # ~/.codex/skills
+#   scripts/install-agent-skills --claude           # ~/.claude/skills
+#   scripts/install-agent-skills --claude --dest .claude/skills   # project scope
+#   scripts/install-agent-skills --check            # report drift, install nothing
+#   scripts/install-agent-skills --manifest         # regenerate digests (maintainers)
+#
+# --check exits non-zero when anything is missing or stale, so CI or a shell
+# profile can use it as a gate.
+
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SOURCE="${REPO}/agent-skills"
+MANIFEST="${SOURCE}/MANIFEST.json"
+
+TARGETS=()
+DEST=""
+MODE="install"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --codex)    TARGETS+=("codex") ;;
+    --claude)   TARGETS+=("claude") ;;
+    --check)    MODE="check" ;;
+    --manifest) MODE="manifest" ;;
+    --dest)     shift; DEST="${1:-}" ;;
+    -h|--help)  sed -n '5,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *)          echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+digest() { shasum -a 256 "$1" | awk '{print $1}'; }
+
+skills() { find "${SOURCE}" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | sort; }
+
+# Files a tool should receive. Editor backups and local scratch are excluded
+# deliberately: a stray SKILL.md.bak beside a SKILL.md confuses both the loader
+# and the next reader.
+skill_files() {
+  find "${SOURCE}/$1" -type f \
+    ! -name '*.bak' ! -name '*.orig' ! -name '*~' ! -name '.DS_Store' \
+    | sed "s|${SOURCE}/$1/||" | sort
+}
+
+target_root() {
+  case "$1" in
+    codex)  echo "${DEST:-${HOME}/.codex/skills}" ;;
+    claude) echo "${DEST:-${HOME}/.claude/skills}" ;;
+  esac
+}
+
+regenerate_manifest() {
+  python3 - "${SOURCE}" "${MANIFEST}" <<'PYEOF'
+import hashlib, json, pathlib, sys
+
+source, manifest_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+
+
+def shipped(root):
+    """Files a tool receives. Must match skill_files() in the shell exactly."""
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix in {".bak", ".orig"} or path.name.endswith("~"):
+            continue
+        if path.name == ".DS_Store":
+            continue
+        yield path
+
+
+import re
+
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+doc = json.loads(manifest_path.read_text())
+doc.setdefault("retired", {})
+
+# A skill name reaches the filesystem, and one of the paths it reaches is an
+# `rm -rf` during retirement. Constrain it to a shape that cannot traverse:
+# lowercase letters, digits and single hyphens, nothing else. No dot, no slash,
+# no empty string.
+unsafe = [n for n in list(doc["skills"]) + list(doc["retired"]) if not NAME_RE.match(n)]
+if unsafe:
+    for name in unsafe:
+        print(f"refused: {name!r} is not a valid skill name", file=sys.stderr)
+    sys.exit(1)
+
+# A directory is a skill only if it carries a SKILL.md. Without this rule any
+# scratch directory left under agent-skills/ is manifested and then installed
+# into every teammate's tool as though it were reviewed guidance.
+present, rejected = [], []
+for d in sorted(x for x in source.iterdir() if x.is_dir()):
+    if not NAME_RE.match(d.name):
+        print(f"refused: agent-skills/{d.name} is not a valid skill name "
+              f"(lowercase letters, digits and hyphens only)", file=sys.stderr)
+        sys.exit(1)
+    (present if (d / "SKILL.md").is_file() else rejected).append(d.name)
+
+if rejected:
+    for name in rejected:
+        print(f"refused: agent-skills/{name} has no SKILL.md, so it is not a skill",
+              file=sys.stderr)
+    print("Move it out of agent-skills/, or give it a SKILL.md.", file=sys.stderr)
+    sys.exit(1)
+
+for name in present:
+    doc["skills"].setdefault(name, {"version": "0.1.0", "summary": "", "files": {}})
+    doc["retired"].pop(name, None)
+
+# A skill that leaves the source is retired, not forgotten. Dropping it silently
+# strands the copy already installed on every machine, where the tool keeps
+# loading it and nothing is left to compare it against.
+for name in sorted(set(doc["skills"]) - set(present)):
+    version = doc["skills"][name].get("version", "unknown")
+    del doc["skills"][name]
+    doc["retired"][name] = {
+        "last_version": version,
+        "reason": "TODO: say why this skill was retired",
+    }
+    print(f"retired: {name} (was {version}); installers will now remove it. "
+          f"Record why in MANIFEST.json.")
+
+for name, entry in doc["skills"].items():
+    root = source / name
+    entry["files"] = {
+        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+        for p in shipped(root)
+    }
+
+manifest_path.write_text(json.dumps(doc, indent=2) + "\n")
+print(f"manifest: {len(doc['skills'])} skill(s), "
+      f"{sum(len(e['files']) for e in doc['skills'].values())} files digested, "
+      f"{len(doc['retired'])} retired")
+PYEOF
+}
+
+# Skills this repository once shipped and has since withdrawn. The installer
+# removes them; --check reports one that is still present.
+retired_skills() {
+  python3 -c 'import json,sys; print("\n".join(sorted(json.load(open(sys.argv[1])).get("retired", {}))))' \
+    "${MANIFEST}"
+}
+
+expected_digest() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["skills"][sys.argv[2]]["files"].get(sys.argv[3],""))' \
+    "${MANIFEST}" "$1" "$2"
+}
+
+version_of() {
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["skills"][sys.argv[2]]["version"])' \
+    "${MANIFEST}" "$1"
+}
+
+if [ "${MODE}" = "manifest" ]; then
+  regenerate_manifest
+  exit 0
+fi
+
+# The source must agree with its own manifest, in BOTH directions, before
+# anything is copied out of it.
+#
+# Checking only source-against-manifest is not enough, and the gap is not
+# theoretical: delete a canonical file and every remaining file still matches
+# its digest, so the install proceeds and the prune step deletes that file from
+# the recipient. An unmanifested deletion then propagates as a successful
+# install. A manifest entry with no source file must therefore be an error, and
+# so must a skill directory the manifest names but the source does not have.
+validate_source() {
+  python3 - "${SOURCE}" "${MANIFEST}" <<'PY'
+import hashlib, json, pathlib, re, sys
+
+source, manifest_path = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+doc = json.loads(manifest_path.read_text())
+problems = []
+
+# Checked before anything else: an invalid name is a filesystem hazard, not a
+# bookkeeping error. `../outside` as a retired name would send the retirement
+# `rm -rf` out of the skills root entirely.
+NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+for section in ("skills", "retired"):
+    for name in sorted(doc.get(section, {})):
+        if not NAME_RE.match(name):
+            problems.append(
+                f"{section}: {name!r} is not a valid skill name "
+                f"(lowercase letters, digits and hyphens only)"
+            )
+for entry in sorted(x.name for x in source.iterdir() if x.is_dir()):
+    if not NAME_RE.match(entry):
+        problems.append(f"agent-skills/{entry} is not a valid skill name")
+if problems:
+    for problem in problems:
+        print(f"SOURCE  {problem}", file=sys.stderr)
+    sys.exit(1)
+
+
+def shipped(root):
+    """Files a tool receives. Must match skill_files() in the shell exactly."""
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix in {".bak", ".orig"} or path.name.endswith("~"):
+            continue
+        if path.name == ".DS_Store":
+            continue
+        yield path
+
+
+declared = set(doc["skills"])
+retired = set(doc.get("retired", {}))
+present = {d.name for d in source.iterdir() if d.is_dir()}
+
+for name in sorted(declared & retired):
+    problems.append(f"{name} is both declared and retired; it cannot be each")
+for name in sorted(present & retired):
+    problems.append(f"agent-skills/{name} exists but the manifest retires it")
+for name in sorted(present):
+    if not (source / name / "SKILL.md").is_file():
+        problems.append(f"agent-skills/{name} has no SKILL.md, so it is not a skill")
+
+for name in sorted(declared - present):
+    problems.append(f"manifest names skill {name!r}, but agent-skills/{name} does not exist")
+for name in sorted(present - declared):
+    problems.append(f"agent-skills/{name} exists, but the manifest does not declare it")
+
+for name in sorted(declared & present):
+    root = source / name
+    listed = doc["skills"][name].get("files", {})
+    if not listed:
+        problems.append(f"{name}: the manifest lists no files for a skill that exists")
+    on_disk = {str(p.relative_to(root)): p for p in shipped(root)}
+
+    for rel in sorted(set(listed) - set(on_disk)):
+        problems.append(f"{name}/{rel} is in the manifest, but not in the source")
+    for rel in sorted(set(on_disk) - set(listed)):
+        problems.append(f"{name}/{rel} is in the source, but not in the manifest")
+    for rel in sorted(set(listed) & set(on_disk)):
+        got = hashlib.sha256(on_disk[rel].read_bytes()).hexdigest()
+        if got != listed[rel]:
+            problems.append(f"{name}/{rel} differs from its manifest digest")
+
+for problem in problems:
+    print(f"SOURCE  {problem}", file=sys.stderr)
+sys.exit(1 if problems else 0)
+PY
+}
+
+if ! validate_source; then
+  echo >&2
+  echo "The canonical source does not agree with agent-skills/MANIFEST.json." >&2
+  echo "Run --manifest and review the diff: a skill change is a change, not a" >&2
+  echo "refresh, and a deleted file is a change too." >&2
+  exit 1
+fi
+
+# The manifest records what the source said, not who approved it: a maintainer
+# can edit a file, run --manifest, and install from an uncommitted tree. Warn,
+# because a dirty tree is usually work in progress rather than intent to
+# distribute. This is a drift detector, not an authorization boundary; review
+# happens in the pull request.
+if git -C "${REPO}" rev-parse --git-dir >/dev/null 2>&1; then
+  if [ -n "$(git -C "${REPO}" status --porcelain -- agent-skills 2>/dev/null)" ]; then
+    echo "note: agent-skills/ has uncommitted changes; installing from the working tree." >&2
+  fi
+fi
+
+if [ "${MODE}" = "check" ] && [ ${#TARGETS[@]} -eq 0 ]; then
+  TARGETS=("codex" "claude")
+fi
+if [ ${#TARGETS[@]} -eq 0 ]; then
+  echo "choose at least one of --codex or --claude (or --check for both)" >&2
+  exit 2
+fi
+
+status=0
+for target in "${TARGETS[@]}"; do
+  root="$(target_root "${target}")"
+
+  # Retirement is handled before installation, and only for names the manifest
+  # names. A directory the manifest never knew about belongs to whoever put it
+  # there — possibly a teammate's own skill — and this installer does not touch
+  # it. Withdrawing a skill has to reach the machines already carrying it;
+  # otherwise the tool keeps loading guidance the project has repudiated.
+  while read -r gone; do
+    [ -n "${gone}" ] || continue
+    # Defence in depth. Validation above already rejects an unsafe name, but
+    # this guard sits immediately before an `rm -rf` and must not depend on an
+    # earlier check having run: a boundary that holds only because something
+    # else held is not a boundary.
+    if ! [[ "${gone}" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+      echo "refusing to act on an invalid retired skill name: ${gone}" >&2
+      exit 1
+    fi
+    if [ -d "${root}/${gone}" ]; then
+      if [ "${MODE}" = "check" ]; then
+        echo "RETIRED  ${target}: ${gone} is still installed at ${root}/${gone}"
+        status=1
+      else
+        rm -rf "${root:?}/${gone}"
+        echo "retired  ${gone} removed from ${root}"
+      fi
+    fi
+  done <<< "$(retired_skills)"
+
+  for skill in $(skills); do
+    version="$(version_of "${skill}")"
+    dest="${root}/${skill}"
+
+    if [ "${MODE}" = "check" ]; then
+      if [ ! -d "${dest}" ]; then
+        echo "MISSING  ${target}: ${skill} is not installed at ${dest}"; status=1; continue
+      fi
+      drift=0
+      while read -r rel; do
+        [ -n "${rel}" ] || continue
+        if [ ! -f "${dest}/${rel}" ]; then
+          echo "MISSING  ${target}: ${skill}/${rel}"; drift=1
+        elif [ "$(digest "${dest}/${rel}")" != "$(expected_digest "${skill}" "${rel}")" ]; then
+          echo "STALE    ${target}: ${skill}/${rel}"; drift=1
+        fi
+      done <<< "$(skill_files "${skill}")"
+      # A file the tool holds and the source does not is a leftover from an
+      # earlier version, and it will still be loaded.
+      if [ -d "${dest}" ]; then
+        while read -r rel; do
+          [ -n "${rel}" ] || continue
+          if [ ! -f "${SOURCE}/${skill}/${rel}" ]; then
+            echo "ORPHAN   ${target}: ${skill}/${rel}"; drift=1
+          fi
+        done <<< "$(cd "${dest}" && find . -type f | sed 's|^\./||' | sort)"
+      fi
+      if [ "${drift}" -eq 0 ]; then
+        echo "OK       ${target}: ${skill} ${version}"
+      else
+        status=1
+      fi
+      continue
+    fi
+
+    mkdir -p "${dest}"
+    while read -r rel; do
+      [ -n "${rel}" ] || continue
+      mkdir -p "${dest}/$(dirname "${rel}")"
+      cp "${SOURCE}/${skill}/${rel}" "${dest}/${rel}"
+    done <<< "$(skill_files "${skill}")"
+    # Remove what this version no longer ships, so an install is the whole
+    # skill rather than the union of every version ever installed.
+    while read -r rel; do
+      [ -n "${rel}" ] || continue
+      [ -f "${SOURCE}/${skill}/${rel}" ] || { rm -f "${dest}/${rel}"; echo "removed  ${skill}/${rel}"; }
+    done <<< "$(cd "${dest}" && find . -type f | sed 's|^\./||' | sort)"
+    echo "installed ${skill} ${version} -> ${dest}"
+  done
+done
+
+exit "${status}"
