@@ -224,8 +224,8 @@ accurate description of what a repo implements.
   provisioning backend signs the whole configuration surface. Anything it
   writes is authorised by construction, including `device.rated_capacity_amps`,
   which a release-owned multiplier turns into a trip point. The split is
-  specified and nothing implements it. Tracked in `ori-cloud` #19 and
-  `ori-runtime` #332.
+  specified and nothing implements it. Tracked in the provisioning backend
+  implementation and in `ori-runtime` #332.
 
 - **The entitlement signer is named by key, not by authority**
   ([runtime-config-authority/v1.md](../runtime-config-authority/v1.md)):
