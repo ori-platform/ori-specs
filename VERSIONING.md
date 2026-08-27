@@ -12,6 +12,7 @@ A version increment means a breaking change for implementers.
 | -------------------------- | ------- | ---------------------------------------------------------------- |
 | events                     | v1      | Implemented in runtime                                           |
 | skills-package             | v2      | Implemented in runtime >= 2.4.0; v1 superseded, accurate < 2.4.0 |
+| skills-package             | v3      | Design target, pre-ratification; no implementations. v2 remains the baseline |
 | skill-hook-isolation       | v1      | Design target; not implemented                                   |
 | gateway-api                | v1      | Implemented baseline; outbound evidence carriage is a pre-ratification design target |
 | evidence-transport         | v1      | Design target, pre-ratification; no deployed conforming service |
