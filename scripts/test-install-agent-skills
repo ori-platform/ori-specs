@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+#
+# Tests for scripts/install-agent-skills.
+#
+# The installer distributes review and safety practice to every engineer on the
+# project, so its failure modes are worth the same evidence as any other gate:
+# a case that was demonstrated once in a terminal and never committed is not a
+# regression test, and the deletion case below is one nobody found by reading.
+#
+# Each case runs against a throwaway copy of agent-skills/ and a sandboxed
+# HOME, so mutating the "canonical source" never touches the real tree.
+#
+#   scripts/test-install-agent-skills
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PASS=0
+FAIL=0
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
+# ── harness ──────────────────────────────────────────────────────────────────
+
+# A fresh sandbox per case: a copy of the repo's script and assets, plus an
+# empty HOME. $SANDBOX/repo is the canonical source under test.
+new_sandbox() {
+  local box="${WORK}/$1"
+  mkdir -p "${box}/repo/scripts" "${box}/home"
+  cp -R "${REPO}/agent-skills" "${box}/repo/agent-skills"
+  cp "${REPO}/scripts/install-agent-skills" "${box}/repo/scripts/"
+  chmod +x "${box}/repo/scripts/install-agent-skills"
+  echo "${box}"
+}
+
+# Run the installer inside a sandbox. Echoes output; returns its exit code.
+run() {
+  local box="$1"; shift
+  HOME="${box}/home" "${box}/repo/scripts/install-agent-skills" "$@" 2>&1
+}
+
+ok()   { PASS=$((PASS + 1)); printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
+bad()  { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m  %s\n' "$1"; [ -n "${2:-}" ] && printf '        %s\n' "$2"; }
+
+# Assert the command exits zero / non-zero, and optionally that output matches.
+expect_ok() {
+  local desc="$1" out code; shift
+  out="$("$@")"; code=$?
+  if [ "${code}" -eq 0 ]; then ok "${desc}"; else bad "${desc}" "exit ${code}: ${out}"; fi
+}
+
+expect_fail() {
+  local desc="$1" pattern="$2" out code; shift 2
+  out="$("$@")"; code=$?
+  if [ "${code}" -eq 0 ]; then
+    bad "${desc}" "expected a non-zero exit, got 0"
+  elif ! grep -q "${pattern}" <<< "${out}"; then
+    bad "${desc}" "exit ${code} but output did not match '${pattern}': ${out}"
+  else
+    ok "${desc}"
+  fi
+}
+
+# ── cases ────────────────────────────────────────────────────────────────────
+
+echo "install and check"
+
+box="$(new_sandbox roundtrip)"
+expect_fail "check before install reports MISSING" "MISSING" run "${box}" --check
+expect_ok   "install to both targets"                            run "${box}" --codex --claude
+expect_ok   "check after install passes"                         run "${box}" --check
+
+for tool in codex claude; do
+  for rel in SKILL.md references/physical-safety-review.md agents/openai.yaml; do
+    if [ -f "${box}/home/.${tool}/skills/ori-rigorous-review/${rel}" ]; then
+      ok "${tool} received ${rel}"
+    else
+      bad "${tool} received ${rel}" "not found"
+    fi
+  done
+done
+
+box="$(new_sandbox backups)"
+touch "${box}/repo/agent-skills/ori-rigorous-review/SKILL.md.bak"
+touch "${box}/repo/agent-skills/ori-rigorous-review/.DS_Store"
+run "${box}" --codex >/dev/null
+if [ -z "$(find "${box}/home" \( -name '*.bak' -o -name '.DS_Store' \) -print -quit)" ]; then
+  ok "editor backups and .DS_Store are not distributed"
+else
+  bad "editor backups and .DS_Store are not distributed" "a excluded file was copied"
+fi
+
+echo
+echo "recipient-side drift"
+
+box="$(new_sandbox stale)"
+run "${box}" --codex >/dev/null
+echo "local edit" >> "${box}/home/.codex/skills/ori-rigorous-review/SKILL.md"
+expect_fail "a locally edited install reports STALE" "STALE" run "${box}" --check --codex
+
+box="$(new_sandbox orphan)"
+run "${box}" --codex >/dev/null
+touch "${box}/home/.codex/skills/ori-rigorous-review/references/from-an-older-version.md"
+expect_fail "a leftover file reports ORPHAN" "ORPHAN" run "${box}" --check --codex
+expect_ok   "reinstalling prunes the orphan"           run "${box}" --codex
+expect_ok   "check passes after the prune"             run "${box}" --check --codex
+
+echo
+echo "source-side validation, both directions"
+
+box="$(new_sandbox edited)"
+echo "unreviewed edit" >> "${box}/repo/agent-skills/ori-rigorous-review/SKILL.md"
+expect_fail "an edited source file refuses to install" "differs from its manifest digest" \
+  run "${box}" --codex
+
+# The case that motivated bidirectional validation. Checking only
+# source-against-manifest leaves every surviving file matching its digest, so
+# the install proceeds and the prune deletes the file from the recipient.
+box="$(new_sandbox deleted)"
+run "${box}" --codex >/dev/null
+rm "${box}/repo/agent-skills/ori-rigorous-review/SKILL.md"
+expect_fail "a deleted source file refuses to install" "in the manifest, but not in the source" \
+  run "${box}" --codex
+if [ -f "${box}/home/.codex/skills/ori-rigorous-review/SKILL.md" ]; then
+  ok "the recipient's copy survives an unmanifested deletion"
+else
+  bad "the recipient's copy survives an unmanifested deletion" "it was pruned"
+fi
+
+box="$(new_sandbox unlisted)"
+echo "notes" > "${box}/repo/agent-skills/ori-rigorous-review/references/unlisted.md"
+expect_fail "an unmanifested new file refuses to install" "not in the manifest" \
+  run "${box}" --codex
+
+box="$(new_sandbox missing-skill)"
+rm -rf "${box}/repo/agent-skills/ori-rigorous-review"
+expect_fail "a manifest entry with no skill directory refuses" "does not exist" \
+  run "${box}" --codex
+
+box="$(new_sandbox undeclared-skill)"
+mkdir -p "${box}/repo/agent-skills/not-declared"
+printf -- '---\nname: not-declared\n---\n' > "${box}/repo/agent-skills/not-declared/SKILL.md"
+expect_fail "an undeclared skill directory refuses" "does not declare it" \
+  run "${box}" --codex
+
+echo
+echo "manifest regeneration"
+
+box="$(new_sandbox regen)"
+echo "reviewed edit" >> "${box}/repo/agent-skills/ori-rigorous-review/SKILL.md"
+expect_ok "--manifest accepts a changed source"  run "${box}" --manifest
+expect_ok "install succeeds once regenerated"    run "${box}" --codex
+
+# The recipient must already HOLD the file, or asserting its absence afterwards
+# proves only that it was never installed. An earlier version of this test
+# skipped the first install and passed for that reason.
+box="$(new_sandbox regen-delete)"
+run "${box}" --codex >/dev/null
+target="${box}/home/.codex/skills/ori-rigorous-review/references/physical-safety-review.md"
+if [ -f "${target}" ]; then
+  ok "precondition: the recipient holds the file before it is deleted"
+else
+  bad "precondition: the recipient holds the file before it is deleted" "not installed"
+fi
+rm "${box}/repo/agent-skills/ori-rigorous-review/references/physical-safety-review.md"
+expect_ok "--manifest accepts a deliberate deletion" run "${box}" --manifest
+expect_ok "install succeeds after a regenerated deletion" run "${box}" --codex
+if [ -f "${target}" ]; then
+  bad "a manifested deletion prunes the existing recipient copy" "the file is still installed"
+else
+  ok "a manifested deletion prunes the existing recipient copy"
+fi
+
+echo
+echo "retiring a whole skill"
+
+# Retiring a skill must reach machines that already have it. Without a
+# tombstone the manifest simply forgets the name, install has nothing to remove,
+# and --check reports success over a skill the tool is still loading.
+box="$(new_sandbox retire)"
+run "${box}" --codex >/dev/null
+installed="${box}/home/.codex/skills/ori-rigorous-review"
+[ -d "${installed}" ] || bad "precondition: skill installed before retirement" "not installed"
+rm -rf "${box}/repo/agent-skills/ori-rigorous-review"
+expect_ok "--manifest tombstones the retired skill" run "${box}" --manifest
+if grep -q '"retired"' "${box}/repo/agent-skills/MANIFEST.json" &&
+   python3 -c 'import json,sys; sys.exit(0 if "ori-rigorous-review" in json.load(open(sys.argv[1]))["retired"] else 1)' \
+     "${box}/repo/agent-skills/MANIFEST.json"; then
+  ok "the manifest records the retirement"
+else
+  bad "the manifest records the retirement" "no tombstone written"
+fi
+expect_fail "check reports a retired skill that is still installed" "RETIRED" \
+  run "${box}" --check --codex
+expect_ok "install removes the retired skill" run "${box}" --codex
+if [ -d "${installed}" ]; then
+  bad "the retired skill is gone from the recipient" "still present"
+else
+  ok "the retired skill is gone from the recipient"
+fi
+expect_ok "check passes once the retirement has been applied" run "${box}" --check --codex
+
+# A directory the manifest never named is not this installer's to delete.
+box="$(new_sandbox foreign)"
+run "${box}" --codex >/dev/null
+mkdir -p "${box}/home/.codex/skills/someone-elses-skill"
+echo "mine" > "${box}/home/.codex/skills/someone-elses-skill/SKILL.md"
+run "${box}" --codex >/dev/null
+if [ -f "${box}/home/.codex/skills/someone-elses-skill/SKILL.md" ]; then
+  ok "an unmanaged skill in the target is left alone"
+else
+  bad "an unmanaged skill in the target is left alone" "the installer deleted it"
+fi
+
+echo
+echo "a directory is only a skill with a SKILL.md"
+
+box="$(new_sandbox not-a-skill)"
+mkdir -p "${box}/repo/agent-skills/not-a-skill"
+echo "scratch notes" > "${box}/repo/agent-skills/not-a-skill/notes.md"
+expect_fail "--manifest refuses a directory with no SKILL.md" "has no SKILL.md" \
+  run "${box}" --manifest
+expect_fail "install refuses a directory with no SKILL.md" "has no SKILL.md" \
+  run "${box}" --codex
+if [ -e "${box}/home/.codex/skills/not-a-skill" ]; then
+  bad "a directory with no SKILL.md is never installed" "it was copied"
+else
+  ok "a directory with no SKILL.md is never installed"
+fi
+
+echo
+echo "skill names cannot reach outside the skills root"
+
+# A retired name flows into `rm -rf "${root}/${name}"`. A traversing name would
+# resolve outside the skills directory entirely, so the sentinel below sits
+# where `../outside` would land and must survive every mode.
+inject_retired() {
+  python3 - "$1" "$2" <<'PYEOF'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+doc = json.loads(p.read_text())
+doc.setdefault("retired", {})[sys.argv[2]] = {"last_version": "1.0.0", "reason": "test"}
+p.write_text(json.dumps(doc, indent=2) + "\n")
+PYEOF
+}
+
+for evil in "../outside" "../../outside" "/etc" "." ".." "" "has space" "UPPER" "dot.name"; do
+  box="$(new_sandbox "traversal-$(printf '%s' "${evil}" | tr -c 'a-z0-9' '-')")"
+  run "${box}" --codex >/dev/null
+  sentinel_dir="${box}/home/.codex/outside"
+  mkdir -p "${sentinel_dir}"
+  echo "do not delete" > "${sentinel_dir}/SENTINEL"
+  inject_retired "${box}/repo/agent-skills/MANIFEST.json" "${evil}"
+
+  install_out="$(run "${box}" --codex)"; install_code=$?
+  check_out="$(run "${box}" --check --codex)"; check_code=$?
+
+  label="$(printf '%q' "${evil}")"
+  if [ "${install_code}" -eq 0 ] || [ "${check_code}" -eq 0 ]; then
+    bad "retired name ${label} is refused" \
+        "install exit ${install_code}, check exit ${check_code}: ${install_out} ${check_out}"
+  else
+    ok "retired name ${label} is refused"
+  fi
+  if [ -f "${sentinel_dir}/SENTINEL" ]; then
+    ok "the sentinel outside the skills root survives ${label}"
+  else
+    bad "the sentinel outside the skills root survives ${label}" "it was removed"
+  fi
+done
+
+# The same rule applies to an active skill directory name.
+box="$(new_sandbox bad-active-name)"
+mkdir -p "${box}/repo/agent-skills/Not_A_Valid_Name"
+printf -- '---\nname: x\n---\n' > "${box}/repo/agent-skills/Not_A_Valid_Name/SKILL.md"
+expect_fail "an invalid source directory name is refused" "not a valid skill name" \
+  run "${box}" --manifest
+expect_fail "an invalid source directory name blocks install" "not a valid skill name" \
+  run "${box}" --codex
+
+echo
+echo "destinations"
+
+box="$(new_sandbox dest)"
+expect_ok "--dest installs to a project-scoped path" \
+  run "${box}" --claude --dest "${box}/project/.claude/skills"
+if [ -f "${box}/project/.claude/skills/ori-rigorous-review/SKILL.md" ]; then
+  ok "the project-scoped copy is present"
+else
+  bad "the project-scoped copy is present" "not found"
+fi
+
+box="$(new_sandbox no-target)"
+expect_fail "no target argument is refused" "choose at least one" run "${box}"
+
+echo
+printf '%d passed, %d failed\n' "${PASS}" "${FAIL}"
+[ "${FAIL}" -eq 0 ]
