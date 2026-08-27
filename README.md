@@ -37,6 +37,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Firmware MQTT transport-identity provisioning | [firmware-mqtt-provisioning/v1.md](firmware-mqtt-provisioning/v1.md) | Implemented baseline; HIL pending |
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | Contract target |
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | Design target, pre-ratification |
+| Runtime configuration authority | [runtime-config-authority/v1.md](runtime-config-authority/v1.md) | Design target, pre-ratification |
 
 ## Gaps
 

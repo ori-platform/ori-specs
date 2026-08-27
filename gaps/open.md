@@ -216,6 +216,23 @@ accurate description of what a repo implements.
   Implementations must keep artifact and manifest verification as separate
   entry points.
 
+## runtime-config-authority/v1 implementation targets
+
+- **One document, one signer, is what ships today**
+  ([runtime-config-authority/v1.md](../runtime-config-authority/v1.md)): every
+  deployed runtime consumes the single-document format, in which the
+  provisioning backend signs the whole configuration surface. Anything it
+  writes is authorised by construction, including `device.rated_capacity_amps`,
+  which a release-owned multiplier turns into a trip point. The split is
+  specified and nothing implements it. Tracked in `ori-cloud` #19 and
+  `ori-runtime` #332.
+
+- **The entitlement signer is named by key, not by authority**
+  ([runtime-config-authority/v1.md](../runtime-config-authority/v1.md)):
+  `device-policy/v1.md` configures a public key and says nothing about which
+  organisational party holds it. The split assumes four distinct authorities;
+  one of them is currently identified only by key material.
+
 ## commissioned-safety-binding/v1 implementation targets
 
 - **No producer, no consumer**
