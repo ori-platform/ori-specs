@@ -227,6 +227,15 @@ accurate description of what a repo implements.
   specified and nothing implements it. Tracked in the provisioning backend
   implementation and in `ori-runtime` #332.
 
+- **`runtime-config/v1` is not recursively closed**
+  ([runtime-config-authority/v1.md](../runtime-config-authority/v1.md)): it
+  documents sections and their fields and does not refuse unknown nested
+  content, and no implementation refuses it. So a `device_site` payload is
+  closed at its top-level paths and open beneath them, and the authority split
+  cannot mechanically stop a provisioning backend introducing safety authority
+  three levels down. The relocation of `rated_capacity_amps` is enforced by
+  name; the general guarantee waits on closing that contract.
+
 - **The entitlement signer is named by key, not by authority**
   ([runtime-config-authority/v1.md](../runtime-config-authority/v1.md)):
   `device-policy/v1.md` configures a public key and says nothing about which
