@@ -22,7 +22,7 @@ A version increment means a breaking change for implementers.
 | runtime-mobile             | v1      | Implemented baseline                                             |
 | device-policy              | v1      | Implemented baseline                                             |
 | offline-tokens             | v1      | Implemented baseline                                             |
-| runtime-config             | v1      | Implemented baseline                                             |
+| runtime-config             | v2      | v2 design target, pre-ratification; v1 implemented baseline      |
 | runtime-config-signing     | v1      | Implemented baseline                                             |
 | runtime-release-bundle     | v1      | Design target                                                    |
 | signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |

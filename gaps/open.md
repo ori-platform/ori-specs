@@ -216,6 +216,22 @@ accurate description of what a repo implements.
   Implementations must keep artifact and manifest verification as separate
   entry points.
 
+## runtime-config/v2 implementation targets
+
+- **The closed schema has no implementation and no vectors**
+  ([runtime-config/v2.md](../runtime-config/v2.md)): v2 states the recursive
+  closure rule and enumerates every node. Nothing validates against it, and the
+  corpus its own Required Test Vectors section calls for does not exist. Until
+  both land, a configuration surface is closed at one level in practice
+  whatever the contract says.
+
+- **`ori.yaml` documents and the runtime loader must agree on the node set**
+  ([runtime-config/v2.md](../runtime-config/v2.md)): v2's enumeration was
+  written from v1 plus `ori.yaml.example`. A key the loader accepts and neither
+  document mentions would be refused by a conforming v2 runtime, which is the
+  correct outcome and still a migration surprise. Reconciling the three is part
+  of implementing v2.
+
 ## commissioned-safety-binding/v1 implementation targets
 
 - **No producer, no consumer**
