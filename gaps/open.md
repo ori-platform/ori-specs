@@ -218,12 +218,13 @@ accurate description of what a repo implements.
 
 ## runtime-config/v2 implementation targets
 
-- **The closed schema has no implementation and no vectors**
+- **The closed schema has no runtime implementation**
   ([runtime-config/v2.md](../runtime-config/v2.md)): v2 states the recursive
-  closure rule and enumerates every node. Nothing validates against it, and the
-  corpus its own Required Test Vectors section calls for does not exist. Until
-  both land, a configuration surface is closed at one level in practice
-  whatever the contract says.
+  closure rule, enumerates every node, and ships a corpus carrying the node
+  table as data. No runtime validates against it. Until one does, a
+  configuration surface is closed at one level in practice whatever the
+  contract says -- and the corpus measures what that costs: root-only closure
+  accepts 14 of the 15 documents v2 refuses.
 
 - **`ori.yaml` documents and the runtime loader must agree on the node set**
   ([runtime-config/v2.md](../runtime-config/v2.md)): v2's enumeration was
