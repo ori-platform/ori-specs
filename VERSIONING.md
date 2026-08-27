@@ -23,6 +23,7 @@ A version increment means a breaking change for implementers.
 | device-policy              | v1      | Implemented baseline                                             |
 | offline-tokens             | v1      | Implemented baseline                                             |
 | runtime-config             | v1      | Implemented baseline                                             |
+| schema-descriptor          | v1      | Design target, pre-ratification; primitive layer, no direct consumers |
 | sensor-configuration       | v1      | Design target, pre-ratification; no shipped conforming consumer  |
 | runtime-config-signing     | v1      | Implemented baseline                                             |
 | runtime-release-bundle     | v1      | Design target                                                    |
