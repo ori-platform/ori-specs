@@ -30,6 +30,18 @@ For a refused case, `must_name` lists identifiers the refusal must contain,
 by full path where the key is nested. Wording is not specified; naming the
 offending declaration is.
 
+**Each case is valid in every respect except the one it names.** A vector
+carrying a second defect lets a conforming implementation refuse for that
+instead and never reach the boundary under test — which reports coverage that
+does not exist.
+
+`signature.json` carries complete community manifests with real ed25519
+signatures over the canonical bytes of [`signing/v1`](../../signing/v1.md),
+made with the published interoperability key from
+[`signing/vectors-v1.json`](../../signing/vectors-v1.json). Verify each
+`manifest` against the file's `public_key_b64`; nothing needs composing and no
+surrounding state needs inventing.
+
 ## The rule this corpus exists to enforce
 
 **All three implementations consume it unchanged** — the runtime that loads
