@@ -42,6 +42,20 @@ made with the published interoperability key from
 `manifest` against the file's `public_key_b64`; nothing needs composing and no
 surrounding state needs inventing.
 
+## Checking it
+
+```bash
+python3 scripts/check-skills-package-vectors
+```
+
+Parses the required-case list out of
+[`schema-descriptor/v1.md`](../../schema-descriptor/v1.md) and maps each
+requirement to the cases discharging it, then checks that no manifest carries a
+defect other than the one its case names. Both halves exist because both were
+got wrong by hand first: an audit compared against a transcription whose reading
+had stopped a bullet short, and two vectors were refusable for a reason other
+than the one under test.
+
 ## The rule this corpus exists to enforce
 
 **All three implementations consume it unchanged** — the runtime that loads

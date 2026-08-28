@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Check the skills-package/v3 corpus against the requirements it claims to meet.
+
+Two things, both of which were got wrong by hand first.
+
+**Descriptor-core coverage.** The required-case list is parsed out of
+`schema-descriptor/v1.md` rather than transcribed here. An earlier audit
+compared the corpus against a hand-copied list whose reading had stopped one
+bullet short, so it reported complete coverage while a required case was
+missing. Checking a corpus against a transcription proves the transcription.
+
+**Case isolation.** A vector carrying a second, independent defect lets a
+conforming implementation refuse for that instead and never reach the boundary
+under test, which reports coverage that does not exist. Every manifest is
+checked for the defects v3 refuses on its own terms, and a case that exists to
+test one of those declares it.
+
+Run from the repository root:
+
+    python3 scripts/check-skills-package-vectors
+
+Exits non-zero on the first unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "skills-package" / "vectors"
+CORE = ROOT / "schema-descriptor" / "v1.md"
+
+#: Which cases discharge each requirement of the descriptor core, in the order
+#: the core lists them. Adding a requirement to the core fails this script until
+#: the mapping is extended, which is the point.
+CORE_COVERAGE: dict[int, list[str]] = {
+    1: [
+        "boolean_accepted",
+        "array_accepted",
+        "object_accepted",
+        "exact_satisfaction_accepted",
+        "wrong_type_refused",
+        "wrong_type_for_string",
+        "wrong_type_for_boolean",
+        "wrong_type_for_array",
+        "wrong_type_for_array_item",
+        "wrong_type_for_object",
+    ],
+    2: ["float_where_integer_declared"],
+    3: ["boolean_where_integer_declared", "boolean_where_number_declared"],
+    4: ["below_minimum_refused", "above_maximum_refused"],
+    5: ["outside_enum_refused"],
+    6: ["non_numeric_bound", "nan_bound", "infinite_bound", "boolean_bound"],
+    7: ["fractional_bound_on_an_integer"],
+    8: ["minimum_above_maximum"],
+    9: ["empty_enum", "enum_member_its_own_descriptor_rejects"],
+    10: ["object_without_properties", "array_without_items"],
+    11: ["undeclared_key_two_levels_deep"],
+    12: ["default_its_own_descriptor_rejects"],
+    13: ["unrecognised_descriptor_property"],
+}
+
+#: Every primitive must appear both accepted and refused for a wrong-type value.
+PRIMITIVES: dict[str, tuple[str, str]] = {
+    "string": ("exact_satisfaction_accepted", "wrong_type_for_string"),
+    "number": ("exact_satisfaction_accepted", "wrong_type_refused"),
+    "integer": ("exact_satisfaction_accepted", "float_where_integer_declared"),
+    "boolean": ("boolean_accepted", "wrong_type_for_boolean"),
+    "array": ("array_accepted", "wrong_type_for_array"),
+    "object": ("object_accepted", "wrong_type_for_object"),
+}
+
+#: Cases whose whole purpose is one of the defects the isolation check looks
+#: for. Each is exempt from that defect only, never from the others.
+ISOLATION_EXEMPT: dict[str, str] = {
+    "default_action_not_declared_in_available_refused": "undeclared_default",
+}
+
+
+def core_requirements() -> list[str]:
+    """The core's required-case bullets, read from the contract."""
+    lines = CORE.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, line in enumerate(lines) if "MUST cover, at minimum" in line)
+    bullets: list[str] = []
+    current: str | None = None
+    for line in lines[start + 1 :]:
+        if line.startswith("- "):
+            if current:
+                bullets.append(current)
+            current = line[2:].strip()
+        elif line.startswith("  ") and current:
+            current += " " + line.strip()
+        elif line.strip() == "":
+            continue
+        else:
+            break
+    if current:
+        bullets.append(current)
+    return bullets
+
+
+def load_cases() -> dict[str, dict]:
+    cases: dict[str, dict] = {}
+    for path in sorted(VECTORS.glob("*.json")):
+        document = json.load(
+            path.open(encoding="utf-8"),
+            parse_constant=lambda name: (_ for _ in ()).throw(
+                ValueError(f"{path.name}: {name} is not JSON")
+            ),
+        )
+        for case in document["cases"]:
+            cases[case["name"]] = case
+    return cases
+
+
+def check_core(cases: dict[str, dict], failures: list[str]) -> None:
+    bullets = core_requirements()
+    if set(CORE_COVERAGE) != set(range(1, len(bullets) + 1)):
+        failures.append(
+            f"the core lists {len(bullets)} requirements and this script maps "
+            f"{len(CORE_COVERAGE)}; extend CORE_COVERAGE"
+        )
+        return
+    for number, names in sorted(CORE_COVERAGE.items()):
+        missing = [name for name in names if name not in cases]
+        if missing:
+            failures.append(f"core requirement {number} ({bullets[number - 1]}): {missing}")
+    for kind, (accepted, refused) in PRIMITIVES.items():
+        for name in (accepted, refused):
+            if name not in cases:
+                failures.append(f"primitive {kind}: missing case {name!r}")
+
+
+def check_isolation(cases: dict[str, dict], failures: list[str]) -> None:
+    for name, case in cases.items():
+        manifest = case.get("manifest")
+        if not manifest:
+            continue
+        exempt = ISOLATION_EXEMPT.get(name)
+        triggers = {trigger["name"] for trigger in manifest["triggers"]}
+        defaults = manifest["actions"]["defaults"]
+        declared = {action["name"] for action in manifest["actions"]["available"]}
+        if set(defaults) != triggers and exempt != "defaults_mismatch":
+            failures.append(f"{name}: actions.defaults keys do not match trigger names")
+        undeclared = {a for names_ in defaults.values() for a in names_} - declared
+        if undeclared and exempt != "undeclared_default":
+            failures.append(f"{name}: default actions not in available: {sorted(undeclared)}")
+
+
+def main() -> int:
+    cases = load_cases()
+    failures: list[str] = []
+    check_core(cases, failures)
+    check_isolation(cases, failures)
+    if failures:
+        print("skills-package vector check FAILED")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print(f"skills-package vector check OK: {len(cases)} cases")
+    print(f"  {len(core_requirements())} descriptor-core requirements mapped")
+    print(f"  {len(PRIMITIVES)} primitives accepted and refused")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
