@@ -35,6 +35,13 @@ carrying a second defect lets a conforming implementation refuse for that
 instead and never reach the boundary under test — which reports coverage that
 does not exist.
 
+`tier-authority.json` carries an `action_registry` fixture — minimum tiers for
+the actions its cases name. The real registry is runtime-owned and outside this
+contract; the fixture exists so a consumer with no registry of its own, an
+authoring SDK or a catalogue, reaches the same verdict as a runtime instead of
+importing runtime state. A case that needs it says so with `"registry":
+"action_registry"`.
+
 `signature.json` carries complete community manifests with real ed25519
 signatures over the canonical bytes of [`signing/v1`](../../signing/v1.md),
 made with the published interoperability key from
@@ -47,6 +54,10 @@ surrounding state needs inventing.
 ```bash
 python3 scripts/check-skills-package-vectors
 ```
+
+It runs as a pre-commit hook and as an explicit step in `validate.yml` —
+explicit as well as hooked, because the workflow's hygiene step carries a `SKIP`
+list and a corpus gate should not be one edit away from silently not running.
 
 Parses the required-case list out of
 [`schema-descriptor/v1.md`](../../schema-descriptor/v1.md) and maps each
