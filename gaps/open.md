@@ -216,19 +216,53 @@ accurate description of what a repo implements.
   Implementations must keep artifact and manifest verification as separate
   entry points.
 
+## safety-profile/v1 implementation targets
+
+- **No consumer** ([safety-profile/v1.md](../safety-profile/v1.md)): the
+  contract is a pre-ratification design target with a profile set and a
+  corpus. `ori-runtime` #324 is the intended consumer — safety registry,
+  typed evaluators, activation from accepted zones, durable trip state — and
+  nothing implements any of it. Every Tier D trip point on a device today is
+  still an untyped number in a first-party `skill.yaml`.
+
+- **Every shipped profile is a `candidate`, and a candidate activates nothing**
+  ([safety-profile/v1.md](../safety-profile/v1.md)): the three profiles carry
+  the numbers the legacy triggers use — `2.0×` capacity, `260.0 V`,
+  `400.0 ppm` — and equivalence with a trigger that never reliably actuated is
+  not a safety argument. Ratifying each needs what the circuit's limiting
+  rating is, a validated RMS measurement window (`ori-runtime` #398), and a
+  time-current answer; until then a consumer MUST NOT activate or execute
+  them. Separately, `battery_emergency_cutoff` and `cpu_overheating` migrate
+  out of Tier D because neither reaches an actuator. All of it is recorded in
+  the contract's open questions.
+
+- **No independent verifier** ([safety-profile/v1.md](../safety-profile/v1.md)):
+  the checker in this repository recomputes the corpus from the contract's
+  rules, which proves the corpus agrees with the text and nothing about a
+  second implementation. Ratification waits for a verifier in another language
+  sharing no code with the runtime's evaluator.
+
+- **Measurement-loss isolation is unexpressed**
+  ([safety-profile/v1.md](../safety-profile/v1.md)): v1 profiles hold state
+  and alert on sustained measurement loss. Whether a zone should open its
+  protected circuit instead is a commissioned property of the load, and no
+  binding field or evaluator rule exists to say so. Related to `ori-runtime`
+  #397 and #398.
+
 ## commissioned-safety-binding/v1 implementation targets
 
-- **No producer, no consumer**
+- **Producer core only, no consumer**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
-  the contract is a pre-ratification design target. `ori-cli` #34 is the
-  intended producer and is itself blocked on this contract; `ori-runtime` #324
-  is the intended consumer. Until both exist, no device can activate an
-  actuating safety profile under this contract's rules.
+  the contract is a pre-ratification design target. `ori-cli` builds and signs
+  a binding and reproduces the corpus in Go; the capture, physical proof and
+  delivery ceremony in `ori-cli` #34 remain open, and `ori-runtime` #324 is
+  the intended consumer. Until both exist, no device can activate an actuating
+  safety profile under this contract's rules.
 
 - **The unsafe NC rule survives in governing documents**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
-  the contract's "contact type is not an input" rule supersedes the
-  normally-closed sentence in ori-specs#71, but that issue text and the
+  the contract's "contact type is not an input" rule is what
+  [safety-profile/v1.md](../safety-profile/v1.md) now defers to, but the
   operator-facing wiring instructions in `ori-runtime` (`CLAUDE.md`,
   `docs/RASPBERRY_PI_SUPPORT.md`) still instruct NC wiring as proof of fail-safe
   behaviour. Correcting the contract without correcting the documents an

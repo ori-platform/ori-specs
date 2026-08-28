@@ -1,0 +1,677 @@
+#!/usr/bin/env python3
+"""Check the safety-profile/v1 corpus against the contract it illustrates.
+
+The corpus is hand-authored. Nothing generates its expectations, so a literal
+in it can contradict the rule it claims to show, and a consumer that vendors
+the file inherits the contradiction. This script recomputes every expectation
+from the contract's rules and refuses the corpus on any disagreement:
+
+- the profile set parses under the closed grammar;
+- every activation verdict, trip point, uncovered zone and startup outcome;
+- every evaluation verdict and rejection reason, in the contract's order;
+- every lifecycle transition, outcome and refusal;
+- every verdict and refusal the contract names has at least one case;
+- each refused case is refusable for exactly the reason it names.
+
+It is not a second implementation of the contract. It reads the corpus against
+the text so that a hand-authored expectation cannot be wrong; the runtime's
+evaluator is the first implementation, and an independent verifier in another
+language is what ratification waits for.
+
+Run from the repository root:
+
+    python3 scripts/check-safety-profile-vectors
+
+Exits non-zero on the first unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import pathlib
+import re
+import sys
+from typing import Any
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "safety-profile" / "vectors"
+
+PROFILE_ID = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\.v[1-9][0-9]*$")
+KIND_FIELDS = {
+    "upper_capacity_multiplier": {"capacity_parameter", "multiplier"},
+    "upper_bound": {"threshold"},
+}
+OUTCOMES = {"open_protected_circuit"}
+STATUSES = {"ratified", "candidate"}
+ALL_OUTCOMES = {"open_protected_circuit", "close_protected_circuit"}
+LEGACY_ACTIONS = {"trip_relay", "close_gas_valve", "release_relay"}
+COMMAND_SOURCES = {"profile_trip", "tier_c_approved", "local_arm", "local_reset"}
+DIRECTION = "positive_is_load_draw"
+
+ACTIVATION_REFUSALS = [
+    "pending_ratification",
+    "unit_mismatch",
+    "direction_unsupported",
+    "parameter_mismatch",
+    "trip_point_unobservable",
+    "undemonstrated_binding",
+]
+REJECTION_REASONS = [
+    "boolean",
+    "non_numeric",
+    "non_finite",
+    "unit_mismatch",
+    "zero_quality",
+    "out_of_range",
+]
+STATES = ["inactive", "armed", "tripped"]
+ARM_REFUSALS = ["tripped", "safety_path_unconfirmed", "no_credible_reading"]
+RESET_REFUSALS = ["not_tripped", "no_credible_reading", "condition_active"]
+EXTERNAL_SOURCES = {"remote_command", "skill", "configuration", "device_policy", "binding_revision"}
+
+MAX_INT = 2**53 - 1
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise Failure(message)
+
+
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def in_agreement_zone(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, int):
+        return -MAX_INT <= value <= MAX_INT
+    if not math.isfinite(value):
+        return False
+    if value == 0.0:
+        return True
+    return 1e-4 <= abs(value) < 1e16
+
+
+def load(name: str) -> dict:
+    path = VECTORS / name
+    with path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if data.get("contract") != "safety-profile/v1" or data.get("version") != 1:
+        fail(f"{name}: contract header is not safety-profile/v1 version 1")
+    return data
+
+
+# ----------------------------------------------------------------- profiles
+
+
+def check_profile_grammar(profile: Any) -> None:
+    if not isinstance(profile, dict):
+        fail("profile is not an object")
+    expected_keys = {"v", "id", "status", "observes", "condition", "outcome"}
+    if set(profile) != expected_keys:
+        missing = sorted(expected_keys - set(profile))
+        extra = sorted(set(profile) - expected_keys)
+        fail(f"profile keys are not the closed set: missing {missing}, undeclared {extra}")
+    version = profile["v"]
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        fail(f"{profile.get('id')}: v must be the integer 1")
+    if not isinstance(profile["id"], str) or not PROFILE_ID.match(profile["id"]):
+        fail(f"profile id {profile.get('id')!r} does not match the id grammar")
+    if not isinstance(profile["status"], str) or profile["status"] not in STATUSES:
+        fail(f"{profile['id']}: status {profile['status']!r} is not ratified or candidate")
+    observes = profile["observes"]
+    if not isinstance(observes, dict) or set(observes) != {"quantity", "unit"}:
+        fail(f"{profile['id']}: observes must be exactly quantity and unit")
+    for key in ("quantity", "unit"):
+        if not isinstance(observes[key], str) or not observes[key].strip():
+            fail(f"{profile['id']}: observes.{key} must be a non-empty string")
+    condition = profile["condition"]
+    if not isinstance(condition, dict) or "kind" not in condition:
+        fail(f"{profile['id']}: condition must be an object with a kind")
+    kind = condition["kind"]
+    if not isinstance(kind, str) or kind not in KIND_FIELDS:
+        fail(f"{profile['id']}: unknown condition kind {kind!r}")
+    expected_condition = {"kind"} | KIND_FIELDS[kind]
+    if set(condition) != expected_condition:
+        missing = sorted(expected_condition - set(condition))
+        extra = sorted(set(condition) - expected_condition)
+        fail(f"{profile['id']}: condition keys for {kind}: missing {missing}, undeclared {extra}")
+    if kind == "upper_capacity_multiplier":
+        parameter = condition["capacity_parameter"]
+        if not isinstance(parameter, str) or not parameter.strip():
+            fail(f"{profile['id']}: capacity_parameter must be a non-empty string")
+        multiplier = condition["multiplier"]
+        if not is_number(multiplier) or not in_agreement_zone(multiplier):
+            fail(f"{profile['id']}: multiplier must be a number in the agreement zone")
+        if not (1.0 < multiplier <= 100.0):
+            fail(f"{profile['id']}: multiplier {multiplier} is outside (1.0, 100.0]")
+    else:
+        threshold = condition["threshold"]
+        if not is_number(threshold) or not in_agreement_zone(threshold):
+            fail(f"{profile['id']}: threshold must be a finite number in the agreement zone")
+    if profile["outcome"] not in OUTCOMES:
+        fail(f"{profile['id']}: outcome {profile['outcome']!r} is not in the closed vocabulary")
+
+
+def load_profile_set(profiles: Any, label: str) -> dict[str, dict]:
+    """Apply the closed grammar to a profile set; raise Failure on the first defect."""
+    if not isinstance(profiles, list) or not profiles:
+        fail(f"{label}: profiles must be a non-empty array")
+    by_id: dict[str, dict] = {}
+    for profile in profiles:
+        check_profile_grammar(profile)
+        if profile["id"] in by_id:
+            fail(f"{label}: duplicate id {profile['id']}")
+        by_id[profile["id"]] = profile
+    return by_id
+
+
+def load_profiles() -> dict[str, dict]:
+    data = load("profiles.json")
+    return load_profile_set(data.get("profiles"), "profiles.json")
+
+
+def fixtures_for(data: dict, name: str, shipped: dict[str, dict]) -> dict[str, dict]:
+    """Ratified fixture profiles carried in a corpus file, grammar-checked, disjoint from the shipped set."""
+    fixtures = load_profile_set(data.get("fixtures"), f"{name} fixtures")
+    for fixture_id, fixture in fixtures.items():
+        if fixture["status"] != "ratified":
+            fail(f"{name}: fixture {fixture_id} must be ratified; candidates are what fixtures exist to avoid")
+        if fixture_id in shipped:
+            fail(f"{name}: fixture {fixture_id} collides with a shipped profile id")
+    return fixtures
+
+
+def resolve_profile(profile_id: str, fixtures: dict[str, dict], shipped: dict[str, dict], name: str) -> dict:
+    profile = fixtures.get(profile_id) or shipped.get(profile_id)
+    if profile is None:
+        fail(f"{name}: unknown profile {profile_id}")
+    return profile
+
+
+def require_ratified(profile: dict, name: str) -> None:
+    if profile["status"] != "ratified":
+        fail(f"{name}: {profile['id']} is a candidate and can be neither evaluated nor armed")
+
+
+def check_profile_load(seen: dict[str, set[str]]) -> None:
+    """Every profile-load case is loaded or refused exactly as it says."""
+    data = load("profile-load.json")
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"profile-load.json: duplicate case name {name}")
+        names.add(name)
+        try:
+            load_profile_set(case["profiles"], name)
+        except Failure as failure:
+            verdict = "malformed_profile"
+            detail = str(failure)
+        else:
+            verdict = "loaded"
+            detail = ""
+            for profile in case["profiles"]:
+                seen["status"].add(profile["status"])
+        if case["expect"] != verdict:
+            fail(f"{name}: expected {case['expect']} but the grammar gives {verdict} {detail}".rstrip())
+        if verdict == "malformed_profile":
+            for needle in case.get("must_name", []):
+                if needle not in detail:
+                    fail(f"{name}: refusal {detail!r} does not name {needle!r}")
+        seen["load"].add(verdict)
+
+
+# ----------------------------------------------------------- legacy actions
+
+
+def check_legacy_actions(seen: dict[str, set[str]]) -> None:
+    """Each legacy name maps to one outcome, and only profile outcomes may be profile outcomes."""
+    data = load("legacy-actions.json")
+    names: set[str] = set()
+    for case in data["cases"]:
+        action = case["legacy_action"]
+        if action in names:
+            fail(f"legacy-actions.json: {action} mapped twice")
+        names.add(action)
+        if action not in LEGACY_ACTIONS:
+            fail(f"legacy-actions.json: {action!r} is not a legacy action the runtime registers")
+        outcome = case["outcome"]
+        if outcome not in ALL_OUTCOMES:
+            fail(f"{action}: outcome {outcome!r} is not a protected-circuit outcome")
+        permitted = case["permitted_as_profile_outcome"]
+        if permitted is not (outcome in OUTCOMES):
+            fail(f"{action}: permitted_as_profile_outcome must be {outcome in OUTCOMES} for {outcome}")
+        sources = set(case["permitted_from"])
+        if not sources or not sources <= COMMAND_SOURCES:
+            fail(f"{action}: permitted_from must be a non-empty subset of {sorted(COMMAND_SOURCES)}")
+        if permitted and sources != {"profile_trip", "tier_c_approved"}:
+            fail(f"{action}: a profile outcome is commanded by a profile trip or a Tier C approval, not {sorted(sources)}")
+        if not permitted and sources != {"local_arm", "local_reset"}:
+            fail(f"{action}: close_protected_circuit is commanded only by local arm or local reset, not {sorted(sources)}")
+        seen["legacy"].add(action)
+    if names != LEGACY_ACTIONS:
+        fail(f"legacy-actions.json: expected exactly {sorted(LEGACY_ACTIONS)}, got {sorted(names)}")
+
+
+# --------------------------------------------------------------- activation
+
+
+def trip_point_for(profile: dict, zone: dict) -> float:
+    condition = profile["condition"]
+    if condition["kind"] == "upper_capacity_multiplier":
+        return float(zone["rated_capacity"]["value"]) * float(condition["multiplier"])
+    return float(condition["threshold"])
+
+
+def activate(profiles: dict[str, dict], zone: dict) -> tuple[list[dict], list[dict], list[dict], bool]:
+    """Return (activated, refused, pending, candidate) for one zone across the set."""
+    activated: list[dict] = []
+    refused: list[dict] = []
+    pending: list[dict] = []
+    candidate = False
+    sensor = zone["sensor"]
+    for profile in profiles.values():
+        if sensor["quantity"] != profile["observes"]["quantity"]:
+            continue
+        candidate = True
+        if profile["status"] != "ratified":
+            pending.append({"zone_id": zone["zone_id"], "profile": profile["id"]})
+            continue
+        reason = None
+        if sensor["unit"] != profile["observes"]["unit"]:
+            reason = "unit_mismatch"
+        elif sensor["direction"] != DIRECTION:
+            reason = "direction_unsupported"
+        elif (
+            profile["condition"]["kind"] == "upper_capacity_multiplier"
+            and zone["rated_capacity"]["parameter"] != profile["condition"]["capacity_parameter"]
+        ):
+            reason = "parameter_mismatch"
+        else:
+            trip_point = trip_point_for(profile, zone)
+            if not (sensor["range_min"] <= trip_point <= sensor["range_max"]):
+                reason = "trip_point_unobservable"
+            elif zone["proof_method"] == "undemonstrated":
+                reason = "undemonstrated_binding"
+        if reason is None:
+            activated.append({"zone_id": zone["zone_id"], "profile": profile["id"], "trip_point": trip_point_for(profile, zone)})
+        else:
+            refused.append({"zone_id": zone["zone_id"], "profile": profile["id"], "reason": reason})
+    return activated, refused, pending, candidate
+
+
+def check_activation(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None:
+    data = load("activation.json")
+    if data.get("activation_order") != ACTIVATION_REFUSALS:
+        fail("activation.json: activation_order does not match the contract")
+    fixtures = fixtures_for(data, "activation.json", shipped)
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"activation.json: duplicate case name {name}")
+        names.add(name)
+        if case["posture"] not in {"production", "development"}:
+            fail(f"{name}: unknown posture {case['posture']!r}")
+        if case["profile_set"] == "fixtures":
+            profiles = fixtures
+        elif case["profile_set"] == "shipped":
+            profiles = shipped
+        else:
+            fail(f"{name}: profile_set must be fixtures or shipped")
+        activated: list[dict] = []
+        refused: list[dict] = []
+        pending: list[dict] = []
+        uncovered: list[str] = []
+        for zone in case["zones"]:
+            zone_activated, zone_refused, zone_pending, candidate = activate(profiles, zone)
+            activated.extend(zone_activated)
+            refused.extend(zone_refused)
+            pending.extend(zone_pending)
+            if not candidate:
+                uncovered.append(zone["zone_id"])
+        expect = case["expect"]
+        for key in ("activated", "refused", "pending_ratification", "uncovered_zones", "startup"):
+            if key not in expect:
+                fail(f"{name}: expect is missing {key}")
+        if expect["activated"] != activated:
+            fail(f"{name}: expected activated {expect['activated']} but the contract gives {activated}")
+        if expect["refused"] != refused:
+            fail(f"{name}: expected refused {expect['refused']} but the contract gives {refused}")
+        if expect["pending_ratification"] != pending:
+            fail(f"{name}: expected pending {expect['pending_ratification']} but the contract gives {pending}")
+        if pending:
+            seen["activation"].add("pending_ratification")
+        if expect["uncovered_zones"] != uncovered:
+            fail(f"{name}: expected uncovered {expect['uncovered_zones']} but the contract gives {uncovered}")
+        if refused:
+            startup = "refuse" if case["posture"] == "production" else "start_degraded"
+        else:
+            startup = "start"
+        if expect["startup"] != startup:
+            fail(f"{name}: expected startup {expect['startup']!r} but the contract gives {startup!r}")
+        for entry in refused:
+            seen["activation"].add(entry["reason"])
+        # Isolation: a refused case names exactly one refusal reason per zone,
+        # and a zone refused for one reason must not also carry a later defect.
+        for zone in case["zones"]:
+            reasons = [r["reason"] for r in refused if r["zone_id"] == zone["zone_id"]]
+            if len(reasons) > 1:
+                fail(f"{name}: zone {zone['zone_id']} is refused for more than one reason: {reasons}")
+            if reasons:
+                check_activation_isolation(profiles, zone, reasons[0], name)
+            if any(p["zone_id"] == zone["zone_id"] for p in pending):
+                # A pending zone must carry no site defect, or the case would
+                # not show that the release status alone decided it.
+                check_activation_isolation({k: dict(v, status="ratified") for k, v in profiles.items()}, zone, None, name)
+        for entry in activated:
+            if not in_agreement_zone(entry["trip_point"]):
+                fail(f"{name}: trip point {entry['trip_point']} is outside the agreement zone")
+
+
+def check_activation_isolation(profiles: dict[str, dict], zone: dict, reason: str | None, name: str) -> None:
+    """A zone refused for one reason must pass every other activation check."""
+    sensor = zone["sensor"]
+    for profile in profiles.values():
+        if sensor["quantity"] != profile["observes"]["quantity"]:
+            continue
+        defects = []
+        if sensor["unit"] != profile["observes"]["unit"]:
+            defects.append("unit_mismatch")
+        if sensor["direction"] != DIRECTION:
+            defects.append("direction_unsupported")
+        if (
+            profile["condition"]["kind"] == "upper_capacity_multiplier"
+            and zone["rated_capacity"]["parameter"] != profile["condition"]["capacity_parameter"]
+        ):
+            defects.append("parameter_mismatch")
+        trip_point = trip_point_for(profile, zone)
+        if not (sensor["range_min"] <= trip_point <= sensor["range_max"]):
+            defects.append("trip_point_unobservable")
+        if zone["proof_method"] == "undemonstrated":
+            defects.append("undemonstrated_binding")
+        expected = [reason] if reason is not None else []
+        if defects != expected:
+            fail(f"{name}: zone {zone['zone_id']} carries defects {defects}, not only {expected}")
+
+
+# --------------------------------------------------------------- evaluation
+
+
+def decode_value(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        if set(raw) != {"non_finite"}:
+            fail(f"reading value object must be exactly {{'non_finite': ...}}, got {raw}")
+        return {"nan": math.nan, "+inf": math.inf, "-inf": -math.inf}[raw["non_finite"]]
+    return raw
+
+
+def credibility_defects(profile: dict, reading: dict) -> list[str]:
+    """Every credibility reason that applies, in the contract's order."""
+    defects: list[str] = []
+    value = decode_value(reading.get("value"))
+    if isinstance(value, bool):
+        defects.append("boolean")
+    elif not isinstance(value, (int, float)):
+        defects.append("non_numeric")
+    elif not math.isfinite(value):
+        defects.append("non_finite")
+    if reading.get("unit") != profile["observes"]["unit"]:
+        defects.append("unit_mismatch")
+    quality = reading.get("quality")
+    if isinstance(quality, bool) or not isinstance(quality, (int, float)) or not quality > 0:
+        defects.append("zero_quality")
+    return defects
+
+
+def rejection_reason(profile: dict, zone: dict, reading: dict) -> str | None:
+    defects = credibility_defects(profile, reading)
+    return defects[0] if defects else None
+
+
+def condition_holds(profile: dict, trip_point: float, value: float) -> bool:
+    return value > trip_point
+
+
+def evaluate(profile: dict, zone: dict, reading: dict) -> tuple[str, str | None]:
+    reason = rejection_reason(profile, zone, reading)
+    if reason is not None:
+        return "rejected_input", reason
+    value = float(decode_value(reading["value"]))
+    trip_point = trip_point_for(profile, zone)
+    if condition_holds(profile, trip_point, value):
+        return "trip", None
+    sensor = zone["sensor"]
+    if not (sensor["range_min"] <= value <= sensor["range_max"]):
+        return "rejected_input", "out_of_range"
+    return "no_trip", None
+
+
+def check_evaluation(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None:
+    data = load("evaluation.json")
+    if data.get("rejection_reason_order") != REJECTION_REASONS:
+        fail("evaluation.json: rejection_reason_order does not match the contract")
+    fixtures = fixtures_for(data, "evaluation.json", shipped)
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"evaluation.json: duplicate case name {name}")
+        names.add(name)
+        profile = resolve_profile(case["profile"], fixtures, shipped, name)
+        require_ratified(profile, name)
+        zone = case["zone"]
+        if zone["sensor"]["unit"] != profile["observes"]["unit"]:
+            fail(f"{name}: zone unit does not match the profile; this case would not have activated")
+        trip_point = trip_point_for(profile, zone)
+        if case["trip_point"] != trip_point:
+            fail(f"{name}: trip_point literal {case['trip_point']} disagrees with computed {trip_point}")
+        if not (zone["sensor"]["range_min"] <= trip_point <= zone["sensor"]["range_max"]):
+            fail(f"{name}: trip point is unobservable; this case would not have activated")
+        raw_value = case["reading"].get("value")
+        if is_number(raw_value) and not in_agreement_zone(raw_value):
+            fail(f"{name}: reading value {raw_value} is outside the agreement zone")
+        verdict, reason = evaluate(profile, zone, case["reading"])
+        expect = case["expect"]
+        if expect["verdict"] != verdict or expect.get("reason") != reason:
+            fail(f"{name}: expected {expect} but the contract gives verdict={verdict} reason={reason}")
+        # Isolation: a rejected case carries exactly the defect it names, so a
+        # consumer cannot refuse it for another reason and never reach the one
+        # under test. A case that exists to prove the reason order carries two
+        # and says so.
+        defects = credibility_defects(profile, case["reading"])
+        if len(defects) > 1 and not case.get("tests_order"):
+            fail(f"{name}: carries defects {defects}, more than the one it names")
+        if case.get("tests_order") and len(defects) < 2:
+            fail(f"{name}: claims to test the reason order but carries only {defects}")
+        seen["evaluation"].add(verdict)
+        if reason is not None:
+            seen["rejection"].add(reason)
+
+
+# ---------------------------------------------------------------- lifecycle
+
+
+class Zone:
+    def __init__(self, profile: dict, zone: dict, trip_point: float) -> None:
+        self.profile = profile
+        self.zone = zone
+        self.trip_point = trip_point
+        self.state = "inactive"
+        self.safety_path = False
+        self.last_credible: float | None = None
+
+    def startup(self, durable: str) -> None:
+        if durable not in {"none", "armed", "tripped"}:
+            fail(f"unknown durable_state {durable!r}")
+        self.state = "tripped" if durable == "tripped" else "inactive"
+        self.safety_path = False
+        self.last_credible = None
+
+    def reading(self, raw: dict) -> tuple[str | None, str | None]:
+        """Return (outcome, rejected_reason)."""
+        verdict, reason = evaluate(self.profile, self.zone, raw)
+        if verdict == "rejected_input":
+            return None, reason
+        self.last_credible = float(decode_value(raw["value"]))
+        if verdict == "trip" and self.state != "tripped":
+            self.state = "tripped"
+            return "open_protected_circuit", None
+        return None, None
+
+    def condition_active(self) -> bool:
+        assert self.last_credible is not None
+        return condition_holds(self.profile, self.trip_point, self.last_credible)
+
+    def arm(self) -> tuple[str | None, str | None]:
+        if self.state == "tripped":
+            return None, "tripped"
+        if not self.safety_path:
+            return None, "safety_path_unconfirmed"
+        if self.last_credible is None:
+            return None, "no_credible_reading"
+        if self.condition_active():
+            return None, "condition_active"
+        self.state = "armed"
+        return "close_protected_circuit", None
+
+    def reset(self) -> tuple[str | None, str | None]:
+        if self.state != "tripped":
+            return None, "not_tripped"
+        if self.last_credible is None:
+            return None, "no_credible_reading"
+        if self.condition_active():
+            return None, "condition_active"
+        self.state = "armed"
+        return "close_protected_circuit", None
+
+
+def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None:
+    data = load("lifecycle.json")
+    fixtures = fixtures_for(data, "lifecycle.json", shipped)
+    if data.get("states") != STATES or data.get("arm_refusals") != ARM_REFUSALS or data.get("reset_refusals") != RESET_REFUSALS or data.get("external_refusal") != "no_authority":
+        fail("lifecycle.json: state or refusal vocabularies do not match the contract")
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"lifecycle.json: duplicate case name {name}")
+        names.add(name)
+        profile = resolve_profile(case["profile"], fixtures, shipped, name)
+        require_ratified(profile, name)
+        trip_point = trip_point_for(profile, case["zone"])
+        if case["trip_point"] != trip_point:
+            fail(f"{name}: trip_point literal {case['trip_point']} disagrees with computed {trip_point}")
+        machine = Zone(profile, case["zone"], trip_point)
+        if not case["events"] or case["events"][0]["event"] != "startup":
+            fail(f"{name}: the first event must be startup")
+        for index, event in enumerate(case["events"]):
+            kind = event["event"]
+            outcome: str | None = None
+            refusal: str | None = None
+            rejected: str | None = None
+            if kind == "startup" or kind == "restart":
+                machine.startup(event["durable_state"])
+                if kind == "startup" and index != 0:
+                    fail(f"{name}: startup may only be the first event")
+            elif kind == "safety_path_confirmed":
+                machine.safety_path = True
+            elif kind == "reading":
+                raw = {"value": event["value"], "unit": profile["observes"]["unit"], "quality": event.get("quality", 1.0)}
+                outcome, rejected = machine.reading(raw)
+            elif kind == "arm_attempt":
+                outcome, refusal = machine.arm()
+                if refusal:
+                    seen["arm"].add(refusal)
+            elif kind == "reset_attempt":
+                outcome, refusal = machine.reset()
+                if refusal:
+                    seen["reset"].add(refusal)
+            elif kind == "external":
+                if event["source"] not in EXTERNAL_SOURCES:
+                    fail(f"{name}: unknown external source {event['source']!r}")
+                refusal = "no_authority"
+                seen["external"].add(event["source"])
+            else:
+                fail(f"{name}: unknown event {kind!r}")
+            label = f"{name} event {index} ({kind})"
+            if event["expect_state"] != machine.state:
+                fail(f"{label}: expected state {event['expect_state']} but the contract gives {machine.state}")
+            if event.get("expect_outcome") != outcome:
+                fail(f"{label}: expected outcome {event.get('expect_outcome')} but the contract gives {outcome}")
+            if event.get("expect_refusal") != refusal:
+                fail(f"{label}: expected refusal {event.get('expect_refusal')} but the contract gives {refusal}")
+            if event.get("expect_rejected") != rejected:
+                fail(f"{label}: expected rejected {event.get('expect_rejected')} but the contract gives {rejected}")
+            seen["states"].add(machine.state)
+
+
+# ------------------------------------------------------------------- driver
+
+
+def check_coverage(seen: dict[str, set[str]]) -> None:
+    missing = []
+    for reason in ACTIVATION_REFUSALS:
+        if reason not in seen["activation"]:
+            missing.append(f"activation refusal {reason}")
+    for verdict in ("trip", "no_trip", "rejected_input"):
+        if verdict not in seen["evaluation"]:
+            missing.append(f"evaluation verdict {verdict}")
+    for reason in REJECTION_REASONS:
+        if reason not in seen["rejection"]:
+            missing.append(f"rejection reason {reason}")
+    for reason in ARM_REFUSALS:
+        if reason not in seen["arm"]:
+            missing.append(f"arm refusal {reason}")
+    for reason in RESET_REFUSALS:
+        if reason not in seen["reset"]:
+            missing.append(f"reset refusal {reason}")
+    for source in sorted(EXTERNAL_SOURCES):
+        if source not in seen["external"]:
+            missing.append(f"external source {source}")
+    for state in STATES:
+        if state not in seen["states"]:
+            missing.append(f"state {state}")
+    for verdict in ("loaded", "malformed_profile"):
+        if verdict not in seen["load"]:
+            missing.append(f"profile-load verdict {verdict}")
+    for action in sorted(LEGACY_ACTIONS):
+        if action not in seen["legacy"]:
+            missing.append(f"legacy action {action}")
+    for status in sorted(STATUSES):
+        if status not in seen["status"]:
+            missing.append(f"profile status {status}")
+    if missing:
+        fail("corpus does not cover: " + ", ".join(missing))
+
+
+def main() -> int:
+    seen: dict[str, set[str]] = {key: set() for key in ("load", "status", "legacy", "activation", "evaluation", "rejection", "arm", "reset", "external", "states")}
+    try:
+        profiles = load_profiles()
+        for profile in profiles.values():
+            seen["status"].add(profile["status"])
+            if profile["status"] != "candidate":
+                fail(f"profiles.json: {profile['id']} is {profile['status']}; no v1 profile is ratified")
+        check_profile_load(seen)
+        check_legacy_actions(seen)
+        check_activation(profiles, seen)
+        check_evaluation(profiles, seen)
+        check_lifecycle(profiles, seen)
+        check_coverage(seen)
+    except Failure as failure:
+        print(f"check-safety-profile-vectors: {failure}", file=sys.stderr)
+        return 1
+    counts = ", ".join(f"{len(seen[key])} {key}" for key in seen)
+    print(f"check-safety-profile-vectors: corpus agrees with the contract ({counts})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
