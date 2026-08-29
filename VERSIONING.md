@@ -25,6 +25,7 @@ A version increment means a breaking change for implementers.
 | offline-tokens             | v1      | Implemented baseline                                             |
 | runtime-config             | v1      | Implemented baseline                                             |
 | runtime-config             | v2      | Design target, pre-ratification; no shipped conforming consumer. v1 remains the baseline |
+| runtime-config-orchestration | v1    | Design target, pre-ratification; no shipped conforming consumer |
 | schema-descriptor          | v1      | Design target, pre-ratification; primitive layer, no direct consumers |
 | sensor-configuration       | v1      | Design target, pre-ratification; no shipped conforming consumer  |
 | runtime-config-signing     | v1      | Implemented baseline                                             |

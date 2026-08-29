@@ -23,6 +23,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |
 | Runtime config surface (closed) | [runtime-config/v2.md](runtime-config/v2.md) | Design target, pre-ratification; the provisioning document closed at every level, with a machine schema |
+| Runtime configuration orchestration | [runtime-config-orchestration/v1.md](runtime-config-orchestration/v1.md) | Design target, pre-ratification; how the provisioning, entitlement and commissioning artifacts compose into one accepted set |
 | Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | Implemented baseline |
 | Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | Design target |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
