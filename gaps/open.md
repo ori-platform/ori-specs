@@ -101,6 +101,25 @@ accurate description of what a repo implements.
   registration over the gateway rather than a manual provisioning step, and
   requires the evidence authority to retain the verification binding
   independently. What remains open is the implementation, not the ownership.
+- **Commissioning reference ingress and authorisation path**
+  ([evidence-exchange/v1.md](../evidence-exchange/v1.md)): the contract now
+  fixes that the authorisation reaches the authority through the
+  organisational commissioning path and the device holds only its digest,
+  delivered by the local bridge command in
+  [cli-commands/v1.md](../cli-commands/v1.md). Nothing implements either end.
+  `ori-runtime` still models a `CommissioningAuthorisationSource` that would
+  hand the registrar the full object, and reports `pending_authorisation`
+  unconditionally; `ori-cli` has no `evidence commission` command; `ori-verity`
+  pairs on an authorisation arriving through the courier
+  (`verity_commissioning_pending`) and its transport accepts
+  `commissioning_authorization` as a courier type; `ori-gateway`'s durable
+  queue still enumerates that type. Each is a consumer follow-up, and the
+  anchor-registration vector note changed and
+  `receiver-state/commissioning-resolution.json` is new, so `ori-runtime` and
+  `ori-verity` must re-vendor `evidence-exchange/vectors` after this lands;
+  the runtime's rule that every vendored receiver-state vector is either
+  consumed or listed with the repository that proves it applies to the new
+  file, whose consumer is the evidence authority.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies all seven artifacts. The runtime now

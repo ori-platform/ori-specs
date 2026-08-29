@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Check the commissioning-resolution corpus against evidence-exchange/v1.
+
+`evidence-exchange/vectors/receiver-state/commissioning-resolution.json` holds
+the cases that no single wire artifact can express: what the evidence
+authority does with an anchor registration depends on the commissioning
+authorisations it already holds, which reach it through the commissioning path
+and never from the device. This script holds the corpus to the contract:
+
+- every artifact's canonical bytes reproduce, and every device or commissioning
+  signature verifies under the published test seeds — a case that does not
+  verify cannot reach the resolution rule it names;
+- every held authorisation and every registration's `commissioning_digest` are
+  checked as the contract defines them, digest over the complete signed object;
+- each case's outcome — applied, retained pending, refused with the named
+  reason, or refused at transport — is recomputed from the resolution table in
+  the contract and compared with the literal, including whether a confirmation
+  is issued, whether anything is quarantined, and whether a gap is recorded;
+- every row of the resolution table has a case, and the transport refusal of a
+  device-side authorisation has one.
+
+    python3 scripts/check-evidence-commissioning-vectors
+
+Requires the `cryptography` package for Ed25519 verification; the check refuses
+to run without it rather than skipping the signatures. Exits non-zero on the
+first unmet requirement.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+from typing import Any
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print("check-evidence-commissioning-vectors: the cryptography package is required", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "evidence-exchange" / "vectors" / "receiver-state" / "commissioning-resolution.json"
+TRANSPORT = ROOT / "evidence-transport" / "vectors" / "ingest-auth.json"
+
+REGISTRATION_DOMAIN = b"ori.evidence_anchor_registration.v1\0"
+AUTHORISATION_DOMAIN = b"ori.evidence_commissioning_authorization.v1\0"
+REGISTRATION_FIELDS = {"v", "device_id", "pubkey_hex", "anchor_epoch_id", "alg", "posture", "capability_profile", "registered_at_ms", "commissioning_digest", "key_id", "signature"}
+AUTHORISATION_FIELDS = {"v", "device_id", "pubkey_hex", "anchor_epoch_id", "actor", "reason", "issued_at_ms", "key_id", "signature"}
+RESOLUTION_ORDER = ["parses", "key_selection", "signature", "recompute_epoch_and_key_id", "resolve_commissioning_digest", "apply"]
+REQUIRED_OUTCOMES = {
+    "registration retained pending": lambda c: c["source"] == "courier" and kind(c["artifact"]) == "registration" and c["expected"] == "accept" and not c["epoch_confirmation_issued"],
+    "authorisation promotes retained registration": lambda c: c["source"] == "commissioning_path" and c["expected"] == "accept" and c["epoch_confirmation_issued"],
+    "registration applied under held authorisation": lambda c: c["source"] == "courier" and kind(c["artifact"]) == "registration" and c["expected"] == "accept" and c["epoch_confirmation_issued"],
+    "wrong digest for held device and epoch": lambda c: c["reject_reason"] == "commissioning_digest_mismatch" and kind(c["artifact"]) == "registration" and any(a["pubkey_hex"] == c["artifact"]["pubkey_hex"] for a in c["receiver_state"]["held_authorisations"]),
+    "resolved authorisation names another device, key or epoch": lambda c: c["reject_reason"] == "commissioning_digest_mismatch" and kind(c["artifact"]) == "registration" and any(digest(a) == c["artifact"]["commissioning_digest"] for a in c["receiver_state"]["held_authorisations"]),
+    "authorisation from the device side refused at transport": lambda c: c["source"] == "courier" and kind(c["artifact"]) == "authorisation" and c["reject_reason"] == "malformed",
+}
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise Failure(message)
+
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def digest(artifact: dict) -> str:
+    return "sha256:" + hashlib.sha256(canonical(artifact)).hexdigest()
+
+
+def kind(artifact: dict) -> str:
+    keys = set(artifact)
+    if keys == REGISTRATION_FIELDS:
+        return "registration"
+    if keys == AUTHORISATION_FIELDS:
+        return "authorisation"
+    fail(f"artifact with keys {sorted(keys)} is neither a registration nor an authorisation")
+    return ""
+
+
+def verify(artifact: dict, domain: bytes, public_hex: str, where: str) -> None:
+    body = {k: v for k, v in artifact.items() if k != "signature"}
+    signature = artifact["signature"]
+    if not signature.startswith("ed25519:"):
+        fail(f"{where}: signature is not ed25519:")
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_hex)).verify(
+            base64.b64decode(signature[len("ed25519:"):], validate=True), domain + canonical(body)
+        )
+    except (InvalidSignature, ValueError) as exc:
+        fail(f"{where}: signature does not verify ({exc.__class__.__name__})")
+
+
+def resolve(case: dict, device_public_hex: str, commissioning_public_hex: str) -> tuple[str, str | None, dict, bool]:
+    """Recompute (expected, reject_reason, authority_state_after, confirmation_issued)."""
+    state = case["receiver_state"]
+    held = list(state["held_authorisations"])
+    retained = list(state["retained_registrations"])
+    artifact = case["artifact"]
+    what = kind(artifact)
+    if case["source"] == "courier" and what == "authorisation":
+        return "reject", "malformed", {"retained_registrations": [r["commissioning_digest"] for r in retained], "confirmed_epochs": []}, False
+    if what == "authorisation":
+        verify(artifact, AUTHORISATION_DOMAIN, commissioning_public_hex, case["name"])
+        held.append(artifact)
+        matching = [r for r in retained if r["commissioning_digest"] == digest(artifact) and binds(artifact, r)]
+        remaining = [r["commissioning_digest"] for r in retained if r not in matching]
+        return "accept", None, {"retained_registrations": remaining, "confirmed_epochs": [r["anchor_epoch_id"] for r in matching]}, bool(matching)
+    verify(artifact, REGISTRATION_DOMAIN, device_public_hex, case["name"])
+    resolved = [a for a in held if digest(a) == artifact["commissioning_digest"]]
+    if resolved:
+        if all(binds(a, artifact) for a in resolved):
+            return "accept", None, {"retained_registrations": [], "confirmed_epochs": [artifact["anchor_epoch_id"]]}, True
+        return "reject", "commissioning_digest_mismatch", {"retained_registrations": [], "confirmed_epochs": []}, False
+    same_epoch = [a for a in held if a["device_id"] == artifact["device_id"] and a["anchor_epoch_id"] == artifact["anchor_epoch_id"]]
+    if same_epoch:
+        return "reject", "commissioning_digest_mismatch", {"retained_registrations": [], "confirmed_epochs": []}, False
+    return "accept", None, {"retained_registrations": [artifact["commissioning_digest"]], "confirmed_epochs": []}, False
+
+
+def binds(authorisation: dict, registration: dict) -> bool:
+    return all(authorisation[f] == registration[f] for f in ("device_id", "pubkey_hex", "anchor_epoch_id"))
+
+
+def main() -> int:
+    try:
+        with CORPUS.open(encoding="utf-8") as handle:
+            corpus = json.load(handle)
+        if corpus.get("artifact") != "commissioning_resolution_state" or corpus.get("resolution_order") != RESOLUTION_ORDER:
+            fail("corpus header or resolution_order does not match the contract")
+        device_public_hex = corpus["signing_key_public_hex"]
+        commissioning_public_hex = corpus["commissioning_key_public_hex"]
+        names: set[str] = set()
+        keys_seen: set[frozenset] = set()
+        for case in corpus["cases"]:
+            name = case["name"]
+            if name in names:
+                fail(f"duplicate case name {name}")
+            names.add(name)
+            keys_seen.add(frozenset(case))
+            body = {k: v for k, v in case["artifact"].items() if k != "signature"}
+            if canonical(body).hex() != case["canonical_hex"]:
+                fail(f"{name}: canonical_hex does not reproduce")
+            for held in case["receiver_state"]["held_authorisations"]:
+                if kind(held) != "authorisation":
+                    fail(f"{name}: a held authorisation is not an authorisation")
+                verify(held, AUTHORISATION_DOMAIN, commissioning_public_hex, f"{name} held authorisation")
+            for retained in case["receiver_state"]["retained_registrations"]:
+                if kind(retained) != "registration":
+                    fail(f"{name}: a retained registration is not a registration")
+                verify(retained, REGISTRATION_DOMAIN, device_public_hex, f"{name} retained registration")
+            expected, reason, after, confirmed = resolve(case, device_public_hex, commissioning_public_hex)
+            literal = (case["expected"], case["reject_reason"], case["authority_state_after"], case["epoch_confirmation_issued"])
+            if literal != (expected, reason, after, confirmed):
+                fail(f"{name}: expected {literal} but the contract gives {(expected, reason, after, confirmed)}")
+            if case["quarantined"] or case["gap_recorded"]:
+                fail(f"{name}: no resolution outcome quarantines or records a gap")
+            expected_auth = "not_reached" if reason == "malformed" else "valid"
+            if case["authenticator"] != expected_auth:
+                fail(f"{name}: authenticator must be {expected_auth}")
+        if len(keys_seen) != 1:
+            fail("every case must carry the same keys")
+        for label, predicate in REQUIRED_OUTCOMES.items():
+            if not any(predicate(c) for c in corpus["cases"]):
+                fail(f"corpus does not cover: {label}")
+        with TRANSPORT.open(encoding="utf-8") as handle:
+            transport = json.load(handle)
+        if not any(c["name"] == "device_side_commissioning_authorization" and c["expected"] == "refused_malformed_before_verifier" for c in transport["negative_cases"]):
+            fail("ingest-auth.json lacks the device-side commissioning_authorization refusal")
+    except Failure as failure:
+        print(f"check-evidence-commissioning-vectors: {failure}", file=sys.stderr)
+        return 1
+    print(f"check-evidence-commissioning-vectors: corpus agrees with the contract ({len(corpus['cases'])} cases, {len(REQUIRED_OUTCOMES)} outcomes covered)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
