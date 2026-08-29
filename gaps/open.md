@@ -112,9 +112,9 @@ accurate description of what a repo implements.
   `ori-runtime` still models a `CommissioningAuthorisationSource` that would
   hand the registrar the full object, and reports `pending_authorisation`
   unconditionally; `ori-cli` has no `evidence commission` command
-  (`ori-cli#34`); `ori-gateway`'s durable queue still enumerates
-  `commissioning_authorization` as a type. The authority-side ingest of a
-  signed authorisation is `ori-specs#130`.
+  (`ori-cli#34`); the gateway courier refuses `commissioning_authorization` at
+  ingress. The authority-side ingest of a signed authorisation is
+  `ori-specs#130`.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies all seven artifacts. The runtime now
