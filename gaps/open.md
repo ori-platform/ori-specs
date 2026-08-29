@@ -226,14 +226,21 @@ accurate description of what a repo implements.
   is carried silently and `device.rated_capacity_amps` is a provisioning-signed
   value.
 
-- **The orchestration contract does not exist**
-  ([runtime-config/v2.md](../runtime-config/v2.md)): v2 defines the
-  provisioning document alone. Which anchors verify which artifact, how a
-  binding's `inventory_generation` is reconciled with
-  `device.inventory_generation`, what a consumer does when one artifact
-  verifies and another does not, and the legacy latch's persistence are all
-  owned by the orchestration contract tracked in `ori-specs` #75, and none of
-  them is specified yet.
+- **No consumer holds a configuration set**
+  ([runtime-config-orchestration/v1.md](../runtime-config-orchestration/v1.md)):
+  the orchestration contract fixes anchors, anchor-wide selection, the
+  inventory invariant that licenses actuation, startup and runtime behaviour
+  on partial failure, entitlement retention and the legacy latch, with a
+  state-transition corpus. Nothing implements it: `ori-runtime` verifies one
+  document against one anchor, reads the entitlement anchor from inside that
+  document, and holds no notion of an inventory generation. Consumer work is
+  `ori-runtime` #332.
+
+- **`signing_key` and the previous provisioning anchor are contract text only**
+  ([runtime-config-signing/v1.md](../runtime-config-signing/v1.md)): the
+  design-target section adds them so that `wrong_authority` is reachable for
+  the provisioning document and the provisioning key can rotate. The runtime's
+  signature path neither reads `signing_key` nor configures a previous anchor.
 
 - **`skills[].config` is closed to one key**
   ([runtime-config/v2.md](../runtime-config/v2.md)): the shipped examples

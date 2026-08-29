@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Check the runtime-config-orchestration/v1 corpus against the contract.
+
+The corpus is hand-authored: sequences of artifacts arriving at a device and
+startups under a posture, each with the verdict and set state expected after
+it. This script recomputes every expectation from the contract's rules —
+anchor collision, anchor-wide selection then signature then authority,
+provisioning freshness by inventory generation, binding freshness by
+binding_seq, the inventory invariant that licenses actuation, startup
+outcomes per posture, entitlement retention, and the legacy latch — and
+refuses the corpus on any disagreement. It also checks that every verdict and
+startup outcome the contract names has a case.
+
+    python3 scripts/check-runtime-config-orchestration-vectors
+
+It is a reader of the corpus against the contract, not a second
+implementation. Exits non-zero on the first unmet requirement.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import sys
+from typing import Any
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "runtime-config-orchestration" / "vectors" / "set-transitions.json"
+
+VERDICTS = [
+    "unknown_signer", "bad_signature", "wrong_authority", "superseded_signer",
+    "foreign_field", "forbidden_content", "stale", "generation_reused",
+    "inventory_ahead", "inventory_behind", "legacy_accepted", "legacy_refused", "entitlement_retained", "accepted",
+]
+STARTUP_OUTCOMES = ["start", "start_degraded", "refuse", "anchor_collision"]
+CLASSES = {"provisioning", "entitlement", "commissioning"}
+CONTENT_VERDICTS = {"foreign_field", "forbidden_content"}
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise Failure(message)
+
+
+class ConfigurationSet:
+    def __init__(self, anchors: dict, initial: dict) -> None:
+        self.anchors = anchors
+        self.provisioning = copy.deepcopy(initial["provisioning"])
+        self.binding = copy.deepcopy(initial["binding"])
+        self.pending = copy.deepcopy(initial["pending_binding"])
+        self.entitlement = bool(initial["entitlement"])
+        self.latched = bool(initial["latched"])
+
+    # ---- derived
+    def collision(self) -> bool:
+        keys = [a["key"] for a in self.anchors.values()]
+        return len(keys) != len(set(keys))
+
+    def hardware(self) -> bool:
+        return bool(self.provisioning and self.provisioning["hardware"])
+
+    def mismatch(self) -> bool:
+        return bool(
+            self.provisioning and self.hardware() and self.binding is not None
+            and self.binding["generation"] != self.provisioning["generation"]
+        )
+
+    def actuation(self) -> bool:
+        return bool(
+            self.provisioning and self.hardware() and self.binding is not None
+            and self.binding["generation"] == self.provisioning["generation"]
+        )
+
+    def view(self) -> dict:
+        return {
+            "provisioning_generation": self.provisioning["generation"] if self.provisioning else None,
+            "binding_generation": self.binding["generation"] if self.binding else None,
+            "pending_binding_generation": self.pending["generation"] if self.pending else None,
+            "entitlement": self.entitlement,
+            "latched": self.latched,
+            "actuation": self.actuation(),
+            "inventory_mismatch": self.mismatch(),
+        }
+
+    # ---- selection, signature, authority
+    def authority(self, event: dict, expected_class: str) -> str | None:
+        label = event["signed_by"]
+        anchor = self.anchors.get(label)
+        if anchor is None:
+            return "unknown_signer"
+        if event["signature"] != "valid":
+            return "bad_signature"
+        if anchor["class"] != expected_class:
+            return "wrong_authority"
+        if anchor["generation"] == "previous":
+            return "superseded_signer"
+        return None
+
+    # ---- events
+    def startup(self, posture: str) -> str:
+        if self.collision():
+            return "anchor_collision"
+        if self.provisioning is None:
+            return "refuse"
+        if self.hardware() and (self.binding is None or self.mismatch()):
+            return "refuse" if posture == "production" else "start_degraded"
+        return "start"
+
+    def provisioning_arrives(self, event: dict) -> str:
+        if event.get("schema") == "legacy":
+            # No signing_key: verified against the current provisioning anchor
+            # alone, so every failure there is a signature failure.
+            anchor = self.anchors.get(event["signed_by"])
+            if anchor is None or anchor["class"] != "provisioning" or anchor["generation"] != "current" or event["signature"] != "valid":
+                return "bad_signature"
+            if self.latched:
+                return "legacy_refused"
+            self.provisioning = {"generation": 1, "content": "legacy", "hardware": bool(event["hardware"]), "legacy": True}
+            return "legacy_accepted"
+        verdict = self.authority(event, "provisioning")
+        if verdict:
+            return verdict
+        content_verdict = event.get("content_verdict")
+        if content_verdict:
+            if content_verdict not in CONTENT_VERDICTS:
+                fail(f"unknown content verdict {content_verdict!r}")
+            return content_verdict
+        incoming = {"generation": event["generation"], "content": event["content"], "hardware": bool(event["hardware"]), "legacy": False}
+        if self.provisioning is not None and not self.provisioning.get("legacy"):
+            if incoming["generation"] < self.provisioning["generation"]:
+                return "stale"
+            if incoming["generation"] == self.provisioning["generation"]:
+                if incoming["content"] != self.provisioning["content"]:
+                    return "generation_reused"
+                self.latched = True
+                return "accepted"
+        self.provisioning = incoming
+        self.latched = True
+        if self.pending is not None and self.pending["generation"] == incoming["generation"]:
+            self.binding = self.pending
+            self.pending = None
+        return "accepted"
+
+    def binding_arrives(self, event: dict) -> str:
+        verdict = self.authority(event, "commissioning")
+        if verdict:
+            return verdict
+        if event["contract"] != "ok":
+            return event["contract"]
+        incoming = {"generation": event["generation"], "seq": event["seq"]}
+        accepted_seq = self.binding["seq"] if self.binding else 0
+        pending_seq = self.pending["seq"] if self.pending else 0
+        if incoming["seq"] <= max(accepted_seq, pending_seq):
+            return "stale"
+        if self.provisioning is None or incoming["generation"] > self.provisioning["generation"]:
+            self.pending = incoming
+            return "inventory_ahead"
+        if incoming["generation"] < self.provisioning["generation"]:
+            return "inventory_behind"
+        self.binding = incoming
+        return "accepted"
+
+    def entitlement_arrives(self, event: dict) -> str:
+        if event["signature"] != "valid":
+            return "entitlement_retained"
+        self.entitlement = True
+        return "accepted"
+
+
+def run_case(case: dict, seen: dict[str, set[str]]) -> None:
+    name = case["name"]
+    for label, anchor in case["anchors"].items():
+        if set(anchor) != {"class", "generation", "key"} or anchor["class"] not in CLASSES or anchor["generation"] not in {"current", "previous"}:
+            fail(f"{name}: anchor {label} is malformed")
+    machine = ConfigurationSet(case["anchors"], case["initial"])
+    for index, event in enumerate(case["events"]):
+        kind = event["event"]
+        if kind == "startup":
+            verdict = machine.startup(event["posture"])
+            seen["startup"].add(verdict)
+        elif kind == "provisioning":
+            verdict = machine.provisioning_arrives(event)
+            seen["verdict"].add(verdict)
+        elif kind == "binding":
+            verdict = machine.binding_arrives(event)
+            seen["verdict"].add(verdict)
+        elif kind == "entitlement":
+            verdict = machine.entitlement_arrives(event)
+            seen["verdict"].add(verdict)
+        elif kind == "restart":
+            verdict = "restarted"
+        else:
+            fail(f"{name}: unknown event {kind!r}")
+        label = f"{name} event {index} ({kind})"
+        expected = event["expect"]
+        if expected["verdict"] != verdict:
+            fail(f"{label}: expected {expected['verdict']} but the contract gives {verdict}")
+        if expected["state"] != machine.view():
+            fail(f"{label}: expected state {expected['state']} but the contract gives {machine.view()}")
+
+
+def main() -> int:
+    seen: dict[str, set[str]] = {"verdict": set(), "startup": set()}
+    try:
+        with VECTORS.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("contract") != "runtime-config-orchestration/v1" or data.get("version") != 1:
+            fail("set-transitions.json: contract header does not match")
+        if data.get("verdicts") != VERDICTS or data.get("startup_outcomes") != STARTUP_OUTCOMES:
+            fail("set-transitions.json: verdict vocabularies do not match the contract")
+        names: set[str] = set()
+        for case in data["cases"]:
+            if case["name"] in names:
+                fail(f"duplicate case name {case['name']}")
+            names.add(case["name"])
+            run_case(case, seen)
+        missing = [f"verdict {v}" for v in VERDICTS if v not in seen["verdict"]]
+        missing += [f"startup outcome {o}" for o in STARTUP_OUTCOMES if o not in seen["startup"]]
+        if missing:
+            fail("corpus does not cover: " + ", ".join(missing))
+    except Failure as failure:
+        print(f"check-runtime-config-orchestration-vectors: {failure}", file=sys.stderr)
+        return 1
+    print(f"check-runtime-config-orchestration-vectors: corpus agrees with the contract ({len(seen['verdict'])} verdicts, {len(seen['startup'])} startup outcomes)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
