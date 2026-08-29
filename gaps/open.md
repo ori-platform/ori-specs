@@ -216,6 +216,31 @@ accurate description of what a repo implements.
   Implementations must keep artifact and manifest verification as separate
   entry points.
 
+## runtime-config/v2 implementation targets
+
+- **No consumer, no producer** ([runtime-config/v2.md](../runtime-config/v2.md)):
+  the closed provisioning document is a pre-ratification design target with a
+  machine schema and a corpus. `ori-runtime` #332 is the intended consumer and
+  `ori-cloud` #19 the intended producer; neither has started. Every shipped
+  runtime still loads the open v1 surface, in which an undeclared nested key
+  is carried silently and `device.rated_capacity_amps` is a provisioning-signed
+  value.
+
+- **The orchestration contract does not exist**
+  ([runtime-config/v2.md](../runtime-config/v2.md)): v2 defines the
+  provisioning document alone. Which anchors verify which artifact, how a
+  binding's `inventory_generation` is reconciled with
+  `device.inventory_generation`, what a consumer does when one artifact
+  verifies and another does not, and the legacy latch's persistence are all
+  owned by the orchestration contract tracked in `ori-specs` #75, and none of
+  them is specified yet.
+
+- **`skills[].config` is closed to one key**
+  ([runtime-config/v2.md](../runtime-config/v2.md)): the shipped examples
+  carry skill settings that never reach the skill and are refused under v2
+  until `skills-package/v3` gives them a signed schema to be validated
+  against. The delegation flips to pass-through when a runtime implements v3.
+
 ## safety-profile/v1 implementation targets
 
 - **No consumer** ([safety-profile/v1.md](../safety-profile/v1.md)): the
