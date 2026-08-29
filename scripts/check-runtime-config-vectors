@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""Check the runtime-config/v2 schema and corpus against the contract.
+
+The schema is hand-authored from the runtime's loader and consumers, and the
+corpus is hand-authored beside it. This script holds both to the contract:
+
+- the schema loads under schema-descriptor/v1 plus the v2 extensions, with
+  every load-time rule applied before any document is read;
+- every retired path is undeclared, and every case naming one is refused with
+  the verdict and destination the table records;
+- every document case is accepted, recognised as legacy, or refused exactly as
+  it says, naming the full path; a refused case carries exactly one defect;
+- every descriptor-core load-time rule has a schema-load case, and every
+  verdict, extension, retired path and document-level requirement class has a
+  document case;
+- the field appendix in v2.md is generated from the schema, so the prose cannot
+  drift from the declaration.
+
+    python3 scripts/check-runtime-config-vectors
+    python3 scripts/check-runtime-config-vectors --write-appendix
+    python3 scripts/check-runtime-config-vectors --runtime-examples <ori-runtime checkout>
+
+The last form applies the contract's migration rules to the runtime's shipped
+example files and reports what a v2 consumer would refuse. It is evidence for
+a PR, not a gate: the examples live in another repository.
+
+Exits non-zero on the first unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import pathlib
+import re
+import sys
+from typing import Any
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "runtime-config" / "vectors"
+CONTRACT_DOC = ROOT / "runtime-config" / "v2.md"
+
+SCHEMA_ID = "ori.runtime-config.v2"
+CORE_PROPERTIES = {"type", "required", "default", "minimum", "maximum", "enum", "properties", "items"}
+EXTENSIONS = {"description", "pattern", "exclusive_minimum", "entries", "delegate"}
+TYPES = {"string", "integer", "number", "boolean", "array", "object"}
+NUMERIC = {"integer", "number"}
+VERDICTS = ["malformed", "foreign_field", "forbidden_content"]
+DELEGATES = {"sensor-configuration/v1": "pass_through", "skills-package/v3": "refuse"}
+APPENDIX_BEGIN = "<!-- surface:begin -->"
+APPENDIX_END = "<!-- surface:end -->"
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise Failure(message)
+
+
+def is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def is_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def type_ok(kind: str, value: Any) -> bool:
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "integer":
+        return is_integer(value)
+    if kind == "number":
+        return is_number(value)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "array":
+        return isinstance(value, list)
+    if kind == "object":
+        return isinstance(value, dict)
+    return False
+
+
+def join(path: str, key: str) -> str:
+    return f"{path}.{key}" if path else key
+
+
+# ------------------------------------------------------------------ schema load
+
+
+def check_descriptor(descriptor: Any, where: str) -> None:
+    if not isinstance(descriptor, dict):
+        fail(f"{where}: descriptor must be an object")
+    unknown = set(descriptor) - CORE_PROPERTIES - EXTENSIONS
+    if unknown:
+        fail(f"{where}: unrecognised descriptor properties {sorted(unknown)}")
+    kind = descriptor.get("type")
+    if kind not in TYPES:
+        fail(f"{where}: type {kind!r} is not a descriptor type")
+    if descriptor.get("required") is True and "default" in descriptor:
+        fail(f"{where}: required and default are mutually exclusive")
+    if "required" in descriptor and not isinstance(descriptor["required"], bool):
+        fail(f"{where}: required must be a boolean")
+    for bound in ("minimum", "maximum", "exclusive_minimum"):
+        if bound in descriptor:
+            value = descriptor[bound]
+            if kind not in NUMERIC:
+                fail(f"{where}: {bound} on a non-numeric descriptor")
+            if not is_number(value) or not math.isfinite(value):
+                fail(f"{where}: {bound} must be a finite number")
+            if kind == "integer" and not is_integer(value):
+                fail(f"{where}: {bound} on an integer descriptor must be an integer")
+    if "minimum" in descriptor and "exclusive_minimum" in descriptor:
+        fail(f"{where}: minimum and exclusive_minimum are mutually exclusive")
+    if "minimum" in descriptor and "maximum" in descriptor and descriptor["minimum"] > descriptor["maximum"]:
+        fail(f"{where}: minimum exceeds maximum")
+    if "exclusive_minimum" in descriptor and "maximum" in descriptor and descriptor["exclusive_minimum"] >= descriptor["maximum"]:
+        fail(f"{where}: exclusive_minimum admits nothing below maximum")
+    if "pattern" in descriptor:
+        if kind != "string":
+            fail(f"{where}: pattern on a non-string descriptor")
+        if not isinstance(descriptor["pattern"], str):
+            fail(f"{where}: pattern must be a string")
+        try:
+            re.compile(descriptor["pattern"])
+        except re.error as exc:
+            fail(f"{where}: pattern does not compile: {exc}")
+    if "enum" in descriptor:
+        enum = descriptor["enum"]
+        if not isinstance(enum, list) or not enum:
+            fail(f"{where}: enum must be a non-empty array")
+        for member in enum:
+            errors = validate_value(member, {k: v for k, v in descriptor.items() if k != "enum"}, where, collect=[])
+            if errors:
+                fail(f"{where}: enum member {member!r} violates the descriptor's own type or bounds")
+    if kind == "object":
+        has_properties = "properties" in descriptor
+        has_entries = "entries" in descriptor
+        if has_properties == has_entries:
+            fail(f"{where}: an object declares exactly one of properties or entries")
+        if has_properties:
+            properties = descriptor["properties"]
+            if not isinstance(properties, dict):
+                fail(f"{where}: properties must be an object")
+            for key, child in properties.items():
+                if not isinstance(key, str) or not key:
+                    fail(f"{where}: property names must be non-empty strings")
+                check_descriptor(child, join(where, key))
+        else:
+            check_descriptor(descriptor["entries"], where + ".<entry>")
+        if "delegate" in descriptor:
+            delegate = descriptor["delegate"]
+            if delegate not in DELEGATES:
+                fail(f"{where}: delegate {delegate!r} is not a contract this version names")
+            if not has_properties:
+                fail(f"{where}: delegate requires declared properties")
+    else:
+        for key in ("properties", "entries", "delegate"):
+            if key in descriptor:
+                fail(f"{where}: {key} on a non-object descriptor")
+    if kind == "array":
+        if "items" not in descriptor:
+            fail(f"{where}: an array declares items")
+        check_descriptor(descriptor["items"], where + "[]")
+    elif "items" in descriptor:
+        fail(f"{where}: items on a non-array descriptor")
+    if "default" in descriptor:
+        errors = validate_value(descriptor["default"], descriptor, where, collect=[])
+        if errors:
+            fail(f"{where}: default {descriptor['default']!r} is refused by its own descriptor: {errors[0][1]}")
+
+
+def load_schema() -> dict:
+    with (VECTORS / "schema.json").open(encoding="utf-8") as handle:
+        schema = json.load(handle)
+    if schema.get("contract") != "runtime-config/v2" or schema.get("version") != 2:
+        fail("schema.json: contract header is not runtime-config/v2 version 2")
+    if schema.get("adopts") != "schema-descriptor/v1" or set(schema.get("extensions", [])) != EXTENSIONS:
+        fail("schema.json: adopts or extensions do not match the contract")
+    root = {"type": "object", "properties": schema["properties"]}
+    check_descriptor(root, "<document>")
+    marker = schema["properties"].get("schema")
+    if marker is None or marker.get("enum") != [SCHEMA_ID] or marker.get("required") is not True:
+        fail("schema.json: the schema marker must be required and fixed to " + SCHEMA_ID)
+    retired = schema.get("retired")
+    if not isinstance(retired, dict) or not retired:
+        fail("schema.json: retired table must be a non-empty object")
+    for path, entry in retired.items():
+        if set(entry) != {"verdict", "authority", "destination", "why"}:
+            fail(f"schema.json: retired {path} must carry verdict, authority, destination, why")
+        if entry["verdict"] not in VERDICTS:
+            fail(f"schema.json: retired {path} verdict {entry['verdict']!r} is not in the vocabulary")
+        if path_is_declared(schema["properties"], path):
+            fail(f"schema.json: retired path {path} is also declared")
+    return schema
+
+
+def path_is_declared(properties: dict, path: str) -> bool:
+    node: Any = {"type": "object", "properties": properties}
+    for part in path.split("."):
+        if node.get("type") == "array":
+            node = node["items"]
+        if node.get("type") != "object" or "properties" not in node:
+            return False
+        if part not in node["properties"]:
+            return False
+        node = node["properties"][part]
+    return True
+
+
+# ------------------------------------------------------------- document walk
+
+
+def validate_value(value: Any, descriptor: dict, path: str, *, collect: list, retired: dict | None = None) -> list:
+    """Append (verdict, message) tuples for every defect under path."""
+    kind = descriptor["type"]
+    if not type_ok(kind, value):
+        collect.append(("malformed", f"{path}: expected {kind}, got {describe(value)}"))
+        return collect
+    if "enum" in descriptor and value not in descriptor["enum"]:
+        collect.append(("malformed", f"{path}: {value!r} is not one of {descriptor['enum']}"))
+        return collect
+    if kind in NUMERIC:
+        if "minimum" in descriptor and value < descriptor["minimum"]:
+            collect.append(("malformed", f"{path}: {value!r} is below the minimum {descriptor['minimum']}"))
+        if "exclusive_minimum" in descriptor and value <= descriptor["exclusive_minimum"]:
+            collect.append(("malformed", f"{path}: {value!r} must exceed {descriptor['exclusive_minimum']}"))
+        if "maximum" in descriptor and value > descriptor["maximum"]:
+            collect.append(("malformed", f"{path}: {value!r} is above the maximum {descriptor['maximum']}"))
+    if kind == "string" and "pattern" in descriptor and not re.fullmatch(descriptor["pattern"], value):
+        collect.append(("malformed", f"{path}: {value!r} does not match {descriptor['pattern']}"))
+    if kind == "array":
+        for index, item in enumerate(value):
+            validate_value(item, descriptor["items"], f"{path}[{index}]", collect=collect, retired=retired)
+    if kind == "object":
+        if "entries" in descriptor:
+            for key, item in value.items():
+                validate_value(item, descriptor["entries"], join(path, str(key)), collect=collect, retired=retired)
+            return collect
+        properties = descriptor["properties"]
+        delegate = descriptor.get("delegate")
+        for key, child in properties.items():
+            child_path = join(path, key)
+            if key in value:
+                validate_value(value[key], child, child_path, collect=collect, retired=retired)
+            elif child.get("required") is True:
+                collect.append(("malformed", f"{child_path}: required key is missing"))
+        for key in value:
+            if key in properties:
+                continue
+            child_path = join(path, str(key))
+            entry = (retired or {}).get(normalise(child_path))
+            if entry is not None:
+                collect.append((entry["verdict"], f"{child_path}: {entry['verdict']} — belongs to {entry['destination']} ({entry['authority']} authority)"))
+            elif delegate is not None and DELEGATES[delegate] == "pass_through":
+                continue
+            elif delegate is not None:
+                collect.append(("malformed", f"{child_path}: not declared here; validated under {delegate}, which this consumer does not implement"))
+            else:
+                collect.append(("malformed", f"{child_path}: undeclared key"))
+    return collect
+
+
+def normalise(path: str) -> str:
+    return re.sub(r"\[\d+\]", "", path)
+
+
+def describe(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def classify(document: Any, schema: dict) -> tuple[str, list]:
+    """Return (outcome, defects). outcome is accepted, legacy_document or refused:<verdict>."""
+    if not isinstance(document, dict):
+        return "refused:malformed", [("malformed", "<document>: expected object, got " + describe(document))]
+    if "schema" not in document:
+        return "legacy_document", []
+    root = {"type": "object", "properties": schema["properties"]}
+    defects = validate_value(document, root, "", collect=[], retired=schema["retired"])
+    if not defects:
+        return "accepted", []
+    return "refused:" + defects[0][0], defects
+
+
+# ------------------------------------------------------------------- corpus
+
+
+def decode_bounds(descriptor: Any) -> Any:
+    """Replace {"non_finite": ...} markers with the IEEE values JSON cannot carry."""
+    if isinstance(descriptor, dict):
+        if set(descriptor) == {"non_finite"}:
+            return {"nan": math.nan, "+inf": math.inf, "-inf": -math.inf}[descriptor["non_finite"]]
+        return {k: decode_bounds(v) for k, v in descriptor.items()}
+    if isinstance(descriptor, list):
+        return [decode_bounds(v) for v in descriptor]
+    return descriptor
+
+
+def check_schema_load(seen: dict[str, set[str]]) -> None:
+    with (VECTORS / "schema-load.json").open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if data.get("contract") != "runtime-config/v2" or data.get("version") != 2:
+        fail("schema-load.json: header does not match the contract")
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"schema-load.json: duplicate case name {name}")
+        names.add(name)
+        try:
+            check_descriptor(decode_bounds(case["descriptor"]), "<fragment>")
+        except Failure as failure:
+            outcome, detail = "schema_error", str(failure)
+        else:
+            outcome, detail = "loaded", ""
+        if outcome != case["expect"]:
+            fail(f"{name}: expected {case['expect']} but the grammar gives {outcome} {detail}".rstrip())
+        for needle in case.get("must_name", []):
+            if needle not in detail:
+                fail(f"{name}: refusal {detail!r} does not name {needle!r}")
+        seen["schema_load"].add(outcome)
+
+
+def check_documents(schema: dict, seen: dict[str, set[str]]) -> None:
+    with (VECTORS / "documents.json").open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if data.get("contract") != "runtime-config/v2" or data.get("version") != 2 or data.get("verdicts") != VERDICTS:
+        fail("documents.json: header does not match the contract")
+    names: set[str] = set()
+    for case in data["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"documents.json: duplicate case name {name}")
+        names.add(name)
+        outcome, defects = classify(case["document"], schema)
+        if outcome != case["expect"]:
+            detail = "; ".join(m for _, m in defects[:3])
+            fail(f"{name}: expected {case['expect']} but the contract gives {outcome}: {detail}")
+        if outcome.startswith("refused:"):
+            if len(defects) != 1:
+                fail(f"{name}: carries {len(defects)} defects, not one: " + "; ".join(m for _, m in defects))
+            message = defects[0][1]
+            for needle in case.get("must_name", []):
+                if needle not in message:
+                    fail(f"{name}: refusal {message!r} does not name {needle!r}")
+            for path in schema["retired"]:
+                if message.startswith(path + ":"):
+                    seen["retired"].add(path)
+            seen["verdict"].add(outcome.split(":", 1)[1])
+        seen["outcome"].add(outcome.split(":", 1)[0])
+        note_features(case, seen)
+
+
+def note_features(case: dict, seen: dict[str, set[str]]) -> None:
+    name = case["name"]
+    features = {
+        "exclusive_minimum": "exclusive_minimum",
+        "coap_command": "entries",
+        "delegated": "delegate_pass_through",
+        "dead_key": "delegate_refuse",
+        "two_levels_deep": "depth",
+        "as_string": "type",
+        "float_where_integer": "type",
+        "boolean_where_integer": "type",
+        "integer_where_string": "type",
+        "enum": "enum",
+        "below_minimum": "minimum",
+        "above_maximum": "maximum",
+        "required_": "required",
+        "missing": "required",
+        "array_item": "array_item",
+        "null_section": "null",
+        "socket_mode": "octal",
+        "digest": "digest",
+        "device_id_with_space": "pattern",
+        "country_code": "pattern",
+        "env_name": "pattern",
+        "custody_key": "pattern",
+    }
+    for needle, feature in features.items():
+        if needle in name:
+            seen["feature"].add(feature)
+
+
+def check_coverage(schema: dict, seen: dict[str, set[str]]) -> None:
+    missing = []
+    for verdict in VERDICTS:
+        if verdict not in seen["verdict"]:
+            missing.append(f"verdict {verdict}")
+    for outcome in ("accepted", "legacy_document", "refused"):
+        if outcome not in seen["outcome"]:
+            missing.append(f"outcome {outcome}")
+    for path in schema["retired"]:
+        if path not in seen["retired"]:
+            missing.append(f"retired path {path}")
+    for feature in ("exclusive_minimum", "entries", "delegate_pass_through", "delegate_refuse", "depth", "type", "enum", "minimum", "maximum", "required", "array_item", "null", "octal", "digest", "pattern"):
+        if feature not in seen["feature"]:
+            missing.append(f"feature {feature}")
+    for outcome in ("loaded", "schema_error"):
+        if outcome not in seen["schema_load"]:
+            missing.append(f"schema-load outcome {outcome}")
+    if missing:
+        fail("corpus does not cover: " + ", ".join(missing))
+
+
+# ----------------------------------------------------------------- appendix
+
+
+def appendix_rows(properties: dict, prefix: str = "") -> list[str]:
+    rows: list[str] = []
+    for key, descriptor in properties.items():
+        path = join(prefix, key)
+        rows.append(appendix_row(path, descriptor))
+        if descriptor["type"] == "object":
+            if "properties" in descriptor:
+                rows.extend(appendix_rows(descriptor["properties"], path))
+            else:
+                rows.append(appendix_row(path + ".<name>", descriptor["entries"]))
+                rows.extend(appendix_rows(descriptor["entries"]["properties"], path + ".<name>"))
+        elif descriptor["type"] == "array" and descriptor["items"]["type"] == "object":
+            rows.extend(appendix_rows(descriptor["items"]["properties"], path + "[]"))
+    return rows
+
+
+def appendix_row(path: str, descriptor: dict) -> str:
+    kind = descriptor["type"]
+    if kind == "array":
+        kind = f"array of {descriptor['items']['type']}"
+    if descriptor.get("required") is True:
+        presence = "required"
+    elif "default" in descriptor:
+        presence = f"default `{json.dumps(descriptor['default'])}`"
+    else:
+        presence = "optional"
+    constraints = []
+    if "enum" in descriptor:
+        constraints.append("one of " + ", ".join(f"`{json.dumps(v)}`" for v in descriptor["enum"]))
+    if "pattern" in descriptor:
+        constraints.append(f"matches `{descriptor['pattern']}`")
+    if "minimum" in descriptor:
+        constraints.append(f"≥ {descriptor['minimum']}")
+    if "exclusive_minimum" in descriptor:
+        constraints.append(f"> {descriptor['exclusive_minimum']}")
+    if "maximum" in descriptor:
+        constraints.append(f"≤ {descriptor['maximum']}")
+    if "delegate" in descriptor:
+        constraints.append(f"further keys: {descriptor['delegate']}")
+    if "entries" in descriptor:
+        constraints.append("map; names operator-chosen")
+    if descriptor.get("description"):
+        constraints.append(descriptor["description"])
+    return f"| `{path}` | {kind} | {presence} | {'; '.join(constraints).replace('|', '\\|')} |"
+
+
+def render_appendix(schema: dict) -> str:
+    lines = ["| Path | Type | Presence | Constraints |", "| --- | --- | --- | --- |"]
+    lines.extend(appendix_rows(schema["properties"]))
+    lines.append("")
+    lines.append("Retired paths, refused by full path with the verdict and destination shown:")
+    lines.append("")
+    lines.append("| Path | Verdict | Belongs to |")
+    lines.append("| --- | --- | --- |")
+    for path, entry in schema["retired"].items():
+        lines.append(f"| `{path}` | `{entry['verdict']}` | {entry['destination']} |")
+    return "\n".join(lines)
+
+
+def check_appendix(schema: dict, write: bool) -> None:
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+    if APPENDIX_BEGIN not in text or APPENDIX_END not in text:
+        fail("v2.md: appendix markers are missing")
+    head, rest = text.split(APPENDIX_BEGIN, 1)
+    _, tail = rest.split(APPENDIX_END, 1)
+    rendered = render_appendix(schema)
+    expected = f"{head}{APPENDIX_BEGIN}\n{rendered}\n{APPENDIX_END}{tail}"
+    if write:
+        CONTRACT_DOC.write_text(expected, encoding="utf-8")
+        return
+    if text != expected:
+        fail("v2.md: the surface appendix does not match schema.json; run --write-appendix")
+
+
+# ------------------------------------------------------- runtime examples
+
+
+def migrate_legacy(document: dict, schema: dict) -> tuple[dict, list[str]]:
+    """Apply the contract's migration rules to a legacy document; return notes."""
+    doc = copy.deepcopy(document)
+    notes: list[str] = []
+    doc = {"schema": SCHEMA_ID, **doc}
+    device = doc.setdefault("device", {})
+    if isinstance(device, dict) and "inventory_generation" not in device:
+        device["inventory_generation"] = 1
+        notes.append("device.inventory_generation set to 1 (first declared inventory)")
+    for path in schema["retired"]:
+        parts = path.split(".")
+        node: Any = doc
+        for part in parts[:-1]:
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+        if isinstance(node, dict) and parts[-1] in node:
+            del node[parts[-1]]
+            notes.append(f"dropped {path}: {schema['retired'][path]['destination']}")
+    for section, key in (("device_policy", "public_key_env"), ):
+        block = doc.get(section)
+        if isinstance(block, dict) and key not in block:
+            block[key] = schema["properties"][section]["properties"][key]["default"]
+    offline = (doc.get("actions") or {}).get("offline_tokens")
+    if isinstance(offline, dict) and "public_key_env" not in offline:
+        offline["public_key_env"] = schema["properties"]["actions"]["properties"]["offline_tokens"]["properties"]["public_key_env"]["default"]
+    for skill in doc.get("skills") or []:
+        config = skill.get("config") if isinstance(skill, dict) else None
+        if isinstance(config, dict):
+            dropped = sorted(k for k in config if k != "approval_timeout_seconds")
+            for k in dropped:
+                del config[k]
+            if dropped:
+                notes.append(f"skills[].config dropped {dropped}: validated under skills-package/v3 when a runtime implements it")
+    for section, key in (("health_socket", "mode"), ("firmware_mqtt_provisioning", "socket_mode")):
+        block = doc.get(section)
+        if isinstance(block, dict) and is_integer(block.get(key)):
+            block[key] = f"0o{block[key]:03o}"
+            notes.append(f"{section}.{key} rewritten as a quoted octal string")
+    return doc, notes
+
+
+def check_runtime_examples(schema: dict, runtime: pathlib.Path) -> int:
+    try:
+        import yaml
+    except ImportError:
+        print("PyYAML is required for --runtime-examples", file=sys.stderr)
+        return 2
+    status = 0
+    for path in sorted(runtime.glob("ori*.yaml*example")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        migrated, notes = migrate_legacy(document, schema)
+        outcome, defects = classify(migrated, schema)
+        print(f"{path.name}: {outcome}")
+        for note in notes:
+            print(f"    migration: {note}")
+        for verdict, message in defects:
+            print(f"    {verdict}: {message}")
+            status = 1
+    return status
+
+
+# ------------------------------------------------------------------- driver
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--write-appendix", action="store_true")
+    parser.add_argument("--runtime-examples", type=pathlib.Path)
+    args = parser.parse_args()
+    seen: dict[str, set[str]] = {key: set() for key in ("schema_load", "verdict", "outcome", "retired", "feature")}
+    try:
+        schema = load_schema()
+        if args.runtime_examples:
+            return check_runtime_examples(schema, args.runtime_examples)
+        check_schema_load(seen)
+        check_documents(schema, seen)
+        check_coverage(schema, seen)
+        check_appendix(schema, args.write_appendix)
+    except Failure as failure:
+        print(f"check-runtime-config-vectors: {failure}", file=sys.stderr)
+        return 1
+    counts = ", ".join(f"{len(seen[key])} {key}" for key in seen)
+    print(f"check-runtime-config-vectors: schema and corpus agree with the contract ({counts})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
