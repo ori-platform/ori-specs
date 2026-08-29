@@ -15,6 +15,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline; evidence carriage implemented on both sides, pre-ratification |
 | Evidence Transport | [evidence-transport/v1.md](evidence-transport/v1.md) | Design target, pre-ratification; implemented by the evidence authority and the gateway, not deployed |
 | Evidence Audit | [evidence-audit/v1.md](evidence-audit/v1.md) | Design target |
+| Evidence Commissioning Ingest | [evidence-commissioning-ingest/v1.md](evidence-commissioning-ingest/v1.md) | Design target, pre-ratification; the authority-side write path for signed commissioning authorisations and their revocation |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |

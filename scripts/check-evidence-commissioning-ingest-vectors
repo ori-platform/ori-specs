@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Check the commissioning-ingest vectors against evidence-commissioning-ingest/v1.
+
+Independent of whatever produced the file: the key identifier is re-derived
+with a hand-written HKDF, the HMAC preimage and signature are recomputed from
+the contract's rules, every artifact digest is recomputed from the
+evidence-exchange artifact it claims to carry, the revocation's Ed25519
+signature is verified under the published commissioning seed's public key,
+and the negative-case set is held to the contract's refusal table.
+
+    python3 scripts/check-evidence-commissioning-ingest-vectors
+
+Requires the `cryptography` package for Ed25519 verification; the check refuses
+to run without it rather than skipping the signature.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import pathlib
+import sys
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print("check-evidence-commissioning-ingest-vectors: the cryptography package is required", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "evidence-commissioning-ingest" / "vectors" / "ingest-auth.json"
+EXCHANGE = ROOT / "evidence-exchange" / "vectors" / "commissioning-authorization.json"
+PATH = "/v1/evidence/commissioning/artifacts"
+SALT = b"ori.commissioning_ingest_key_id.v1"
+INFO = b"commissioning_ingest"
+REQUEST_DOMAIN = b"ori.commissioning_ingest_request.v1\x00"
+REVOCATION_DOMAIN = b"ori.evidence_commissioning_revocation.v1\x00"
+REVOCATION_FIELDS = {"v", "commissioning_digest", "key_id", "actor", "reason", "revoked_at_ms", "signature"}
+REQUIRED_NEGATIVES = {
+    "body_substitution": ("refused_before_key_lookup", 401),
+    "wrong_purpose_secret": ("unknown_key", 401),
+    "nonce_replay": ("replay", 401),
+    "key_not_permitted": ("key_not_permitted", 403),
+    "unknown_commissioning_key": ("unknown_commissioning_key", 422),
+    "self_authorised": ("self_authorised", 422),
+    "wrong_type_for_body": ("malformed", 400),
+    "courier_artifact_here": ("malformed", 400),
+    "unknown_authorisation_revocation": ("unknown_authorisation", 422),
+    "resubmission_after_revocation": ("revoked", 409),
+    "fresh_retry": ("same_semantic_response", 200),
+}
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise Failure(message)
+
+
+def canonical(obj: object) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def digest(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out, block, counter = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def check_submission(label: str, submission: dict, secret: str, key_id: str, artifact_type: str, body: bytes) -> None:
+    if submission["artifact_hex"] != body.hex():
+        fail(f"{label}: artifact_hex does not reproduce the artifact's canonical bytes")
+    if submission["artifact_digest"] != digest(body):
+        fail(f"{label}: artifact_digest does not match the body")
+    request = submission["request"]
+    if request["method"] != "POST" or request["path"] != PATH or request["artifact_type"] != artifact_type:
+        fail(f"{label}: request names the wrong method, path or type")
+    metadata = {
+        "artifact_digest": submission["artifact_digest"],
+        "artifact_type": artifact_type,
+        "client_id": request["client_id"],
+        "key_id": key_id,
+        "method": "POST",
+        "nonce": request["nonce"],
+        "path": PATH,
+        "sent_at_ms": request["sent_at_ms"],
+    }
+    if len(request["nonce"]) != 32 or any(c not in "0123456789abcdef" for c in request["nonce"]):
+        fail(f"{label}: nonce is not 32 lowercase hex characters")
+    if submission["canonical_metadata"] != canonical(metadata).decode("utf-8"):
+        fail(f"{label}: canonical_metadata does not reproduce")
+    preimage = REQUEST_DOMAIN + canonical(metadata)
+    if submission["hmac_preimage_hex"] != preimage.hex():
+        fail(f"{label}: hmac_preimage_hex does not reproduce")
+    expected = "Ori-Commissioning-HMAC hmac-sha256:" + hmac.new(secret.encode("utf-8"), preimage, hashlib.sha256).hexdigest()
+    if submission["expected_authorization"] != expected:
+        fail(f"{label}: expected_authorization does not reproduce")
+    if submission["expected"]["http"] != 200 or submission["expected"]["outcome"] != "accepted":
+        fail(f"{label}: a valid submission must be accepted")
+
+
+def main() -> int:
+    try:
+        with VECTORS.open(encoding="utf-8") as handle:
+            doc = json.load(handle)
+        with EXCHANGE.open(encoding="utf-8") as handle:
+            exchange = json.load(handle)
+        cases = {case["name"]: case for case in exchange["cases"]}
+        secret = doc["secret"]
+        if len(secret.encode("utf-8")) < 32:
+            fail("the published secret is shorter than 256 bits")
+        if doc["key_purpose"] != "commissioning_ingest":
+            fail("key_purpose must be commissioning_ingest")
+        key_id = "hkdf-sha256:" + hkdf_sha256(secret.encode("utf-8"), SALT, INFO, 16).hex()
+        if doc["key_id"] != key_id:
+            fail("key_id does not derive from the secret under the contract's salt and info")
+        credential = doc["credential"]
+        if not credential["permitted_commissioning_key_ids"]:
+            fail("the credential permits no commissioning key")
+
+        valid = canonical(cases["valid"]["artifact"])
+        check_submission("authorisation_submission", doc["authorisation_submission"], secret, key_id, "commissioning_authorization", valid)
+        if cases["valid"]["artifact"]["key_id"] not in credential["permitted_commissioning_key_ids"]:
+            fail("the valid authorisation's key_id is not permitted for the credential")
+        if doc["authorisation_submission"]["expected"]["registration"] != "awaiting_registration":
+            fail("an authorisation retained with no registration held awaits one")
+
+        revocation = doc["revocation_submission"]["artifact"]
+        if set(revocation) != REVOCATION_FIELDS:
+            fail(f"revocation fields are {sorted(revocation)}")
+        if revocation["commissioning_digest"] != digest(valid):
+            fail("the revocation does not name the valid authorisation's digest")
+        body = {k: v for k, v in revocation.items() if k != "signature"}
+        signature = revocation["signature"]
+        if not signature.startswith("ed25519:"):
+            fail("revocation signature is not ed25519:")
+        public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exchange["signing_key_public_hex"]))
+        try:
+            public.verify(base64.b64decode(signature[len("ed25519:"):], validate=True), REVOCATION_DOMAIN + canonical(body))
+        except (InvalidSignature, ValueError) as exc:
+            fail(f"revocation signature does not verify under the published commissioning key ({exc.__class__.__name__})")
+        if revocation["key_id"] not in credential["permitted_commissioning_key_ids"]:
+            fail("the revocation's key_id is not permitted for the credential")
+        check_submission("revocation_submission", doc["revocation_submission"], secret, key_id, "commissioning_revocation", canonical(revocation))
+        if doc["revocation_submission"]["expected"]["registration"] != "not_applicable":
+            fail("a revocation carries registration not_applicable")
+        if doc["authorisation_submission"]["request"]["nonce"] == doc["revocation_submission"]["request"]["nonce"]:
+            fail("the two submissions reuse a nonce")
+
+        negatives = {case["name"]: case for case in doc["negative_cases"]}
+        if set(negatives) != set(REQUIRED_NEGATIVES):
+            fail(f"negative cases are {sorted(negatives)}; the contract requires {sorted(REQUIRED_NEGATIVES)}")
+        for name, (expected, http) in REQUIRED_NEGATIVES.items():
+            case = negatives[name]
+            if case["expected"] != expected or case["http"] != http:
+                fail(f"{name}: expects {case['expected']}/{case['http']}, the contract says {expected}/{http}")
+        for name, source in (("unknown_commissioning_key", "unknown_key_id"), ("self_authorised", "self_authorised_by_device_key")):
+            if negatives[name]["artifact_digest"] != digest(canonical(cases[source]["artifact"])):
+                fail(f"{name}: artifact_digest does not name the exchange's {source} artifact")
+            if cases[source]["expected"] != "reject":
+                fail(f"{name}: the exchange case it reuses is not a rejection")
+    except Failure as failure:
+        print(f"check-evidence-commissioning-ingest-vectors: {failure}", file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError) as exc:
+        print(f"check-evidence-commissioning-ingest-vectors: corpus is malformed ({exc!r})", file=sys.stderr)
+        return 1
+    print(f"check-evidence-commissioning-ingest-vectors: corpus agrees with the contract ({len(REQUIRED_NEGATIVES)} refusals covered)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
