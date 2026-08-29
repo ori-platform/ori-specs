@@ -14,8 +14,10 @@ A version increment means a breaking change for implementers.
 | skills-package             | v2      | Implemented in runtime >= 2.4.0; v1 superseded, accurate < 2.4.0 |
 | skills-package             | v3      | Design target, pre-ratification; no implementations. v2 remains the baseline |
 | skill-hook-isolation       | v1      | Design target; not implemented                                   |
-| gateway-api                | v1      | Implemented baseline; outbound evidence carriage is a pre-ratification design target |
-| evidence-transport         | v1      | Design target, pre-ratification; no deployed conforming service |
+| gateway-api                | v1      | Implemented baseline; evidence carriage implemented on both sides, pre-ratification |
+| gateway-config             | v1      | Implemented in gateway                                           |
+| gateway-mqtt-canonical-json | v1     | Implemented baseline; cross-language vectors                    |
+| evidence-transport         | v1      | Design target, pre-ratification; implemented by verity and the gateway, no deployed conforming service |
 | evidence-audit             | v1      | Design target, pre-ratification; no deployed conforming service |
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
 | runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
@@ -31,8 +33,9 @@ A version increment means a breaking change for implementers.
 | runtime-config-signing     | v1      | Implemented baseline                                             |
 | runtime-release-bundle     | v1      | Design target                                                    |
 | signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |
-| evidence                   | v2      | v2 design target, neutral vocabulary and public byte format; v1 is what the private producer emits |
-| evidence-exchange          | v1      | Design target, pre-ratification; no shipped conforming consumer |
+| runtime-evidence-anchor    | v1      | Design target, pre-ratification; derivation implemented in runtime and verity, verity not yet vector-proven |
+| evidence                   | v2      | Design target, pre-ratification; produced by runtime, verified by verity; v1 retained for rows written by the retired private producer |
+| evidence-exchange          | v1      | Design target, pre-ratification; every half implemented on main, no shipped or end-to-end proven exchange |
 | firmware-telemetry         | v1      | Implemented baseline; HIL pending                                |
 | firmware-commands          | v1      | Implemented baseline; HIL pending                                |
 | device-provisioning        | v1      | Implemented baseline; HIL pending                                |

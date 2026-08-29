@@ -12,8 +12,8 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | Implemented in runtime >= 2.4.0 |
 | Skill package format (previous) | [skills-package/v1.md](skills-package/v1.md) | Superseded by v2; accurate for runtime < 2.4.0 |
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | Design target; community hook execution disabled until implemented |
-| Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline; evidence carriage pending |
-| Evidence Transport | [evidence-transport/v1.md](evidence-transport/v1.md) | Design target |
+| Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | Implemented baseline; evidence carriage implemented on both sides, pre-ratification |
+| Evidence Transport | [evidence-transport/v1.md](evidence-transport/v1.md) | Design target, pre-ratification; implemented by verity and the gateway, not deployed |
 | Evidence Audit | [evidence-audit/v1.md](evidence-audit/v1.md) | Design target |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
@@ -29,10 +29,10 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | Implemented baseline |
 | Skill signing contract | [signing/v1.md](signing/v1.md) | Runtime manifest and SDK manifest/artifact profiles implemented; adoption pending |
 | Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | Implemented baseline; cross-language vectors for runtime, gateway and Verity |
-| Runtime evidence anchor | [runtime-evidence-anchor/v1.md](runtime-evidence-anchor/v1.md) | Design target; derivation of the identifiers a runtime seals evidence under |
-| Evidence chain | [evidence/v2.md](evidence/v2.md) | Design target; neutral vocabulary and the first public byte-level specification |
-| Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | Implemented baseline; format specified only in the private producer; anchor registry and export ingestion superseded by evidence-exchange/v1 |
-| Evidence exchange (off-site delivery) | [evidence-exchange/v1.md](evidence-exchange/v1.md) | Design target |
+| Runtime evidence anchor | [runtime-evidence-anchor/v1.md](runtime-evidence-anchor/v1.md) | Design target, pre-ratification; derivation implemented in the runtime and verity, verity not yet vector-proven |
+| Evidence chain | [evidence/v2.md](evidence/v2.md) | Design target, pre-ratification; produced natively by the runtime and verified by verity |
+| Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | Superseded by v2 for new rows; retained for rows written by the retired private producer; anchor registry and export ingestion superseded by evidence-exchange/v1 |
+| Evidence exchange (off-site delivery) | [evidence-exchange/v1.md](evidence-exchange/v1.md) | Design target, pre-ratification; every half implemented on main, no end-to-end proven exchange |
 | Firmware telemetry / evidence Layer 1 | [firmware-telemetry/v1.md](firmware-telemetry/v1.md) | Implemented baseline; HIL pending |
 | Firmware commands | [firmware-commands/v1.md](firmware-commands/v1.md) | Implemented baseline; HIL pending |
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | Implemented baseline; HIL pending |

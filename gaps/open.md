@@ -106,20 +106,15 @@ accurate description of what a repo implements.
   fixes that the authorisation reaches the authority through the
   organisational commissioning path and the device holds only its digest,
   delivered by the local bridge command in
-  [cli-commands/v1.md](../cli-commands/v1.md). Nothing implements either end.
+  [cli-commands/v1.md](../cli-commands/v1.md). `ori-verity` resolves a
+  registration against held authorisations and refuses a courier-submitted
+  authorisation at the transport (`ori-verity#45`). The device side is open:
   `ori-runtime` still models a `CommissioningAuthorisationSource` that would
   hand the registrar the full object, and reports `pending_authorisation`
-  unconditionally; `ori-cli` has no `evidence commission` command; `ori-verity`
-  pairs on an authorisation arriving through the courier
-  (`verity_commissioning_pending`) and its transport accepts
-  `commissioning_authorization` as a courier type; `ori-gateway`'s durable
-  queue still enumerates that type. Each is a consumer follow-up, and the
-  anchor-registration vector note changed and
-  `receiver-state/commissioning-resolution.json` is new, so `ori-runtime` and
-  `ori-verity` must re-vendor `evidence-exchange/vectors` after this lands;
-  the runtime's rule that every vendored receiver-state vector is either
-  consumed or listed with the repository that proves it applies to the new
-  file, whose consumer is the evidence authority.
+  unconditionally; `ori-cli` has no `evidence commission` command
+  (`ori-cli#34`); `ori-gateway`'s durable queue still enumerates
+  `commissioning_authorization` as a type. The authority-side ingest of a
+  signed authorisation is `ori-specs#130`.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies all seven artifacts. The runtime now
@@ -127,10 +122,12 @@ accurate description of what a repo implements.
   specified in [gateway-api/v1.md](../gateway-api/v1.md); that contract now also
   specifies byte-literal runtime-to-gateway carriage. The separate
   [evidence-transport/v1.md](../evidence-transport/v1.md) fixes authenticated
-  gateway-to-authority ingest. The gateway courier and independent evidence
-  authority implementations remain open, and no runtime release ships an
-  authority-key registry, so receipts and epoch confirmations are still refused
-  as unknown-key.
+  gateway-to-authority ingest. The gateway courier (`ori-gateway#84`) and the
+  authority ingest (`ori-verity#43`) are implemented on main, and the runtime
+  now carries envelopes and checkpoints to the courier (`ori-runtime#439`).
+  No runtime release ships an authority-key registry, so receipts and epoch
+  confirmations are still refused as unknown-key, and no exchange has been
+  proven end to end through an authority.
   The current carriage also gives the authority no custody observation;
   `custodied, unreceipted` is therefore runtime-observed, while authority-side
   checkpoint scheduling/reporting remains implementation work. The authority
@@ -142,11 +139,12 @@ accurate description of what a repo implements.
   credential, authorisation, pagination and neutral refusal boundary. What
   remains open is its implementation and deployment proof; it must not be
   grafted onto the courier credential merely to claim that work is complete.
-- **On-device evidence topology** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
-  the runtime confirms epochs against a chain loaded in its own process, which
-  the exchange topology rules out. Nothing yet crosses the device boundary, so
-  the confirmation gate cannot be satisfied in the deployment the contract
-  describes.
+- **Epoch confirmation has no path back yet** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+  the runtime confirms an epoch only from a signed epoch confirmation arriving
+  through ingest, and artifacts now cross to the courier; but with no
+  authority-key registry shipped and no authority reachable from a deployed
+  gateway, no confirmation can arrive, so the confirmation gate stays closed in
+  every deployment today.
 
 ## firmware-telemetry/v1 proof targets
 
