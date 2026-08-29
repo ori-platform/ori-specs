@@ -19,6 +19,7 @@ A version increment means a breaking change for implementers.
 | gateway-mqtt-canonical-json | v1     | Implemented baseline; cross-language vectors                    |
 | evidence-transport         | v1      | Design target, pre-ratification; implemented by the evidence authority and the gateway, no deployed conforming service |
 | evidence-audit             | v1      | Design target, pre-ratification; no deployed conforming service |
+| evidence-commissioning-ingest | v1   | Design target, pre-ratification; no implementation                |
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
 | runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
 | runtime-telemetry          | v1      | Implemented baseline                                             |
