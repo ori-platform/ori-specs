@@ -45,7 +45,8 @@ and coverage, and checks that the field appendix in `v2.md` is what the schema
 generates. The second regenerates that appendix. The third applies the
 contract's migration rules to the runtime's shipped example files and reports
 what a v2 consumer would refuse; it is evidence for a change, not a gate, since
-the examples live in another repository.
+the examples live in another repository. It needs PyYAML
+(`python3 -m pip install pyyaml`), which the gated forms do not.
 
 The checker is a reader of the corpus against the contract, not a second
 implementation. The runtime's loader is the first implementation, and an
