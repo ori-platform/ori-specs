@@ -4,9 +4,10 @@
 Independent of whatever produced the file: the key identifier is re-derived
 with a hand-written HKDF, the HMAC preimage and signature are recomputed from
 the contract's rules, every artifact digest is recomputed from the
-evidence-exchange artifact it claims to carry, the revocation's Ed25519
-signature is verified under the published commissioning seed's public key,
-and the negative-case set is held to the contract's refusal table.
+evidence-exchange artifact it claims to carry, every revocation's Ed25519
+signature is verified under the registry key it names and whether it is
+permitted is recomputed from the registry's revocation relation, and the
+negative-case set is held to the contract's refusal table.
 
     python3 scripts/check-evidence-commissioning-ingest-vectors
 
@@ -48,6 +49,7 @@ REQUIRED_NEGATIVES = {
     "self_authorised": ("self_authorised", 422),
     "wrong_type_for_body": ("malformed", 400),
     "courier_artifact_here": ("malformed", 400),
+    "revocation_by_unrelated_key": ("revocation_not_permitted", 422),
     "unknown_authorisation_revocation": ("unknown_authorisation", 422),
     "resubmission_after_revocation": ("revoked", 409),
     "fresh_retry": ("same_semantic_response", 200),
@@ -138,23 +140,66 @@ def main() -> int:
         if doc["authorisation_submission"]["expected"]["registration"] != "awaiting_registration":
             fail("an authorisation retained with no registration held awaits one")
 
+        registry = {entry["key_id"]: entry for entry in doc["commissioning_registry"]}
+        issuing = cases["valid"]["artifact"]["key_id"]
+        if registry[issuing]["public_key_hex"] != exchange["signing_key_public_hex"]:
+            fail("the registry's issuing key is not the exchange's published commissioning key")
+        if any(e["purpose"] != "commissioning_authority" for e in registry.values()):
+            fail("every registry entry must hold a commissioning_authority key")
+        if not registry[issuing]["revocation_key_ids"]:
+            fail("the issuing key designates no revocation key, so the recovery case cannot exist")
+
+        def verify_revocation(label: str, revocation: dict) -> None:
+            if set(revocation) != REVOCATION_FIELDS:
+                fail(f"{label}: revocation fields are {sorted(revocation)}")
+            if revocation["commissioning_digest"] != digest(valid):
+                fail(f"{label}: the revocation does not name the valid authorisation's digest")
+            signer = registry.get(revocation["key_id"])
+            if signer is None:
+                fail(f"{label}: revocation names a key the registry does not hold")
+            body = {k: v for k, v in revocation.items() if k != "signature"}
+            signature = revocation["signature"]
+            if not signature.startswith("ed25519:"):
+                fail(f"{label}: revocation signature is not ed25519:")
+            public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(signer["public_key_hex"]))
+            try:
+                public.verify(base64.b64decode(signature[len("ed25519:"):], validate=True), REVOCATION_DOMAIN + canonical(body))
+            except (InvalidSignature, ValueError) as exc:
+                fail(f"{label}: revocation signature does not verify under {revocation['key_id']} ({exc.__class__.__name__})")
+
+        def permitted(revocation: dict) -> bool:
+            return revocation["key_id"] == issuing or revocation["key_id"] in registry[issuing]["revocation_key_ids"]
+
         revocation = doc["revocation_submission"]["artifact"]
-        if set(revocation) != REVOCATION_FIELDS:
-            fail(f"revocation fields are {sorted(revocation)}")
-        if revocation["commissioning_digest"] != digest(valid):
-            fail("the revocation does not name the valid authorisation's digest")
-        body = {k: v for k, v in revocation.items() if k != "signature"}
-        signature = revocation["signature"]
-        if not signature.startswith("ed25519:"):
-            fail("revocation signature is not ed25519:")
-        public = Ed25519PublicKey.from_public_bytes(bytes.fromhex(exchange["signing_key_public_hex"]))
-        try:
-            public.verify(base64.b64decode(signature[len("ed25519:"):], validate=True), REVOCATION_DOMAIN + canonical(body))
-        except (InvalidSignature, ValueError) as exc:
-            fail(f"revocation signature does not verify under the published commissioning key ({exc.__class__.__name__})")
-        if revocation["key_id"] not in credential["permitted_commissioning_key_ids"]:
-            fail("the revocation's key_id is not permitted for the credential")
+        verify_revocation("revocation_submission", revocation)
+        if revocation["key_id"] != issuing:
+            fail("revocation_submission must be signed by the issuing key")
         check_submission("revocation_submission", doc["revocation_submission"], secret, key_id, "commissioning_revocation", canonical(revocation))
+
+        outcomes = {}
+        for case in doc["revocation_cases"]:
+            label = f"revocation_cases/{case['name']}"
+            if case["authenticator"] != "valid":
+                fail(f"{label}: every revocation case must verify so the permission rule is reached")
+            verify_revocation(label, case["artifact"])
+            if case["signer_key_id"] != case["artifact"]["key_id"]:
+                fail(f"{label}: signer_key_id disagrees with the artifact")
+            if case["artifact_hex"] != canonical(case["artifact"]).hex():
+                fail(f"{label}: artifact_hex does not reproduce")
+            if case["artifact"]["key_id"] not in credential["permitted_commissioning_key_ids"]:
+                fail(f"{label}: the credential does not permit the signer, so the permission rule is not what refuses it")
+            expected = ("accept", None) if permitted(case["artifact"]) else ("reject", "revocation_not_permitted")
+            if (case["expected"], case["reject_reason"]) != expected:
+                fail(f"{label}: expects {(case['expected'], case['reject_reason'])}, the registry relation gives {expected}")
+            if "request" in case:
+                check_submission(label, {**case, "expected": {"http": 200, "outcome": "accepted"}}, secret, key_id, "commissioning_revocation", canonical(case["artifact"]))
+            outcomes[case["name"]] = case["expected"]
+        for name, expected in (("by_issuing_key", "accept"), ("by_designated_recovery_key", "accept"), ("by_unrelated_held_key", "reject")):
+            if outcomes.get(name) != expected:
+                fail(f"revocation_cases must carry {name} as {expected}")
+        signers = {case["artifact"]["key_id"] for case in doc["revocation_cases"]}
+        if len(signers) != len(doc["revocation_cases"]):
+            fail("revocation cases must each be signed by a different key")
         if doc["revocation_submission"]["expected"]["registration"] != "not_applicable":
             fail("a revocation carries registration not_applicable")
         if doc["authorisation_submission"]["request"]["nonce"] == doc["revocation_submission"]["request"]["nonce"]:
@@ -167,6 +212,8 @@ def main() -> int:
             case = negatives[name]
             if case["expected"] != expected or case["http"] != http:
                 fail(f"{name}: expects {case['expected']}/{case['http']}, the contract says {expected}/{http}")
+        if negatives["revocation_by_unrelated_key"]["revocation_case"] != "by_unrelated_held_key":
+            fail("revocation_by_unrelated_key must point at the unrelated-key revocation case")
         for name, source in (("unknown_commissioning_key", "unknown_key_id"), ("self_authorised", "self_authorised_by_device_key")):
             if negatives[name]["artifact_digest"] != digest(canonical(cases[source]["artifact"])):
                 fail(f"{name}: artifact_digest does not name the exchange's {source} artifact")
@@ -178,7 +225,7 @@ def main() -> int:
     except (KeyError, OSError, ValueError) as exc:
         print(f"check-evidence-commissioning-ingest-vectors: corpus is malformed ({exc!r})", file=sys.stderr)
         return 1
-    print(f"check-evidence-commissioning-ingest-vectors: corpus agrees with the contract ({len(REQUIRED_NEGATIVES)} refusals covered)")
+    print(f"check-evidence-commissioning-ingest-vectors: corpus agrees with the contract ({len(REQUIRED_NEGATIVES)} refusals, {len(doc['revocation_cases'])} revocation signers covered)")
     return 0
 
 
