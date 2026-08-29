@@ -106,9 +106,9 @@ accurate description of what a repo implements.
   fixes that the authorisation reaches the authority through the
   organisational commissioning path and the device holds only its digest,
   delivered by the local bridge command in
-  [cli-commands/v1.md](../cli-commands/v1.md). `ori-verity` resolves a
-  registration against held authorisations and refuses a courier-submitted
-  authorisation at the transport (`ori-verity#45`). The device side is open:
+  [cli-commands/v1.md](../cli-commands/v1.md). The evidence authority resolves
+  a registration against held authorisations and refuses a courier-submitted
+  authorisation at the transport. The device side is open:
   `ori-runtime` still models a `CommissioningAuthorisationSource` that would
   hand the registrar the full object, and reports `pending_authorisation`
   unconditionally; `ori-cli` has no `evidence commission` command
@@ -123,7 +123,7 @@ accurate description of what a repo implements.
   specifies byte-literal runtime-to-gateway carriage. The separate
   [evidence-transport/v1.md](../evidence-transport/v1.md) fixes authenticated
   gateway-to-authority ingest. The gateway courier (`ori-gateway#84`) and the
-  authority ingest (`ori-verity#43`) are implemented on main, and the runtime
+  authority ingest are implemented on main, and the runtime
   now carries envelopes and checkpoints to the courier (`ori-runtime#439`).
   No runtime release ships an authority-key registry, so receipts and epoch
   confirmations are still refused as unknown-key, and no exchange has been
