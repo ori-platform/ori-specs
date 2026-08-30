@@ -92,4 +92,4 @@ and the installer does not touch it.
 
 | Skill | Version | What it is for |
 | --- | --- | --- |
-| `ori-rigorous-review` | 1.0.0 | Evidence-first, safety-aware review for merge decisions, design reviews, defect verification, and roadmap research. Detailed physical-authority rules load on demand from `references/`. |
+| `ori-rigorous-review` | 1.1.0 | Evidence-first, safety-aware review for merge decisions, design reviews, defect verification, and roadmap research. Detailed physical-authority rules load on demand from `references/`. |
