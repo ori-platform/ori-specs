@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""Check the commissioned-safety-binding/v1 corpus against the contract.
+
+The corpus is the normative fixture for this contract, and until now it was
+checked only inside a consumer repository. A hand edit here would travel to
+every consumer at the next re-vendor, arriving as a contract change nobody
+wrote. This script holds the corpus to the rules the contract states, in the
+repository that owns it:
+
+- every recorded byte string reproduces from the document beside it, so a
+  document and its `canonical_hex`, `canonical_sha256` and `message_hex`
+  cannot drift apart;
+- every signature verifies, or fails, exactly as `signature_valid` declares,
+  and a case refused after the signature stage must carry a valid one;
+- every reason maps to the one stage the contract decides it at, and every
+  stage in each declared acceptance order has at least one case that stops
+  there;
+- every number is spelled as its field's declared type requires, which is the
+  rule a decoded corpus cannot otherwise show;
+- every `raw_reject_cases` entry really is raw: its bytes must not be the
+  canonical form of what they decode to, or must not decode at all. An entry
+  that is already canonical proves nothing a decoded case could not.
+
+It is deliberately **not** a third implementation of the twelve stages. The
+runtime's verifier is the first implementation and ori-cli's Go verifier is the
+independent second; this script checks that the fixture those two are held to
+says what the contract says.
+
+Run from the repository root:
+
+    python3 scripts/check-commissioned-binding-vectors
+
+Requires the `cryptography` package for Ed25519 verification; it refuses to run
+without it rather than skipping the signatures. Exits non-zero on the first
+unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+from typing import Any
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print(
+        "check-commissioned-binding-vectors: the cryptography package is required",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "commissioned-safety-binding" / "binding-vectors-v1.json"
+
+# The contract's error-semantics table: one stage decides each reason.
+VERDICT_STAGE = {
+    "malformed": "parses",
+    "wrong_device": "device_id",
+    "anchor_collision": "key_selection",
+    "unknown_signer": "key_selection",
+    "bad_signature": "signature",
+    "wrong_authority": "authority",
+    "superseded_signer": "authority",
+    "stale": "freshness",
+    "mapping_contradiction": "mapping_self_consistency",
+    "proof_contradiction": "proof_consistency",
+    "stale_proof": "proof_consistency",
+    "out_of_bounds": "bounds",
+    "ambiguous_binding": "disambiguation",
+    "unknown_hardware": "inventory",
+    "unbound_actuator": "inventory",
+    "undemonstrated_binding": "activation_posture",
+}
+PROFILE_VERDICT_STAGE = {
+    "malformed": "parses",
+    "wrong_device": "device_binding",
+    "profile_channel_mismatch": "device_binding",
+    "anchor_collision": "key_selection",
+    "unknown_signer": "key_selection",
+    "bad_signature": "signature",
+    "wrong_authority": "authority",
+    "superseded_signer": "authority",
+    "profile_binding_mismatch": "binding_match",
+    "profile_mapping_mismatch": "mapping_match",
+}
+
+# The field-type table. A number's spelling follows the field's declared type,
+# not its value, so the two sets are what decide whether a literal is legal.
+INTEGER_FIELDS = {
+    "v",
+    "binding_seq",
+    "issued_at_ms",
+    "inventory_generation",
+    "performed_at_ms",
+    "gpio_pin",
+}
+NUMBER_FIELDS = {
+    "value",
+    "range_min",
+    "range_max",
+    "noise_floor",
+    "sensor_before",
+    "sensor_after",
+}
+
+failures: list[str] = []
+
+
+def fail(message: str) -> None:
+    failures.append(message)
+
+
+class Literal:
+    """A JSON number with the spelling it was written with."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+def canonical(value: Any) -> bytes:
+    """The contract's canonical form: sorted keys, no insignificant space."""
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def literals(node: Any, path: str = "") -> Any:
+    """Every number in the tree, with its path and its spelling."""
+    if isinstance(node, Literal):
+        yield path, node.text
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from literals(value, f"{path}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from literals(value, f"{path}[{index}]")
+
+
+def check_number_spelling(label: str, raw: bytes) -> None:
+    """Every number is spelled as its field's declared type requires."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail(f"{label}: canonical bytes are not valid UTF-8")
+        return
+    decoded = json.loads(text, parse_float=Literal, parse_int=Literal)
+    for path, spelling in literals(decoded):
+        field = path.rsplit(".", 1)[-1].split("[")[0]
+        fractional = "." in spelling
+        exponent = "e" in spelling.lower()
+        if field in INTEGER_FIELDS:
+            if fractional or exponent:
+                fail(
+                    f"{label}: {path} is an integer field spelled {spelling!r}; "
+                    "an integer carries no fractional part and no exponent"
+                )
+            elif spelling != str(int(spelling)):
+                fail(f"{label}: {path} spelled {spelling!r}, not its shortest form")
+        elif field in NUMBER_FIELDS:
+            if exponent:
+                fail(
+                    f"{label}: {path} is a number field spelled {spelling!r}; "
+                    "exponent notation never appears on the wire"
+                )
+            elif not fractional:
+                fail(
+                    f"{label}: {path} is a number field spelled {spelling!r}; "
+                    "a number carries a mandatory fractional part"
+                )
+            elif spelling != repr(float(spelling)):
+                fail(f"{label}: {path} spelled {spelling!r}, not its shortest form")
+        else:
+            fail(f"{label}: {path} is a number in no field the type table declares")
+
+
+def verifies(public_key_hex: str, signature_b64: str, message: bytes) -> bool:
+    import base64
+
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex)).verify(
+            base64.b64decode(signature_b64), message
+        )
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def check_document_case(corpus: dict, case: dict, key: str, label: str) -> None:
+    """Recorded bytes reproduce, and the signature is what the case claims.
+
+    The spelling rule is applied to every case except the ones whose declared
+    verdict is `malformed`, where a spelling the grammar refuses may be the
+    point. Everywhere else a bad spelling would refuse the document at `parses`
+    — before the stage the case claims to exercise — so the case would prove
+    nothing about the rule it names.
+    """
+    document = case[key]
+    body = canonical(document)
+    if body.hex() != case["canonical_hex"]:
+        fail(f"{label}: canonical_hex does not reproduce from the document")
+        return
+    if "canonical_sha256" in case:
+        import hashlib
+
+        want = "sha256:" + hashlib.sha256(body).hexdigest()
+        if case["canonical_sha256"] != want:
+            fail(f"{label}: canonical_sha256 is not the digest of its own bytes")
+    if "message_hex" in case:
+        envelope = {key: document, "signature": "ed25519:" + case["signature_b64"]}
+        if canonical(envelope).hex() != case["message_hex"]:
+            fail(f"{label}: message_hex does not reproduce from the envelope")
+
+    if case.get("reason") != "malformed":
+        check_number_spelling(label, body)
+
+    # The signature is checked against the key the document names, which is the
+    # only key a consumer would select for it.
+    named = document.get("signing_key", "")
+    if not isinstance(named, str) or not named.startswith("ed25519:"):
+        return
+    import base64
+
+    try:
+        key_hex = base64.b64decode(named.removeprefix("ed25519:"), validate=True).hex()
+    except Exception:  # noqa: BLE001 - a malformed key is a case, not a crash
+        return
+    if len(key_hex) != 64:
+        return
+    valid = verifies(key_hex, case["signature_b64"], body)
+    declared = case.get("signature_valid")
+    if declared is not None and valid != declared:
+        fail(
+            f"{label}: signature_valid says {declared} and the signature "
+            f"{'verifies' if valid else 'does not verify'}"
+        )
+
+
+def check_stage(case: dict, table: dict, order: list, label: str) -> None:
+    reason, stage = case["reason"], case["stage"]
+    if reason not in table:
+        fail(f"{label}: refuses with {reason!r}, which the contract does not define")
+        return
+    if table[reason] != stage:
+        fail(
+            f"{label}: names stage {stage!r} for {reason!r}; the contract "
+            f"decides it at {table[reason]!r}"
+        )
+    if stage not in order:
+        fail(f"{label}: stage {stage!r} is not in the declared acceptance order")
+        return
+    declared = case.get("signature_valid")
+    if declared is False and order.index(stage) > order.index("signature"):
+        fail(
+            f"{label}: refused after the signature stage while declaring the "
+            "signature invalid; the stage could not have been reached"
+        )
+
+
+def main() -> int:
+    corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    order = corpus["acceptance_order"]
+    profile_order = corpus["firmware_profile_acceptance_order"]
+
+    for case in corpus["cases"]:
+        check_document_case(corpus, case, "binding", f"cases/{case['name']}")
+    for case in corpus["reject_cases"]:
+        label = f"reject_cases/{case['name']}"
+        check_document_case(corpus, case, "binding", label)
+        check_stage(case, VERDICT_STAGE, order, label)
+    for case in corpus["firmware_profile_cases"]:
+        check_document_case(
+            corpus, case, "firmware_profile", f"firmware_profile_cases/{case['name']}"
+        )
+    for case in corpus["firmware_profile_reject_cases"]:
+        label = f"firmware_profile_reject_cases/{case['name']}"
+        check_document_case(corpus, case, "firmware_profile", label)
+        check_stage(case, PROFILE_VERDICT_STAGE, profile_order, label)
+
+    for case in corpus["envelope_reject_cases"]:
+        label = f"envelope_reject_cases/{case['name']}"
+        if canonical(case["envelope"]).hex() != case["canonical_hex"]:
+            fail(f"{label}: canonical_hex does not reproduce from the envelope")
+        if (case["reason"], case["stage"]) != ("malformed", "parses"):
+            fail(f"{label}: the wrapper is grammar, so every case is malformed/parses")
+
+    # A raw case earns its section only by carrying something a decoded case
+    # cannot. If its bytes are already the canonical form of what they decode
+    # to, an ordinary case would have covered it.
+    for case in corpus.get("raw_reject_cases", []):
+        label = f"raw_reject_cases/{case['name']}"
+        raw = bytes.fromhex(case["envelope_hex"])
+        if (case["reason"], case["stage"]) != ("malformed", "parses"):
+            fail(f"{label}: raw cases are refused by the grammar, at parses")
+        try:
+            decoded = json.loads(raw.decode("utf-8"))
+            reserialised = canonical(decoded)
+        except (UnicodeDecodeError, ValueError, UnicodeEncodeError):
+            # Bytes that will not decode, or that decode to something no
+            # canonical serialiser will re-emit — a lone surrogate is the
+            # second kind — are raw by construction. This check had to learn
+            # that itself: it first crashed here on exactly that case.
+            continue
+        if reserialised == raw:
+            fail(
+                f"{label}: the bytes are already canonical, so decoding loses "
+                "nothing and an ordinary case would cover this"
+            )
+
+    # A stage no case stops at is a rule the corpus holds nobody to.
+    for name, cases, expected in (
+        ("acceptance_order", corpus["reject_cases"], order),
+        (
+            "firmware_profile_acceptance_order",
+            corpus["firmware_profile_reject_cases"],
+            profile_order,
+        ),
+    ):
+        reached = {case["stage"] for case in cases}
+        for stage in expected:
+            if stage not in reached:
+                fail(f"{name}: no case stops at {stage!r}")
+
+    for failure in failures:
+        print("FAIL", failure)
+    counts = (
+        f"{len(corpus['cases'])} accept, {len(corpus['reject_cases'])} reject, "
+        f"{len(corpus['envelope_reject_cases'])} envelope, "
+        f"{len(corpus.get('raw_reject_cases', []))} raw, "
+        f"{len(corpus['firmware_profile_cases'])} profile accept, "
+        f"{len(corpus['firmware_profile_reject_cases'])} profile reject"
+    )
+    print(f"\n{counts}; {len(failures)} failures")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
