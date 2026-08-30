@@ -118,6 +118,50 @@ mock call, function name, or document phrase. When mutation testing is useful,
 mutate the exact behavior claimed and confirm the named test fails for that
 property, rather than incidentally through a crash or unrelated lookup.
 
+### Attack the implementation, not only its tests
+
+**Every implementation gets an adversarial pass before it is handed off.** Not
+a review of the diff, and not a mutation of its own boundaries — hostile input
+driven through the entry point a caller actually reaches.
+
+Mutation testing is necessary and it is not sufficient. Reverting a check and
+watching a named test fail proves the tests agree with the code; the same
+author wrote both, under the same assumptions, so it cannot find what was never
+considered. A commissioning bridge passed that pass cleanly while a read-only
+command created the runtime's state database — 324 KB, owned by whoever ran the
+query, on a device commissioned before its first start — and while refused
+documents were reported as successes with a zero exit, in a tool whose sibling
+command already answered an invalid document with a failure. Neither is subtle.
+Both were invisible from inside the assumptions that produced them.
+
+The pass:
+
+- **Drive the real entry point.** The subprocess, the CLI, the public function
+  a caller reaches — not an internal helper. Defects of this class live in the
+  gap between what an internal returns and what an operator sees.
+- **Assert invariants that hold for every case**, not per-case expectations:
+  one well-formed response, an exit status in the right class, no crash
+  reaching a generic handler, no unintended side effect. A table of hostile
+  inputs then either satisfies all of them or names the row that does not.
+- **Check side effects, not only return values.** List the directory, the
+  database, the environment before and after. Every assertion about the
+  returned payload above was correct; only the filesystem showed the defect.
+- **Include the state before first use** — missing file, empty store, nothing
+  configured, no prior run. For an installation-time tool that *is* the normal
+  case, and no fixture sets it up by default.
+- **Input classes that keep finding things:** absent path, directory where a
+  file is expected, empty, truncated, valid but wrongly typed, an extra field,
+  nesting past the recursion limit, embedded NUL, invalid UTF-8, absent and
+  malformed configuration and environment, and every argument error.
+- **Where a second implementation exists, run a differential.** Feeding
+  thousands of mutated, re-signed documents through two verifiers in different
+  languages took a disagreement count from twenty-three to zero and found what
+  neither suite did.
+
+Report what the pass found, including that it found nothing when it does. An
+implementation reported without one is reported without evidence about the
+boundary its caller will actually meet.
+
 ### Do not ratify a tool's blindness
 
 When a change makes an analysis tool report less than before, the fix is the
@@ -177,6 +221,11 @@ named test fails for that property.
 **Always state what remains unverified.** A handoff that lists only successes
 misrepresents its own coverage. Name what was simulated, deferred, tested on the
 host only, or dependent on another repository or on hardware.
+
+Reading the diff and mutating its boundaries are both passes over work you
+wrote. Neither reaches what you did not think of, so an implementation is not
+ready to hand off until it has also been attacked from outside — see
+*Attack the implementation, not only its tests*.
 
 Self-review does not substitute for independent review of shared contracts,
 Tier D or physical-authority changes, release and install work, or any claim of
