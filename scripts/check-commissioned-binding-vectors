@@ -106,6 +106,8 @@ NUMBER_FIELDS = {
     "sensor_after",
 }
 
+CONTROL_METHODS = {"commanded_and_observed", "undemonstrated"}
+
 failures: list[str] = []
 
 
@@ -259,17 +261,112 @@ def check_stage(case: dict, table: dict, order: list, label: str) -> None:
         )
 
 
+def control_leg(zone: Any) -> Any:
+    proof = zone.get("proof") if isinstance(zone, dict) else None
+    return proof.get("control_path") if isinstance(proof, dict) else None
+
+
+def expected_state(binding: Any) -> str:
+    """Verification is not authority, recomputed from the contract's rule.
+
+    A binding is in force only when every zone's control leg is proven, and
+    only a `local_gpio` zone can prove one: the method names an operation that
+    has no design for a firmware channel.
+    """
+    for zone in binding.get("zones", []):
+        leg = control_leg(zone)
+        if not isinstance(leg, dict) or leg.get("method") != "commanded_and_observed":
+            return "provisional"
+        if zone.get("actuator", {}).get("kind") != "local_gpio":
+            return "provisional"
+    return "in_force"
+
+
+def check_control_legs(label: str, binding: Any) -> None:
+    """The leg's own grammar, where it is present at all."""
+    for index, zone in enumerate(binding.get("zones", [])):
+        leg = control_leg(zone)
+        if leg is None:
+            continue
+        where = f"{label}: zones[{index}].proof.control_path"
+        if not isinstance(leg, dict):
+            fail(f"{where} is not an object")
+            continue
+        method = leg.get("method")
+        if method not in CONTROL_METHODS:
+            fail(f"{where} names method {method!r}, which the contract does not define")
+            continue
+        kind = zone.get("actuator", {}).get("kind")
+        if method == "commanded_and_observed" and kind != "local_gpio":
+            fail(
+                f"{where} claims a commanded proof on a {kind!r} actuator; the "
+                "method is admissible only for local_gpio"
+            )
+        observations = leg.get("observations")
+        if not isinstance(observations, list):
+            fail(f"{where}.observations is not a list")
+            continue
+        if method == "undemonstrated":
+            if observations:
+                fail(f"{where} is undemonstrated and carries observations")
+            if not str(leg.get("reason", "")).strip():
+                fail(f"{where} is undemonstrated with no reason")
+            continue
+        if not observations:
+            fail(f"{where} claims a proof with no observations")
+        for j, observation in enumerate(observations):
+            if not isinstance(observation, dict):
+                fail(f"{where}.observations[{j}] is not an object")
+                continue
+            if kind == "local_gpio" and "gpio_level" not in observation:
+                fail(
+                    f"{where}.observations[{j}] has no gpio_level; the level "
+                    "driven is the evidence this leg exists to record"
+                )
+
+
 def main() -> int:
     corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
     order = corpus["acceptance_order"]
     profile_order = corpus["firmware_profile_acceptance_order"]
 
     for case in corpus["cases"]:
-        check_document_case(corpus, case, "binding", f"cases/{case['name']}")
+        label = f"cases/{case['name']}"
+        check_document_case(corpus, case, "binding", label)
+        check_control_legs(label, case["binding"])
+        # Verification is not authority. A case that does not say which state a
+        # consumer reaches leaves the boundary this corpus exists to fix untested.
+        declared = case.get("expected_state")
+        if declared not in {"provisional", "in_force"}:
+            fail(f"{label}: expected_state is {declared!r}")
+        else:
+            computed = expected_state(case["binding"])
+            if declared != computed:
+                fail(
+                    f"{label}: declares {declared!r} and the contract's rule "
+                    f"gives {computed!r}"
+                )
+        # A provisional record is not in the freshness chain. Where one is held,
+        # the floor must still be the in-force sequence, so the document is
+        # accepted rather than refused as stale behind a record that carried no
+        # authority.
+        provisional = case["verifier_context"].get("provisional_binding_seq")
+        if provisional is not None:
+            floor = case["verifier_context"]["accepted_binding_seq"]
+            if case["binding"]["binding_seq"] > provisional:
+                fail(
+                    f"{label}: binding_seq {case['binding']['binding_seq']} already "
+                    f"exceeds the provisional {provisional}, so the case cannot show "
+                    "that a provisional record fails to raise the floor"
+                )
+            if case["binding"]["binding_seq"] <= floor:
+                fail(f"{label}: not accepted against the in-force floor {floor}")
     for case in corpus["reject_cases"]:
         label = f"reject_cases/{case['name']}"
         check_document_case(corpus, case, "binding", label)
         check_stage(case, VERDICT_STAGE, order, label)
+        if case["reason"] != "malformed":
+            check_control_legs(label, case["binding"])
     for case in corpus["firmware_profile_cases"]:
         check_document_case(
             corpus, case, "firmware_profile", f"firmware_profile_cases/{case['name']}"
@@ -308,6 +405,28 @@ def main() -> int:
                 f"{label}: the bytes are already canonical, so decoding loses "
                 "nothing and an ordinary case would cover this"
             )
+
+    # No accept case may bring a firmware zone into force: the method that
+    # would do it has no design, and admitting one here would publish the
+    # contradiction as a fixture.
+    for case in corpus["cases"]:
+        if case.get("expected_state") != "in_force":
+            continue
+        for zone in case["binding"]["zones"]:
+            if zone.get("actuator", {}).get("kind") != "local_gpio":
+                fail(
+                    f"cases/{case['name']}: reaches in_force with a "
+                    f"{zone['actuator'].get('kind')!r} zone"
+                )
+
+    # The two states and the leg's refusals each need a case, or the corpus
+    # certifies a consumer that implements neither.
+    states = {case.get("expected_state") for case in corpus["cases"]}
+    for state in ("provisional", "in_force"):
+        if state not in states:
+            fail(f"cases: no case reaches {state!r}")
+    if not any(control_leg(z) for c in corpus["cases"] for z in c["binding"]["zones"]):
+        fail("cases: no accept case carries a control_path leg")
 
     # A stage no case stops at is a rule the corpus holds nobody to.
     for name, cases, expected in (
