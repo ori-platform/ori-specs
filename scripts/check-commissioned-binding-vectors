@@ -291,6 +291,83 @@ def expected_state(binding: Any) -> str:
     return "in_force"
 
 
+def whole(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def retained_row(case: dict, zone_id: str) -> Any:
+    state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+    return state.get(zone_id)
+
+
+def check_revision_freshness(corpus: dict) -> None:
+    """A revision is stale leg by leg, and the corpus must show which leg decided.
+
+    A `stale_proof` vector whose circuit leg is also stale proves the circuit
+    rule twice and the control rule not at all, so the control-leg case is
+    required to carry a circuit leg that is demonstrably fresh.
+    """
+    for case in corpus["cases"] + corpus["reject_cases"]:
+        for zone_id, row in (
+            case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        ).items():
+            at_ms = row.get("control_proof_at_ms")
+            if at_ms is None:
+                continue
+            if not whole(at_ms):
+                fail(
+                    f"{case['name']}: accepted_zone_state[{zone_id}]."
+                    "control_proof_at_ms is not a whole number"
+                )
+
+    decided_by_control = []
+    for case in corpus["reject_cases"]:
+        if case.get("reason") != "stale_proof":
+            continue
+        for zone in case["binding"].get("zones", []):
+            row = retained_row(case, zone.get("zone_id"))
+            leg = control_leg(zone)
+            if not isinstance(row, dict) or not isinstance(leg, dict):
+                continue
+            if leg.get("method") != "commanded_and_observed":
+                continue
+            was_control = row.get("control_proof_at_ms")
+            if was_control is None:
+                continue
+            times = (
+                zone["proof"].get("performed_at_ms"),
+                row.get("proof_at_ms"),
+                leg.get("performed_at_ms"),
+                was_control,
+            )
+            if not all(whole(t) for t in times):
+                continue
+            circuit_fresh = times[0] > times[1]
+            control_stale = times[2] <= times[3]
+            if circuit_fresh and control_stale:
+                decided_by_control.append(case["name"])
+
+    if not decided_by_control:
+        fail(
+            "reject_cases: no stale_proof case is decided by the control leg "
+            "alone -- a revision reusing a control proof taken at the old "
+            "polarity would reach in force uncontradicted"
+        )
+
+    if not any(
+        case.get("expected_state") == "in_force"
+        and any(
+            isinstance(retained_row(case, z.get("zone_id")), dict)
+            for z in case["binding"].get("zones", [])
+        )
+        for case in corpus["cases"]
+    ):
+        fail(
+            "cases: no revision with both legs refreshed reaches in force -- "
+            "the rule would be indistinguishable from refusing every revision"
+        )
+
+
 def check_control_legs(label: str, binding: Any) -> None:
     """The leg's own grammar, where it is present at all."""
     for index, zone in enumerate(binding.get("zones", [])):
@@ -464,6 +541,8 @@ def main() -> int:
             fail(f"cases: no case reaches {state!r}")
     if not any(control_leg(z) for c in corpus["cases"] for z in c["binding"]["zones"]):
         fail("cases: no accept case carries a control_path leg")
+
+    check_revision_freshness(corpus)
 
     # A stage no case stops at is a rule the corpus holds nobody to.
     for name, cases, expected in (
