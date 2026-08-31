@@ -300,6 +300,101 @@ def retained_row(case: dict, zone_id: str) -> Any:
     return state.get(zone_id)
 
 
+def outcomes_in(leg: Any) -> set:
+    if not isinstance(leg, dict):
+        return set()
+    return {
+        o.get("commanded")
+        for o in leg.get("observations", [])
+        if isinstance(o, dict)
+    }
+
+
+def coil_disagrees(zone: Any, leg: Any) -> bool:
+    """One observation records a coil state the mapping assigns to the other outcome."""
+    if not isinstance(leg, dict) or not isinstance(zone, dict):
+        return False
+    mapping = zone.get("actuator", {}).get("commissioned_mapping", {})
+    return any(
+        isinstance(o, dict) and o.get("coil_state") != mapping.get(o.get("commanded"))
+        for o in leg.get("observations", [])
+    )
+
+
+def check_per_leg_coverage(corpus: dict) -> None:
+    """Every rule the control leg inherits by reference needs its own vector.
+
+    The contract binds the control leg with "checked by the same rules", so a
+    consumer implementing it as a separate code path is conforming in intent
+    and divergent in fact. Circuit-leg coverage standing in for both is the
+    failure this check exists to refuse, so each rule is required in each leg.
+    """
+    found = {
+        ("one_sided", "circuit"): [],
+        ("one_sided", "control"): [],
+        ("coil", "circuit"): [],
+        ("coil", "control"): [],
+    }
+    for case in corpus["reject_cases"]:
+        if (case.get("stage"), case.get("reason")) != (
+            "proof_consistency",
+            "proof_contradiction",
+        ):
+            continue
+        for zone in case["binding"].get("zones", []):
+            proof = zone.get("proof") if isinstance(zone, dict) else None
+            if not isinstance(proof, dict):
+                continue
+            legs = {"circuit": proof, "control": control_leg(zone)}
+            for which, leg in legs.items():
+                if not isinstance(leg, dict):
+                    continue
+                if leg.get("method") in ("undemonstrated", None):
+                    continue
+                if len(outcomes_in(leg)) == 1:
+                    found[("one_sided", which)].append(case["name"])
+                if coil_disagrees(zone, leg):
+                    found[("coil", which)].append(case["name"])
+
+    wanted = {
+        ("one_sided", "circuit"): "a circuit leg observing one outcome",
+        ("one_sided", "control"): "a control leg observing one outcome",
+        ("coil", "circuit"): "a circuit-leg coil_state disagreeing with the mapping",
+        ("coil", "control"): "a control-leg coil_state disagreeing with the mapping",
+    }
+    for key, described in wanted.items():
+        if not found[key]:
+            fail(
+                f"reject_cases: no proof_contradiction case carries {described} -- "
+                "the rule is stated once and binds both legs, so coverage of one "
+                "leg holds no consumer to the other"
+            )
+
+    # An accept case carrying either shape would publish, as a conforming
+    # fixture, exactly what the contract forbids.
+    for case in corpus["cases"]:
+        for zone in case["binding"].get("zones", []):
+            proof = zone.get("proof") if isinstance(zone, dict) else None
+            if not isinstance(proof, dict):
+                continue
+            for which, leg in (("circuit", proof), ("control", control_leg(zone))):
+                if not isinstance(leg, dict) or leg.get("method") in (
+                    "undemonstrated",
+                    None,
+                ):
+                    continue
+                if len(outcomes_in(leg)) == 1:
+                    fail(
+                        f"{case['name']}: an accept case carries a one-sided "
+                        f"{which} leg"
+                    )
+                if coil_disagrees(zone, leg):
+                    fail(
+                        f"{case['name']}: an accept case carries a {which}-leg "
+                        "coil_state disagreeing with the mapping"
+                    )
+
+
 def check_revision_freshness(corpus: dict) -> None:
     """A revision is stale leg by leg, and the corpus must show which leg decided.
 
@@ -543,6 +638,7 @@ def main() -> int:
         fail("cases: no accept case carries a control_path leg")
 
     check_revision_freshness(corpus)
+    check_per_leg_coverage(corpus)
 
     # A stage no case stops at is a rule the corpus holds nobody to.
     for name, cases, expected in (
