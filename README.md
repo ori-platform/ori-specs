@@ -41,6 +41,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | Contract target |
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | Design target, pre-ratification |
 | Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | Design target, pre-ratification; release-owned Tier D conditions activated by commissioned zones |
+| Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | Design target, pre-ratification; signed skill authority ceiling, capped at Tier C |
 
 ## Gaps
 
