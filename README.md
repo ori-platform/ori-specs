@@ -42,6 +42,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | Design target, pre-ratification |
 | Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | Design target, pre-ratification; release-owned Tier D conditions activated by commissioned zones |
 | Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | Design target, pre-ratification; signed skill authority ceiling, capped at Tier C |
+| Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | Design target, pre-ratification; issuance, custody, rotation, denial by signed release, implicit Tier A |
 
 ## Gaps
 

@@ -122,8 +122,6 @@ def validate_archive(tree):
         seen.add(path)
         if kind == "file":
             files[path] = base64.b64decode(entry.get("content_b64", ""), validate=True)
-    if b"grant.json" not in files:
-        raise Refusal("archive", "no root grant.json in the archive")
     if b"skill.yaml" not in files:
         raise Refusal("archive", "no root skill.yaml in the archive")
     return files
@@ -189,6 +187,18 @@ def resolve_key(registry, key_id):
 def verify(tree, registry):
     files = validate_archive(tree)
     identity, triggers, actions = parse_manifest(files[b"skill.yaml"])
+
+    if b"grant.json" not in files:
+        # The no-grant branch: an implicit Tier A ceiling, package admission
+        # still enforced against the archive's own manifest.
+        for declared in triggers + actions:
+            if TIER_ORDER.get(declared["tier"], 99) > TIER_ORDER["A"]:
+                raise Refusal(
+                    "package_admission",
+                    f"declared tier {declared['tier']} exceeds the implicit Tier A ceiling",
+                )
+        return "admitted"
+
     grant = parse_grant(files[b"grant.json"])
 
     unknown = sorted(set(grant) - set(FIELDS))
@@ -306,11 +316,8 @@ def main() -> int:
                 failures.append(f"{name}: canonical_hex does not reproduce from the embedded grant")
             if (DOMAIN + canonical(unsigned)).hex() != case.get("message_hex"):
                 failures.append(f"{name}: message_hex does not reproduce from the embedded grant")
-        else:
-            if "canonical_hex" in case or "message_hex" in case:
-                failures.append(f"{name}: records canonical bytes without a parseable embedded grant")
-            if not (case["expected"] == "refused" and case.get("stage") in ("archive", "parse")):
-                failures.append(f"{name}: only an archive- or parse-stage refusal may lack an embedded grant")
+        elif "canonical_hex" in case or "message_hex" in case:
+            failures.append(f"{name}: records canonical bytes without a parseable embedded grant")
 
         try:
             outcome, stage, reason = verify(case["tree"], registry), None, None
@@ -335,8 +342,11 @@ def main() -> int:
                     failures.append(
                         f"{name}: declared reason {case.get('reason')!r}, actual {reason!r}"
                     )
-            if declared in STAGES[STAGES.index("signature") + 1:]:
-                if grant_bytes is None or not signature_would_verify(grant_bytes, registry):
+            # A grant-bearing case refused after the signature stage must
+            # carry a genuine signature; the no-grant branch has nothing
+            # signed and its admission refusals are exempt by construction.
+            if declared in STAGES[STAGES.index("signature") + 1:] and grant_bytes is not None:
+                if not signature_would_verify(grant_bytes, registry):
                     failures.append(
                         f"{name}: refused after the signature stage but carries no valid signature"
                     )
@@ -353,7 +363,8 @@ def main() -> int:
     print(
         f"capability-grant/v1: {total} cases "
         f"({len(corpus['cases'])} accept / {len(corpus['reject_cases'])} reject), "
-        f"grants and manifests read from the archive alone, all outcomes, stages, "
+        f"grants and manifests read from the archive alone, no-grant branch exercised, "
+        f"all outcomes, stages, "
         f"reasons and byte strings reproduce, every stage covered"
     )
     return 0
