@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""Check the capability-grant/v1 corpus against the contract.
+
+No consumer implements this contract yet, so this checker is the corpus's
+only executable reader until the runtime verifier lands: it implements the
+contract's nine stages from the contract text and shares no code with
+whatever authored the corpus. Everything is read from the enumerated archive
+alone — the grant is the exact bytes of the tree's single regular root
+grant.json, and identity and declarations come from parsing its root
+skill.yaml (vector manifests are JSON, which is valid YAML, so the
+authenticated bytes parse with no YAML dependency). There is no sidecar to
+verify instead of the archive. Every case is held to:
+
+- every recorded byte string reproducing from the embedded grant;
+- resolving to its declared outcome at its declared stage and for its
+  declared reason;
+- a case refused after the signature stage carrying a signature that
+  verifies, so binding and admission refusals are proven to be about genuine
+  grants, not forgeries;
+- every stage stopping at least one case, and canonical bytes recorded
+  exactly when an embedded grant exists and parses strictly.
+
+Run from the repository root:
+
+    python3 scripts/check-capability-grant-vectors
+"""
+
+import base64
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import unicodedata
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+CORPUS = pathlib.Path(__file__).resolve().parent.parent / "capability-grant/grant-vectors-v1.json"
+DOMAIN = b"ori.capability_grant.v1\n"
+STAGES = (
+    "archive",
+    "parse",
+    "schema",
+    "field_validity",
+    "key_resolution",
+    "signature",
+    "payload_binding",
+    "identity_binding",
+    "package_admission",
+)
+FIELDS = {
+    "schema": str,
+    "skill_name": str,
+    "skill_version": str,
+    "payload_sha256": str,
+    "permitted_triggers": list,
+    "permitted_actions": list,
+    "max_tier": str,
+    "authority_key_id": str,
+    "signature": str,
+}
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+SIG_RE = re.compile(r"^ed25519:[A-Za-z0-9+/]+={0,2}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+TIER_ORDER = {"A": 0, "B": 1, "C": 2, "D": 3}
+FORBIDDEN_CATEGORIES = {"Cc", "Cf", "Zl", "Zp", "Cs"}
+
+
+class Refusal(Exception):
+    def __init__(self, stage, reason):
+        super().__init__(reason)
+        self.stage = stage
+        self.reason = reason
+
+
+def canonical(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def strict_pairs(pairs):
+    keys = [k for k, _ in pairs]
+    for key in keys:
+        if keys.count(key) > 1:
+            raise Refusal("parse", f"duplicate key {key}")
+    return dict(pairs)
+
+
+def validate_archive(tree):
+    """Stage 1: every entry validated whatever its kind, then the roots located.
+
+    Returns {path_bytes: content_bytes} for the regular files.
+    """
+    seen = set()
+    files = {}
+    for entry in tree:
+        kind = entry["kind"]
+        if kind not in ("file", "dir"):
+            raise Refusal("archive", "non-regular entry in tree")
+        path = base64.b64decode(entry["path_b64"], validate=True)
+        if not path:
+            raise Refusal("archive", "tree path is empty")
+        if b"\x00" in path:
+            raise Refusal("archive", "tree path contains 0x00")
+        try:
+            path.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refusal("archive", "tree path is not valid UTF-8") from None
+        if b"\\" in path:
+            raise Refusal("archive", "tree path contains a backslash")
+        if path.startswith(b"/"):
+            raise Refusal("archive", "tree path is absolute")
+        segments = path.split(b"/")
+        if any(seg in (b".", b"..") for seg in segments):
+            raise Refusal("archive", "tree path contains a dot segment")
+        if any(seg == b"" for seg in segments):
+            raise Refusal("archive", "tree path contains an empty segment")
+        if path in seen:
+            raise Refusal("archive", "duplicate path in tree")
+        seen.add(path)
+        if kind == "file":
+            files[path] = base64.b64decode(entry.get("content_b64", ""), validate=True)
+    if b"grant.json" not in files:
+        raise Refusal("archive", "no root grant.json in the archive")
+    if b"skill.yaml" not in files:
+        raise Refusal("archive", "no root skill.yaml in the archive")
+    return files
+
+
+def parse_manifest(manifest_bytes):
+    """The authenticated manifest, in the corpus's JSON subset of YAML."""
+    try:
+        parsed = json.loads(manifest_bytes.decode("utf-8"), object_pairs_hook=strict_pairs)
+        identity = {"name": parsed["name"], "version": parsed["version"]}
+        declared = [
+            {"name": t["name"], "tier": t["action_tier"]} for t in parsed["triggers"]
+        ], [
+            {"name": a["name"], "tier": a["tier"]}
+            for a in parsed["actions"]["available"]
+        ]
+    except (Refusal, ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        raise Refusal("archive", "manifest does not parse") from exc
+    return identity, declared[0], declared[1]
+
+
+def parse_grant(grant_bytes):
+    try:
+        raw = grant_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refusal("parse", "grant is not valid UTF-8") from None
+    try:
+        parsed = json.loads(raw, object_pairs_hook=strict_pairs)
+    except Refusal:
+        raise
+    except ValueError as exc:
+        raise Refusal("parse", f"not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise Refusal("parse", "grant is not an object")
+    return parsed
+
+
+def tree_digest(files):
+    h = hashlib.sha256()
+    for path in sorted(p for p in files if p != b"grant.json"):
+        content = files[path]
+        h.update(path + b"\x00" + str(len(content)).encode("ascii") + b"\x00" + content)
+    return "sha256:" + h.hexdigest()
+
+
+def check_identity_fields(grant):
+    name, version = grant["skill_name"], grant["skill_version"]
+    if not NAME_RE.match(name):
+        raise Refusal("field_validity", "skill_name does not satisfy the manifest name syntax")
+    if len(name) > 64:
+        raise Refusal("field_validity", "skill_name exceeds 64 characters")
+    if len(version) > 32:
+        raise Refusal("field_validity", "skill_version exceeds 32 characters")
+    for value in (name, version):
+        if any(unicodedata.category(ch) in FORBIDDEN_CATEGORIES or ch == "\x7f" for ch in value):
+            raise Refusal("field_validity", "identity field contains a forbidden character")
+
+
+def resolve_key(registry, key_id):
+    return next((k for k in registry["keys"] if k["key_id"] == key_id), None)
+
+
+def verify(tree, registry):
+    files = validate_archive(tree)
+    identity, triggers, actions = parse_manifest(files[b"skill.yaml"])
+    grant = parse_grant(files[b"grant.json"])
+
+    unknown = sorted(set(grant) - set(FIELDS))
+    if unknown:
+        raise Refusal("parse", f"unknown field {unknown[0]}")
+    missing = sorted(set(FIELDS) - set(grant))
+    if missing:
+        raise Refusal("parse", f"missing field {missing[0]}")
+    for name, kind in FIELDS.items():
+        if not isinstance(grant[name], kind) or isinstance(grant[name], bool):
+            raise Refusal("parse", f"field {name} has the wrong type")
+
+    if grant["schema"] != "ori.capability_grant.v1":
+        raise Refusal("schema", "schema is not ori.capability_grant.v1")
+
+    if grant["max_tier"] not in ("A", "B", "C"):
+        raise Refusal("field_validity", "max_tier must be A, B, or C")
+    if not DIGEST_RE.match(grant["payload_sha256"]):
+        raise Refusal("field_validity", "payload_sha256 is not sha256 hex")
+    for list_name in ("permitted_triggers", "permitted_actions"):
+        entries = grant[list_name]
+        if any(not isinstance(e, str) for e in entries):
+            raise Refusal("field_validity", f"non-string entry in {list_name}")
+        if len(set(entries)) != len(entries):
+            raise Refusal("field_validity", f"duplicate entry in {list_name}")
+    check_identity_fields(grant)
+
+    key = resolve_key(registry, grant["authority_key_id"])
+    if key is None:
+        raise Refusal("key_resolution", "authority_key_id is not in the registry")
+    if key["status"] not in ("active", "verify_only"):
+        raise Refusal("key_resolution", "authority_key_id names a revoked key")
+
+    if not SIG_RE.match(grant["signature"]):
+        raise Refusal("signature", "signature is not valid ed25519 encoding")
+    unsigned = {k: v for k, v in grant.items() if k != "signature"}
+    try:
+        raw_sig = base64.b64decode(grant["signature"][len("ed25519:"):], validate=True)
+        if len(raw_sig) != 64:
+            raise Refusal("signature", "signature is not 64 bytes")
+        Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(key["public_key"], validate=True)
+        ).verify(raw_sig, DOMAIN + canonical(unsigned))
+    except (InvalidSignature, ValueError):
+        raise Refusal("signature", "signature does not verify over the presented grant") from None
+
+    if tree_digest(files) != grant["payload_sha256"]:
+        raise Refusal("payload_binding", "payload tree digest does not match payload_sha256")
+
+    if grant["skill_name"] != identity["name"]:
+        raise Refusal("identity_binding", "skill_name does not match the manifest name")
+    if grant["skill_version"] != identity["version"]:
+        raise Refusal("identity_binding", "skill_version does not match the manifest version")
+
+    ceiling = TIER_ORDER[grant["max_tier"]]
+    for trigger in triggers:
+        if trigger["name"] not in grant["permitted_triggers"]:
+            raise Refusal("package_admission", f"trigger {trigger['name']} is not permitted")
+    for action in actions:
+        if action["name"] not in grant["permitted_actions"]:
+            raise Refusal("package_admission", f"action {action['name']} is not permitted")
+    for declared in triggers + actions:
+        if TIER_ORDER.get(declared["tier"], 99) > ceiling:
+            raise Refusal(
+                "package_admission",
+                f"declared tier {declared['tier']} exceeds max_tier {grant['max_tier']}",
+            )
+    return "admitted"
+
+
+def embedded_grant_bytes(tree):
+    for entry in tree:
+        if entry["kind"] == "file" and base64.b64decode(entry["path_b64"], validate=True) == b"grant.json":
+            return base64.b64decode(entry.get("content_b64", ""), validate=True)
+    return None
+
+
+def signature_would_verify(grant_bytes, registry):
+    try:
+        grant = parse_grant(grant_bytes)
+    except Refusal:
+        return False
+    key = resolve_key(registry, grant.get("authority_key_id"))
+    if key is None or not isinstance(grant.get("signature"), str) or not SIG_RE.match(grant["signature"]):
+        return False
+    unsigned = {k: v for k, v in grant.items() if k != "signature"}
+    try:
+        raw_sig = base64.b64decode(grant["signature"][len("ed25519:"):], validate=True)
+        Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(key["public_key"], validate=True)
+        ).verify(raw_sig, DOMAIN + canonical(unsigned))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def main() -> int:
+    corpus = json.loads(CORPUS.read_text())
+    registry = corpus["registry"]
+    failures = []
+    stages_hit = set()
+
+    for case in corpus["cases"] + corpus["reject_cases"]:
+        name = case["name"]
+        grant_bytes = embedded_grant_bytes(case["tree"])
+        parsed = None
+        if grant_bytes is not None:
+            try:
+                parsed = parse_grant(grant_bytes)
+            except Refusal:
+                parsed = None
+        if parsed is not None:
+            unsigned = {k: v for k, v in parsed.items() if k != "signature"}
+            if canonical(unsigned).hex() != case.get("canonical_hex"):
+                failures.append(f"{name}: canonical_hex does not reproduce from the embedded grant")
+            if (DOMAIN + canonical(unsigned)).hex() != case.get("message_hex"):
+                failures.append(f"{name}: message_hex does not reproduce from the embedded grant")
+        else:
+            if "canonical_hex" in case or "message_hex" in case:
+                failures.append(f"{name}: records canonical bytes without a parseable embedded grant")
+            if not (case["expected"] == "refused" and case.get("stage") in ("archive", "parse")):
+                failures.append(f"{name}: only an archive- or parse-stage refusal may lack an embedded grant")
+
+        try:
+            outcome, stage, reason = verify(case["tree"], registry), None, None
+        except Refusal as refusal:
+            outcome, stage, reason = "refused", refusal.stage, refusal.reason
+
+        if case["expected"] == "admitted":
+            if outcome != "admitted":
+                failures.append(f"{name}: expected admission, refused at {stage} ({reason})")
+        else:
+            declared = case.get("stage")
+            if declared not in STAGES:
+                failures.append(f"{name}: declares unknown stage {declared}")
+                continue
+            if outcome != "refused" or stage != declared:
+                failures.append(
+                    f"{name}: declared stage {declared}, actually resolved at {stage or outcome}"
+                )
+            else:
+                stages_hit.add(declared)
+                if reason != case.get("reason"):
+                    failures.append(
+                        f"{name}: declared reason {case.get('reason')!r}, actual {reason!r}"
+                    )
+            if declared in STAGES[STAGES.index("signature") + 1:]:
+                if grant_bytes is None or not signature_would_verify(grant_bytes, registry):
+                    failures.append(
+                        f"{name}: refused after the signature stage but carries no valid signature"
+                    )
+
+    for stage in STAGES:
+        if stage not in stages_hit:
+            failures.append(f"no reject case stops at stage {stage}")
+
+    if failures:
+        for line in failures:
+            print(f"FAIL {line}")
+        return 1
+    total = len(corpus["cases"]) + len(corpus["reject_cases"])
+    print(
+        f"capability-grant/v1: {total} cases "
+        f"({len(corpus['cases'])} accept / {len(corpus['reject_cases'])} reject), "
+        f"grants and manifests read from the archive alone, all outcomes, stages, "
+        f"reasons and byte strings reproduce, every stage covered"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
