@@ -565,9 +565,15 @@ def load_journal(journal: list, current_seq: int, zone_id: str, profile_id: str,
                 seen["journal"].add("resolved_by_record")
             unresolved = []
             unjustified_resolutions = 0
-            record_status = entry["record"].get("command_status") or "legacy"
-            if record_status not in COMMAND_STATUSES and record_status != "legacy":
-                fail(f"unknown durable command status {record_status!r}")
+            record_status = entry["record"].get("command_status")
+            # Legacy treatment belongs to the pre-journal durable source
+            # alone: a journal record is current-format by construction, so
+            # a missing or empty status here is corruption, not history.
+            if record_status not in COMMAND_STATUSES or record_status == "none":
+                fail(
+                    f"journal record carries command status {record_status!r}, "
+                    "outside the vocabulary"
+                )
             continue
         if "intent" in entry:
             intent = entry["intent"]
@@ -807,11 +813,14 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
                             "quality": event.get("quality", 1.0),
                         }
                         outcomes[pid], _ = machine.reading(raw, "appended", "accepted")
-                    if deferred:
-                        if all(outcome is None for outcome in outcomes.values()):
-                            startup_command = "de_energised"
-                            seen["startup_command"].add(startup_command)
-                            deferred = False
+                    if any(outcomes.values()) or any(
+                        machine.state == "tripped" for machine in machines.values()
+                    ):
+                        deferred = False
+                    elif deferred:
+                        startup_command = "de_energised"
+                        seen["startup_command"].add(startup_command)
+                        deferred = False
                     expected = event.get("expect_outcomes", {})
                     for pid, outcome in outcomes.items():
                         if expected.get(pid) != outcome:
@@ -882,13 +891,14 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
                         else "committed"
                     )
                     seen["record"].add(machine.record_state)
-                if deferred and rejected is None:
-                    # The deferred startup command is licensed only by a
-                    # credible reading that tripped nothing.
-                    if outcome is None:
-                        startup_command = "de_energised"
-                        seen["startup_command"].add(startup_command)
-                    deferred = outcome is not None
+                if outcome is not None:
+                    # A trip extinguishes the deferred command permanently:
+                    # a latched zone's circuit is closed only by reset.
+                    deferred = False
+                elif deferred and rejected is None and machine.state != "tripped":
+                    startup_command = "de_energised"
+                    seen["startup_command"].add(startup_command)
+                    deferred = False
             elif kind == "arm_attempt":
                 outcome, refusal = machine.arm()
                 if refusal:
