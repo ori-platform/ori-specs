@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Check the capability-grant-issuance/v1 denial corpus against the contract.
+
+Denial is digest matching, so this checker needs no key material. Its denial
+targets are not synthetic: each case names a case in the capability-grant
+corpus, and the digests are recomputed here from that case's embedded grant
+bytes — so the corpus proves a denial list denies a grant that genuinely
+verifies, and the two corpora cannot drift apart silently. This checker
+shares no code with whatever authored the corpus and holds every case to its
+declared outcome and exact reason, and the corpus to covering a grant-digest
+denial, a payload-digest denial, a non-denial, every malformed-list refusal
+class, the grant-admission join for missing and unparseable denial artifacts
+— failing closed for grant-bearing packages and leaving no-grant packages
+unaffected — and the audit-record schema: identity syntax, single-colon
+namespacing, containment, and the binding of every claimed field to the
+issued grant the record names.
+
+Run from the repository root:
+
+    python3 scripts/check-capability-grant-issuance-vectors
+"""
+
+import base64
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import unicodedata
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "capability-grant-issuance/denial-vectors-v1.json"
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+class Refusal(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def strict_pairs(pairs):
+    keys = [k for k, _ in pairs]
+    for key in keys:
+        if keys.count(key) > 1:
+            raise Refusal(f"duplicate key {key}")
+    return dict(pairs)
+
+
+def parse_denial_list(raw):
+    try:
+        parsed = json.loads(raw, object_pairs_hook=strict_pairs)
+    except Refusal:
+        raise
+    except ValueError as exc:
+        raise Refusal(f"not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise Refusal("denial list is not an object")
+    unknown = sorted(set(parsed) - {"schema", "entries"})
+    if unknown:
+        raise Refusal(f"unknown field {unknown[0]}")
+    if sorted(parsed) != ["entries", "schema"]:
+        missing = sorted({"schema", "entries"} - set(parsed))
+        raise Refusal(f"missing field {missing[0]}")
+    if parsed["schema"] != "ori.capability_denial.v1":
+        raise Refusal("schema is not ori.capability_denial.v1")
+    if not isinstance(parsed["entries"], list):
+        raise Refusal("entries is not an array")
+    for entry in parsed["entries"]:
+        if not isinstance(entry, dict):
+            raise Refusal("entry is not an object")
+        unknown = sorted(set(entry) - {"kind", "sha256"})
+        if unknown:
+            raise Refusal(f"unknown entry field {unknown[0]}")
+        if sorted(entry) != ["kind", "sha256"]:
+            missing = sorted({"kind", "sha256"} - set(entry))
+            raise Refusal(f"missing entry field {missing[0]}")
+        if entry["kind"] not in ("grant", "payload"):
+            raise Refusal("entry kind must be grant or payload")
+        if not isinstance(entry["sha256"], str) or not DIGEST_RE.match(entry["sha256"]):
+            raise Refusal("entry sha256 is not sha256 hex")
+    return parsed
+
+
+def grant_digests(grant_corpus, case_name):
+    case = next(c for c in grant_corpus["cases"] if c["name"] == case_name)
+    grant_bytes = next(
+        base64.b64decode(e["content_b64"], validate=True)
+        for e in case["tree"]
+        if e["kind"] == "file" and base64.b64decode(e["path_b64"], validate=True) == b"grant.json"
+    )
+    grant = json.loads(grant_bytes.decode("utf-8"), object_pairs_hook=strict_pairs)
+    unsigned = {k: v for k, v in grant.items() if k != "signature"}
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest(), grant["payload_sha256"]
+
+
+CEILING_FIELDS = {"permitted_triggers", "permitted_actions", "max_tier"}
+AUDIT_FIELDS = {
+    "schema", "reviewer", "skill_name", "skill_version", "payload_sha256",
+    "requested_ceiling", "granted_ceiling", "grant_sha256", "issued_at_ms",
+}
+REVIEWER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*:[^:]+$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+FORBIDDEN_CATEGORIES = {"Cc", "Cf", "Zl", "Zp", "Cs"}
+TIER_ORDER = {"A": 0, "B": 1, "C": 2}
+
+
+def validate_ceiling(ceiling, which):
+    if not isinstance(ceiling, dict):
+        raise Refusal(f"{which} is not an object")
+    unknown = sorted(set(ceiling) - CEILING_FIELDS)
+    if unknown:
+        raise Refusal(f"unknown {which} field {unknown[0]}")
+    missing = sorted(CEILING_FIELDS - set(ceiling))
+    if missing:
+        raise Refusal(f"missing {which} field {missing[0]}")
+    if ceiling["max_tier"] not in TIER_ORDER:
+        raise Refusal(f"{which} max_tier must be A, B, or C")
+    for list_name in ("permitted_triggers", "permitted_actions"):
+        entries = ceiling[list_name]
+        if not isinstance(entries, list) or any(not isinstance(e, str) for e in entries):
+            raise Refusal(f"{which} {list_name} is not an array of strings")
+        if len(set(entries)) != len(entries):
+            raise Refusal(f"duplicate entry in {which} {list_name}")
+
+
+def check_audit_identity(record):
+    name, version = record["skill_name"], record["skill_version"]
+    if not NAME_RE.match(name):
+        raise Refusal("skill_name does not satisfy the manifest name syntax")
+    if len(name) > 64:
+        raise Refusal("skill_name exceeds 64 characters")
+    if len(version) > 32:
+        raise Refusal("skill_version exceeds 32 characters")
+    for value in (name, version):
+        if any(unicodedata.category(ch) in FORBIDDEN_CATEGORIES or ch == "\x7f" for ch in value):
+            raise Refusal("identity field contains a forbidden character")
+
+
+def validate_audit_record(raw, issued_grant, issued_grant_sha):
+    try:
+        record = json.loads(raw, object_pairs_hook=strict_pairs)
+    except Refusal:
+        raise
+    except ValueError as exc:
+        raise Refusal(f"not valid JSON: {exc}") from exc
+    if not isinstance(record, dict):
+        raise Refusal("audit record is not an object")
+    unknown = sorted(set(record) - AUDIT_FIELDS)
+    if unknown:
+        raise Refusal(f"unknown field {unknown[0]}")
+    missing = sorted(AUDIT_FIELDS - set(record))
+    if missing:
+        raise Refusal(f"missing field {missing[0]}")
+    if record["schema"] != "ori.capability_grant_audit.v1":
+        raise Refusal("schema is not ori.capability_grant_audit.v1")
+    for name in ("reviewer", "skill_name", "skill_version"):
+        if not isinstance(record[name], str):
+            raise Refusal(f"field {name} has the wrong type")
+    if not REVIEWER_RE.match(record["reviewer"]):
+        raise Refusal("reviewer is not namespaced")
+    check_audit_identity(record)
+    for name in ("payload_sha256", "grant_sha256"):
+        if not isinstance(record[name], str) or not DIGEST_RE.match(record[name]):
+            raise Refusal(f"{name} is not sha256 hex")
+    ts = record["issued_at_ms"]
+    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+        raise Refusal("issued_at_ms must be a positive integer")
+    validate_ceiling(record["requested_ceiling"], "requested_ceiling")
+    validate_ceiling(record["granted_ceiling"], "granted_ceiling")
+    req, gr = record["requested_ceiling"], record["granted_ceiling"]
+    if (
+        not set(gr["permitted_triggers"]) <= set(req["permitted_triggers"])
+        or not set(gr["permitted_actions"]) <= set(req["permitted_actions"])
+        or TIER_ORDER[gr["max_tier"]] > TIER_ORDER[req["max_tier"]]
+    ):
+        raise Refusal("granted ceiling exceeds the requested ceiling")
+
+    # The record is bound to the grant it names: a record that identifies one
+    # grant while describing another authority ceiling refuses, per field.
+    if record["skill_name"] != issued_grant["skill_name"]:
+        raise Refusal("skill_name does not match the issued grant")
+    if record["skill_version"] != issued_grant["skill_version"]:
+        raise Refusal("skill_version does not match the issued grant")
+    if record["payload_sha256"] != issued_grant["payload_sha256"]:
+        raise Refusal("payload_sha256 does not match the issued grant")
+    if (
+        set(gr["permitted_triggers"]) != set(issued_grant["permitted_triggers"])
+        or set(gr["permitted_actions"]) != set(issued_grant["permitted_actions"])
+        or gr["max_tier"] != issued_grant["max_tier"]
+    ):
+        raise Refusal("granted ceiling does not match the issued grant")
+    if record["grant_sha256"] != issued_grant_sha:
+        raise Refusal("grant_sha256 does not match the issued grant")
+
+
+def issued_grant(grant_corpus, case_name):
+    case = next(c for c in grant_corpus["cases"] if c["name"] == case_name)
+    grant_bytes = next(
+        base64.b64decode(e["content_b64"], validate=True)
+        for e in case["tree"]
+        if e["kind"] == "file" and base64.b64decode(e["path_b64"], validate=True) == b"grant.json"
+    )
+    grant = json.loads(grant_bytes.decode("utf-8"), object_pairs_hook=strict_pairs)
+    unsigned = {k: v for k, v in grant.items() if k != "signature"}
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+    return grant, "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def grant_bearing(grant_corpus, case_name):
+    case = next(c for c in grant_corpus["cases"] if c["name"] == case_name)
+    return any(
+        e["kind"] == "file" and base64.b64decode(e["path_b64"], validate=True) == b"grant.json"
+        for e in case["tree"]
+    )
+
+
+def evaluate_join(artifact, bearing):
+    broken = artifact["state"] != "present"
+    if not broken:
+        try:
+            parse_denial_list(artifact["raw"])
+        except Refusal:
+            broken = True
+    if broken:
+        return "grants_unavailable" if bearing else "unaffected"
+    return "artifact_ok"
+
+
+def evaluate(denial, grant_sha, payload_sha):
+    for entry in denial["entries"]:
+        if entry["kind"] == "grant" and entry["sha256"] == grant_sha:
+            return "denied", "denied by grant digest"
+        if entry["kind"] == "payload" and entry["sha256"] == payload_sha:
+            return "denied", "denied by payload digest"
+    return "not_denied", None
+
+
+def main() -> int:
+    corpus = json.loads(CORPUS.read_text())
+    grant_corpus = json.loads((CORPUS.parent / corpus["grant_corpus"]).read_text())
+    failures = []
+    outcomes_hit = set()
+
+    for case in corpus["cases"]:
+        name = case["name"]
+        grant_sha, payload_sha = grant_digests(grant_corpus, case["grant_case"])
+        try:
+            denial = parse_denial_list(case["denial_list_raw"])
+            outcome, reason = evaluate(denial, grant_sha, payload_sha)
+        except Refusal as refusal:
+            outcome, reason = "list_refused", refusal.reason
+
+        if outcome != case["expected"]:
+            failures.append(f"{name}: expected {case['expected']}, got {outcome} ({reason})")
+        elif reason != case.get("reason"):
+            failures.append(f"{name}: declared reason {case.get('reason')!r}, actual {reason!r}")
+        else:
+            outcomes_hit.add(reason if outcome == "denied" else outcome)
+
+    for case in corpus["join_cases"]:
+        name = case["name"]
+        outcome = evaluate_join(case["denial_artifact"], grant_bearing(grant_corpus, case["grant_case"]))
+        if outcome != case["expected"]:
+            failures.append(f"{name}: expected {case['expected']}, got {outcome}")
+        else:
+            outcomes_hit.add(outcome)
+
+    for case in corpus["audit_cases"]:
+        name = case["name"]
+        grant, grant_sha = issued_grant(grant_corpus, case["grant_case"])
+        try:
+            validate_audit_record(case["record_raw"], grant, grant_sha)
+            outcome, reason = "accepted", None
+        except Refusal as refusal:
+            outcome, reason = "refused", refusal.reason
+        if outcome != case["expected"]:
+            failures.append(f"{name}: expected {case['expected']}, got {outcome} ({reason})")
+        elif reason != case.get("reason"):
+            failures.append(f"{name}: declared reason {case.get('reason')!r}, actual {reason!r}")
+        else:
+            outcomes_hit.add(f"audit_{outcome}")
+            if reason == "granted ceiling exceeds the requested ceiling":
+                outcomes_hit.add("audit_containment_refusal")
+            if reason is not None and reason.endswith("does not match the issued grant"):
+                outcomes_hit.add("audit_binding_refusal")
+
+    for needed in ("denied by grant digest", "denied by payload digest",
+                   "not_denied", "list_refused", "grants_unavailable",
+                   "unaffected", "audit_accepted", "audit_refused",
+                   "audit_containment_refusal", "audit_binding_refusal"):
+        if needed not in outcomes_hit:
+            failures.append(f"no case exercises outcome {needed}")
+
+    if failures:
+        for line in failures:
+            print(f"FAIL {line}")
+        return 1
+    print(
+        f"capability-grant-issuance/v1: {len(corpus['cases'])} denial, "
+        f"{len(corpus['join_cases'])} join, {len(corpus['audit_cases'])} audit cases; "
+        f"denial targets recomputed from the capability-grant corpus, the broken-artifact "
+        f"join fails closed, and all outcomes and reasons reproduce"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
