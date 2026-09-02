@@ -498,32 +498,236 @@ def check_evaluation(shipped: dict[str, dict], seen: dict[str, set[str]]) -> Non
 # ---------------------------------------------------------------- lifecycle
 
 
+COMMAND_STATUSES = ("none", "command_pending", "driver_refused", "command_issued")
+INTENT_FIELDS = {"zone_id", "profile_id", "attempt_id", "binding_seq", "outcome",
+                 "created_at_ms", "resolved"}
+
+
+def intent_is_well_formed(intent, zone_id: str, profile_id: str) -> bool:
+    """The closed intent grammar. A violation is a malformed entry."""
+    if not isinstance(intent, dict) or set(intent) != INTENT_FIELDS:
+        return False
+    for key in ("zone_id", "profile_id"):
+        if not isinstance(intent[key], str) or not intent[key]:
+            return False
+    if intent["zone_id"] != zone_id or intent["profile_id"] != profile_id:
+        return False
+    if not isinstance(intent["attempt_id"], str) or not intent["attempt_id"]:
+        return False
+    for key in ("binding_seq", "created_at_ms"):
+        value = intent[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            return False
+    if intent["outcome"] != "open_protected_circuit":
+        return False
+    if not isinstance(intent["resolved"], bool):
+        return False
+    return True
+
+
+def load_journal(journal: list, current_seq: int, zone_id: str, profile_id: str,
+                 seen: dict[str, set[str]]):
+    """Walk the durable journal in append order, per the contract.
+
+    Returns (record_status, latest_unresolved_intent, fail_closed) where
+    record_status is the surviving full record's command status ("legacy"
+    for a record predating the vocabulary), latest_unresolved_intent is the
+    last unresolved intent appended after any record or clear, and
+    fail_closed marks an identifiable-corrupt or malformed entry standing in
+    for an intent.
+    """
+    record_status: str | None = None
+    unresolved: list = []
+    attempt_ids: set[str] = set()
+    unjustified_resolutions = 0
+    for entry in journal:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            fail("journal entries carry exactly one of intent, record, clear, corrupt")
+        if "corrupt" in entry:
+            if entry["corrupt"] == "unidentifiable":
+                fail("the intent journal cannot be read")
+            if entry["corrupt"] != "identifiable":
+                fail(f"unknown corruption class {entry['corrupt']!r}")
+            unresolved.append("corrupt")
+            continue
+        if "clear" in entry:
+            # Reset's durable clear resolves everything before it, and
+            # justifies every resolution marked before it.
+            record_status = None
+            unresolved = []
+            unjustified_resolutions = 0
+            seen["journal"].add("cleared")
+            continue
+        if "record" in entry:
+            # A full record resolves every intent appended before it, and
+            # none appended after.
+            if unresolved:
+                seen["journal"].add("resolved_by_record")
+            unresolved = []
+            unjustified_resolutions = 0
+            record_status = entry["record"].get("command_status") or "legacy"
+            if record_status not in COMMAND_STATUSES and record_status != "legacy":
+                fail(f"unknown durable command status {record_status!r}")
+            continue
+        if "intent" in entry:
+            intent = entry["intent"]
+            if not intent_is_well_formed(intent, zone_id, profile_id):
+                # Malformed but positionally identifiable: fail closed.
+                unresolved.append("corrupt")
+                seen["journal"].add("malformed_fail_closed")
+                continue
+            if intent["attempt_id"] in attempt_ids:
+                # Two entries claiming one identity is corruption beyond the
+                # entry level: the journal refuses to load.
+                fail("the intent journal repeats an attempt id")
+            attempt_ids.add(intent["attempt_id"])
+            if intent["resolved"]:
+                # Resolution is a sequence invariant: only a later record or
+                # clear can justify this mark.
+                unjustified_resolutions += 1
+                continue
+            unresolved.append(intent)
+            continue
+        fail("journal entries carry exactly one of intent, record, clear, corrupt")
+    if unjustified_resolutions:
+        fail(
+            "a resolved intent with no later record or clear claims a "
+            "resolution nothing durable performed"
+        )
+    if len(unresolved) > 1:
+        seen["journal"].add("duplicate_collapse")
+    latest = unresolved[-1] if unresolved else None
+    fail_closed = latest == "corrupt"
+    if latest is not None and not fail_closed and latest["binding_seq"] != current_seq:
+        seen["journal"].add("mismatch_orphan")
+        return record_status, latest, "orphaned"
+    return record_status, latest, "fail_closed" if fail_closed else None
+
+
 class Zone:
     def __init__(self, profile: dict, zone: dict, trip_point: float) -> None:
         self.profile = profile
         self.zone = zone
+        self.zone_id = zone.get("zone_id", "protected-zone")
         self.trip_point = trip_point
+        self.terminal_state = zone.get("de_energised_terminal_state", "open")
+        if self.terminal_state not in ("open", "closed"):
+            fail(f"unknown de_energised_terminal_state {self.terminal_state!r}")
         self.state = "inactive"
         self.safety_path = False
         self.last_credible: float | None = None
+        self.command_status = "none"
+        self.record_state = "committed"
+        self.effect = "unknown"
+        self.retry_cancelled = False
+        self.last_intent_appended: bool | None = None
+        self.orphaned = False
+        self.retired = False
 
-    def startup(self, durable: str) -> None:
+    def startup(self, durable: str, journal: list, durable_status: str | None,
+                current_seq: int, seen: dict[str, set[str]]) -> str:
+        """Load durables and return the startup coil decision."""
         if durable not in {"none", "armed", "tripped"}:
             fail(f"unknown durable_state {durable!r}")
-        self.state = "tripped" if durable == "tripped" else "inactive"
         self.safety_path = False
         self.last_credible = None
+        self.retry_cancelled = False
+        self.effect = "unknown"
+        record_status, latest_intent, marker = load_journal(
+            journal, current_seq, self.zone_id, self.profile["id"], seen
+        )
+        if durable == "tripped" and not journal:
+            # A record predating the journal. No status field proves no
+            # acceptance: absence migrates to the retryable status, never to
+            # the one that stops retries.
+            record_status = durable_status or "legacy"
+            if record_status not in COMMAND_STATUSES and record_status != "legacy":
+                fail(f"unknown durable command status {record_status!r}")
+        if latest_intent is not None:
+            # Append order governs: an unresolved intent survives only after
+            # the last record or clear, so it outranks any earlier record —
+            # a record resolves every intent before it and none after.
+            self.state = "tripped"
+            self.command_status = "command_pending"
+            self.orphaned = marker == "orphaned"
+            if record_status is not None:
+                seen["journal"].add("later_intent_governs")
+            return "none"
+        if record_status is not None:
+            if durable != "tripped":
+                fail("a surviving full record requires durable_state tripped")
+            self.state = "tripped"
+            self.command_status = (
+                "command_pending" if record_status == "legacy" else record_status
+            )
+            if record_status == "legacy":
+                seen["journal"].add("legacy_pending")
+            return "none"
+        if durable == "tripped":
+            fail("durable_state tripped requires a record, in the journal or legacy")
+        self.state = "inactive"
+        self.command_status = "none"
+        # The startup coil command is conditioned on the commissioned
+        # terminal state: de-energising a closed-terminal zone closes the
+        # protected circuit, so its coil waits for a credible reading.
+        return "de_energised" if self.terminal_state == "open" else "deferred"
 
-    def reading(self, raw: dict) -> tuple[str | None, str | None]:
+    def reading(self, raw: dict, intent_result: str, driver_result: str) -> tuple[str | None, str | None]:
         """Return (outcome, rejected_reason)."""
         verdict, reason = evaluate(self.profile, self.zone, raw)
         if verdict == "rejected_input":
             return None, reason
         self.last_credible = float(decode_value(raw["value"]))
         if verdict == "trip" and self.state != "tripped":
+            if intent_result not in ("appended", "append_failed"):
+                fail(f"unknown intent_result {intent_result!r}")
+            self.last_intent_appended = intent_result == "appended"
             self.state = "tripped"
+            self.retry_cancelled = False
+            self.command_status = (
+                "command_issued" if driver_result == "accepted" else "driver_refused"
+            )
             return "open_protected_circuit", None
         return None, None
+
+    def effect_report(self, result: str) -> None:
+        """Physical verification is its own axis: it never moves the latch,
+        and no command status ever implies it."""
+        if result not in ("matched", "mismatched"):
+            fail(f"unknown effect verification {result!r}")
+        self.effect = result
+
+    def record_retry(self, result: str) -> None:
+        """Persistence recovery is its own obligation: it runs whatever the
+        command status, and never touches the physical command."""
+        if self.record_state == "pending" and result == "committed":
+            self.record_state = "committed"
+
+    def retry(self, driver_result: str) -> str:
+        """The registry-owned retry loop, independent of readings."""
+        if self.state != "tripped" or self.retry_cancelled:
+            return "skipped"
+        if self.orphaned:
+            # Never actuate through a binding the intent was not commanded
+            # under, or through a zone the binding no longer carries.
+            return "skipped"
+        if self.command_status == "command_issued":
+            # An accepted command is never re-issued merely because its
+            # physical effect remains unverified.
+            return "skipped"
+        self.command_status = (
+            "command_issued" if driver_result == "accepted" else "driver_refused"
+        )
+        return "attempted"
+
+    def remove_binding(self) -> None:
+        self.orphaned = True
+
+    def retire_orphan(self) -> str | None:
+        if not self.orphaned:
+            return "not_orphaned"
+        self.retired = True
+        return None
 
     def condition_active(self) -> bool:
         assert self.last_credible is not None
@@ -549,6 +753,9 @@ class Zone:
         if self.condition_active():
             return None, "condition_active"
         self.state = "armed"
+        # Reset serialises with the retry loop: a retry scheduled before the
+        # reset must not reopen the circuit the operator just closed.
+        self.retry_cancelled = True
         return "close_protected_circuit", None
 
 
@@ -563,6 +770,61 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
         if name in names:
             fail(f"lifecycle.json: duplicate case name {name}")
         names.add(name)
+        if "profiles" in case:
+            # Multiple active profiles on one zone: the deferred startup
+            # command is licensed only after the reading is evaluated
+            # against all of them, and one trip withholds it for the zone.
+            machines = {
+                pid: Zone(
+                    resolve_profile(pid, fixtures, shipped, name),
+                    case["zone"],
+                    trip_point_for(resolve_profile(pid, fixtures, shipped, name), case["zone"]),
+                )
+                for pid in case["profiles"]
+            }
+            deferred = False
+            for index, event in enumerate(case["events"]):
+                kind = event["event"]
+                label = f"{name} event {index} ({kind})"
+                startup_command: str | None = None
+                if kind == "startup":
+                    commands = {
+                        pid: machine.startup(event["durable_state"], [], None, 1, seen)
+                        for pid, machine in machines.items()
+                    }
+                    values = set(commands.values())
+                    if len(values) != 1:
+                        fail(f"{label}: the startup command is zonal, not per profile")
+                    startup_command = values.pop()
+                    deferred = startup_command == "deferred"
+                    seen["startup_command"].add(startup_command)
+                elif kind == "reading":
+                    outcomes = {}
+                    for pid, machine in machines.items():
+                        raw = {
+                            "value": event["value"],
+                            "unit": machine.profile["observes"]["unit"],
+                            "quality": event.get("quality", 1.0),
+                        }
+                        outcomes[pid], _ = machine.reading(raw, "appended", "accepted")
+                    if deferred:
+                        if all(outcome is None for outcome in outcomes.values()):
+                            startup_command = "de_energised"
+                            seen["startup_command"].add(startup_command)
+                            deferred = False
+                    expected = event.get("expect_outcomes", {})
+                    for pid, outcome in outcomes.items():
+                        if expected.get(pid) != outcome:
+                            fail(f"{label}: {pid} expected outcome {expected.get(pid)} but the contract gives {outcome}")
+                else:
+                    fail(f"{label}: multi-profile cases carry only startup and reading events")
+                for pid, machine in machines.items():
+                    if event["expect_states"][pid] != machine.state:
+                        fail(f"{label}: {pid} expected state {event['expect_states'][pid]} but the contract gives {machine.state}")
+                    seen["states"].add(machine.state)
+                if event.get("expect_startup_command", startup_command) != startup_command:
+                    fail(f"{label}: expected startup command {event.get('expect_startup_command')} but the contract gives {startup_command}")
+            continue
         profile = resolve_profile(case["profile"], fixtures, shipped, name)
         require_ratified(profile, name)
         trip_point = trip_point_for(profile, case["zone"])
@@ -571,20 +833,62 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
         machine = Zone(profile, case["zone"], trip_point)
         if not case["events"] or case["events"][0]["event"] != "startup":
             fail(f"{name}: the first event must be startup")
+        deferred = False
         for index, event in enumerate(case["events"]):
             kind = event["event"]
             outcome: str | None = None
             refusal: str | None = None
             rejected: str | None = None
+            startup_command: str | None = None
+            retry_outcome: str | None = None
             if kind == "startup" or kind == "restart":
-                machine.startup(event["durable_state"])
+                journal = event.get("durable_journal", [])
+                has_unresolved = any(
+                    isinstance(e, dict) and "intent" in e
+                    and isinstance(e["intent"], dict) and not e["intent"].get("resolved", False)
+                    for e in journal
+                )
+                # Coherence: the declared durables must be reachable from
+                # this case's own history. An unresolved intent requires the
+                # last trip to have appended one; a residual restart with no
+                # journal after a trip requires that append to have failed.
+                if kind == "restart":
+                    if has_unresolved and machine.last_intent_appended is not True:
+                        fail(f"{name}: an unresolved intent its history never appended")
+                    if (
+                        not journal
+                        and event["durable_state"] == "none"
+                        and machine.last_intent_appended is True
+                    ):
+                        fail(f"{name}: an appended intent cannot vanish; only append_failed leaves nothing")
+                startup_command = machine.startup(
+                    event["durable_state"], journal, event.get("durable_command_status"),
+                    case.get("binding_seq_in_force", 1), seen,
+                )
+                deferred = startup_command == "deferred"
                 if kind == "startup" and index != 0:
                     fail(f"{name}: startup may only be the first event")
+                seen["startup_command"].add(startup_command)
             elif kind == "safety_path_confirmed":
                 machine.safety_path = True
             elif kind == "reading":
                 raw = {"value": event["value"], "unit": profile["observes"]["unit"], "quality": event.get("quality", 1.0)}
-                outcome, rejected = machine.reading(raw)
+                outcome, rejected = machine.reading(
+                    raw, event.get("intent_result", "appended"), event.get("driver_result", "accepted")
+                )
+                if outcome == "open_protected_circuit":
+                    machine.record_state = (
+                        "pending" if event.get("record_result", "committed") == "write_failed"
+                        else "committed"
+                    )
+                    seen["record"].add(machine.record_state)
+                if deferred and rejected is None:
+                    # The deferred startup command is licensed only by a
+                    # credible reading that tripped nothing.
+                    if outcome is None:
+                        startup_command = "de_energised"
+                        seen["startup_command"].add(startup_command)
+                    deferred = outcome is not None
             elif kind == "arm_attempt":
                 outcome, refusal = machine.arm()
                 if refusal:
@@ -593,6 +897,20 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
                 outcome, refusal = machine.reset()
                 if refusal:
                     seen["reset"].add(refusal)
+            elif kind == "retry_tick":
+                retry_outcome = machine.retry(event.get("driver_result", "accepted"))
+                seen["retry"].add(retry_outcome)
+            elif kind == "record_retry_tick":
+                machine.record_retry(event.get("record_result", "committed"))
+                seen["record"].add(machine.record_state)
+            elif kind == "effect_report":
+                machine.effect_report(event["result"])
+            elif kind == "binding_removed":
+                machine.remove_binding()
+            elif kind == "orphan_retirement":
+                refusal = machine.retire_orphan()
+                if refusal:
+                    seen["orphan"].add(refusal)
             elif kind == "external":
                 if event["source"] not in EXTERNAL_SOURCES:
                     fail(f"{name}: unknown external source {event['source']!r}")
@@ -609,7 +927,51 @@ def check_lifecycle(shipped: dict[str, dict], seen: dict[str, set[str]]) -> None
                 fail(f"{label}: expected refusal {event.get('expect_refusal')} but the contract gives {refusal}")
             if event.get("expect_rejected") != rejected:
                 fail(f"{label}: expected rejected {event.get('expect_rejected')} but the contract gives {rejected}")
+            if "expect_command_status" in event:
+                if event["expect_command_status"] != machine.command_status:
+                    fail(f"{label}: expected command status {event['expect_command_status']} but the contract gives {machine.command_status}")
+                seen["command_status"].add(machine.command_status)
+            if event.get("expect_startup_command", startup_command) != startup_command:
+                fail(f"{label}: expected startup command {event.get('expect_startup_command')} but the contract gives {startup_command}")
+            if event.get("expect_retry", retry_outcome) != retry_outcome:
+                fail(f"{label}: expected retry {event.get('expect_retry')} but the contract gives {retry_outcome}")
+            if event.get("expect_orphaned", machine.orphaned) != machine.orphaned:
+                fail(f"{label}: expected orphaned {event.get('expect_orphaned')} but the contract gives {machine.orphaned}")
+            if event.get("expect_retired", machine.retired) != machine.retired:
+                fail(f"{label}: expected retired {event.get('expect_retired')} but the contract gives {machine.retired}")
+            if event.get("expect_record", machine.record_state) != machine.record_state:
+                fail(f"{label}: expected record {event.get('expect_record')} but the contract gives {machine.record_state}")
+            if event.get("expect_effect", machine.effect) != machine.effect:
+                fail(f"{label}: expected effect {event.get('expect_effect')} but the contract gives {machine.effect}")
+            if "expect_effect" in event:
+                seen["effect"].add(machine.effect)
+            if machine.retired:
+                seen["orphan"].add("retired")
+            if machine.orphaned:
+                seen["orphan"].add("orphaned")
             seen["states"].add(machine.state)
+
+    for case in data.get("durable_reject_cases", []):
+        name = case["name"]
+        if name in names:
+            fail(f"lifecycle.json: duplicate case name {name}")
+        names.add(name)
+        machine = Zone(
+            resolve_profile(case["profile"], fixtures, shipped, name), case["zone"],
+            trip_point_for(resolve_profile(case["profile"], fixtures, shipped, name), case["zone"]),
+        )
+        failed = False
+        try:
+            machine.startup(
+                case["durable_state"], case.get("durable_journal", []),
+                case.get("durable_command_status"),
+                case.get("binding_seq_in_force", 1), seen,
+            )
+        except Failure:
+            failed = True
+        if not failed:
+            fail(f"{name}: an out-of-vocabulary durable record must refuse, not load")
+        seen["orphan"].add("durable_reject")
 
 
 # ------------------------------------------------------------------- driver
@@ -638,6 +1000,30 @@ def check_coverage(seen: dict[str, set[str]]) -> None:
     for state in STATES:
         if state not in seen["states"]:
             missing.append(f"state {state}")
+    for status in COMMAND_STATUSES[1:]:
+        if status not in seen["command_status"]:
+            missing.append(f"command status {status}")
+    for command in ("de_energised", "deferred", "none"):
+        if command not in seen["startup_command"]:
+            missing.append(f"startup command {command}")
+    for outcome in ("attempted", "skipped"):
+        if outcome not in seen["retry"]:
+            missing.append(f"retry outcome {outcome}")
+    for marker in ("orphaned", "retired", "not_orphaned", "durable_reject"):
+        if marker not in seen["orphan"]:
+            missing.append(f"orphan lifecycle {marker}")
+    for marker in ("resolved_by_record", "duplicate_collapse", "mismatch_orphan",
+                   "malformed_fail_closed", "legacy_pending", "cleared"):
+        if marker not in seen["journal"]:
+            missing.append(f"journal rule {marker}")
+    for state in ("pending", "committed"):
+        if state not in seen["record"]:
+            missing.append(f"record persistence {state}")
+    for effect in ("unknown", "matched", "mismatched"):
+        if effect not in seen["effect"]:
+            missing.append(f"effect verification {effect}")
+    if "later_intent_governs" not in seen["journal"]:
+        missing.append("journal rule later_intent_governs")
     for verdict in ("loaded", "malformed_profile"):
         if verdict not in seen["load"]:
             missing.append(f"profile-load verdict {verdict}")
@@ -652,7 +1038,7 @@ def check_coverage(seen: dict[str, set[str]]) -> None:
 
 
 def main() -> int:
-    seen: dict[str, set[str]] = {key: set() for key in ("load", "status", "legacy", "activation", "evaluation", "rejection", "arm", "reset", "external", "states")}
+    seen: dict[str, set[str]] = {key: set() for key in ("load", "status", "legacy", "activation", "evaluation", "rejection", "arm", "reset", "external", "states", "command_status", "startup_command", "retry", "orphan", "journal", "record", "effect")}
     try:
         profiles = load_profiles()
         for profile in profiles.values():
