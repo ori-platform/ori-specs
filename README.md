@@ -43,6 +43,10 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | Design target, pre-ratification; release-owned Tier D conditions activated by commissioned zones |
 | Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | Design target, pre-ratification; signed skill authority ceiling, capped at Tier C |
 | Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | Design target, pre-ratification; issuance, custody, rotation, denial by signed release, implicit Tier A |
+| Safety qualification fixture | [safety-qualification-fixture/v1.md](safety-qualification-fixture/v1.md) | Design target, pre-ratification; the bounded, release-signed instrument that exercises one candidate safety profile on one commissioned zone under supervision |
+| Safety profile ratification | [safety-profile/ratification.md](safety-profile/ratification.md) | Design target, pre-ratification; the six arguments a dossier must close before a profile's status may flip, and who decides |
+| Qualification session procedure | [safety-qualification-fixture/procedure.md](safety-qualification-fixture/procedure.md) | Design target, pre-ratification; how a supervised session is conducted, and the source of the fixture exposure ceilings |
+| Hazard session procedure | [safety-qualification-fixture/hazard-session.md](safety-qualification-fixture/hazard-session.md) | Design target, pre-ratification and unreviewed; discrimination and protection runs for the trip-point argument |
 
 ## Gaps
 

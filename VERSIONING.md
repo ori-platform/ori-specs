@@ -21,7 +21,7 @@ A version increment means a breaking change for implementers.
 | evidence-audit             | v1      | Design target, pre-ratification; no deployed conforming service |
 | evidence-commissioning-ingest | v1   | Design target, pre-ratification; no implementation                |
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
-| runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
+| runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1; an additive, optional `safety_zones` surface is drafted and unmerged |
 | runtime-telemetry          | v1      | Implemented baseline                                             |
 | runtime-mobile             | v1      | Implemented baseline                                             |
 | device-policy              | v1      | Implemented baseline                                             |
@@ -35,7 +35,7 @@ A version increment means a breaking change for implementers.
 | runtime-release-bundle     | v1      | Design target                                                    |
 | signing                    | v1      | Runtime manifest and SDK profiles implemented; adoption pending  |
 | runtime-evidence-anchor    | v1      | Design target, pre-ratification; derivation implemented in runtime and the evidence authority, the latter not yet vector-proven |
-| evidence                   | v2      | Design target, pre-ratification; produced by runtime, verified by the evidence authority; v1 retained for rows written by the retired private producer |
+| evidence                   | v2      | Design target, pre-ratification; produced by runtime, verified by the evidence authority; v1 retained for rows written by the retired private producer; a breaking `authority` requirement on `runtime_action` payloads is drafted and unmerged |
 | evidence-exchange          | v1      | Design target, pre-ratification; every half implemented on main, no shipped or end-to-end proven exchange |
 | firmware-telemetry         | v1      | Implemented baseline; HIL pending                                |
 | firmware-commands          | v1      | Implemented baseline; HIL pending                                |
@@ -43,6 +43,7 @@ A version increment means a breaking change for implementers.
 | firmware-mqtt-provisioning | v1      | Implemented baseline; HIL pending                                |
 | commissioned-safety-binding | v1    | Design target, pre-ratification; no shipped conforming consumer |
 | safety-profile             | v1      | Design target, pre-ratification; no shipped conforming consumer |
+| safety-qualification-fixture | v1    | Design target, pre-ratification; no corpus and no implementation |
 
 ## Compatibility
 

@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+"""Check the safety-qualification-fixture corpus against the contract.
+
+The corpus makes two claims that a human check keeps getting wrong: that its
+bytes and signatures are what they say, and that its fixture cases are
+**deferred** rather than exercised. The second is the one that matters most.
+While the exposure ceilings are unratified, a conforming consumer refuses every
+fixture at stage 0 with `limits_unratified`, before the stage each fixture case
+declares — so those cases cannot demonstrate that the later check exists. A
+suite that quietly counted them would report coverage the implementation does
+not have, which is the failure this script is written to prevent.
+
+The deferral rule is not hardcoded. It is derived from the contract: if
+`limits_unratified` is still in the acceptance order, every fixture case MUST
+be marked deferred; once the ceiling amendment removes stage 0, every fixture
+case MUST stop being deferred and start being exercised. Neither state can be
+left behind, because this script refuses the other one.
+
+For the **withdrawal** document this script carries a reference decision
+procedure and decides each case's verdict from the bytes, rather than reading
+the verdict the case declares. That is what lets a withdrawal case be called
+exercised: strict parsing, key selection, signature, authority, freshness, and
+the retained-state transition an acceptance performs are all recomputed here
+and compared with what the case claims. It is still not evidence about any
+consumer — that needs the independent verifier, in another language, that
+ratification waits on.
+
+For the **fixture** document it decides nothing, because stage 0 refuses every
+fixture before the stage each case declares. Those cases are checked for bytes,
+signatures and deferral only, and are never counted as coverage.
+
+Run from the repository root:
+
+    python3 scripts/check-safety-qualification-fixture-vectors
+
+Requires the `cryptography` package for Ed25519 verification; it refuses to run
+without it rather than skipping the signatures. Exits non-zero on the first
+unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+except ImportError:  # pragma: no cover - the gate refuses rather than skips
+    sys.exit("cryptography is required: pip install cryptography")
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "safety-qualification-fixture" / "vectors" / "fixture-vectors-v1.json"
+CONTRACT = ROOT / "safety-qualification-fixture" / "v1.md"
+
+FAILURES: list[str] = []
+
+
+def fail(msg: str) -> None:
+    FAILURES.append(msg)
+
+
+def canonical(obj) -> bytes:
+    """Recursively sorted keys, no insignificant whitespace, UTF-8."""
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+# Fields the contract declares `integer`. A float or boolean spelling of any of
+# them is `malformed` at `parses`, which a decoded document cannot show.
+INTEGER_FIELDS = {
+    "v",
+    "fixture_seq",
+    "binding_seq",
+    "issued_at_ms",
+    "not_after_ms",
+    "max_sessions",
+    "session_limit_seconds",
+    "withdraws_through",
+}
+
+FIXTURE_ORDER = [
+    "contract_limits",
+    "parses",
+    "device_id",
+    "key_selection",
+    "signature",
+    "authority",
+    "freshness",
+    "validity",
+    "posture",
+    "binding_match",
+    "pair_resolution",
+    "pair_eligibility",
+]
+WITHDRAWAL_ORDER = [
+    "parses",
+    "device_id",
+    "key_selection",
+    "signature",
+    "authority",
+    "withdrawal_freshness",
+]
+
+# Every verdict the contract names, and the one stage it is decided at.
+VERDICT_STAGE = {
+    "limits_unratified": "contract_limits",
+    "malformed": "parses",
+    "wrong_device": "device_id",
+    "anchor_collision": "key_selection",
+    "unknown_signer": "key_selection",
+    "bad_signature": "signature",
+    "wrong_authority": "authority",
+    "superseded_signer": "authority",
+    "stale": {"freshness", "withdrawal_freshness"},
+    "seq_reused": "freshness",
+    "expired": "validity",
+    "window_too_long": "validity",
+    "posture_forbidden": "posture",
+    "binding_mismatch": "binding_match",
+    "binding_not_in_force": "binding_match",
+    "unknown_profile": "pair_resolution",
+    "profile_not_candidate": "pair_resolution",
+    "unknown_zone": "pair_resolution",
+    "outcome_mismatch": "pair_resolution",
+    "not_eligible": "pair_eligibility",
+    "unit_mismatch": "pair_eligibility",
+    "direction_unsupported": "pair_eligibility",
+    "parameter_mismatch": "pair_eligibility",
+    "trip_point_unobservable": "pair_eligibility",
+    "undemonstrated_binding": "pair_eligibility",
+    "zone_contended": "pair_eligibility",
+}
+
+
+def stage_zero_in_force(text: str) -> bool:
+    """Is the contract still refusing every fixture before it is parsed?"""
+    return "| 0 | `contract_limits` | `limits_unratified` |" in text
+
+
+def verify_signature(pub_b64: str, message: bytes, sig_field: str) -> bool:
+    try:
+        raw = base64.b64decode(pub_b64, validate=True)
+        sig = base64.b64decode(sig_field.split("ed25519:", 1)[1], validate=True)
+        Ed25519PublicKey.from_public_bytes(raw).verify(sig, message)
+        return True
+    except (InvalidSignature, ValueError, IndexError):
+        return False
+
+
+class Refused(Exception):
+    def __init__(self, reason: str, stage: str):
+        super().__init__(f"{reason} at {stage}")
+        self.reason, self.stage = reason, stage
+
+
+def _b64_raw(field: str, prefix: str, length: int) -> bytes:
+    if not isinstance(field, str) or not field.startswith(prefix):
+        raise Refused("malformed", "parses")
+    try:
+        raw = base64.b64decode(field[len(prefix) :], validate=True)
+    except ValueError as exc:
+        raise Refused("malformed", "parses") from exc
+    if len(raw) != length:
+        raise Refused("malformed", "parses")
+    return raw
+
+
+WITHDRAWAL_KEYS = {
+    "v",
+    "device_id",
+    "issued_at_ms",
+    "withdraws_through",
+    "signer_id",
+    "signing_key",
+    "actor",
+    "reason",
+}
+NON_EMPTY = ("device_id", "signer_id", "actor", "reason")
+
+
+def parse_withdrawal(envelope: dict) -> dict:
+    """Strict grammar. Every violation is `malformed` at `parses`."""
+    if not isinstance(envelope, dict) or set(envelope) != {"withdrawal", "signature"}:
+        raise Refused("malformed", "parses")
+    body = envelope["withdrawal"]
+    if not isinstance(body, dict) or set(body) != WITHDRAWAL_KEYS:
+        raise Refused("malformed", "parses")
+    for field in ("v", "issued_at_ms", "withdraws_through"):
+        value = body[field]
+        # A boolean is not an integer, though Python's bool subclasses int.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise Refused("malformed", "parses")
+    if body["v"] != 1 or body["issued_at_ms"] < 1 or body["withdraws_through"] < 1:
+        raise Refused("malformed", "parses")
+    for field in NON_EMPTY:
+        value = body[field]
+        if not isinstance(value, str) or not value.strip():
+            raise Refused("malformed", "parses")
+    _b64_raw(body["signing_key"], "ed25519:", 32)
+    _b64_raw(envelope["signature"], "ed25519:", 64)
+    return body
+
+
+# Every anchor a deployment configures. The qualification anchors are the two
+# this contract owns; the rest belong to neighbouring contracts and are compared
+# against, never added to.
+QUALIFICATION_ANCHORS = ("qualification_current", "qualification_previous")
+FOREIGN_ANCHORS = (
+    "provisioning",
+    "commissioning_current",
+    "commissioning_previous",
+    "config_signing",
+)
+
+
+def anchor_collision(anchors: dict) -> bool:
+    """Does any qualification anchor share key material with a foreign one?
+
+    Optional anchors are modelled by absence, not by a sentinel. A deployment
+    that configures no previous qualification anchor, or no previous
+    commissioning generation, is an ordinary configuration: it must reach a
+    contract verdict, never an exception. Indexing an optional anchor
+    unconditionally is how a valid configuration becomes a crash.
+    """
+    qualification = {
+        anchors[name] for name in QUALIFICATION_ANCHORS if anchors.get(name) is not None
+    }
+    foreign = {
+        anchors[name] for name in FOREIGN_ANCHORS if anchors.get(name) is not None
+    }
+    return bool(qualification & foreign)
+
+
+def decide_withdrawal(envelope: dict, scenario: dict, state: dict) -> dict:
+    """Decide one withdrawal, or raise Refused(reason, stage).
+
+    Returns the retained state the acceptance produces, so a case's declared
+    transition is checked rather than asserted.
+    """
+    anchors = scenario["anchors"]
+    body = parse_withdrawal(envelope)
+
+    if body["device_id"] != scenario["device_id"]:
+        raise Refused("wrong_device", "device_id")
+
+    # key_selection: the collision precondition, then exactly one candidate
+    # chosen by comparing key material. No signature is attempted against a
+    # key the document did not name.
+    if anchor_collision(anchors):
+        raise Refused("anchor_collision", "key_selection")
+    named = body["signing_key"].split("ed25519:", 1)[1]
+    selected = next(
+        (n for n, k in anchors.items() if k is not None and k == named), None
+    )
+    if selected is None:
+        raise Refused("unknown_signer", "key_selection")
+
+    message = canonical(body)
+    if not verify_signature(named, message, envelope["signature"]):
+        raise Refused("bad_signature", "signature")
+
+    # authority: only now, over a document proven to be signed by the key it
+    # names. Deciding this earlier would let anyone name a public key over
+    # arbitrary bytes and manufacture the verdict.
+    if selected == "qualification_previous":
+        raise Refused("superseded_signer", "authority")
+    if selected != "qualification_current":
+        # Any other configured anchor — provisioning, either commissioning
+        # generation, config signing — is a key with authority somewhere else.
+        raise Refused("wrong_authority", "authority")
+
+    if body["withdraws_through"] < state["min_acceptable_seq"]:
+        raise Refused("stale", "withdrawal_freshness")
+
+    through = body["withdraws_through"]
+    covered = state.get("accepted_seq") is not None and state["accepted_seq"] <= through
+    return {
+        "min_acceptable_seq": through + 1,
+        "accepted_seq": None if covered else state.get("accepted_seq"),
+        "accepted_hash": None if covered else state.get("accepted_hash"),
+        "sessions_opened": 0 if covered else state.get("sessions_opened", 0),
+    }
+
+
+def strict_parse_bytes(raw: bytes) -> dict:
+    """Parse wire bytes under the rules decoding destroys.
+
+    Duplicate keys, an integer field spelled as a float, and a lone surrogate
+    are all invisible to a decoded document, so they are decided here.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Refused("malformed", "parses") from exc
+
+    def no_duplicates(pairs):
+        seen = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise Refused("malformed", "parses")
+            seen.add(key)
+        return dict(pairs)
+
+    class Float(float):
+        pass
+
+    try:
+        decoded = json.loads(text, object_pairs_hook=no_duplicates, parse_float=Float)
+    except ValueError as exc:
+        raise Refused("malformed", "parses") from exc
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in INTEGER_FIELDS and isinstance(value, Float):
+                    raise Refused("malformed", "parses")
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, str) and any(0xD800 <= ord(ch) <= 0xDFFF for ch in node):
+            raise Refused("malformed", "parses")
+
+    walk(decoded)
+    return decoded
+
+
+def check_document_case(case: dict, kind: str, order: list[str], corpus: dict) -> None:
+    cid = case["id"]
+    body = case["envelope"].get(kind)
+    if body is None:
+        fail(f"{cid}: envelope carries no `{kind}` object")
+        return
+
+    # 1. bytes reproduce from the document beside them
+    cb = canonical(body)
+    if case.get("canonical_hex") != cb.hex():
+        fail(f"{cid}: canonical_hex does not reproduce from the document")
+    if case.get("canonical_sha256") != hashlib.sha256(cb).hexdigest():
+        fail(f"{cid}: canonical_sha256 does not match the canonical bytes")
+    if case.get("message_hex") != cb.hex():
+        fail(f"{cid}: message_hex is not the signed canonical bytes")
+
+    # 2. integer fields are spelled as integers
+    for field in INTEGER_FIELDS & set(body):
+        value = body[field]
+        if case["expected"] == "reject":
+            continue
+        if isinstance(value, bool):
+            fail(f"{cid}: `{field}` is a boolean in a case expected to accept")
+        elif isinstance(value, float):
+            fail(f"{cid}: `{field}` is spelled as a float in an accept case")
+
+    # 3. the signature verifies exactly as declared
+    key_field = body.get("signing_key", "")
+    pub = key_field.split("ed25519:", 1)[-1] if key_field else ""
+    ok = (
+        verify_signature(pub, cb, case["envelope"].get("signature", ""))
+        if pub
+        else False
+    )
+    if ok is not bool(case.get("signature_valid")):
+        fail(
+            f"{cid}: signature_valid says {case.get('signature_valid')}, verification says {ok}"
+        )
+
+    if case["expected"] == "accept":
+        if not case.get("signature_valid"):
+            fail(f"{cid}: an accept case must carry a valid signature")
+        return
+
+    # 4. the verdict is decided at the one stage the contract decides it at
+    reason, stage = case.get("reason"), case.get("stage")
+    expected = VERDICT_STAGE.get(reason)
+    if expected is None:
+        fail(f"{cid}: `{reason}` is not a verdict this contract names")
+    elif isinstance(expected, set):
+        if stage not in expected:
+            fail(f"{cid}: `{reason}` is decided at {sorted(expected)}, not `{stage}`")
+    elif stage != expected:
+        fail(f"{cid}: `{reason}` is decided at `{expected}`, not `{stage}`")
+    if stage not in order:
+        fail(f"{cid}: stage `{stage}` is not in the {kind} acceptance order")
+        return
+
+    # 5. a refusal after the signature stage only demonstrates its check ran
+    #    if the signature was good
+    if order.index(stage) > order.index("signature") and not case.get(
+        "signature_valid"
+    ):
+        fail(f"{cid}: refused at `{stage}`, after signature, with an invalid signature")
+
+
+def enforce_deferral(case: dict, kind: str, deferred_required: bool) -> None:
+    """Every fixture case is deferred while stage 0 stands, whatever list it is in.
+
+    The rule belongs to the document kind, not to one group of cases: a fixture
+    envelope is refused at stage 0 exactly as a fixture body is, so counting it
+    while deferring its siblings would report coverage from the same blocked
+    path under a different heading.
+    """
+    if kind == "fixture":
+        if deferred_required and not case.get("deferred"):
+            fail(
+                f"{case['id']}: stage 0 is in force, so this fixture case must be "
+                "marked deferred and must not be counted as coverage"
+            )
+        if not deferred_required and case.get("deferred"):
+            fail(
+                f"{case['id']}: stage 0 has been removed from the contract — this "
+                "fixture case must now be exercised rather than deferred"
+            )
+    elif case.get("deferred"):
+        fail(
+            f"{case['id']}: a withdrawal case must never be deferred — "
+            "stage 0 does not refuse a withdrawal, so its verdict can be decided"
+        )
+
+
+def decide_case(case: dict, scenario: dict) -> None:
+    """Decide the case from its bytes and hold it to what it declares."""
+    cid = case["id"]
+    state = case.get("retained_state") or {"min_acceptable_seq": 1}
+    if "scenario_override" in case:
+        scenario = dict(scenario, anchors=case["scenario_override"])
+    try:
+        after = decide_withdrawal(case["envelope"], scenario, state)
+    except Refused as refusal:
+        if case["expected"] == "accept":
+            fail(f"{cid}: expected accept, decided {refusal.reason} at {refusal.stage}")
+        elif (refusal.reason, refusal.stage) != (case.get("reason"), case.get("stage")):
+            fail(
+                f"{cid}: decided {refusal.reason}/{refusal.stage}, "
+                f"case declares {case.get('reason')}/{case.get('stage')}"
+            )
+        return
+    if case["expected"] != "accept":
+        fail(
+            f"{cid}: expected {case.get('reason')} at {case.get('stage')}, but it was accepted"
+        )
+        return
+    expected_after = case.get("expected_state_after")
+    if expected_after is None:
+        fail(
+            f"{cid}: an accept case must declare the retained state its acceptance produces"
+        )
+    elif after != expected_after:
+        fail(f"{cid}: acceptance produces {after}, case declares {expected_after}")
+
+
+def main() -> int:
+    if not CORPUS.exists():
+        return fail_out(f"corpus missing: {CORPUS}")
+    corpus = json.loads(CORPUS.read_text())
+    contract = CONTRACT.read_text()
+
+    if corpus.get("acceptance_order") != FIXTURE_ORDER:
+        fail("corpus acceptance_order disagrees with the contract's stage list")
+    if corpus.get("withdrawal_acceptance_order") != WITHDRAWAL_ORDER:
+        fail("corpus withdrawal_acceptance_order disagrees with the contract")
+
+    deferred_required = stage_zero_in_force(contract)
+
+    scenario = corpus.get("scenario")
+    if not scenario:
+        fail("corpus carries no scenario, so no verdict can be decided from it")
+        scenario = {"device_id": "", "anchors": {}}
+    for name in QUALIFICATION_ANCHORS + FOREIGN_ANCHORS:
+        if name not in scenario.get("anchors", {}):
+            fail(
+                f"the scenario configures no `{name}` anchor, so collisions "
+                "against it cannot be decided"
+            )
+
+    for case in corpus.get("withdrawal_cases", []) + corpus.get(
+        "withdrawal_reject_cases", []
+    ):
+        check_document_case(case, "withdrawal", WITHDRAWAL_ORDER, corpus)
+        enforce_deferral(case, "withdrawal", deferred_required)
+        decide_case(case, scenario)
+
+    for case in corpus.get("fixture_cases_deferred", []):
+        check_document_case(case, "fixture", FIXTURE_ORDER, corpus)
+        enforce_deferral(case, "fixture", deferred_required)
+
+    # Withdrawal coverage is real, so it is required to be complete.
+    covered = {c.get("stage") for c in corpus.get("withdrawal_reject_cases", [])}
+    for stage in WITHDRAWAL_ORDER:
+        if stage not in covered:
+            fail(f"no withdrawal reject case stops at `{stage}`")
+    if not corpus.get("withdrawal_cases"):
+        fail("no withdrawal accept case")
+
+    # Every verdict the contract names has at least one case somewhere.
+    named = {
+        c.get("reason")
+        for group in (
+            "withdrawal_reject_cases",
+            "fixture_cases_deferred",
+            "envelope_reject_cases",
+            "raw_reject_cases",
+            "config_reject_cases",
+        )
+        for c in corpus.get(group, [])
+    }
+    for verdict in VERDICT_STAGE:
+        if verdict == "limits_unratified":
+            continue  # stage 0 refuses every fixture case; it has no case of its own
+        if verdict not in named:
+            fail(f"no case carries the verdict `{verdict}`")
+
+    # Envelope cases are grammar, and the grammar is decided, not declared.
+    for case in corpus.get("envelope_reject_cases", []) + corpus.get(
+        "raw_reject_cases", []
+    ):
+        kind = case.get("kind")
+        if kind not in ("fixture", "withdrawal"):
+            fail(
+                f"{case['id']}: carries no document kind, so its deferral cannot be decided"
+            )
+            continue
+        enforce_deferral(case, kind, deferred_required)
+
+    for case in corpus.get("envelope_reject_cases", []):
+        if case.get("kind") != "withdrawal":
+            continue  # a fixture envelope is refused at stage 0, so nothing is decided
+        try:
+            parse_withdrawal(case["envelope"])
+        except Refused as refusal:
+            if (refusal.reason, refusal.stage) != (
+                case.get("reason"),
+                case.get("stage"),
+            ):
+                fail(
+                    f"{case['id']}: decided {refusal.reason}/{refusal.stage}, "
+                    f"case declares {case.get('reason')}/{case.get('stage')}"
+                )
+        else:
+            fail(f"{case['id']}: expected a refusal, the grammar accepted it")
+
+    # Configuration cases: the collision precondition, recomputed from the
+    # anchors each case configures, across every source the contract names.
+    for case in corpus.get("config_reject_cases", []):
+        collides = anchor_collision(case.get("config", {}))
+        if case["expected"] == "reject":
+            if case.get("reason") != "anchor_collision":
+                fail(
+                    f"{case['id']}: the only configuration verdict is anchor_collision"
+                )
+            elif not collides:
+                fail(f"{case['id']}: declares anchor_collision, but no anchor collides")
+        elif collides:
+            fail(f"{case['id']}: expected accept, but its anchors collide")
+
+    # Every collision source the contract names carries a case of its own.
+    reference = corpus.get("scenario", {}).get("anchors", {})
+    for foreign in FOREIGN_ANCHORS:
+        material = reference.get(foreign)
+        covered = any(
+            material is not None
+            and any(
+                c.get("config", {}).get(q) == material for q in QUALIFICATION_ANCHORS
+            )
+            for c in corpus.get("config_reject_cases", [])
+        )
+        if not covered:
+            fail(
+                f"no configuration case collides a qualification anchor with `{foreign}`"
+            )
+    if not any(
+        c.get("config", {}).get("qualification_previous") is None
+        for c in corpus.get("config_reject_cases", [])
+    ):
+        fail("no configuration case omits the optional previous qualification anchor")
+
+    # Raw cases: decided under the byte-level rules, and really raw.
+    for case in corpus.get("raw_reject_cases", []):
+        raw = bytes.fromhex(case["raw_hex"])
+        try:
+            strict_parse_bytes(raw)
+        except Refused as refusal:
+            if (refusal.reason, refusal.stage) != (
+                case.get("reason"),
+                case.get("stage"),
+            ):
+                fail(
+                    f"{case['id']}: decided {refusal.reason}/{refusal.stage}, "
+                    f"case declares {case.get('reason')}/{case.get('stage')}"
+                )
+        else:
+            fail(
+                f"{case['id']}: byte-level parsing accepted it; the rule it names does not hold"
+            )
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            continue  # does not decode at all, which is the point
+        try:
+            reserialised = canonical(decoded)
+        except UnicodeEncodeError:
+            # Decoded to something with no UTF-8 encoding — a lone surrogate.
+            # That is exactly what such a case exists to carry, and it is why
+            # the rule belongs to the bytes: a Python parser raises here while
+            # another language substitutes a replacement character and carries
+            # on, so the two would disagree about a document neither refused.
+            continue
+        if reserialised == raw:
+            fail(
+                f"{case['id']}: already canonical, so it proves nothing a decoded case could not"
+            )
+
+    if FAILURES:
+        for f in FAILURES:
+            print(f"FAIL: {f}", file=sys.stderr)
+        return 1
+
+    print(
+        f"safety-qualification-fixture corpus OK — "
+        f"{len(corpus.get('withdrawal_cases', []))} withdrawal accept, "
+        f"{len(corpus.get('withdrawal_reject_cases', []))} withdrawal reject (exercised), "
+        f"{len(corpus.get('fixture_cases_deferred', []))} fixture cases "
+        f"({'deferred' if deferred_required else 'exercised'}), "
+        f"{len(corpus.get('envelope_reject_cases', []))} envelope, "
+        f"{len(corpus.get('raw_reject_cases', []))} raw, "
+        f"{len(corpus.get('config_reject_cases', []))} config"
+    )
+    return 0
+
+
+def fail_out(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
