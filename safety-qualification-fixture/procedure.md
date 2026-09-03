@@ -83,7 +83,7 @@ procedural one.
 A session MUST NOT open unless all of the following hold. They are checked and
 recorded, not assumed.
 
-**On the device**
+### On the device
 
 - The commissioned binding for the zone is **in force** — both proof legs,
   circuit and control — and its hash matches the fixture's.
@@ -93,7 +93,7 @@ recorded, not assumed.
 - The durable session state is readable, and sessions remain against
   `max_sessions`.
 
-**On the circuit**
+### On the circuit
 
 - The zone's commissioned `rated_capacity` is **true of the circuit**: its
   limiting element is identified, its rating documented, its `provenance`
@@ -109,7 +109,7 @@ recorded, not assumed.
 - The load can be interrupted without damage. Qualification interrupts it,
   possibly repeatedly.
 
-**In the room**
+### In the room
 
 - **An independent means of removing power, not under the runtime's control**,
   within reach of the person supervising. This is the one precondition with no

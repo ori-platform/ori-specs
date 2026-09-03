@@ -110,19 +110,24 @@ circuit requirements above, plus:
   since repeated over-rating accumulates thermal damage that no single run
   shows.
 
-Then, replacing steps 7 and 8 of [procedure.md](procedure.md#the-session):
+Then, replacing steps 7 and 8 of [procedure.md](procedure.md#the-session), and
+adding one:
 
-7. **Ramp.** Raise the current toward the trip point in stated increments,
-   holding at each, with both the reference instrument and the runtime
-   recording. Hold below the trip point at least once — a negative run — and
-   confirm nothing fires.
-8. **Cross and observe.** Continue past the trip point. Record, from the
-   reference instrument, the current at which the circuit actually opened and
-   the elapsed time from crossing to interruption; and from the runtime, the
-   reading that satisfied the condition, the verdict, `intent_append_ms`,
-   `command_issue_ms`, the command status, and the observed effect.
-9. **Inspect.** Before any further run, inspect the limiting element for
-   thermal damage and record the result.
+**Step 7 — Ramp.** Raise the current toward the trip point in stated
+increments, holding at each, with both the reference instrument and the runtime
+recording. Hold below the trip point at least once — a negative run — and
+confirm nothing fires.
+
+**Step 8 — Cross and observe.** Continue past the trip point. Record, from the
+reference instrument, the current at which the circuit actually opened and the
+elapsed time from crossing to interruption; and from the runtime, the reading
+that satisfied the condition, the verdict, `intent_append_ms`,
+`command_issue_ms`, the command status, and the observed effect.
+
+**Step 9 — Inspect.** Before any further run, inspect the limiting element for
+thermal damage and record the result. This step is additional: the ordinary
+procedure has no equivalent, because a mechanism session does not drive a
+circuit past its rating.
 
 **If the pair does not trip**, the upstream device or the source's own limit
 ends the run. That is a **failed protection run**, it is recorded as one, and
