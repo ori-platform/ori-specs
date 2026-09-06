@@ -90,8 +90,40 @@ accurate description of what a repo implements.
   carries the claim as a distinct phase and records it BLOCKED until such an
   artifact exists. Tracked in `ori-runtime` #335.
 
-  Stock Raspberry Pi OS Trixie ships Python 3.13 only, which no published
-  bundle targets. Tracked in `ori-runtime` #328.
+  Stock Raspberry Pi OS Trixie ships Python 3.13 only. Both 3.13 targets are
+  now published and the contract names them; `ori-runtime` #328 is closed, and
+  `v2.5.0-rc.7` was installed and proven on Trixie `aarch64` under system
+  Python 3.13.
+
+  A third supported interpreter widens a separate gap rather than closing one:
+  re-running the installer on a host that has gained an interpreter silently
+  resolves to a different target, because the installed state does not record
+  which target it was built for. The reinstall works and says nothing. Tracked
+  in `ori-runtime` #361.
+
+## runtime-mobile/v2 design targets
+
+- **No conformance corpus exists**
+  ([runtime-mobile/v2.md](../runtime-mobile/v2.md)): the contract defines a
+  signed publication and verification grammar for Android payloads and is not
+  implementable from prose alone. No vectors accompany it, so nothing drives
+  the producing signer in `ori-runtime` and the consuming verifier in the
+  Android application against the same bytes, and neither may claim
+  conformance.
+
+  The corpus must cover at minimum one accepted payload per target, a duplicate
+  key, an unknown field, a missing field, each field malformed in turn, a
+  signature made under the release-bundle domain, a `runtime_release_bundle`
+  key entry carrying the same public key, a `revoked` key, a `verify_only` key
+  verifying an existing payload, a digest mismatch, a size mismatch, a wrong
+  `runtime_version`, an `artifact` disagreeing with the derived name, a
+  downloaded basename disagreeing with it, an `artifact` carrying a path
+  separator or a `..` component, each ABI substituted into each other slot
+  including the width-only cases, and a payload absent.
+
+  Until then no release publishes a signed payload, and the Android consumer
+  obtains one by building it from the runtime source tree. Tracked in
+  `ori-runtime` #536.
 
 ## evidence/v1 design targets
 
