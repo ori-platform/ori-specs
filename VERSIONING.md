@@ -23,7 +23,7 @@ A version increment means a breaking change for implementers.
 | cli-commands               | v1      | Runtime entrypoint implemented; CLI command set planned          |
 | runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1; an additive, optional `safety_zones` surface is drafted and unmerged |
 | runtime-telemetry          | v1      | Implemented baseline                                             |
-| runtime-mobile             | v1      | Implemented baseline                                             |
+| runtime-mobile             | v1, v2  | v1 implemented baseline; v2 is a design target adding signed release publication and consumer verification, required of no v1 consumer |
 | device-policy              | v1      | Implemented baseline                                             |
 | offline-tokens             | v1      | Implemented baseline                                             |
 | runtime-config             | v1      | Implemented baseline                                             |
