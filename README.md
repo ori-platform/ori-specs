@@ -20,6 +20,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | Implemented baseline |
+| Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | Design target |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |
