@@ -262,16 +262,18 @@ state of each argument, as of this document:
 | Argument | State | Blocker |
 | --- | --- | --- |
 | 1 Quantity | **Supported** | Semantic pinned to the most limiting series element's continuous rating, with a required `limiting_element`; the binding amendment and its regenerated corpus are unmerged |
-| 2 Measurement | **Open** | `ads1115_current` reports an uncalibrated instantaneous sample as amperes ([ori-runtime#398](https://github.com/ori-platform/ori-runtime/issues/398)); calibration never reaches the adapter |
+| 2 Measurement | **Open** | The adapter now requires `sensitivity_v_per_amp` and `mains_frequency_hz` and reduces a frequency-aligned window to an RMS current, so the quantity is no longer an uncalibrated instantaneous sample. What remains open is target validation: measured accuracy on the supported hardware, adequacy of the window geometry, clipping behaviour at and above the declared range, and the hardware population the result covers ([ori-runtime#398](https://github.com/ori-platform/ori-runtime/issues/398)) |
 | 3 Trip point | **Open** | `2.0` was chosen for equivalence with the legacy trip point and observability on the documented sensor. Neither is a protection or discrimination argument. Whether an instantaneous characteristic suffices is undecided |
 | 4 Latency | **Open** | No measured latency exists on the target. Requires qualification sessions, which require the fixture, which requires its ceilings |
 | 5 Failure modes | **Open** | Not stated for any load class |
 | 6 Coverage | **Open** | Population not identified |
 
-Argument 2 is the true critical path: sessions run against an unvalidated
-measurement produce latency numbers and no evidence about arguments 3 or 6,
-because what was compared against the trip point was not the quantity the
-condition names.
+Argument 2 remains the critical path, for a narrower reason than it once was.
+The quantity the condition names is now the quantity the adapter produces; what
+is unestablished is how accurately it produces it on the target. Sessions run
+before that is measured still yield latency numbers and no evidence about
+arguments 3 or 6, because the accuracy of what was compared against the trip
+point would be unknown.
 
 ### `electrical.overvoltage.v1` — `260.0 V`
 
