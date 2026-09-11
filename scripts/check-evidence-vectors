@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the `evidence/v2` corpus against the contract that owns it.
+
+Both consumers already reconstruct these vectors independently, and in
+different languages — `ori-runtime` in Python, `ori-verity` in Rust. What
+neither can do is stop a broken corpus being published: a consumer discovers the
+problem after vendoring, which is the wrong end of the pipeline. This is the
+check that runs where the contract lives.
+
+Nothing here is imported from whatever produced the vectors, and no expectation
+is read from the file under test. The derivations are restated from `v2.md` —
+the canonical form, the genesis preimage, the eight envelope fields, the hash
+and signature construction — because a check that takes its expectations from
+its subject only proves the subject agrees with itself.
+
+Every rejection case is evaluated for **its own declared rule**. A case that
+fails for some other reason is reported as a failure, not a pass: a reject
+vector that rejects by accident certifies coverage that does not exist, which is
+worse than a missing one.
+
+Run from the repository root:
+
+    python3 scripts/check-evidence-vectors
+
+Exits non-zero on the first unmet requirement, so it is usable as a gate.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import json
+import math
+import pathlib
+import re
+import sys
+import unicodedata
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "evidence" / "vectors"
+
+SCHEMA_VERSION = "ori.evidence.v2"
+GENESIS_PREIMAGE = "ori.evidence.genesis.v2"
+ENVELOPE_FIELDS = frozenset(
+    {
+        "device_id",
+        "emitted_at_ms",
+        "event_id",
+        "event_type",
+        "payload",
+        "prev_event_hash",
+        "schema_version",
+        "sequence_num",
+    }
+)
+EVENT_VOCABULARY = frozenset(
+    {
+        "UPTIME_HEARTBEAT",
+        "OUTAGE_STARTED",
+        "OUTAGE_RESOLVED",
+        "DISPLACEMENT_RECORD",
+        "MAINTENANCE_PERFORMED",
+        "REVENUE_COLLECTED",
+        "UTILISATION_RECORD",
+        "KEY_ROTATION",
+        "SAFETY_ACTION_EXECUTED",
+    }
+)
+
+#: `authority` is required on every `runtime_action` payload, and `kind` selects
+#: the remaining fields — all required, none other permitted. Restated from the
+#: contract rather than read from the corpus.
+AUTHORITY_KINDS: dict[str, frozenset[str]] = {
+    "tier_c_approval": frozenset({"proposal_id"}),
+    "tier_d_profile": frozenset({"profile_id", "zone_id", "binding_seq"}),
+    "tier_d_qualification": frozenset(
+        {"profile_id", "zone_id", "binding_seq", "fixture_hash"}
+    ),
+    "tier_d_legacy_skill": frozenset({"skill_name", "skill_version", "trigger_name"}),
+}
+
+#: Each identifier's grammar belongs to the contract that owns the thing it
+#: names, and is restated here for the same reason everything else is: a check
+#: that reads its expectations from its subject only proves the subject agrees
+#: with itself. Where these and an owning contract disagree, the contract wins
+#: and this is the defect.
+PROPOSAL_ID = re.compile(r"^[A-Z0-9]{8}$")
+PROFILE_ID = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\.v[1-9][0-9]*$")
+SKILL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+FIXTURE_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+#: The skills-package identity-field rule: no control characters (`Cc`, plus
+#: DEL), format characters (`Cf`), line or paragraph separators (`Zl`, `Zp`), or
+#: surrogates (`Cs`).
+FORBIDDEN_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def _identity_clean(value: str) -> bool:
+    return all(
+        unicodedata.category(ch) not in FORBIDDEN_CATEGORIES and ch != "\x7f"
+        for ch in value
+    )
+
+
+def _field_fault(field: str, value: Any) -> str | None:
+    """Why *value* fails *field*'s grammar, or None when it holds."""
+    if field == "binding_seq":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return "binding_seq is not an integer"
+        if not 1 <= value <= INTEGER_MAX:
+            return f"binding_seq {value} is outside 1..{INTEGER_MAX}"
+        return None
+    if not isinstance(value, str):
+        return f"{field} is not a string"
+    if field == "proposal_id":
+        return (
+            None
+            if PROPOSAL_ID.match(value)
+            else f"proposal_id {value!r} is not ^[A-Z0-9]{{8}}$"
+        )
+    if field == "profile_id":
+        return (
+            None
+            if PROFILE_ID.match(value)
+            else f"profile_id {value!r} fails the profile id grammar"
+        )
+    if field == "fixture_hash":
+        return (
+            None
+            if FIXTURE_HASH.match(value)
+            else f"fixture_hash {value!r} is not sha256: plus 64 lowercase hex"
+        )
+    if field == "zone_id":
+        return None if value.strip() else "zone_id is empty after trimming"
+    if field == "skill_name":
+        if len(value) > 64:
+            return "skill_name exceeds 64 characters"
+        return (
+            None
+            if SKILL_NAME.match(value)
+            else f"skill_name {value!r} fails the manifest name charset"
+        )
+    if field == "skill_version":
+        if not value.strip():
+            return "skill_version is empty"
+        if len(value) > 32:
+            return "skill_version exceeds 32 characters"
+        return (
+            None
+            if _identity_clean(value)
+            else "skill_version carries a forbidden character category"
+        )
+    if field == "trigger_name":
+        if not value.strip():
+            return "trigger_name is empty after trimming"
+        return (
+            None
+            if _identity_clean(value)
+            else "trigger_name carries a forbidden character category"
+        )
+    return None
+
+
+def authority_rule(payload: Any) -> tuple[int, str] | None:
+    """The first authority rule this payload breaks, in contract order.
+
+    Order is normative: a payload with no `authority` cannot also be said to
+    carry a field its kind forbids, so only the earlier rule is reported.
+    """
+    if not isinstance(payload, dict) or payload.get("kind") != "runtime_action":
+        return None
+    if "authority" not in payload:
+        return 14, "runtime_action payload carries no authority"
+    authority = payload["authority"]
+    if not isinstance(authority, dict):
+        return 15, "authority is not an object"
+    kind = authority.get("kind")
+    if not isinstance(kind, str) or kind not in AUTHORITY_KINDS:
+        return (
+            16,
+            f"authority.kind {kind!r} is absent, not a string, or outside the vocabulary",
+        )
+    required = AUTHORITY_KINDS[kind]
+    present = set(authority) - {"kind"}
+    missing = sorted(required - present)
+    if missing:
+        return 17, f"authority kind {kind!r} is missing {missing}"
+    for field in sorted(required):
+        fault = _field_fault(field, authority[field])
+        if fault is not None:
+            return 18, fault
+    foreign = sorted(present - required)
+    if foreign:
+        return (
+            19,
+            f"authority kind {kind!r} carries fields it does not permit: {foreign}",
+        )
+    return None
+
+
+failures: list[str] = []
+
+
+def fail(where: str, detail: str) -> None:
+    failures.append(f"{where}: {detail}")
+
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def load(name: str) -> Any:
+    path = VECTORS / name
+    if not path.is_file():
+        fail(name, "vector file is missing")
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        fail(name, f"is not readable as UTF-8 JSON ({exc})")
+        return None
+
+
+def public_key(hex_key: str, where: str) -> Ed25519PublicKey | None:
+    try:
+        return Ed25519PublicKey.from_public_bytes(bytes.fromhex(hex_key))
+    except (ValueError, binascii.Error) as exc:
+        fail(where, f"public key is not 32 bytes of hex ({exc})")
+        return None
+
+
+def signature_bytes(value: str, where: str) -> bytes | None:
+    if not value.startswith("ed25519:"):
+        fail(where, "signature does not carry the 'ed25519:' prefix")
+        return None
+    raw = value[len("ed25519:") :]
+    try:
+        decoded = base64.b64decode(raw.encode("ascii"), validate=True)
+    except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
+        fail(where, f"signature is not standard base64 ({exc})")
+        return None
+    if len(decoded) != 64:
+        fail(where, f"signature decodes to {len(decoded)} bytes, not 64")
+        return None
+    return decoded
+
+
+def verifies(key: Ed25519PublicKey, sig: bytes, message: bytes) -> bool:
+    try:
+        key.verify(sig, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+# ── genesis ───────────────────────────────────────────────────────────────────
+
+
+def check_genesis() -> str | None:
+    doc = load("genesis.json")
+    if doc is None:
+        return None
+    where = "genesis.json"
+    declared = str(doc.get("genesis_prev_event_hash", ""))
+    expected = hashlib.sha256(GENESIS_PREIMAGE.encode("utf-8")).hexdigest()
+    if doc.get("preimage") != GENESIS_PREIMAGE:
+        fail(where, f"preimage is {doc.get('preimage')!r}, not {GENESIS_PREIMAGE!r}")
+    hex_preimage = str(doc.get("preimage_utf8_hex", ""))
+    if hex_preimage != GENESIS_PREIMAGE.encode("utf-8").hex():
+        fail(where, "preimage_utf8_hex does not encode the preimage")
+    if declared != expected:
+        fail(where, f"genesis hash is {declared}, recomputed {expected}")
+    return declared
+
+
+# ── canonical form ────────────────────────────────────────────────────────────
+
+
+INTEGER_MAX = 9007199254740991
+FLOAT_MIN_MAGNITUDE = 1e-4
+FLOAT_MAX_MAGNITUDE_EXCLUSIVE = 1e16
+
+
+def _violations(value: Any) -> set[str]:
+    """Every agreement-zone rule this parsed value breaks, by the corpus's names."""
+    found: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, bool):
+            return
+        if isinstance(node, float):
+            if math.isnan(node) or math.isinf(node):
+                found.add("non_finite")
+            elif node != 0.0 and not (
+                FLOAT_MIN_MAGNITUDE <= abs(node) < FLOAT_MAX_MAGNITUDE_EXCLUSIVE
+            ):
+                found.add("number_zone")
+            return
+        if isinstance(node, int):
+            if abs(node) > INTEGER_MAX:
+                found.add("integer_range")
+            return
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if not isinstance(key, str):
+                    found.add("non_string_key")
+                walk(item)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(value)
+    return found
+
+
+def _parse_recording_faults(raw: str) -> tuple[Any, set[str]]:
+    """Parse *raw*, recording the faults parsing itself can observe."""
+    found: set[str] = set()
+
+    def pairs(items: list[tuple[str, Any]]) -> dict:
+        seen: set[str] = set()
+        for key, _ in items:
+            if key in seen:
+                found.add("duplicate_key")
+            seen.add(key)
+        return dict(items)
+
+    def constant(name: str) -> float:
+        found.add("non_finite")
+        return {
+            "NaN": float("nan"),
+            "Infinity": float("inf"),
+            "-Infinity": float("-inf"),
+        }[name]
+
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    return value, found
+
+
+def check_canonical_form() -> None:
+    doc = load("canonical-form.json")
+    if doc is None:
+        return
+    where = "canonical-form.json"
+
+    declared_max = doc.get("integer_max")
+    if declared_max != INTEGER_MAX:
+        fail(where, f"integer_max is {declared_max}, not {INTEGER_MAX}")
+    zone = doc.get("float_zone") or {}
+    if zone.get("min_magnitude") != FLOAT_MIN_MAGNITUDE or (
+        zone.get("max_magnitude_exclusive") != FLOAT_MAX_MAGNITUDE_EXCLUSIVE
+    ):
+        fail(where, f"float_zone is {zone}, not the agreement zone this check restates")
+
+    accepts = doc.get("accept_cases") or []
+    if not accepts:
+        fail(where, "declares no accept cases")
+    for case in accepts:
+        name = case.get("name", "<unnamed>")
+        label = f"{where}[{name}]"
+        value = case.get("value")
+        broken = _violations(value)
+        if broken:
+            fail(label, f"accept case breaks the agreement zone: {sorted(broken)}")
+            continue
+        try:
+            produced = canonical(value)
+        except (ValueError, TypeError) as exc:
+            fail(label, f"accept case is not canonicalisable ({exc})")
+            continue
+        if produced.decode("utf-8") != case.get("canonical_utf8"):
+            fail(label, "canonical_utf8 disagrees with recanonicalisation")
+        if produced.hex() != case.get("canonical_hex"):
+            fail(label, "canonical_hex disagrees with recanonicalisation")
+
+    kinds = set(doc.get("violation_kinds") or {})
+    rejects = doc.get("reject_cases") or []
+    if not rejects:
+        fail(where, "declares no reject cases")
+    covered: set[str] = set()
+    for case in rejects:
+        name = case.get("name", "<unnamed>")
+        label = f"{where}[{name}]"
+        violates = case.get("violates")
+        if violates not in kinds:
+            fail(
+                label, f"violates {violates!r}, which is not a declared violation kind"
+            )
+            continue
+        covered.add(violates)
+        if case.get("input_kind") == "native_pairs":
+            # Not expressible as JSON text, so the corpus carries no executable
+            # input. The rule is still restated above and exercised by the
+            # accept cases, which must contain no such key.
+            continue
+        raw = case.get("input_json")
+        if not isinstance(raw, str):
+            fail(label, "json_text case carries no input_json string")
+            continue
+        try:
+            value, parse_faults = _parse_recording_faults(raw)
+        except (json.JSONDecodeError, ValueError):
+            # Refused before the rules are reached. That is a rejection, but it
+            # does not show *this* rule holds, so it is only accepted for the
+            # kinds a parser is entitled to refuse outright.
+            if violates in {"non_finite", "duplicate_key", "non_string_key"}:
+                continue
+            fail(label, f"input is unparseable, so it does not exercise {violates!r}")
+            continue
+        broken = parse_faults | _violations(value)
+        if violates not in broken:
+            fail(
+                label,
+                f"is declared against {violates!r} and does not break it "
+                f"(breaks {sorted(broken) or 'nothing'}), so it proves that rule is unenforced",
+            )
+
+    uncovered = sorted(kinds - covered)
+    if uncovered:
+        fail(where, f"violation kinds with no reject case: {uncovered}")
+
+
+# ── event ids ─────────────────────────────────────────────────────────────────
+
+
+def _uuid5(namespace_bytes: bytes, name: str) -> str:
+    # SHA-1 is what RFC 4122 §4.3 specifies for a version 5 UUID. It is the
+    # derivation under test, not a security choice, and substituting a stronger
+    # hash would produce a different identifier.
+    digest = hashlib.sha1(namespace_bytes + name.encode("utf-8")).digest()
+    b = bytearray(digest[:16])
+    b[6] = (b[6] & 0x0F) | 0x50
+    b[8] = (b[8] & 0x3F) | 0x80
+    hexed = bytes(b).hex()
+    return f"{hexed[:8]}-{hexed[8:12]}-{hexed[12:16]}-{hexed[16:20]}-{hexed[20:]}"
+
+
+def check_event_ids() -> None:
+    doc = load("event-id.json")
+    if doc is None:
+        return
+    where = "event-id.json"
+    root = str(doc.get("root_namespace_uuid", ""))
+    try:
+        root_bytes = bytes.fromhex(root.replace("-", ""))
+    except ValueError:
+        fail(where, "root_namespace_uuid is not hex")
+        return
+    if len(root_bytes) != 16:
+        fail(where, "root_namespace_uuid is not 16 bytes")
+        return
+    name_uri = str(doc.get("namespace_name_uri", ""))
+    derived_ns = _uuid5(root_bytes, name_uri)
+    if derived_ns != str(doc.get("event_id_namespace", "")):
+        fail(
+            where,
+            f"event_id_namespace is {doc.get('event_id_namespace')}, derived {derived_ns}",
+        )
+        return
+    ns_bytes = bytes.fromhex(derived_ns.replace("-", ""))
+    fmt = str(doc.get("per_event_name_format", ""))
+    for case in doc.get("cases") or []:
+        name = fmt.format(
+            device_id=case.get("device_id"), action_log_id=case.get("action_log_id")
+        )
+        if name != case.get("uuid5_name"):
+            fail(where, f"uuid5_name disagrees with the declared format for {name!r}")
+            continue
+        derived = _uuid5(ns_bytes, name)
+        if derived != case.get("event_id"):
+            fail(
+                where,
+                f"event_id for {name!r} is {case.get('event_id')}, derived {derived}",
+            )
+
+
+# ── authority grammar ─────────────────────────────────────────────────────────
+
+
+def authority_fault(payload: Any) -> str | None:
+    """Why this payload's `authority` is non-conforming, or None when it holds."""
+    if not isinstance(payload, dict):
+        return "payload is not an object"
+    if payload.get("kind") != "runtime_action":
+        return None
+    if "authority" not in payload:
+        return "authority is absent"
+    authority = payload["authority"]
+    if not isinstance(authority, dict):
+        return "authority is not an object"
+    kind = authority.get("kind")
+    if not isinstance(kind, str) or kind not in AUTHORITY_KINDS:
+        return f"authority.kind {kind!r} is not one of {sorted(AUTHORITY_KINDS)}"
+    required = AUTHORITY_KINDS[kind]
+    present = set(authority) - {"kind"}
+    missing = sorted(required - present)
+    if missing:
+        return f"authority kind {kind!r} is missing {missing}"
+    foreign = sorted(present - required)
+    if foreign:
+        every_other = set().union(*AUTHORITY_KINDS.values()) - required
+        belonging = sorted(set(foreign) & every_other)
+        if belonging:
+            return f"authority kind {kind!r} carries {belonging}, which belong to another kind"
+        return f"authority kind {kind!r} carries undefined fields {foreign}"
+    return None
+
+
+# ── chain rows ────────────────────────────────────────────────────────────────
+
+
+def rule_faults(
+    row: Any, envelope: Any, context: Any, key: Ed25519PublicKey
+) -> set[int]:
+    """Every contract rejection rule this row breaks, by number.
+
+    *context* carries what the chain expected of this row — the corpus states it
+    as `expected_sequence_num` and `expected_prev_event_hash` rather than as a
+    preceding row, because a rejection case need not carry the chain it joins.
+    """
+    broken: set[int] = set()
+    if not isinstance(envelope, dict):
+        return {13}
+    columns = row.get("row_columns") or {}
+    canonical_json = row.get("canonical_json")
+    if not isinstance(canonical_json, str):
+        return {3}
+    message = canonical_json.encode("utf-8")
+
+    # Rules 1 and 2 are chain-position rules, and a reader queries the row's
+    # stored columns rather than reopening the signed envelope. So they are
+    # evaluated against the effective column value — the column where one is
+    # stored, the envelope otherwise. Evaluating them on the envelope instead
+    # collapses them into rules 5 and 6, which exist precisely to catch a column
+    # disagreeing with the envelope, and would make every such case impure.
+    effective_seq = columns.get("seq", envelope.get("sequence_num"))
+    effective_prev = columns.get("prev_event_hash", envelope.get("prev_event_hash"))
+    if isinstance(context, dict):
+        if "expected_sequence_num" in context and int(effective_seq or -1) != int(
+            context["expected_sequence_num"]
+        ):
+            broken.add(1)
+        if (
+            "expected_prev_event_hash" in context
+            and effective_prev != context["expected_prev_event_hash"]
+        ):
+            broken.add(2)
+
+    if row.get("event_hash") != hashlib.sha256(message).hexdigest():
+        broken.add(3)
+
+    sig = signature_bytes(str(row.get("signature", "")), "chain-row.json")
+    if sig is None or not verifies(key, sig, message):
+        broken.add(4)
+
+    column_rules = {
+        "seq": (5, "sequence_num"),
+        "prev_event_hash": (6, "prev_event_hash"),
+        "event_id": (7, "event_id"),
+        "event_type": (8, "event_type"),
+        "device_id": (9, "device_id"),
+        "emitted_at_ms": (10, "emitted_at_ms"),
+    }
+    for column, (number, field) in column_rules.items():
+        if column in columns and columns[column] != envelope.get(field):
+            broken.add(number)
+
+    if envelope.get("schema_version") != SCHEMA_VERSION:
+        broken.add(11)
+
+    payload_json = row.get("payload_json", columns.get("payload_json"))
+    if payload_json is not None:
+        try:
+            if json.loads(payload_json) != envelope.get("payload"):
+                broken.add(12)
+        except (json.JSONDecodeError, TypeError):
+            broken.add(12)
+
+    if set(envelope) - ENVELOPE_FIELDS:
+        broken.add(13)
+
+    authority = authority_rule(envelope.get("payload"))
+    if authority is not None:
+        broken.add(authority[0])
+
+    return broken
+
+
+def check_chain_rows(genesis: str | None) -> None:
+    doc = load("chain-row.json")
+    if doc is None:
+        return
+    where = "chain-row.json"
+    if doc.get("schema_version") != SCHEMA_VERSION:
+        fail(where, f"schema_version is {doc.get('schema_version')!r}")
+
+    seed_hex = str(doc.get("device_seed_hex", ""))
+    declared_public = str(doc.get("device_public_key_hex", ""))
+    try:
+        derived_public = (
+            Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex))
+            .public_key()
+            .public_bytes_raw()
+            .hex()
+        )
+    except (ValueError, binascii.Error) as exc:
+        fail(where, f"device_seed_hex is not a usable Ed25519 seed ({exc})")
+        return
+    if derived_public != declared_public:
+        fail(where, "device_public_key_hex is not the public key of device_seed_hex")
+        return
+    key = public_key(declared_public, where)
+    if key is None:
+        return
+
+    if genesis is not None and doc.get("genesis_prev_event_hash") != genesis:
+        fail(where, "genesis_prev_event_hash disagrees with genesis.json")
+
+    rows = doc.get("rows") or []
+    if len(rows) < 2:
+        fail(where, "declares fewer than two rows, so chain linkage is unexercised")
+    previous: dict | None = None
+    for index, row in enumerate(rows):
+        label = f"{where}[row {index}]"
+        envelope = row.get("envelope")
+        if not isinstance(envelope, dict):
+            fail(label, "envelope is not an object")
+            continue
+        unknown = sorted(set(envelope) - ENVELOPE_FIELDS)
+        if unknown:
+            fail(label, f"envelope carries undefined fields {unknown}")
+        missing = sorted(ENVELOPE_FIELDS - set(envelope))
+        if missing:
+            fail(label, f"envelope is missing required fields {missing}")
+        if envelope.get("event_type") not in EVENT_VOCABULARY:
+            fail(
+                label,
+                f"event_type {envelope.get('event_type')!r} is outside the vocabulary",
+            )
+
+        produced = canonical(envelope)
+        if produced.decode("utf-8") != row.get("canonical_json"):
+            fail(
+                label,
+                "canonical_json disagrees with recanonicalisation of the envelope",
+            )
+        if produced.hex() != row.get("canonical_hex"):
+            fail(
+                label, "canonical_hex disagrees with recanonicalisation of the envelope"
+            )
+        if row.get("event_hash") != hashlib.sha256(produced).hexdigest():
+            fail(label, "event_hash disagrees with SHA-256 of canonical_json")
+        sig = signature_bytes(str(row.get("signature", "")), label)
+        if sig is not None and not verifies(key, sig, produced):
+            fail(label, "signature does not verify under the device key")
+
+        if previous is None:
+            if genesis is not None and envelope.get("prev_event_hash") != genesis:
+                fail(label, "first row does not chain to the genesis hash")
+        else:
+            if envelope.get("prev_event_hash") != previous.get("event_hash"):
+                fail(label, "prev_event_hash does not chain to the previous row")
+            if (
+                int(envelope.get("sequence_num", -1))
+                != int(previous["envelope"]["sequence_num"]) + 1
+            ):
+                fail(label, "sequence_num is not the successor of the previous row")
+
+        authority = authority_rule(envelope.get("payload"))
+        if authority is not None:
+            fail(
+                label,
+                f"accepted row breaks authority rule {authority[0]}: {authority[1]}",
+            )
+
+        previous = {**row, "sequence_num": envelope.get("sequence_num")}
+
+    check_rejection_cases(doc, rows, key, where)
+
+
+def check_rejection_cases(
+    doc: Any, rows: list, key: Ed25519PublicKey, where: str
+) -> None:
+    cases = doc.get("rejection_cases") or []
+    if not cases:
+        fail(where, "declares no rejection cases")
+    declared_rules = {int(c["rule"]) for c in cases if isinstance(c.get("rule"), int)}
+    expected_rules = set(range(1, 20))
+    uncovered = sorted(expected_rules - declared_rules)
+    if uncovered:
+        fail(where, f"contract rejection rules with no case: {uncovered}")
+
+    for case in cases:
+        name = case.get("name", "<unnamed>")
+        label = f"{where}[{name}]"
+        if case.get("expected") != "reject":
+            fail(label, f"expected is {case.get('expected')!r}, not 'reject'")
+            continue
+        rule = case.get("rule")
+        if not isinstance(rule, int):
+            fail(label, "case declares no rule number")
+            continue
+        row = case.get("row")
+        if not isinstance(row, dict):
+            fail(label, "case carries no row")
+            continue
+        envelope = row.get("envelope")
+        broken = rule_faults(row, envelope, case.get("chain_context"), key)
+        if rule not in broken:
+            fail(
+                label,
+                f"is declared against rule {rule} and does not break it "
+                f"(breaks {sorted(broken) or 'nothing'}), so it proves that rule is unenforced",
+            )
+        elif broken != {rule}:
+            # The contract requires each case to violate exactly the rule it
+            # names. A case breaking a second rule is rejected for whichever the
+            # verifier reaches first, so the rule it claims to exercise may never
+            # be reached at all — and a suite of impure cases reports full
+            # coverage while testing one rule repeatedly.
+            fail(
+                label,
+                f"is declared against rule {rule} but also breaks "
+                f"{sorted(broken - {rule})}, so a verifier may reject it for the "
+                f"wrong reason and never exercise rule {rule}",
+            )
+
+
+def main() -> int:
+    genesis = check_genesis()
+    check_canonical_form()
+    check_event_ids()
+    check_chain_rows(genesis)
+
+    if failures:
+        for failure in failures:
+            print(f"check-evidence-vectors: {failure}", file=sys.stderr)
+        return 1
+    print(
+        "check-evidence-vectors: corpus agrees with the contract "
+        "(genesis, canonical form, event ids, chain rows, rejection rules)"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
