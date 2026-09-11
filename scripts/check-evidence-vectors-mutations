@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Prove `check-evidence-vectors` fails when the corpus is wrong.
+
+A checker that passes is only evidence once it has been shown to fire. This
+mutates a scratch copy of the corpus in each way the checker claims to catch and
+requires a failure naming that fault — so a check quietly reduced to a no-op,
+or a rule whose evaluation is skipped, fails here rather than passing silently
+for the life of the repository.
+
+The mutations that matter most are the two that produce *false coverage* rather
+than an obvious break: a rejection case neutered until it violates nothing, and
+a rejection case made impure so a verifier would reject it for the wrong reason
+and never exercise the rule it claims. Both look like a healthy corpus from the
+outside.
+
+Run from the repository root:
+
+    python3 scripts/check-evidence-vectors-mutations
+
+Exits non-zero if any mutation goes uncaught.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CHECKER = ROOT / "scripts" / "check-evidence-vectors"
+VECTORS = ROOT / "evidence" / "vectors"
+
+
+def _run(mutate: Callable[[dict], None], target: str) -> tuple[int, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = pathlib.Path(tmp) / "repo"
+        (work / "evidence").mkdir(parents=True)
+        (work / "scripts").mkdir()
+        shutil.copytree(VECTORS, work / "evidence" / "vectors")
+        shutil.copy(CHECKER, work / "scripts" / "check-evidence-vectors")
+        path = work / "evidence" / "vectors" / target
+        document = json.loads(path.read_text(encoding="utf-8"))
+        mutate(document)
+        path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "scripts/check-evidence-vectors"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode, result.stderr + result.stdout
+
+
+def _first_case(document: dict, rule: int) -> dict:
+    for case in document["rejection_cases"]:
+        if case.get("rule") == rule:
+            return case
+    raise AssertionError(f"no rejection case for rule {rule}")
+
+
+def corrupt_signature(document: dict) -> None:
+    document["rows"][0]["signature"] = "ed25519:" + "A" * 86 + "=="
+
+
+def corrupt_event_hash(document: dict) -> None:
+    document["rows"][0]["event_hash"] = "f" * 64
+
+
+def break_chain_link(document: dict) -> None:
+    document["rows"][1]["envelope"]["prev_event_hash"] = "0" * 64
+
+
+def undefined_envelope_field(document: dict) -> None:
+    document["rows"][0]["envelope"]["surprise"] = 1
+
+
+def foreign_event_type(document: dict) -> None:
+    document["rows"][0]["envelope"]["event_type"] = "NOT_IN_VOCABULARY"
+
+
+def neuter_a_rejection_case(document: dict) -> None:
+    """Make a case violate nothing. It then proves its rule is unenforced."""
+    case = _first_case(document, 6)
+    case["row"]["envelope"]["prev_event_hash"] = case["row"]["row_columns"][
+        "prev_event_hash"
+    ]
+
+
+def make_a_rejection_case_impure(document: dict) -> None:
+    """Make a case violate a second rule, so a verifier may never reach its own."""
+    case = _first_case(document, 5)
+    case["row"]["row_columns"]["seq"] = 9
+
+
+def drop_a_rejection_case(document: dict) -> None:
+    document["rejection_cases"] = [
+        case for case in document["rejection_cases"] if case.get("rule") != 11
+    ]
+
+
+def strip_authority(document: dict) -> None:
+    payload = document["rows"][0]["envelope"]["payload"]
+    payload.pop("authority", None)
+
+
+def unknown_authority_kind(document: dict) -> None:
+    document["rows"][0]["envelope"]["payload"]["authority"]["kind"] = "tier_e_invented"
+
+
+def authority_field_wrong_type(document: dict) -> None:
+    authority = document["rows"][0]["envelope"]["payload"]["authority"]
+    field = next(name for name in authority if name != "kind")
+    authority[field] = []
+
+
+def authority_foreign_field(document: dict) -> None:
+    document["rows"][0]["envelope"]["payload"]["authority"]["zone_id"] = "zone-a"
+
+
+def canonical_reject_made_acceptable(document: dict) -> None:
+    document["reject_cases"][0]["input_json"] = '{"n":1}'
+
+
+MUTATIONS: list[tuple[str, Callable[[dict], None], str, str]] = [
+    ("signature no longer verifies", corrupt_signature, "chain-row.json", "signature"),
+    ("event_hash corrupted", corrupt_event_hash, "chain-row.json", "event_hash"),
+    ("chain link broken", break_chain_link, "chain-row.json", "canonical"),
+    (
+        "envelope carries an undefined field",
+        undefined_envelope_field,
+        "chain-row.json",
+        "undefined",
+    ),
+    (
+        "event_type outside the vocabulary",
+        foreign_event_type,
+        "chain-row.json",
+        "vocabulary",
+    ),
+    (
+        "a rejection case neutered",
+        neuter_a_rejection_case,
+        "chain-row.json",
+        "does not break it",
+    ),
+    (
+        "a rejection case made impure",
+        make_a_rejection_case_impure,
+        "chain-row.json",
+        "also breaks",
+    ),
+    (
+        "a contract rule left with no case",
+        drop_a_rejection_case,
+        "chain-row.json",
+        "no case",
+    ),
+    (
+        "authority removed from an accept row",
+        strip_authority,
+        "chain-row.json",
+        "rule 14",
+    ),
+    (
+        "authority kind outside the vocabulary",
+        unknown_authority_kind,
+        "chain-row.json",
+        "rule 16",
+    ),
+    (
+        "a required authority field mistyped",
+        authority_field_wrong_type,
+        "chain-row.json",
+        "rule 18",
+    ),
+    (
+        "authority carries a foreign field",
+        authority_foreign_field,
+        "chain-row.json",
+        "rule 19",
+    ),
+    (
+        "a canonical reject case made acceptable",
+        canonical_reject_made_acceptable,
+        "canonical-form.json",
+        "does not break it",
+    ),
+]
+
+
+def main() -> int:
+    uncaught: list[str] = []
+    for label, mutate, target, expected in MUTATIONS:
+        code, output = _run(mutate, target)
+        if code == 0:
+            uncaught.append(f"{label}: the checker passed a corpus it should refuse")
+        elif expected not in output:
+            uncaught.append(
+                f"{label}: refused, but no finding mentioned {expected!r} — "
+                f"it may have been caught for an unrelated reason"
+            )
+        else:
+            print(f"  caught: {label}")
+
+    if uncaught:
+        for failure in uncaught:
+            print(f"check-evidence-vectors-mutations: {failure}", file=sys.stderr)
+        return 1
+    print(
+        f"check-evidence-vectors-mutations: the checker fired on all "
+        f"{len(MUTATIONS)} mutations"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

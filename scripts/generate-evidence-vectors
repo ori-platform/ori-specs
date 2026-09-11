@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Regenerate `evidence/vectors/chain-row.json` from the published seeds.
+
+The corpus carries cryptographic values that cannot be hand-authored, so this
+computes them. It is deliberately *not* the thing that validates them:
+`check-evidence-vectors` restates every derivation from the contract and shares
+no code with this file, so a defect here is caught there rather than certified.
+
+Run from the repository root, then run the checker:
+
+    python3 scripts/generate-evidence-vectors
+    python3 scripts/check-evidence-vectors
+
+Each rejection case carries exactly one defect. Where the defect is the hash or
+the signature, that value is left corrupt rather than recomputed; everything
+else is recomputed so no case violates a second rule by accident.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+from typing import Any
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TARGET = ROOT / "evidence" / "vectors" / "chain-row.json"
+
+AUTHORITIES: dict[str, dict[str, Any]] = {
+    "tier_c_approval": {"kind": "tier_c_approval", "proposal_id": "AB12CD34"},
+    "tier_d_legacy_skill": {
+        "kind": "tier_d_legacy_skill",
+        "skill_name": "energy-anomaly-detector",
+        "skill_version": "0.2.1",
+        "trigger_name": "dangerous_overcurrent",
+    },
+    "tier_d_profile": {
+        "kind": "tier_d_profile",
+        "profile_id": "electrical.overcurrent.v1",
+        "zone_id": "zone-main-incomer",
+        "binding_seq": 4,
+    },
+    "tier_d_qualification": {
+        "kind": "tier_d_qualification",
+        "profile_id": "electrical.overcurrent.v1",
+        "zone_id": "zone-main-incomer",
+        "binding_seq": 4,
+        "fixture_hash": "sha256:" + "b" * 64,
+    },
+}
+
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def seal(envelope: dict, key: Ed25519PrivateKey) -> dict:
+    body = canonical(envelope)
+    return {
+        "envelope": envelope,
+        "canonical_json": body.decode("utf-8"),
+        "canonical_hex": body.hex(),
+        "event_hash": hashlib.sha256(body).hexdigest(),
+        "signature": "ed25519:" + base64.b64encode(key.sign(body)).decode("ascii"),
+    }
+
+
+def main() -> int:
+    document = json.loads(TARGET.read_text(encoding="utf-8"))
+    key = Ed25519PrivateKey.from_private_bytes(
+        bytes.fromhex(document["device_seed_hex"])
+    )
+    genesis = document["genesis_prev_event_hash"]
+
+    # ── accept rows: one per authority kind, chained ──────────────────────────
+    template = json.loads(json.dumps(document["rows"][0]["envelope"]))
+    attestations = ["at_emission", "reconciled_late", "at_emission", "at_emission"]
+    event_ids = [row["envelope"]["event_id"] for row in document["rows"]]
+    rows: list[dict] = []
+    previous = genesis
+    for index, (kind, authority) in enumerate(AUTHORITIES.items()):
+        envelope = json.loads(json.dumps(template))
+        envelope["sequence_num"] = index + 1
+        envelope["prev_event_hash"] = previous
+        envelope["payload"] = {
+            "kind": "runtime_action",
+            "attestation": attestations[index],
+            "action_log_id": index + 1,
+            "authority": authority,
+        }
+        if index < len(event_ids):
+            envelope["event_id"] = event_ids[index]
+        else:
+            # Outside the published event-id cases, so a distinct deterministic
+            # value rather than a reused one.
+            envelope["event_id"] = f"0000000{index}-0000-5000-8000-00000000000{index}"
+        row = seal(envelope, key)
+        rows.append(row)
+        previous = row["event_hash"]
+    document["rows"] = rows
+    first_hash = rows[0]["event_hash"]
+
+    # ── existing rejection cases: give each a conforming authority ────────────
+    for case in document["rejection_cases"]:
+        rule = case["rule"]
+        row = case["row"]
+        envelope = row["envelope"]
+        envelope["payload"] = {
+            **envelope["payload"],
+            "authority": AUTHORITIES["tier_c_approval"],
+        }
+        context = case.get("chain_context") or {}
+        # Rules 1 and 2 are stated against the head this row would follow, which
+        # moved when row 0 was resealed.
+        if context.get("expected_prev_event_hash") not in (None, genesis):
+            context["expected_prev_event_hash"] = first_hash
+        if rule == 1 and envelope.get("prev_event_hash") != genesis:
+            envelope["prev_event_hash"] = first_hash
+            row.get("row_columns", {})["prev_event_hash"] = first_hash
+
+        sealed = seal(envelope, key)
+        row["canonical_json"] = sealed["canonical_json"]
+        row["canonical_hex"] = sealed["canonical_hex"]
+        # The defect stays the defect: a corrupt hash or signature is not repaired.
+        row["event_hash"] = (
+            row["event_hash"] if rule == 3 else sealed["event_hash"]
+        )
+        row["signature"] = (
+            row["signature"] if rule == 4 else sealed["signature"]
+        )
+        if "payload_json" in row and rule != 12:
+            row["payload_json"] = json.dumps(
+                envelope["payload"], sort_keys=True, separators=(",", ":")
+            )
+
+    # ── new rejection cases, one per authority rule ───────────────────────────
+    def authority_case(rule: int, name: str, note: str, authority: Any) -> dict:
+        envelope = json.loads(json.dumps(rows[0]["envelope"]))
+        envelope["sequence_num"] = 1
+        envelope["prev_event_hash"] = genesis
+        payload = {
+            "kind": "runtime_action",
+            "attestation": "at_emission",
+            "action_log_id": 1,
+        }
+        if authority is not ...:
+            payload["authority"] = authority
+        envelope["payload"] = payload
+        sealed = seal(envelope, key)
+        # Derived from this envelope rather than copied from another case, so
+        # the stored columns agree with what was signed and rules 5 to 10 stay
+        # clean. Copying them from a neighbour carried that neighbour's
+        # emitted_at_ms and made every authority case break rule 10 as well.
+        columns = {
+            "seq": envelope["sequence_num"],
+            "prev_event_hash": envelope["prev_event_hash"],
+            "event_id": envelope["event_id"],
+            "event_type": envelope["event_type"],
+            "device_id": envelope["device_id"],
+            "emitted_at_ms": envelope["emitted_at_ms"],
+        }
+        return {
+            "rule": rule,
+            "name": name,
+            "expected": "reject",
+            "authenticator": "valid",
+            "note": note,
+            "row": {
+                **sealed,
+                "row_columns": columns,
+                "payload_json": json.dumps(
+                    payload, sort_keys=True, separators=(",", ":")
+                ),
+            },
+            "chain_context": {
+                "expected_sequence_num": 1,
+                "expected_prev_event_hash": genesis,
+            },
+        }
+
+    valid = AUTHORITIES["tier_c_approval"]
+    document["rejection_cases"] += [
+        authority_case(
+            14,
+            "runtime_action payload carries no authority",
+            "Every other rule holds. The payload names a runtime action and "
+            "declares no licensing authority, which is the absence rule 14 exists "
+            "to catch.",
+            ...,
+        ),
+        authority_case(
+            15,
+            "authority is not an object",
+            "The field is present, so rule 14 passes. It is a string, so no kind "
+            "can be selected and no field rule is reachable.",
+            "tier_c_approval",
+        ),
+        authority_case(
+            16,
+            "authority kind is outside the vocabulary",
+            "A well-formed object carrying a well-formed proposal_id. Only the "
+            "kind is unrecognised, so no field rule is reachable.",
+            {"kind": "tier_e_invented", "proposal_id": "AB12CD34"},
+        ),
+        authority_case(
+            17,
+            "a field the kind requires is absent",
+            "The kind is recognised and every present field is valid; profile_id "
+            "is missing, which is rule 17 and not rule 18.",
+            {
+                "kind": "tier_d_profile",
+                "zone_id": "zone-main-incomer",
+                "binding_seq": 4,
+            },
+        ),
+        authority_case(
+            18,
+            "a required field fails its grammar",
+            "The field set is exact and the kind recognised. profile_id fails its "
+            "owning grammar on case alone, which is the narrowest way to break "
+            "only rule 18.",
+            {
+                "kind": "tier_d_profile",
+                "profile_id": "Electrical.Overcurrent.V1",
+                "zone_id": "zone-main-incomer",
+                "binding_seq": 4,
+            },
+        ),
+        authority_case(
+            19,
+            "authority carries a field its kind does not permit",
+            "proposal_id is well formed, so rule 18 passes and the only fault is "
+            "the zone_id this kind does not permit.",
+            {**valid, "zone_id": "zone-main-incomer"},
+        ),
+    ]
+
+    TARGET.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"generate-evidence-vectors: wrote {len(document['rows'])} accept rows and "
+        f"{len(document['rejection_cases'])} rejection cases"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
