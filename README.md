@@ -48,6 +48,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Safety profile ratification | [safety-profile/ratification.md](safety-profile/ratification.md) | Design target, pre-ratification; the six arguments a dossier must close before a profile's status may flip, and who decides |
 | Qualification session procedure | [safety-qualification-fixture/procedure.md](safety-qualification-fixture/procedure.md) | Design target, pre-ratification; how a supervised session is conducted, and the source of the fixture exposure ceilings |
 | Hazard session procedure | [safety-qualification-fixture/hazard-session.md](safety-qualification-fixture/hazard-session.md) | Design target, pre-ratification and unreviewed; discrimination and protection runs for the trip-point argument |
+| Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | Design target, pre-ratification, not implementable; the `transfer_supply` outcome, what a zone must record before it may be resolved, and why it is never a profile outcome |
 
 ## Gaps
 

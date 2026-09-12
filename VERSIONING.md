@@ -44,6 +44,7 @@ A version increment means a breaking change for implementers.
 | commissioned-safety-binding | v1    | Design target, pre-ratification; no shipped conforming consumer |
 | safety-profile             | v1      | Design target, pre-ratification; no shipped conforming consumer |
 | safety-qualification-fixture | v1    | Design target, pre-ratification; no corpus and no implementation |
+| supply-transfer            | v1      | Design target, pre-ratification; not implementable — no zone shape, no proof method, no ceilings, no corpus, no implementation |
 
 ## Compatibility
 
