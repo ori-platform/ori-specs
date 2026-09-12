@@ -36,7 +36,9 @@ instead and never reach the boundary under test — which reports coverage that
 does not exist.
 
 `tier-authority.json` carries an `action_registry` fixture — minimum tiers for
-the actions its cases name. The real registry is runtime-owned and outside this
+the actions its cases name. Its physical vocabulary is the outcome
+`open_protected_circuit` at a hard floor, never an actuator name, and no entry
+holds a Tier D floor. The real registry is runtime-owned and outside this
 contract; the fixture exists so a consumer with no registry of its own, an
 authoring SDK or a catalogue, reaches the same verdict as a runtime instead of
 importing runtime state. A case that needs it says so with `"registry":
