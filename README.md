@@ -18,7 +18,8 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Evidence Commissioning Ingest | [evidence-commissioning-ingest/v1.md](evidence-commissioning-ingest/v1.md) | Design target, pre-ratification; the authority-side write path for signed commissioning authorisations and their revocation |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | Contract target; runtime entrypoint implemented |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1 |
-| Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline |
+| Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline; superseded, see its Known Defects |
+| Runtime telemetry HTTP export | [runtime-telemetry/v2.md](runtime-telemetry/v2.md) | Design target; per-event idempotency and a sensor-status route |
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | Implemented baseline |
 | Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | Design target |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |
