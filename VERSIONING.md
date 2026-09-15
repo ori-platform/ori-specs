@@ -24,7 +24,7 @@ A version increment means a breaking change for implementers.
 | runtime-health             | v2      | v2 implemented in runtime and CLI; `2.4.x` and earlier serve v1; an additive, optional `safety_zones` surface is drafted and unmerged |
 | runtime-telemetry          | v1      | Implemented baseline; superseded by v2 and retained for unmigrated consumers. Permits acknowledged readings to be discarded — see its Known Defects |
 | runtime-telemetry          | v2      | Design target, pre-ratification; no shipped conforming consumer. Per-event idempotency, retry identity, a defined ingest response, and a sensor-status route. Request bytes and `schema_version` unchanged from v1 |
-| runtime-mobile             | v1, v2  | v1 implemented baseline; v2 is a design target adding signed release publication and consumer verification, required of no v1 consumer |
+| runtime-mobile             | v1, v2  | v1 implemented baseline; v2 is a design target adding signed release publication and consumer verification, required of no v1 consumer. v2 has a conformance corpus and no producing signer or consuming verifier driven by it |
 | device-policy              | v1      | Implemented baseline                                             |
 | offline-tokens             | v1      | Implemented baseline                                             |
 | runtime-config             | v1      | Implemented baseline                                             |

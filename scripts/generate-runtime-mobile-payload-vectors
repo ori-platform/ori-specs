@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the runtime-mobile/v2 payload publication corpus.
+
+Writes runtime-mobile/payload-vectors-v2.json. Every case is a complete
+consumer input -- the envelope as raw text, the registry, the artifact bytes,
+the basename the file was downloaded under, the runtime version the consumer
+selected and the ABI slot it is filling -- and the outcome the contract's
+nine ordered checks reach for it. Registry documents are cased separately, with
+whether a consumer loads or refuses each.
+
+Envelopes are stored as text rather than as objects because two of the
+contract's refusals are properties of text that decoding destroys: a repeated
+key, and a document that is not strict JSON.
+
+The checker shares no code with this generator. It reimplements the checks from
+the contract and must agree with every case here, which is the only reason the
+corpus is evidence of anything.
+
+The signing seeds below are public by construction. A consumer's key registry
+must never contain their public keys, and the corpus lists them so a verifier
+can refuse them at registry load -- a published seed accepted as a trust anchor
+is a forgery anyone with a clone can make.
+
+Run from the repository root:
+
+    python3 scripts/generate-runtime-mobile-payload-vectors
+"""
+
+import base64
+import hashlib
+import json
+import pathlib
+import struct
+import sys
+from collections import OrderedDict
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+if len(sys.argv) > 1:
+    print(__doc__)
+    sys.exit(0 if sys.argv[1] in ("-h", "--help") else 2)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "runtime-mobile" / "payload-vectors-v2.json"
+
+SCHEMA = "ori.android_runtime_payload_signature.v1"
+DOMAIN = SCHEMA.encode() + b"\0"
+BUNDLE_DOMAIN = b"ori.runtime_release_bundle_signature.v1\0"
+REGISTRY_SCHEMA = "ori.android_runtime_payload_keys.v1"
+VERSION = "2.6.0"
+
+# (EI_CLASS, e_machine) per target, from the ELF header rather than any prose.
+TARGETS = OrderedDict(
+    [
+        ("android-arm64-v8a-api21", (2, 183)),
+        ("android-armeabi-v7a-api21", (1, 40)),
+        ("android-x86_64-api21", (2, 62)),
+    ]
+)
+
+SHELL_LINE = b"#!/system/bin/sh\n"
+PLACEHOLDER_MARKER = b"ORI_ANDROID_RUNTIME_PAYLOAD_SHIM"
+
+# Seeds are sequential byte runs chosen not to collide with any seed another
+# corpus in this repository already publishes.
+SEEDS = OrderedDict(
+    [
+        ("active", bytes(range(0xB0, 0xD0))),
+        ("verify_only", bytes(range(0xD0, 0xF0))),
+        ("revoked", bytes(range(0x30, 0x50))),
+        ("rogue", bytes(range(0x50, 0x70))),
+    ]
+)
+KEYS = {name: Ed25519PrivateKey.from_private_bytes(seed) for name, seed in SEEDS.items()}
+
+
+def b64(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def public_b64(name):
+    return b64(KEYS[name].public_key().public_bytes_raw())
+
+
+KEY_IDS = {
+    "active": "ori-test-android-payload-active",
+    "verify_only": "ori-test-android-payload-verify-only",
+    "revoked": "ori-test-android-payload-revoked",
+    "bundle_purpose": "ori-test-release-bundle-same-key",
+    "unknown": "ori-test-android-payload-absent",
+}
+
+REGISTRY = OrderedDict(
+    [
+        (
+            "keys",
+            [
+                OrderedDict(
+                    [
+                        ("key_id", KEY_IDS["active"]),
+                        ("public_key_b64", public_b64("active")),
+                        ("purpose", "android_runtime_payload"),
+                        ("status", "active"),
+                    ]
+                ),
+                OrderedDict(
+                    [
+                        ("key_id", KEY_IDS["verify_only"]),
+                        ("public_key_b64", public_b64("verify_only")),
+                        ("purpose", "android_runtime_payload"),
+                        ("status", "verify_only"),
+                    ]
+                ),
+                OrderedDict(
+                    [
+                        ("key_id", KEY_IDS["revoked"]),
+                        ("public_key_b64", public_b64("revoked")),
+                        ("purpose", "android_runtime_payload"),
+                        ("status", "revoked"),
+                    ]
+                ),
+                # The release-bundle authority's entry for the very same key
+                # material. A conforming registry load refuses it; it is present
+                # so the corpus can prove verification refuses it independently,
+                # because a check that holds only while an earlier one held is
+                # not a boundary.
+                OrderedDict(
+                    [
+                        ("key_id", KEY_IDS["bundle_purpose"]),
+                        ("public_key_b64", public_b64("active")),
+                        ("purpose", "runtime_release_bundle"),
+                        ("status", "active"),
+                    ]
+                ),
+            ],
+        ),
+        ("schema", REGISTRY_SCHEMA),
+    ]
+)
+
+
+def elf(ei_class, machine, extra=b"", ei_data=1):
+    """A minimal ELF image: a correct header, then filler.
+
+    Only the identification bytes and `e_machine` are consulted by the
+    contract's ABI check, so the rest is deterministic padding rather than a
+    loadable program. It is not a runtime and must never be packaged as one.
+    """
+    header_size = 64 if ei_class == 2 else 52
+    ident = b"\x7fELF" + bytes([ei_class, ei_data, 1, 0]) + bytes(8)
+    rest = struct.pack("<HHI", 3, machine, 1)  # e_type ET_DYN, e_machine, e_version
+    header = ident + rest
+    header += bytes(header_size - len(header))
+    body = bytes((i * 7 + 13) % 251 for i in range(1024))
+    return header + extra + body
+
+
+def artifact_name(version, target):
+    return f"ori-runtime-{version}-{target}.so"
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def sign(fields, key="active", domain=DOMAIN):
+    return "ed25519:" + b64(KEYS[key].sign(domain + canonical(fields)))
+
+
+def envelope_fields(artifact, *, version=VERSION, target, key_id=None, stripped=True, name=None):
+    return OrderedDict(
+        [
+            ("artifact", name if name is not None else artifact_name(version, target)),
+            ("artifact_sha256", "sha256:" + hashlib.sha256(artifact).hexdigest()),
+            ("artifact_size", len(artifact)),
+            ("key_id", key_id or KEY_IDS["active"]),
+            ("runtime_version", version),
+            ("schema", SCHEMA),
+            ("stripped", stripped),
+            ("target", target),
+        ]
+    )
+
+
+def signed_text(fields, key="active", domain=DOMAIN):
+    envelope = OrderedDict(fields)
+    envelope["signature"] = sign(fields, key=key, domain=domain)
+    return json.dumps(OrderedDict(sorted(envelope.items())), indent=2) + "\n"
+
+
+cases = []
+
+
+def case(name, note, *, envelope_text, artifact, slot, expect, stage=None, reason=None,
+         basename=None, selected=VERSION):
+    entry = OrderedDict(
+        [
+            ("name", name),
+            ("note", note),
+            ("selected_runtime_version", selected),
+            ("slot_target", slot),
+            ("downloaded_basename", basename if basename is not None else artifact_name(selected, slot)),
+            ("artifact_b64", None if artifact is None else b64(artifact)),
+            ("envelope_text", envelope_text),
+        ]
+    )
+    if expect == "accept":
+        entry["expect"] = OrderedDict([("outcome", "accept")])
+    else:
+        entry["expect"] = OrderedDict([("outcome", "reject"), ("stage", stage), ("reason", reason)])
+    cases.append(entry)
+
+
+# --- accepted -----------------------------------------------------------------
+
+artifacts = {target: elf(*shape) for target, shape in TARGETS.items()}
+
+for target in TARGETS:
+    art = artifacts[target]
+    case(
+        f"accept_{target}",
+        "A payload for this slot, signed by an active payload key, fetched under its derived name.",
+        envelope_text=signed_text(envelope_fields(art, target=target)),
+        artifact=art,
+        slot=target,
+        expect="accept",
+    )
+
+arm64 = "android-arm64-v8a-api21"
+armv7 = "android-armeabi-v7a-api21"
+x64 = "android-x86_64-api21"
+art = artifacts[arm64]
+good = envelope_fields(art, target=arm64)
+
+case(
+    "accept_verify_only_key_verifies_an_existing_payload",
+    "A rotated key demoted to verify_only still verifies what it signed. A registry that "
+    "admitted only active keys would make every earlier payload unverifiable at rotation.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, key_id=KEY_IDS["verify_only"]), key="verify_only"),
+    artifact=art,
+    slot=arm64,
+    expect="accept",
+)
+
+case(
+    "accept_unstripped_payload",
+    "Strip state is recorded, not required. An unstripped payload is still a payload.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, stripped=False)),
+    artifact=art,
+    slot=arm64,
+    expect="accept",
+)
+
+# --- stage envelope -----------------------------------------------------------
+
+text = signed_text(good)
+dup = text.replace('  "artifact_size":', '  "artifact_size": 1,\n  "artifact_size":', 1)
+assert dup != text
+case(
+    "envelope_duplicate_key",
+    "A repeated key makes two documents of one. A parser that keeps either is choosing which "
+    "to verify, so the text is not a document this contract defines.",
+    envelope_text=dup, artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+unknown = OrderedDict(good)
+unknown["build_host"] = "laptop"
+case(
+    "envelope_unknown_field",
+    "A field the contract does not define is outside what a verifier knows how to judge.",
+    envelope_text=signed_text(unknown), artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+for missing in good:
+    reduced = OrderedDict((k, v) for k, v in good.items() if k != missing)
+    case(
+        f"envelope_missing_{missing}",
+        f"Every one of the nine fields is required, so an envelope without `{missing}` is refused "
+        "before anything it does carry is used.",
+        envelope_text=signed_text(reduced), artifact=art, slot=arm64, expect="reject",
+        stage="envelope", reason="invalid_signature_envelope",
+    )
+
+missing_sig = json.dumps(OrderedDict(sorted(good.items())), indent=2) + "\n"
+case(
+    "envelope_missing_signature",
+    "An envelope that carries no signature is not a signed envelope with a bad signature; it is "
+    "not a signature envelope at all.",
+    envelope_text=missing_sig, artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+case(
+    "envelope_not_json",
+    "Not strict JSON.",
+    envelope_text="{artifact: ori-runtime-2.6.0-android-arm64-v8a-api21.so}\n",
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+malformed = [
+    ("artifact_sha256", "sha256:" + hashlib.sha256(art).hexdigest().upper(), "uppercase hex"),
+    ("artifact_sha256", hashlib.sha256(art).hexdigest(), "no sha256: prefix"),
+    ("artifact_size", 0, "zero"),
+    ("artifact_size", True, "a boolean"),
+    ("artifact_size", str(len(art)), "a string"),
+    ("key_id", "", "empty"),
+    ("key_id", "k" * 65, "65 characters"),
+    ("key_id", "ori/test", "a slash"),
+    ("runtime_version", "v2.6.0", "a leading v"),
+    ("runtime_version", "", "empty"),
+    ("schema", "ori.runtime_release_bundle_signature.v1", "the release-bundle schema"),
+    ("stripped", "true", "a string"),
+    ("target", "ARM64", "outside the target grammar"),
+    ("target", 7, "not a string"),
+]
+for field, value, label in malformed:
+    fields = OrderedDict(good)
+    fields[field] = value
+    slug = label.replace(" ", "_").replace(":", "").replace("-", "_").replace(".", "").replace("/", "")
+    case(
+        f"envelope_malformed_{field}_{slug}",
+        f"`{field}` is present but is {label}. A malformed field is refused rather than coerced.",
+        envelope_text=signed_text(fields), artifact=art, slot=arm64, expect="reject",
+        stage="envelope", reason="invalid_signature_envelope",
+    )
+
+bad_sig = OrderedDict(sorted(dict(good, signature="ed25519:" + b64(bytes(63))).items()))
+case(
+    "envelope_malformed_signature_63_bytes",
+    "The signature decodes to 63 bytes. Length is grammar, checked before any key is consulted.",
+    envelope_text=json.dumps(bad_sig, indent=2) + "\n", artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+unpadded = sign(good).rstrip("=")
+unpadded_env = OrderedDict(sorted(dict(good, signature=unpadded).items()))
+case(
+    "envelope_malformed_signature_unpadded_base64",
+    "Standard padded Base64 is required. An unpadded spelling of the same bytes is a second "
+    "encoding of one signature, and the contract admits one.",
+    envelope_text=json.dumps(unpadded_env, indent=2) + "\n", artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+# Strict Base64 is not canonical Base64. 64 bytes encode to 86 data characters
+# and two padding characters, and the last data character carries two bits of
+# the signature and four bits that must be zero. Setting one of those four gives
+# a second spelling that a strict decoder still accepts and decodes to the same
+# 64 bytes, so only a round-trip comparison refuses it.
+canonical_sig = sign(good)
+encoded = canonical_sig[len("ed25519:"):]
+alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+last = alphabet.index(encoded[85])
+assert last & 0b1111 == 0, "the canonical spelling leaves the padding bits clear"
+loose = encoded[:85] + alphabet[last | 0b0001] + encoded[86:]
+assert base64.b64decode(loose, validate=True) == base64.b64decode(encoded, validate=True)
+assert loose != encoded
+loose_env = OrderedDict(sorted(dict(good, signature="ed25519:" + loose).items()))
+case(
+    "envelope_malformed_signature_noncanonical_base64",
+    "The signature's final data character has a padding bit set. A strict decoder accepts it "
+    "and yields the same 64 bytes, so the signature would verify; it is refused because the "
+    "contract admits one spelling of a signature and this is a second.",
+    envelope_text=json.dumps(loose_env, indent=2) + "\n", artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+for label, bad_name in [
+    ("path_separator", f"../ori-runtime-{VERSION}-{arm64}.so"),
+    ("dotdot", ".."),
+    ("dot", "."),
+    ("backslash", f"sub\\ori-runtime-{VERSION}-{arm64}.so"),
+    ("control_character", f"ori-runtime-{VERSION}-{arm64}.so\n"),
+]:
+    fields = envelope_fields(art, target=arm64, name=bad_name)
+    case(
+        f"envelope_artifact_{label}",
+        "`artifact` is attacker-influenced until the signature is checked, so it must be a plain "
+        "filename before anything could join it to a path. This one is validly signed; the "
+        "refusal is about its form, not its authenticity.",
+        envelope_text=signed_text(fields), artifact=art, slot=arm64, expect="reject",
+        stage="envelope", reason="invalid_signature_envelope",
+    )
+
+for label, bad_name, why in [
+    ("delete_character", f"ori-runtime-{VERSION}-{arm64}.so\x7f", "DEL is a control character"),
+    ("non_ascii", f"ori-runtime-{VERSION}-{arm64}-\u00e9.so", "the form is printable ASCII"),
+    ("quote", f'ori-runtime-{VERSION}-"{arm64}".so', "a quote would need escaping in the canonical bytes"),
+]:
+    fields = envelope_fields(art, target=arm64, name=bad_name)
+    case(
+        f"envelope_artifact_{label}",
+        f"`artifact` is validly signed and not of its form: {why}. Keeping every string ASCII with "
+        "nothing to escape is what makes the canonical bytes identical in every language.",
+        envelope_text=signed_text(fields), artifact=art, slot=arm64, expect="reject",
+        stage="envelope", reason="invalid_signature_envelope",
+    )
+
+for field, value, label in [
+    ("runtime_version", VERSION + "+build.7", "build_metadata"),
+    ("target", "android-arm64-v8a-api0", "api_zero"),
+    ("target", "android-arm64-v8a-api021", "api_leading_zero"),
+    ("artifact_size", 2**53, "above_2_to_the_53_minus_1"),
+]:
+    fields = OrderedDict(good)
+    fields[field] = value
+    case(
+        f"envelope_malformed_{field}_{label}",
+        f"`{field}` is validly signed and outside its form ({label.replace('_', ' ')}).",
+        envelope_text=signed_text(fields), artifact=art, slot=arm64, expect="reject",
+        stage="envelope", reason="invalid_signature_envelope",
+    )
+
+case(
+    "envelope_artifact_size_too_long_to_convert",
+    "A 5000-digit integer. Several parsers raise converting it rather than refusing it, and a "
+    "verifier that crashes has not refused.",
+    envelope_text=text.replace(f'"artifact_size": {len(art)}', '"artifact_size": ' + "9" * 5000, 1),
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+case(
+    "envelope_artifact_size_with_exponent",
+    "The right number spelled with an exponent. The form is decimal digits.",
+    envelope_text=text.replace(f'"artifact_size": {len(art)}', f'"artifact_size": {len(art)}e0', 1),
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+case(
+    "envelope_deeply_nested_value",
+    "A field whose value is an array nested thirty thousand deep, inside the size bound. No field "
+    "is an array, and a recursive parser exhausts its stack before it can say so.",
+    envelope_text=text.replace('"stripped": true', '"stripped": ' + "[" * 30000 + "]" * 30000, 1),
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+case(
+    "envelope_lone_surrogate_escape",
+    "`artifact` begins with the escape of a lone surrogate, which is not a Unicode scalar value "
+    "and cannot be encoded as UTF-8. A verifier that admits it to canonical encoding crashes there.",
+    envelope_text=text.replace('"artifact": "', '"artifact": "\\ud800', 1),
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+case(
+    "envelope_longer_than_64_kib",
+    "A genuine envelope padded with whitespace past 64 KiB. It is refused unread, so the size of "
+    "what a verifier parses is bounded before parsing.",
+    envelope_text=text + " " * (64 * 1024),
+    artifact=art, slot=arm64, expect="reject",
+    stage="envelope", reason="invalid_signature_envelope",
+)
+
+# --- stage signature ----------------------------------------------------------
+
+case(
+    "signature_does_not_verify",
+    "Signed over different bytes: the size was changed after signing.",
+    envelope_text=json.dumps(
+        OrderedDict(sorted(dict(good, artifact_size=len(art) + 1, signature=sign(good)).items())), indent=2
+    ) + "\n",
+    artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="invalid_signature",
+)
+
+case(
+    "signature_under_the_release_bundle_domain",
+    "The same key, the same fields, signed under the release-bundle domain separator. The "
+    "domain is what stops a bundle signature verifying as a payload signature.",
+    envelope_text=signed_text(good, domain=BUNDLE_DOMAIN), artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="invalid_signature",
+)
+
+case(
+    "signature_by_a_key_not_in_the_registry",
+    "The envelope names a key the registry does not hold. An envelope names a key; it cannot supply one.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, key_id=KEY_IDS["unknown"]), key="rogue"),
+    artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="untrusted_release_key",
+)
+
+case(
+    "signature_by_a_revoked_key",
+    "Revoked keys fail closed, including for payloads signed before revocation.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, key_id=KEY_IDS["revoked"]), key="revoked"),
+    artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="untrusted_release_key",
+)
+
+case(
+    "signature_by_a_release_bundle_purpose_entry_with_the_same_key",
+    "The signature verifies under the key material, and the entry's purpose is "
+    "runtime_release_bundle. Purpose is an authorisation statement, never inferred from the key "
+    "bytes. A conforming registry load refuses this entry; verification refuses it again on its own.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, key_id=KEY_IDS["bundle_purpose"])),
+    artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="untrusted_release_key",
+)
+
+case(
+    "signature_by_the_wrong_registered_key",
+    "The envelope names the active key and was signed by the rogue key.",
+    envelope_text=signed_text(good, key="rogue"), artifact=art, slot=arm64, expect="reject",
+    stage="signature", reason="invalid_signature",
+)
+
+# --- stage identity -----------------------------------------------------------
+
+case(
+    "identity_runtime_version_not_selected",
+    "A genuine, validly signed payload from a different release. The consumer selected 2.6.0.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, version="2.5.0")),
+    artifact=art, slot=arm64, expect="reject",
+    basename=artifact_name("2.5.0", arm64),
+    stage="identity", reason="artifact_integrity_mismatch",
+)
+
+case(
+    "identity_target_not_a_v2_target",
+    "Well-formed and validly signed, naming a target this contract does not list. A consumer "
+    "refuses a target it does not know rather than guessing.",
+    envelope_text=signed_text(envelope_fields(art, target="android-riscv64-api21")),
+    artifact=art, slot=arm64, expect="reject",
+    stage="identity", reason="unsupported_target",
+)
+
+riscv = "android-riscv64-api21"
+riscv_payload = elf(2, 243)
+case(
+    "identity_slot_is_not_a_v2_target",
+    "The consumer's own slot is a target this contract does not list, and the envelope names that "
+    "same target. Target and slot agree, so only the v2 membership check refuses it.",
+    envelope_text=signed_text(envelope_fields(riscv_payload, target=riscv)),
+    artifact=riscv_payload, slot=riscv, expect="reject",
+    stage="identity", reason="unsupported_target",
+)
+
+for signed_for in TARGETS:
+    for slot in TARGETS:
+        if signed_for == slot:
+            continue
+        payload = artifacts[signed_for]
+        case(
+            f"identity_{signed_for}_payload_in_{slot}_slot",
+            "A correctly built payload with a valid signature for its own target, exported into "
+            "another slot. Every property of the file is genuine, which is why only the identity "
+            "check catches it.",
+            envelope_text=signed_text(envelope_fields(payload, target=signed_for)),
+            artifact=payload, slot=slot, expect="reject",
+            basename=artifact_name(VERSION, signed_for),
+            stage="identity", reason="unsupported_target",
+        )
+
+# --- stage artifact_name ------------------------------------------------------
+
+case(
+    "artifact_name_disagrees_with_derived_name",
+    "A plain filename, validly signed, that is not the name derived from the selected version "
+    "and slot. Comparing it with the downloaded name would not catch this if both were renamed.",
+    envelope_text=signed_text(envelope_fields(art, target=arm64, name="libori_runtime_exec.so")),
+    artifact=art, slot=arm64, expect="reject",
+    basename="libori_runtime_exec.so",
+    stage="artifact_name", reason="artifact_integrity_mismatch",
+)
+
+# --- stage presence -----------------------------------------------------------
+
+case(
+    "payload_absent",
+    "The envelope is genuine and the payload is missing. A consumer never substitutes a "
+    "placeholder, a stub or a previously staged file.",
+    envelope_text=signed_text(good), artifact=None, slot=arm64, expect="reject",
+    stage="presence", reason="invalid_artifact",
+)
+
+case(
+    "presence_before_basename",
+    "The payload is missing and the name it would have been fetched under is wrong. Presence is "
+    "step 5 and the basename step 6, so absence is what refuses it.",
+    envelope_text=signed_text(good), artifact=None, slot=arm64, expect="reject",
+    basename=artifact_name(VERSION, armv7),
+    stage="presence", reason="invalid_artifact",
+)
+
+# --- stage basename -----------------------------------------------------------
+
+case(
+    "downloaded_basename_disagrees_with_derived_name",
+    "The envelope names the derived name and the file on disk was fetched under another. The "
+    "signature says nothing about which file the consumer is holding.",
+    envelope_text=signed_text(good), artifact=art, slot=arm64, expect="reject",
+    basename=artifact_name(VERSION, armv7),
+    stage="basename", reason="artifact_integrity_mismatch",
+)
+
+# --- stage integrity ----------------------------------------------------------
+
+tampered = bytearray(art)
+tampered[200] ^= 0xFF
+case(
+    "integrity_digest_mismatch",
+    "Same length, one byte altered after signing.",
+    envelope_text=signed_text(good), artifact=bytes(tampered), slot=arm64, expect="reject",
+    stage="integrity", reason="artifact_integrity_mismatch",
+)
+
+longer = art + b"\x00"
+case(
+    "integrity_size_mismatch",
+    "One byte appended after signing. The digest also differs; size is checked so a verifier "
+    "that compared only digests prefixes would still refuse it.",
+    envelope_text=signed_text(good), artifact=longer, slot=arm64, expect="reject",
+    stage="integrity", reason="artifact_integrity_mismatch",
+)
+
+declared_wrong = envelope_fields(art, target=arm64)
+declared_wrong["artifact_size"] = len(art) + 1
+case(
+    "integrity_declared_size_wrong_digest_right",
+    "The producer recorded the right digest and the wrong size, and signed both. The bytes are "
+    "untouched, so a verifier comparing only the digest accepts an envelope whose own size claim "
+    "is false.",
+    envelope_text=signed_text(declared_wrong), artifact=art, slot=arm64, expect="reject",
+    stage="integrity", reason="artifact_integrity_mismatch",
+)
+
+# --- stage abi ----------------------------------------------------------------
+
+for claimed in TARGETS:
+    for actual in TARGETS:
+        if claimed == actual:
+            continue
+        wrong = artifacts[actual]
+        case(
+            f"abi_{actual}_bytes_signed_as_{claimed}",
+            "A producer that mislabelled: the envelope, the name, the digest and the slot all "
+            "agree, and the ELF header describes a different ABI. The signature proves only that "
+            "these bytes were signed.",
+            envelope_text=signed_text(envelope_fields(wrong, target=claimed)),
+            artifact=wrong, slot=claimed, expect="reject",
+            stage="abi", reason="unsupported_target",
+        )
+
+for label, target, shape in [
+    ("aarch64_machine_at_32_bit_class", arm64, (1, 183)),
+    ("arm_machine_at_64_bit_class", armv7, (2, 40)),
+]:
+    width = elf(*shape)
+    case(
+        f"abi_width_only_{label}",
+        "The machine matches the slot and the class does not. A check that read only e_machine "
+        "accepts it.",
+        envelope_text=signed_text(envelope_fields(width, target=target)),
+        artifact=width, slot=target, expect="reject",
+        stage="abi", reason="unsupported_target",
+    )
+
+big_endian = elf(2, 183, ei_data=2)
+case(
+    "abi_big_endian",
+    "Every Android ABI here is little-endian.",
+    envelope_text=signed_text(envelope_fields(big_endian, target=arm64)),
+    artifact=big_endian, slot=arm64, expect="reject",
+    stage="abi", reason="unsupported_target",
+)
+
+not_elf = SHELL_LINE + b"exec true\n" + bytes(512)
+case(
+    "abi_not_an_elf",
+    "No ELF magic at all.",
+    envelope_text=signed_text(envelope_fields(not_elf, target=arm64)),
+    artifact=not_elf, slot=arm64, expect="reject",
+    stage="abi", reason="unsupported_target",
+)
+
+short = b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+assert len(short) < 20
+case(
+    "abi_shorter_than_an_elf_header_prefix",
+    "The ELF magic and identification bytes, and nothing where e_machine would be. A verifier must "
+    "refuse it rather than index past the end.",
+    envelope_text=signed_text(envelope_fields(short, target=arm64)),
+    artifact=short, slot=arm64, expect="reject",
+    stage="abi", reason="unsupported_target",
+)
+
+wrong_magic = b"\x7eELF" + art[4:]
+case(
+    "abi_first_magic_byte_wrong",
+    "Every header byte right except the first byte of the magic.",
+    envelope_text=signed_text(envelope_fields(wrong_magic, target=arm64)),
+    artifact=wrong_magic, slot=arm64, expect="reject",
+    stage="abi", reason="unsupported_target",
+)
+
+wrong_abi_with_shell = elf(1, 40, extra=SHELL_LINE)
+case(
+    "abi_before_content",
+    "An armeabi-v7a header, signed as arm64, carrying a shell interpreter line. The ABI is step 8 "
+    "and content step 9, so the ABI is what refuses it.",
+    envelope_text=signed_text(envelope_fields(wrong_abi_with_shell, target=arm64)),
+    artifact=wrong_abi_with_shell, slot=arm64, expect="reject",
+    stage="abi", reason="unsupported_target",
+)
+
+# --- stage content ------------------------------------------------------------
+
+shell = elf(2, 183, extra=SHELL_LINE)
+case(
+    "content_shell_interpreter_line",
+    "A valid arm64 header carrying a shell interpreter line. The consuming application ships a "
+    "shell script to keep its own build green, and a payload containing one is that script.",
+    envelope_text=signed_text(envelope_fields(shell, target=arm64)),
+    artifact=shell, slot=arm64, expect="reject",
+    stage="content", reason="invalid_artifact",
+)
+
+shim = elf(2, 183, extra=PLACEHOLDER_MARKER)
+case(
+    "content_placeholder_marker",
+    "A valid arm64 header carrying the placeholder marker.",
+    envelope_text=signed_text(envelope_fields(shim, target=arm64)),
+    artifact=shim, slot=arm64, expect="reject",
+    stage="content", reason="invalid_artifact",
+)
+
+# --- registry load ------------------------------------------------------------
+
+# The contract's own example key. Its seed is not published anywhere, which is
+# the property a loadable registry needs; the corpus never signs with it.
+UNPUBLISHED_PUBLIC_KEY = "aDlW3MqinQM8y96szEqNske2ytKkxbmMDl87CuLbAQ8="
+
+registry_cases = []
+
+
+def entry(key_id="ori-android-payload-2026-01", public=UNPUBLISHED_PUBLIC_KEY,
+          purpose="android_runtime_payload", status="active"):
+    return OrderedDict([("key_id", key_id), ("public_key_b64", public), ("purpose", purpose), ("status", status)])
+
+
+def registry_text(keys, schema=REGISTRY_SCHEMA):
+    return json.dumps(OrderedDict([("keys", keys), ("schema", schema)]), indent=2) + "\n"
+
+
+def registry_case(name, note, text_, expect):
+    registry_cases.append(OrderedDict([("name", name), ("note", note), ("registry_text", text_), ("expect", expect)]))
+
+
+registry_case("load_one_unpublished_active_key", "One active key whose seed is not published.",
+              registry_text([entry()]), "load")
+registry_case("load_active_and_verify_only", "Rotation: the old key verify_only beside a new active one.",
+              registry_text([entry(), entry(key_id="ori-android-payload-2025-01", status="verify_only")]), "load")
+for label in SEEDS:
+    registry_case(
+        f"refuse_published_{label}_test_key",
+        "The public key of a seed this corpus publishes. Anyone with a clone can sign under it, so a "
+        "registry holding it is refused at load, whatever else the registry holds.",
+        registry_text([entry(), entry(key_id="ori-android-payload-test", public=public_b64(label))]),
+        "refuse",
+    )
+_last = alphabet.index(UNPUBLISHED_PUBLIC_KEY[42])
+assert _last & 0b11 == 0, "the canonical spelling leaves the two padding bits clear"
+noncanonical_key = UNPUBLISHED_PUBLIC_KEY[:42] + alphabet[_last | 0b01] + "="
+assert base64.b64decode(noncanonical_key, validate=True) == base64.b64decode(UNPUBLISHED_PUBLIC_KEY)
+assert noncanonical_key != UNPUBLISHED_PUBLIC_KEY
+for label, keys, schema in [
+    ("empty_keys", [], REGISTRY_SCHEMA),
+    ("wrong_schema", [entry()], "ori.release_keys.v1"),
+    ("release_bundle_purpose", [entry(purpose="runtime_release_bundle")], REGISTRY_SCHEMA),
+    ("unknown_status", [entry(status="retired")], REGISTRY_SCHEMA),
+    ("status_not_a_string", [entry(status=["active"])], REGISTRY_SCHEMA),
+    ("duplicate_key_id", [entry(), entry(status="verify_only")], REGISTRY_SCHEMA),
+    ("malformed_key_id", [entry(key_id="ori/payload")], REGISTRY_SCHEMA),
+    ("public_key_31_bytes", [entry(public=b64(bytes(31)))], REGISTRY_SCHEMA),
+    ("public_key_noncanonical_base64", [entry(public=noncanonical_key)], REGISTRY_SCHEMA),
+]:
+    registry_case(f"refuse_{label}", f"A registry whose only fault is: {label.replace('_', ' ')}.",
+                  registry_text(keys, schema), "refuse")
+unknown_entry = entry()
+unknown_entry["expires_at"] = "2027-01-01"
+registry_case("refuse_unknown_entry_field", "An entry with a field the contract does not define.",
+              registry_text([unknown_entry]), "refuse")
+dup_text = registry_text([entry()]).replace('"status": "active"', '"status": "revoked",\n      "status": "active"', 1)
+registry_case("refuse_duplicate_entry_key", "A repeated key inside an entry: revoked, then active.", dup_text, "refuse")
+
+rnames = [c["name"] for c in registry_cases]
+assert len(rnames) == len(set(rnames))
+
+names = [c["name"] for c in cases]
+assert len(names) == len(set(names)), [n for n in names if names.count(n) > 1]
+
+corpus = OrderedDict(
+    [
+        ("contract", "ori-specs/runtime-mobile/v2.md"),
+        ("version", 1),
+        (
+            "comment",
+            "Consumer verification vectors for Android runtime payload publication. Each case is a "
+            "complete consumer input and the outcome the contract's ordered checks reach, with the "
+            "stage that refuses it. A consumer must accept every accept case and refuse every reject "
+            "case at its declared stage and for its declared reason.",
+        ),
+        (
+            "test_keys_comment",
+            "Every seed here is public. A consumer registry must never contain any of these public "
+            "keys, and a verifier should refuse them at registry load: a published seed accepted as a "
+            "trust anchor is a forgery anyone with a clone of this repository can make.",
+        ),
+        (
+            "test_keys",
+            OrderedDict(
+                (name, OrderedDict([("test_seed_hex", seed.hex()), ("public_key_b64", public_b64(name))]))
+                for name, seed in SEEDS.items()
+            ),
+        ),
+        ("known_test_public_keys_b64", [public_b64(name) for name in SEEDS]),
+        ("schema", SCHEMA),
+        ("domain_separator_hex", DOMAIN.hex()),
+        ("canonical_form", "UTF-8 JSON, keys sorted by code point, no insignificant whitespace, no escaping of characters that need none"),
+        (
+            "targets",
+            OrderedDict(
+                (t, OrderedDict([("ei_class", c), ("ei_data", 1), ("e_machine", m)])) for t, (c, m) in TARGETS.items()
+            ),
+        ),
+        ("shell_interpreter_substring", "system/bin/sh"),
+        ("placeholder_marker", PLACEHOLDER_MARKER.decode()),
+        ("acceptance_order", ["envelope", "signature", "identity", "artifact_name", "presence", "basename", "integrity", "abi", "content"]),
+        ("registry", REGISTRY),
+        ("cases", cases),
+        ("registry_cases", registry_cases),
+    ]
+)
+
+OUT.write_text(json.dumps(corpus, indent=2, ensure_ascii=False) + "\n")
+print(f"wrote {OUT.relative_to(ROOT)}: {len(cases)} cases")
