@@ -21,7 +21,7 @@ This repository is documentation-only. It contains no runtime implementation cod
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | Implemented baseline; superseded, see its Known Defects |
 | Runtime telemetry HTTP export | [runtime-telemetry/v2.md](runtime-telemetry/v2.md) | Design target; per-event idempotency and a sensor-status route |
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | Implemented baseline |
-| Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | Design target |
+| Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | Design target; corpus, no implementation |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | Implemented baseline |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | Implemented baseline |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | Implemented baseline |

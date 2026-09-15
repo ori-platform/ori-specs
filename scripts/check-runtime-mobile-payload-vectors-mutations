@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Prove `check-runtime-mobile-payload-vectors` fails when the corpus is wrong.
+
+A checker that passes is only evidence once it has been shown to fire. This
+mutates a scratch copy of the corpus in each way the checker claims to catch and
+requires a failure naming that fault, so a check quietly reduced to a no-op
+fails here rather than passing for the life of the repository.
+
+The mutations that matter most produce false coverage rather than an obvious
+break: a rejection case neutered until it violates nothing, a rejection case
+made impure so it is refused at an earlier stage than the rule it claims, and a
+stage left with no case at all. Each looks like a healthy corpus from outside.
+
+Run from the repository root:
+
+    python3 scripts/check-runtime-mobile-payload-vectors-mutations
+
+Exits non-zero if any mutation goes uncaught.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CHECKER = ROOT / "scripts" / "check-runtime-mobile-payload-vectors"
+CORPUS = ROOT / "runtime-mobile" / "payload-vectors-v2.json"
+
+
+def _run(mutate: Callable[[dict], None]) -> tuple[int, str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = pathlib.Path(tmp) / "repo"
+        (work / "runtime-mobile").mkdir(parents=True)
+        (work / "scripts").mkdir()
+        shutil.copy(CHECKER, work / "scripts" / CHECKER.name)
+        document = json.loads(CORPUS.read_text(encoding="utf-8"))
+        mutate(document)
+        (work / "runtime-mobile" / CORPUS.name).write_text(
+            json.dumps(document, indent=2), encoding="utf-8"
+        )
+        result = subprocess.run(
+            [sys.executable, f"scripts/{CHECKER.name}"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        return result.returncode, result.stdout + result.stderr
+
+
+def _case(document: dict, name: str) -> dict:
+    matches = [c for c in document["cases"] if c["name"] == name]
+    assert len(matches) == 1, f"the corpus no longer has exactly one case named {name}"
+    return matches[0]
+
+
+def neuter_the_duplicate_key(document: dict) -> None:
+    case = _case(document, "envelope_duplicate_key")
+    text = case["envelope_text"]
+    lines = text.splitlines(keepends=True)
+    kept = [line for line in lines if line.strip() != '"artifact_size": 1,']
+    assert len(kept) == len(lines) - 1, "the injected duplicate line was not found"
+    case["envelope_text"] = "".join(kept)
+
+
+def make_the_digest_case_impure(document: dict) -> None:
+    case = _case(document, "integrity_digest_mismatch")
+    envelope = json.loads(case["envelope_text"])
+    envelope["key_id"] = "ori-test-android-payload-absent"
+    case["envelope_text"] = json.dumps(envelope, indent=2)
+
+
+def corrupt_an_accepted_signature(document: dict) -> None:
+    case = _case(document, "accept_android-arm64-v8a-api21")
+    envelope = json.loads(case["envelope_text"])
+    raw = bytearray(base64.b64decode(envelope["signature"][len("ed25519:"):]))
+    raw[0] ^= 0x01
+    envelope["signature"] = "ed25519:" + base64.b64encode(bytes(raw)).decode("ascii")
+    case["envelope_text"] = json.dumps(envelope, indent=2)
+
+
+def swap_a_reason(document: dict) -> None:
+    _case(document, "abi_big_endian")["expect"]["reason"] = "invalid_artifact"
+
+
+def move_a_refusal_to_a_later_stage(document: dict) -> None:
+    _case(document, "signature_by_a_revoked_key")["expect"]["stage"] = "identity"
+
+
+def drop_every_basename_case(document: dict) -> None:
+    document["cases"] = [c for c in document["cases"] if c["expect"].get("stage") != "basename"]
+
+
+def drop_an_accepted_target(document: dict) -> None:
+    document["cases"] = [c for c in document["cases"] if c["name"] != "accept_android-x86_64-api21"]
+
+
+def put_an_unpublished_key_in_the_registry(document: dict) -> None:
+    document["registry"]["keys"][0]["public_key_b64"] = base64.b64encode(bytes(range(32))).decode("ascii")
+
+
+def alter_a_published_seed(document: dict) -> None:
+    key = document["test_keys"]["rogue"]
+    key["test_seed_hex"] = "ff" + key["test_seed_hex"][2:]
+
+
+def change_the_domain_separator(document: dict) -> None:
+    document["domain_separator_hex"] = b"ori.runtime_release_bundle_signature.v1\x00".hex()
+
+
+def accept_a_payload_in_the_wrong_slot(document: dict) -> None:
+    case = _case(document, "identity_android-arm64-v8a-api21_payload_in_android-armeabi-v7a-api21_slot")
+    case["expect"] = {"outcome": "accept"}
+
+
+def load_a_registry_holding_a_published_key(document: dict) -> None:
+    case = [c for c in document["registry_cases"] if c["name"] == "refuse_published_active_test_key"]
+    assert len(case) == 1, "the corpus no longer has the published active key registry case"
+    case[0]["expect"] = "load"
+
+
+def refuse_after_presence_at_basename(document: dict) -> None:
+    _case(document, "presence_before_basename")["expect"]["stage"] = "basename"
+    _case(document, "presence_before_basename")["expect"]["reason"] = "artifact_integrity_mismatch"
+
+
+MUTATIONS: list[tuple[str, Callable[[dict], None], str]] = [
+    ("neutered duplicate key", neuter_the_duplicate_key, "envelope_duplicate_key"),
+    ("impure digest case", make_the_digest_case_impure, "integrity_digest_mismatch"),
+    ("corrupted accepted signature", corrupt_an_accepted_signature, "accept_android-arm64-v8a-api21"),
+    ("swapped reason", swap_a_reason, "abi_big_endian"),
+    ("refusal moved to a later stage", move_a_refusal_to_a_later_stage, "signature_by_a_revoked_key"),
+    ("stage left without a case", drop_every_basename_case, "no case is refused at stage basename"),
+    ("target left without an accept case", drop_an_accepted_target, "not every target"),
+    ("unpublished key in the registry", put_an_unpublished_key_in_the_registry, "has no published seed"),
+    ("altered published seed", alter_a_published_seed, "does not derive"),
+    ("wrong domain separator", change_the_domain_separator, "domain separator"),
+    ("wrong-slot payload accepted", accept_a_payload_in_the_wrong_slot, "expected accept"),
+    ("published key registry loaded", load_a_registry_holding_a_published_key, "refuse_published_active_test_key"),
+    ("basename checked before presence", refuse_after_presence_at_basename, "presence_before_basename"),
+]
+
+
+def main() -> int:
+    code, output = _run(lambda document: None)
+    if code != 0:
+        print("the unmutated corpus does not pass, so no mutation result means anything:")
+        print(output)
+        return 1
+
+    uncaught = []
+    for label, mutate, finding in MUTATIONS:
+        code, output = _run(mutate)
+        if code == 0 or finding not in output:
+            uncaught.append(label)
+            print(f"UNCAUGHT {label}: exit {code}, finding {finding!r} not reported")
+        else:
+            print(f"caught   {label}")
+
+    if uncaught:
+        return 1
+    print(f"check-runtime-mobile-payload-vectors-mutations: all {len(MUTATIONS)} mutations caught")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

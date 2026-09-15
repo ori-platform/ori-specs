@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the runtime-mobile/v2 payload corpus against the contract.
+
+No consumer implements this contract yet, so this checker is the corpus's only
+executable reader until a consumer's verifier lands. It implements the
+contract's ordered checks from the contract text and shares no code with the
+generator: it has its own strict parser, its own canonical encoder and its own
+field grammar, and every case must reach its declared outcome, at its declared
+stage, for its declared reason.
+
+Beyond each case it holds the corpus to:
+
+- every stage in the acceptance order stopping at least one case, so no check
+  is present in prose and absent from evidence;
+- every case refused after the signature stage carrying a signature that
+  verifies, so identity, name, integrity, ABI and content refusals are proven
+  to be about genuine envelopes rather than forgeries;
+- the registry holding only keys whose seeds the corpus itself publishes, and
+  those seeds deriving exactly the public keys it lists, so the test keys are
+  known and a consumer can refuse them;
+- every registry case loading or being refused as it declares, with the
+  contract's registry rules implemented here rather than read from the corpus.
+
+Run from the repository root:
+
+    python3 scripts/check-runtime-mobile-payload-vectors
+"""
+
+import base64
+import binascii
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+
+CORPUS = pathlib.Path(__file__).resolve().parent.parent / "runtime-mobile/payload-vectors-v2.json"
+
+SCHEMA = "ori.android_runtime_payload_signature.v1"
+DOMAIN = b"ori.android_runtime_payload_signature.v1\x00"
+PURPOSE = "android_runtime_payload"
+VERIFYING_STATUSES = {"active", "verify_only"}
+KNOWN_STATUSES = {"active", "verify_only", "revoked"}
+
+FIELDS = (
+    "artifact",
+    "artifact_sha256",
+    "artifact_size",
+    "key_id",
+    "runtime_version",
+    "schema",
+    "signature",
+    "stripped",
+    "target",
+)
+
+# The contract's v2 targets and the ELF identity each one requires.
+TARGETS = {
+    "android-arm64-v8a-api21": (2, 183),
+    "android-armeabi-v7a-api21": (1, 40),
+    "android-x86_64-api21": (2, 62),
+}
+
+ORDER = (
+    "envelope",
+    "signature",
+    "identity",
+    "artifact_name",
+    "presence",
+    "basename",
+    "integrity",
+    "abi",
+    "content",
+)
+
+KEY_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?")
+TARGET = re.compile(r"android-[a-z0-9_-]+-api[1-9][0-9]*")
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+ARTIFACT = re.compile(r"[!#-\[\]-~]{1,255}")  # printable ASCII except '"' and '\\'
+MAX_ENVELOPE_BYTES = 64 * 1024
+MAX_SIZE = 2**53 - 1
+REGISTRY_SCHEMA = "ori.android_runtime_payload_keys.v1"
+ENTRY_FIELDS = {"key_id", "public_key_b64", "purpose", "status"}
+
+
+class Refused(Exception):
+    def __init__(self, stage, reason, detail):
+        super().__init__(f"{stage}/{reason}: {detail}")
+        self.stage = stage
+        self.reason = reason
+
+
+def refuse(stage, reason, detail):
+    raise Refused(stage, reason, detail)
+
+
+def strict_object(text):
+    """Parse strict JSON, refusing duplicate keys and non-finite constants."""
+
+    def pairs(items):
+        seen = {}
+        for key, value in items:
+            if key in seen:
+                raise ValueError(f"duplicate key {key!r}")
+            seen[key] = value
+        return seen
+
+    def no_constants(name):
+        raise ValueError(f"non-standard constant {name}")
+
+    def bounded_int(digits):
+        if len(digits.lstrip("-")) > 16:
+            raise ValueError("integer longer than the form allows")
+        return int(digits)
+
+    if len(text.encode("utf-8", "surrogatepass")) > MAX_ENVELOPE_BYTES:
+        raise ValueError("longer than 64 KiB")
+    try:
+        value = json.loads(text, object_pairs_hook=pairs, parse_constant=no_constants, parse_int=bounded_int)
+    except RecursionError:
+        raise ValueError("nested beyond any defined field") from None
+    if not isinstance(value, dict):
+        raise ValueError("not an object")
+    return value
+
+
+def encode_canonical(value):
+    """UTF-8 JSON, keys by code point, no whitespace, minimal escaping."""
+    if isinstance(value, bool):
+        return b"true" if value else b"false"
+    if isinstance(value, int):
+        return str(value).encode("ascii")
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False).encode("utf-8")
+    if isinstance(value, dict):
+        parts = [encode_canonical(k) + b":" + encode_canonical(value[k]) for k in sorted(value)]
+        return b"{" + b",".join(parts) + b"}"
+    raise TypeError(f"no canonical form for {type(value).__name__}")
+
+
+def plain_filename(name):
+    if not isinstance(name, str) or not ARTIFACT.fullmatch(name):
+        return False
+    return "/" not in name and name not in (".", "..")
+
+
+def decode_signature(value):
+    if not isinstance(value, str) or not value.startswith("ed25519:"):
+        return None
+    encoded = value[len("ed25519:"):]
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if base64.b64encode(raw).decode("ascii") != encoded or len(raw) != 64:
+        return None
+    return raw
+
+
+def check_envelope(text):
+    try:
+        env = strict_object(text)
+    except ValueError as exc:
+        refuse("envelope", "invalid_signature_envelope", str(exc))
+
+    if set(env) != set(FIELDS):
+        refuse("envelope", "invalid_signature_envelope", f"fields {sorted(env)}")
+
+    if not plain_filename(env["artifact"]):
+        refuse("envelope", "invalid_signature_envelope", "artifact is not a plain filename")
+    if not isinstance(env["artifact_sha256"], str) or not DIGEST.fullmatch(env["artifact_sha256"]):
+        refuse("envelope", "invalid_signature_envelope", "artifact_sha256 form")
+    size = env["artifact_size"]
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= MAX_SIZE:
+        refuse("envelope", "invalid_signature_envelope", "artifact_size form")
+    if not isinstance(env["key_id"], str) or not KEY_ID.fullmatch(env["key_id"]):
+        refuse("envelope", "invalid_signature_envelope", "key_id form")
+    if not isinstance(env["runtime_version"], str) or not VERSION.fullmatch(env["runtime_version"]):
+        refuse("envelope", "invalid_signature_envelope", "runtime_version form")
+    if env["schema"] != SCHEMA:
+        refuse("envelope", "invalid_signature_envelope", "schema")
+    if decode_signature(env["signature"]) is None:
+        refuse("envelope", "invalid_signature_envelope", "signature form")
+    if not isinstance(env["stripped"], bool):
+        refuse("envelope", "invalid_signature_envelope", "stripped form")
+    if not isinstance(env["target"], str) or not TARGET.fullmatch(env["target"]):
+        refuse("envelope", "invalid_signature_envelope", "target form")
+    return env
+
+
+def check_signature(env, registry):
+    entries = [e for e in registry["keys"] if e["key_id"] == env["key_id"]]
+    if len(entries) != 1:
+        refuse("signature", "untrusted_release_key", "key_id not in registry")
+    entry = entries[0]
+    if entry["purpose"] != PURPOSE:
+        refuse("signature", "untrusted_release_key", f"purpose {entry['purpose']}")
+    if entry["status"] not in VERIFYING_STATUSES:
+        refuse("signature", "untrusted_release_key", f"status {entry['status']}")
+
+    key = Ed25519PublicKey.from_public_bytes(base64.b64decode(entry["public_key_b64"], validate=True))
+    unsigned = {k: v for k, v in env.items() if k != "signature"}
+    try:
+        key.verify(decode_signature(env["signature"]), DOMAIN + encode_canonical(unsigned))
+    except InvalidSignature:
+        refuse("signature", "invalid_signature", "does not verify")
+
+
+def check_after_signature(env, case):
+    selected = case["selected_runtime_version"]
+    slot = case["slot_target"]
+
+    if env["runtime_version"] != selected:
+        refuse("identity", "artifact_integrity_mismatch", "runtime_version not selected")
+    if env["target"] not in TARGETS:
+        refuse("identity", "unsupported_target", "not a v2 target")
+    if env["target"] != slot:
+        refuse("identity", "unsupported_target", "target is not the slot")
+
+    derived = f"ori-runtime-{selected}-{slot}.so"
+    if env["artifact"] != derived:
+        refuse("artifact_name", "artifact_integrity_mismatch", "artifact is not the derived name")
+
+    if case["artifact_b64"] is None:
+        refuse("presence", "invalid_artifact", "payload absent")
+    data = base64.b64decode(case["artifact_b64"], validate=True)
+
+    if case["downloaded_basename"] != derived:
+        refuse("basename", "artifact_integrity_mismatch", "downloaded basename is not the derived name")
+
+    if len(data) != env["artifact_size"] or "sha256:" + hashlib.sha256(data).hexdigest() != env["artifact_sha256"]:
+        refuse("integrity", "artifact_integrity_mismatch", "digest or size")
+
+    if len(data) < 20 or data[:4] != b"\x7fELF":
+        refuse("abi", "unsupported_target", "not ELF")
+    want_class, want_machine = TARGETS[slot]
+    machine = data[18] | (data[19] << 8)
+    if data[5] != 1 or data[4] != want_class or machine != want_machine:
+        refuse("abi", "unsupported_target", f"class {data[4]} data {data[5]} machine {machine}")
+
+    if b"system/bin/sh" in data:
+        refuse("content", "invalid_artifact", "shell interpreter line")
+    if b"ORI_ANDROID_RUNTIME_PAYLOAD_SHIM" in data:
+        refuse("content", "invalid_artifact", "placeholder marker")
+
+
+def registry_loads(text, known_public):
+    """The contract's registry rules. True when a consumer loads the document."""
+    try:
+        doc = strict_object(text)
+    except ValueError:
+        return False
+    if set(doc) != {"keys", "schema"} or doc["schema"] != REGISTRY_SCHEMA:
+        return False
+    keys = doc["keys"]
+    if not isinstance(keys, list) or not keys:
+        return False
+    seen = set()
+    for entry in keys:
+        if not isinstance(entry, dict) or set(entry) != ENTRY_FIELDS:
+            return False
+        key_id = entry["key_id"]
+        if not isinstance(key_id, str) or not KEY_ID.fullmatch(key_id) or key_id in seen:
+            return False
+        seen.add(key_id)
+        public = entry["public_key_b64"]
+        if not isinstance(public, str):
+            return False
+        try:
+            raw = base64.b64decode(public, validate=True)
+            Ed25519PublicKey.from_public_bytes(raw)
+        except (binascii.Error, ValueError):
+            return False
+        if len(raw) != 32 or base64.b64encode(raw).decode("ascii") != public:
+            return False
+        if public in known_public:
+            return False
+        if entry["purpose"] != PURPOSE:
+            return False
+        if not isinstance(entry["status"], str) or entry["status"] not in KNOWN_STATUSES:
+            return False
+    return True
+
+
+def evaluate(case, registry):
+    """Run the contract's checks in order. Returns (stage, reason) or None to accept."""
+    try:
+        env = check_envelope(case["envelope_text"])
+        check_signature(env, registry)
+        check_after_signature(env, case)
+    except Refused as refusal:
+        return refusal.stage, refusal.reason
+    return None
+
+
+def main():
+    corpus = json.loads(CORPUS.read_text())
+    failures = []
+
+    if corpus.get("contract") != "ori-specs/runtime-mobile/v2.md":
+        failures.append("corpus names the wrong contract")
+    if tuple(corpus.get("acceptance_order", ())) != ORDER:
+        failures.append(f"acceptance order {corpus.get('acceptance_order')} is not the contract's")
+    if bytes.fromhex(corpus.get("domain_separator_hex", "")) != DOMAIN:
+        failures.append("domain separator disagrees with the contract")
+
+    derived_public = set()
+    for name, key in corpus["test_keys"].items():
+        public = base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(bytes.fromhex(key["test_seed_hex"])).public_key().public_bytes_raw()
+        ).decode("ascii")
+        if public != key["public_key_b64"]:
+            failures.append(f"test key {name}: seed does not derive its listed public key")
+        derived_public.add(public)
+    if set(corpus["known_test_public_keys_b64"]) != derived_public:
+        failures.append("known_test_public_keys_b64 is not exactly the published seeds' public keys")
+
+    registry = corpus["registry"]
+    for entry in registry["keys"]:
+        if entry["public_key_b64"] not in derived_public:
+            failures.append(f"registry key {entry['key_id']} has no published seed; the corpus must not carry a real key")
+        if entry["status"] not in KNOWN_STATUSES:
+            failures.append(f"registry key {entry['key_id']} status {entry['status']}")
+
+    stopped = {stage: 0 for stage in ORDER}
+    accepted = 0
+    names = set()
+    for case in corpus["cases"]:
+        name = case["name"]
+        if name in names:
+            failures.append(f"duplicate case name {name}")
+        names.add(name)
+
+        got = evaluate(case, registry)
+        expect = case["expect"]
+        if expect["outcome"] == "accept":
+            accepted += 1
+            if got is not None:
+                failures.append(f"{name}: expected accept, refused at {got[0]}/{got[1]}")
+            continue
+
+        want = (expect["stage"], expect["reason"])
+        if got != want:
+            failures.append(f"{name}: expected {want[0]}/{want[1]}, got {got}")
+            continue
+        stopped[want[0]] += 1
+
+        # A refusal after the signature stage must be about a genuine envelope.
+        if ORDER.index(want[0]) > ORDER.index("signature"):
+            try:
+                check_signature(check_envelope(case["envelope_text"]), registry)
+            except Refused as refusal:
+                failures.append(f"{name}: refused at {want[0]} but its signature does not hold ({refusal})")
+
+    registry_outcomes = set()
+    for rcase in corpus.get("registry_cases", []):
+        want = rcase["expect"]
+        got = "load" if registry_loads(rcase["registry_text"], derived_public) else "refuse"
+        registry_outcomes.add(want)
+        if got != want:
+            failures.append(f"registry case {rcase['name']}: expected {want}, got {got}")
+    if registry_outcomes != {"load", "refuse"}:
+        failures.append("registry cases do not include both a loadable and a refused registry")
+    published_refused = {
+        c["name"] for c in corpus.get("registry_cases", [])
+        if c["expect"] == "refuse" and any(k in c["registry_text"] for k in derived_public)
+    }
+    if not published_refused:
+        failures.append("no registry case refuses a published test key")
+
+    for stage, count in stopped.items():
+        if count == 0:
+            failures.append(f"no case is refused at stage {stage}")
+    if accepted == 0:
+        failures.append("no case is accepted")
+    accepted_targets = {
+        c["slot_target"] for c in corpus["cases"] if c["expect"]["outcome"] == "accept"
+    }
+    if accepted_targets != set(TARGETS):
+        failures.append(f"accept cases cover {sorted(accepted_targets)}, not every target")
+
+    if failures:
+        for failure in failures:
+            print(f"FAIL {failure}")
+        return 1
+
+    summary = ", ".join(f"{count} {stage}" for stage, count in stopped.items())
+    print(
+        f"check-runtime-mobile-payload-vectors: corpus agrees with the contract "
+        f"({accepted} accept; refused: {summary})"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
