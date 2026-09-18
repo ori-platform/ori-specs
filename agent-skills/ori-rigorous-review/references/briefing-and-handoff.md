@@ -46,7 +46,8 @@ real and all about the text; the five defects about the world, including a
 sentence that would have regressed staleness detection for every phone that
 buffers offline, were found only by the receiver's implementer running the
 paragraph against the receiver. Send a draft to every implementer, not only
-to a reader.
+to a reader. The run costs one pass against a checkout the implementer
+already has open; the same finding after merge is a migration.
 
 Ask for the report in the shape the main skill defines: decision first, each
 finding with its class, its sweep, and whether it was reproduced or reasoned.
@@ -63,6 +64,10 @@ The tell is a failing test that moves between runs while the code is
 unchanged.
 
 ## What you do with a finding
+
+What needs to be a guard is a test or a script on the product, and nothing
+else counts: not a memory entry, not a paragraph, not a gate on the process.
+The main skill states the rule; this is where it is applied.
 
 Decide, for every valid finding, whether its class can recur on another
 field, route, caller, platform, or release path. When it can, the fix is a
@@ -104,7 +109,11 @@ item in the "what is not verified" list gets exactly one of:
 - a named dependency in another repository, with the check that closes it.
 
 Say which. The list itself stays in the PR body; the disposition is what
-makes it survive the merge.
+makes it survive the merge. The shape of the whole report is
+`references/report-template.md`. It asks only for facts about what was done.
+Never require a declaration that nothing can contradict: where nothing can
+check a field, the field becomes the answer, and a required tier would
+license less review on the author's own say-so.
 
 ## Shape before merge, never a pin
 
@@ -122,6 +131,14 @@ Make the rule enforceable where you can. A consumer's vendored manifest must
 name a forty-hex-character source commit, so a placeholder pin fails the suite
 until the upstream merge exists. A pin that names no commit is then
 unwritable, and nobody has to remember the discipline.
+
+The rule is wider than pins. Anything keyed on a pre-merge commit identity
+breaks at the squash: a watcher armed to fire when that commit reaches
+`main` polls for a commit that no longer exists until it times out and
+reports the merge as not having happened. A loaded copy of a versioned
+artifact fails the same way in the other direction, holding an identity that
+is no longer the one installed. Key on the merge commit, the digest of the
+bytes, or the manifest, never on what existed before the merge.
 
 ## What depth the change needs
 

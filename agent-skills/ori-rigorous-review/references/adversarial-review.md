@@ -85,7 +85,10 @@ bought.
 
 Every finding is an instance of something. Name the class in the report, then
 search every applicable surface for that class before handing back, and say
-what the sweep covered. Rounds that each return one more spelling of the same
+what the sweep covered. When the surface belongs to a repository whose
+source you do not hold, hand the sweep over with the finding, class named
+and the ask explicit, or say it was not run; a sweep claimed on a surface you
+could not read is a hollow one. Rounds that each return one more spelling of the same
 defect are the failure this rule exists for: an architecture guard needed
 eleven rounds because each round named one bypass; an author wrote, in one
 session, a third test satisfied by something other than the property in its
@@ -130,7 +133,14 @@ Classes that recur, each stated as the sweep to run:
 - **A probe that measures the wrong surface.** A mocked dispatcher never
   consulted the admission gate, so "the action was dispatched" said nothing
   about whether it was admitted; a 0.0 ms latency was the handler never
-  running. Confirm the probe crosses the boundary it claims to measure.
+  running. Confirm the probe crosses the boundary it claims to measure, and
+  that the field it reads could carry the failure: a producer drove four
+  cases at a receiver and could observe the outcome of one, because the field
+  it could read was derived from its own receipt and could not have shown the
+  defect. Name the field read and why it could show the failure, and count
+  the case as untested otherwise. The same class from the other side is a
+  field named for one fact whose value carries another, the receipt time
+  under the measurement time's name.
 - **A gate that exists only on a release path.** Three release tags were
   spent discovering that a tag-only check had never executed. Any check that
   runs only on a tag, a merge, or a hosted runner needs a documented ordinary
