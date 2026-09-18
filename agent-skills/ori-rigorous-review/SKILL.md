@@ -73,7 +73,13 @@ an issue, compare the claim with existing issues, implementation, tests, and
 history before calling it new, duplicate, or partial.
 
 Review the exact revision under discussion. Treat repository state as current
-truth; use prior decisions only to identify what must be rechecked. Preserve
+truth; use prior decisions only to identify what must be rechecked. That
+includes this skill: a loaded copy is a copy, and a session that loaded it
+hours ago is holding the text as it was then. One session ran a full
+implementation on the version it had loaded while two later ones were
+installed underneath it, and nothing told it. Before
+relying on the text for a decision that matters, re-verify the installed copy
+against the manifest with `scripts/install-agent-skills --check`. Preserve
 unrelated local changes. If a PR or merged change needs a clean inspection,
 use an isolated worktree rather than altering the maintainer's branch.
 
@@ -168,6 +174,32 @@ review findings have actually come from — the parties an author never
 modelled, and the claims an author's own tests could not contradict — and the
 rule that every finding names its class and the same round sweeps it. It
 applies whether or not the change reaches physical authority.
+
+When the change is in another repository and the only entry point you own
+is on your side of the wire, the real entry point is both ends: your producer,
+over the real transport, into their route, with their state read afterwards
+rather than your counters. You cannot sweep a surface whose source you do not
+hold, so the sweep travels with the finding, class named and the ask explicit,
+or the report says it was not run. A change you cannot merge gets findings
+with their classes and what was unobservable, not a merge verdict.
+
+### Where a guard lives
+
+What needs to be a guard is a test or a script on the product. It is not a
+memory entry, which reaches only the session that wrote it; not a line in a
+document, which reaches whoever reads it; and not a gate on the process, which
+can only say a block is present. A test fails the suite for everyone,
+including the next person who never read any of it. This skill records the
+rule so it survives transit between sessions; it is never the guard, and
+writing the rule down here does not discharge writing the test there. Prose
+failed twice on the same class in one repository; the guards held everywhere
+the estate has them.
+
+A guard states its own limit in its failure message, not only in its
+docstring, because the message is what the next person meets. An
+import-direction guard forecloses one spelling of "reaches" and not a value
+passed as a parameter through a module that legitimately imports both sides;
+the failure has to say so, and a second guard covers what the first cannot.
 
 ### Do not ratify a tool's blindness
 
@@ -326,7 +358,11 @@ For each verified finding, state:
 6. the smallest fail-closed guard, or why only a local fix is possible, and how
    it must be validated.
 
-Consolidate findings so a collaborator can address them in one pass.
+Consolidate findings so a collaborator can address them in one pass. The
+shape is `references/report-template.md`; a repository may copy it into its
+pull request template. Every field in it is a fact about what was done, and
+none is a judgement about the change, because nothing in a pull request can
+contradict a judgement and a field nothing can contradict becomes the answer.
 
 Reporting a defect on someone else's work is an outward action and carries a
 higher bar than a private conclusion: read the issue, comment, or instruction
