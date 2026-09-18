@@ -63,6 +63,12 @@ Edit under `agent-skills/`, run `scripts/install-agent-skills --manifest`,
 review the digest diff, and open a PR. Bump the skill's `version` in
 `MANIFEST.json` when behaviour changes.
 
+A skill's references are organised by rule, with the incident that bought each
+rule kept only as proof that it was bought. An incident earns a line only until
+a class statement absorbs it; then the anecdote is cut. A reference that grows
+by appending every new finding becomes a checklist agents skim, and skimming is
+how the discipline it carries dies.
+
 A change to a skill is a change to how every agent reviews Ori code. Review it
 as you would a change to a contract, not as documentation.
 
@@ -92,4 +98,4 @@ and the installer does not touch it.
 
 | Skill | Version | What it is for |
 | --- | --- | --- |
-| `ori-rigorous-review` | 1.2.0 | Evidence-first, safety-aware review for merge decisions, design reviews, defect verification, and roadmap research. The adversarial pass, the briefing and handoff that surround it, and the physical-authority rules load on demand from `references/`. |
+| `ori-rigorous-review` | 1.2.1 | Evidence-first, safety-aware review for merge decisions, design reviews, defect verification, and roadmap research. The adversarial pass, the briefing and handoff that surround it, and the physical-authority rules load on demand from `references/`. |
