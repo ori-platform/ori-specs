@@ -144,6 +144,13 @@ was not run. Nothing here removes the pass; what irreversibility adds is the
 independent oracles, because those are what a hurried week drops first, and
 a discipline that is dropped under pressure protects nothing.
 
+The third-party model is a reviewer, and owes what every reviewer owes: an
+oracle and a labelled finding. Execute for "does it work"; read the prior
+code for "is it the same as what worked"; say which was done. A model that
+reads a diff and approves it adds a signature, not evidence, and the estate's
+record holds a confident, specific wrong claim from exactly that shape. Brief
+it as you would brief any reviewer, and ask it what it ran and what broke.
+
 A greenlight is a statement about the boundary that was covered. It is never
 a statement that the change is safe in production, on a handset, or in
 another repository unless those oracles ran, and the handoff says which did.

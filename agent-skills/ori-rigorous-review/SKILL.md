@@ -244,6 +244,16 @@ Tier D or physical-authority changes, release and install work, or any claim of
 HIL proof. Those need a second reviewer regardless of how clean the first pass
 looked.
 
+How much more a change needs is decided by the author first and usually
+alone, so the rule is stated here as well as in the briefing reference. The
+floor for every change is the self-review, the repository's gates, the
+adversarial pass with its class sweep, and a report that labels each finding
+reproduced or reasoned. A change that is irreversible toward a customer, or
+toward anything another party pins — a tag, a digest, a published key, a
+vendored fixture — adds the further holistic pass, a second independent
+reviewer, the third-party model, and the bench or the strongest external
+oracle that can be reached before release. Nothing removes the pass.
+
 ## Contracts, vectors, and cross-repository work
 
 Treat shared contracts as the authority for shared semantics. Write or amend a
@@ -303,6 +313,7 @@ Lead with the decision and proof level. Classify every finding:
 | **Not mergeable as written** | Directionally right; the evidence does not yet support the claim. |
 | **Qualification** | Merge is defensible once the limitation is stated in the PR or issue. |
 | **Follow-up** | Real, out of scope, needs its own item with an owner and repository. |
+| **Defect in a merged artifact** | The thing under review has already shipped — a merged contract, an installed skill, a published fixture. Name the boundary that is wrong now, the fix PR, and which installed or vendored copies must be refreshed once it lands. |
 
 For each verified finding, state:
 
