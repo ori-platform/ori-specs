@@ -252,6 +252,14 @@ authenticator purpose, trust anchors, artifact identity, or rejection meaning.
 Keep an implementation PR explicitly blocked and reconcile it against the
 merged contract before merge when work must proceed in parallel.
 
+A draft contract is reviewed twice, by different oracles. A reader checks the
+text: coherence, completeness, whether two sections say two things. Each
+implementer runs the draft against the code they own and reports where it
+forbids something they do, permits something they refuse, or says two things.
+The second finds where the text is wrong about the world, which no reading
+reaches, because each such defect is a relation between the prose and an
+implementation the prose does not contain. Both, not either.
+
 For canonical-byte or signed artifacts, verify exact-byte reproduction,
 signer/key-purpose separation, rejection ordering, and the cases that
 differentiate selection from trial verification. Do not manufacture test state

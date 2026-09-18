@@ -19,74 +19,67 @@ every party whose behaviour or state the change depends on, and for each ask:
 what can it omit, repeat, reorder, retain, expose, reset, or supply from a
 clock or a state this code does not control?
 
-The parties that keep producing findings:
+Build that inventory from the change in front of you. The list below is what
+the estate has already paid for, not what exists: a reviewer who sweeps these
+and stops has checked seven classes and declared the rest absent. Each entry
+is a rule, with the incident that bought it kept only as proof that it was
+bought.
 
-- **Clocks the code does not own.** A device clock, a payment provider's
-  timestamp, a handset with no battery-backed time, a Pi with no RTC. The
-  same defect has been found five times in two repositories: a reading dated
-  by a fast device clock that never went stale; a reply window that refused on
-  one millisecond of provider-ahead skew; a payment ordered by receipt time
-  when the provider's time was the fact; an adoption test that compared local
-  receipt against a provider's creation time; and a status snapshot pinned
-  forever by a device sending the largest representable timestamp, while the
-  receiver answered `accepted`. The rule depends on which fact the timestamp
-  represents, and the wrong generalisation has already been made once: taking
-  the lesser of the producer's and the receiver's time still lets a clock that
-  has moved backward freeze an honest later state. **Which state the receiver
-  currently holds is the receiver's fact, and its ordering never depends on
-  producer wall time. When a reading or a payment happened is the producer's
-  fact, and it is kept as the producer reported it, but never compared against
-  a clock it does not share.** Freshness sits between them: the age the
-  receiver itself observed is a ceiling no producer timestamp may raise.
-  Enumerate every producer-supplied timestamp on the surface, classify each,
-  and fail closed on one the guard does not recognise.
-- **Producers in another repository, read at their own source.** Do not
-  infer a producer from the consumer's fixture. A telemetry fixture carried a
-  subscription field the provider's own corpus says a charge never carries;
-  a refund parser read `reference` where the canonical shape carries
-  `refund_reference`, so the stored column was blank for every real refund; a
-  generated fixture held 23 shapes against a 24-shape corpus, and its own
-  `>= 23` guard institutionalised the omission. Read the producer at its
-  `main`, and the provider at its published corpus.
-- **Other callers of shared code.** A guard placed on one loader left the
-  CLI's own seed-reading path open; a shared verifier turned out to have three
-  consumers, and the offline-token one let anyone with a clone forge an
-  operator's approval on a physical action; an app's install action wrapped
-  four distinct refusals into one "check the link" message. When a change
-  hardens a helper, enumerate its callers by tooling, not by memory.
-- **The operating system.** It logs the install link that carried a
-  long-lived key; it reuses an inode the moment a socket is unlinked, on Linux
-  and not on macOS; it lets `argv[0]` be anything, so a process-kill keyed on
-  the command line kills the wrong process; it byte-compiles scripts into a
-  directory the uninstaller did not expect; it reports a symlink as mode 0777.
-- **Prior state and first use.** An installer replaced an unmanaged script
-  the operator had written; a supervisor cleared the last exit reason on
-  finding the process already alive; a release build in a stale generated
-  directory packaged last week's payload; a read-only command created the
-  state database, owned by whoever ran it. Ask what is on disk, in the
-  database, and in the environment *before* this code runs, and whether the
-  fixtures ever set that up.
-- **Delivery that repeats, reorders, or arrives late.** A provider retries
-  webhooks for three days; a stop delivered at 10:10 must not refuse a payment
-  made at 10:05; a snapshot that fails to post is discarded, never retried, so
-  two from one device cannot race, which is exactly the fact a receiver-side
-  reorder window was built without knowing.
-- **The environment the reviewer has and the author did not.** The
-  strongest round-two finding of one release was seventeen absolute host
-  paths in every payload, visible only because the reviewer's toolchain
-  carried a source component the author's did not. A workflow's fixture
-  trusted a hosted-runner interpreter that the runner keeps writable. An unset
-  user-agent is not a neutral omission; it is the banned value, and every
-  provider call the product had ever made had failed. Differences between
-  your machine and the author's are an oracle. Use them, and label them, since
-  the same difference also produces false blockers: two merge conditions once
-  raised against a change were the reviewer's sandbox refusing sockets and a
-  type checker drifting, not the change.
-- **Hardware and the handset.** Nothing on this list substitutes for them.
-  A test suite toggled a wired relay pin; a killed process left a coil driven;
-  a driver never selected its multiplexer and every sample was a plausible
-  constant; a re-read that every unit test approved overwrote a correct
-  status on the phone. Say plainly when the pass could not reach them.
+- **Clocks the code does not own.** Three quantities, one asymmetry. *When it
+  was measured* is the producer's, kept raw, and compared only against bounds
+  a caller supplies, never against a clock the producer does not share. *When
+  it was received* is the receiver's, and is the key for which record is
+  current and which state is held; producer wall time never orders those.
+  *How old it is* takes the greater of the two intervals: a producer may make
+  a record older than the receiver observed, since a phone that buffered in a
+  basement delivers hours-old readings a second ago, and never fresher, since
+  a clock running ahead cannot make a record younger than its arrival. A
+  displayed timestamp takes the lesser. Two repairs are already known wrong:
+  ordering by the producer's time, which let a device pin its state with one
+  large timestamp while the receiver answered `accepted`; and taking the
+  lesser of the two clocks, which still lets a stopped clock hold an honest
+  later state down. Five incidents in two repositories bought this rule, one
+  of them on a route whose sibling carried it in prose. Enumerate every
+  producer-supplied timestamp on the surface, classify each, and fail closed
+  on one the guard does not recognise.
+- **Producers in another repository.** Read the producer at its own `main`
+  and the provider at its published corpus; never infer either from the
+  consumer's fixture. A fixture carried a field the provider's corpus says the
+  event never carries; another held 23 shapes against a 24-shape corpus, and
+  its own `>= 23` guard institutionalised the omission.
+- **Other callers of shared code.** When a change hardens a helper, enumerate
+  its callers by tooling and check each against the new premise. A guard on
+  one loader left a CLI's own ingress open; a shared verifier had a third
+  consumer that let anyone with a clone forge an operator's approval on a
+  physical action.
+- **The operating system.** For every OS facility the change touches, ask
+  what it logs, reuses, reports, defaults, or lets a caller supply. It logged
+  the install link that carried a long-lived key; it reuses an inode the
+  moment a socket is unlinked, on Linux and not on macOS; it lets `argv[0]`
+  be anything, so a process-kill keyed on the command line kills the wrong
+  process.
+- **Prior state and first use.** Ask what is on disk, in the database, and
+  in the environment before this code runs, and whether any fixture sets that
+  up. An installer replaced a script the operator had written; a build in a
+  stale generated directory packaged last week's payload; a read-only command
+  created the state database, owned by whoever ran it.
+- **Delivery that repeats, reorders, or arrives late.** Assume a message can
+  be retried for days, arrive out of order, or arrive after the state it
+  describes has changed, and read the producer's actual retry behaviour
+  before designing against a race it cannot produce. A stop delivered at
+  10:10 must not refuse a payment made at 10:05; a receiver-side reorder
+  window was built against a producer that never retries.
+- **The environment the reviewer has and the author did not.** Differences
+  between your machine and the author's are an oracle: use them, and label
+  them, because the same difference also produces false blockers. A reviewer's
+  toolchain carrying one extra component exposed seventeen host paths in every
+  payload; an unset user-agent was the banned value and every provider call
+  the product had ever made had failed; two merge conditions once raised were
+  the reviewer's own sandbox refusing sockets.
+- **Hardware and the handset.** Nothing on this list substitutes for them,
+  and say plainly when the pass could not reach them. A test suite toggled a
+  wired relay pin; a killed process left a coil driven; a re-read that every
+  unit test approved overwrote a correct status on the phone.
 
 ## Report the class and sweep it in the same round
 
@@ -136,7 +129,13 @@ Classes that recur, each stated as the sweep to run:
 - **A gate that exists only on a release path.** Three release tags were
   spent discovering that a tag-only check had never executed. Any check that
   runs only on a tag, a merge, or a hosted runner needs a documented ordinary
-  invocation, and a test that the invocation exists.
+  invocation, and a test that the invocation exists. That is not enough on its
+  own: the third tag was spent by a check whose ordinary run planted a probe
+  term chosen to appear nowhere, so it fired on every pull request and never
+  met the substring-versus-boundary defect the real input carried. The
+  ordinary invocation must use an input with the same hazardous property as
+  the real one, asserted two-sided: it fires on the hazard and stays quiet on
+  the benign neighbour.
 
 The repair is normally a surface-wide, fail-closed guard, not a local fix. The
 estate already has the shape: executor registration refuses an action with no
@@ -196,3 +195,10 @@ are the prior code, the producer at its own source, a machine that is not the
 author's, and the hardware. Where a change is irreversible toward a customer
 or toward something another party pins, the strongest of those that can be
 reached must be, before the greenlight.
+
+The depth this rule demands is set by that irreversibility, and
+`briefing-and-handoff.md` says what each tier owes. The pass, its class
+sweep, and the labelled report are the floor for every change; a process that
+costs hours on a copy change is abandoned the first week anyone is in a hurry,
+and a discipline abandoned under pressure is worse than a cheaper one that
+survives it.

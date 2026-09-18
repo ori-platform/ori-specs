@@ -36,6 +36,18 @@ boundary. A deviation that survives belongs in the contract as an amendment,
 not as one implementation's private liberty; otherwise the next implementer
 writes the version the contract still describes.
 
+A draft contract gets a second kind of review that no reader can give: each
+implementer runs the draft against the code they own and reports where it
+forbids something they do, permits something they refuse, or says two things.
+Textual review is necessary and finds a different class. One amendment went
+through two textual rounds, which found a missing replacement rule, an
+ambiguity, a self-contradicting example, and two missing obligations, all
+real and all about the text; the five defects about the world, including a
+sentence that would have regressed staleness detection for every phone that
+buffers offline, were found only by the receiver's implementer running the
+paragraph against the receiver. Send a draft to every implementer, not only
+to a reader.
+
 Ask for the report in the shape the main skill defines: decision first, each
 finding with its class, its sweep, and whether it was reproduced or reasoned.
 
@@ -56,7 +68,8 @@ Decide, for every valid finding, whether its class can recur on another
 field, route, caller, platform, or release path. When it can, the fix is a
 guard that fails closed, and the local repair is incomplete without it. The
 record is clear on which compounds: the repository that had already written,
-in prose, that freshness must be bounded by the receiver's clock made the same
+in prose, that a reading's age is the greater of the device's interval and the
+receiver's own, made the same
 mistake on its next route, because prose is not checkable. A test that
 enumerates every producer-supplied timestamp on the surface, requires each to
 be classified as a producer fact or excluded from receiver ordering, and
@@ -71,7 +84,10 @@ every tracked file and skipped four extensions. Each passed its tests.
 
 No gate may exist only on a release path. Before any tag, merge-only step, or
 hosted-runner check is trusted, document the ordinary invocation and test that
-it runs. Three release tags were spent learning this.
+it runs, on an input carrying the same hazardous property as the real one,
+asserted two-sided. Three release tags were spent learning this, and the third
+was spent by a check whose ordinary run used a probe term that could not
+exercise the defect the real document carried.
 
 ## What leaves the PR body
 
@@ -113,12 +129,20 @@ Irreversibility sets the depth, and it runs in two directions: toward the
 customer, where a payments defect takes money or quietly ends protection
 without saying so, and toward the trust surface, where a tag, a digest, a
 published key, or a vendored fixture is spent the moment another party pins
-it. A change that reaches either gets everything the estate has: the
-independent adversarial pass, a second reviewer, the bench, and the
-third-party model, and the strongest external oracle that can be reached
-before release. A change that reaches neither still gets the self-review, the
-gates, and the adversarial pass. Depth is added by irreversibility; nothing
-here removes the pass.
+it. Neither needs a customer present: a version tag is spent permanently when
+pushed, and published test keys once sat in trust-anchor positions with no
+customer anywhere near.
+
+Two tiers, and the floor is the same for both. Every change gets the
+self-review, the gates, the adversarial pass with its class sweep, and the
+labelled report. A change that is irreversible in either direction adds the
+rest of the stopping rule's further holistic pass, a second independent
+reviewer, the third-party model, and the bench or the strongest external
+oracle that can be reached before release. A change irreversible in neither
+may stop when the pass and its sweep come back clean and the report says what
+was not run. Nothing here removes the pass; what irreversibility adds is the
+independent oracles, because those are what a hurried week drops first, and
+a discipline that is dropped under pressure protects nothing.
 
 A greenlight is a statement about the boundary that was covered. It is never
 a statement that the change is safe in production, on a handset, or in
