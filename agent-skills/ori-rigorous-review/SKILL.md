@@ -162,6 +162,13 @@ Report what the pass found, including that it found nothing when it does. An
 implementation reported without one is reported without evidence about the
 boundary its caller will actually meet.
 
+When you are the independent reviewer of someone else's change, read
+`references/adversarial-review.md` first. It records where the estate's
+review findings have actually come from — the parties an author never
+modelled, and the claims an author's own tests could not contradict — and the
+rule that every finding names its class and the same round sweeps it. It
+applies whether or not the change reaches physical authority.
+
 ### Do not ratify a tool's blindness
 
 When a change makes an analysis tool report less than before, the fix is the
@@ -227,6 +234,11 @@ wrote. Neither reaches what you did not think of, so an implementation is not
 ready to hand off until it has also been attacked from outside — see
 *Attack the implementation, not only its tests*.
 
+Briefing that attack is your job, and it is done badly more often than
+the attack itself. Read `references/briefing-and-handoff.md` before briefing
+the reviewer: what it receives and what you withhold, what a finding must
+become before the change is done, and what leaves the PR body.
+
 Self-review does not substitute for independent review of shared contracts,
 Tier D or physical-authority changes, release and install work, or any claim of
 HIL proof. Those need a second reviewer regardless of how clean the first pass
@@ -287,9 +299,13 @@ Lead with the decision and proof level. Classify every finding:
 For each verified finding, state:
 
 1. severity and merge effect;
-2. exact source, contract, test, or operational evidence;
-3. real impact, including the boundary that fails;
-4. the smallest correct fix and how it must be validated.
+2. the defect class, and what the same-round sweep for that class covered;
+3. whether it was **reproduced** or **reasoned**, the oracle used, and what
+   the environment could not run;
+4. exact source, contract, test, or operational evidence;
+5. real impact, including the boundary that fails;
+6. the smallest fail-closed guard, or why only a local fix is possible, and how
+   it must be validated.
 
 Consolidate findings so a collaborator can address them in one pass.
 
@@ -300,5 +316,8 @@ on purpose looks identical to work lost by accident. Check for an existing issue
 or PR before filing either. If the user asks for feedback in their voice, post
 only after the holistic pass, then read back the stored comment.
 
-A greenlight must say what was revalidated and what remains unproven, deferred,
-or dependent on another repository or HIL.
+A greenlight must say what was revalidated and what remains unproven,
+deferred, or dependent on another repository or HIL, and it must meet the
+stopping rule in `references/adversarial-review.md`. A clean round is not that
+rule: a clean round that follows rounds which each found something new is
+evidence the class was still being discovered, not that it was exhausted.
