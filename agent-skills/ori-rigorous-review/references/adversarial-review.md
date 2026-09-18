@@ -26,16 +26,20 @@ is a rule, with the incident that bought it kept only as proof that it was
 bought.
 
 - **Clocks the code does not own.** Three quantities, one asymmetry. *When it
-  was measured* is the producer's, kept raw, and compared only against bounds
-  a caller supplies, never against a clock the producer does not share. *When
-  it was received* is the receiver's, and is the key for which record is
-  current and which state is held; producer wall time never orders those.
-  *How old it is* takes the greater of the two intervals: a producer may make
-  a record older than the receiver observed, since a phone that buffered in a
-  basement delivers hours-old readings a second ago, and never fresher, since
-  a clock running ahead cannot make a record younger than its arrival. A
-  displayed timestamp takes the lesser. Two repairs are already known wrong:
-  ordering by the producer's time, which let a device pin its state with one
+  was measured* is the producer's, kept raw, filtered only against bounds a
+  caller supplies, and never ranked against another stored record. *When it
+  was received* is the receiver's, and is the key for which record is current
+  and which state is held; producer wall time never orders those. *How old it
+  is* takes the greater of the two intervals: a producer may make a record
+  older than the receiver observed, since a phone that buffered in a basement
+  delivers hours-old readings a second ago, and never fresher, since a clock
+  running ahead cannot make a record younger than its arrival. A displayed
+  timestamp is shown as reported under its own name; a receiver may mark one
+  that exceeds its arrival and never alters it, because a bounded value puts
+  the receiver's fact under the producer's name. Three repairs are already
+  known wrong: bounding the display, which the contract once permitted while
+  forbidding it three paragraphs earlier, so two implementers did opposite
+  things; ordering by the producer's time, which let a device pin its state with one
   large timestamp while the receiver answered `accepted`; and taking the
   lesser of the two clocks, which still lets a stopped clock hold an honest
   later state down. Five incidents in two repositories bought this rule, one
@@ -140,7 +144,10 @@ Classes that recur, each stated as the sweep to run:
   defect. Name the field read and why it could show the failure, and count
   the case as untested otherwise. The same class from the other side is a
   field named for one fact whose value carries another, the receipt time
-  under the measurement time's name.
+  under the measurement time's name. The test for it is one an author can run
+  alone, before any review: a field whose honest name is hard to write is a
+  field doing two jobs. It found the last clamped field on a receiver's
+  surface when reading had not.
 - **A gate that exists only on a release path.** Three release tags were
   spent discovering that a tag-only check had never executed. Any check that
   runs only on a tag, a merge, or a hosted runner needs a documented ordinary
