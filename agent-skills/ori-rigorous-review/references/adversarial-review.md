@@ -98,7 +98,12 @@ Classes that recur, each stated as the sweep to run:
 - **Named instance, not the rule.** A substring or regex where a parser or
   exact grammar is required: `ARM` matching `aarch64`; a comment quoting the
   API call a scaffold guard was looking for; a units allow-list that grows on
-  every new column. Sweep for every other place the same recognition is done.
+  every new column. Sweep for every other place the same recognition is done,
+  and include the guard itself: a timestamp guard that recognised its domain
+  by a name suffix asked about seven of the seventeen integers on its surface
+  and was fail-closed over a recognition that was wide open. A guard discovers
+  what it governs by type, exhaustively, and requires every member to be
+  declared; a name is not a type.
 - **A test satisfied by something other than its name.** Asserting
   `no_readings` on a device that never stored a reading; `key not in url`
   when the payload is base64; a release gate that `skip`s when the wheel
