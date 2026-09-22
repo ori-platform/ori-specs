@@ -548,6 +548,129 @@ def check_retained_sensor(corpus: dict) -> None:
         )
 
 
+def same_actuator(retained: Any, identity: Any) -> bool:
+    """One actuator as the inventory reads it: a GPIO line by its pin alone."""
+    if not isinstance(retained, dict) or not isinstance(identity, dict):
+        return False
+    if "gpio_pin" in retained and "gpio_pin" in identity:
+        return retained["gpio_pin"] == identity["gpio_pin"]
+    return retained == identity
+
+
+def match_ways(zone: Any, zone_id: str, row: Any) -> set:
+    """How a revision's zone finds a retained zone: by name, actuator or sensor."""
+    ways = set()
+    if zone_id == zone.get("zone_id"):
+        ways.add("name")
+    if same_actuator(row.get("identity"), zone.get("actuator", {}).get("identity")):
+        ways.add("actuator")
+    if row.get("sensor", {}).get("sensor_id") == zone.get("sensor", {}).get("sensor_id"):
+        ways.add("sensor")
+    return ways
+
+
+def check_retained_matching(corpus: dict) -> None:
+    """A revision is held to every retained zone it shares a name, an actuator or
+    a sensor with, and the corpus must show each way of finding one on its own.
+
+    A stale-proof case whose zone keeps its name is refused by a consumer that
+    matches on the name alone, so it proves nothing about the other ways. Three
+    isolations are required, each refused with a real change: a local-GPIO
+    actuator found by its pin while its identity as a whole differs, so a
+    consumer comparing whole identities finds nothing; a firmware actuator
+    found by its full identity; and a zone found by its sensor. An accepted
+    case must also show that a firmware channel of the same name on another
+    board is not a match, so a consumer comparing channels alone is refused.
+    """
+    isolated: set = set()
+    for case in corpus["reject_cases"]:
+        if case.get("reason") != "stale_proof":
+            continue
+        state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        for zone in case["binding"].get("zones", []):
+            identity = zone.get("actuator", {}).get("identity", {})
+            for zone_id, row in state.items():
+                ways = match_ways(zone, zone_id, row)
+                if len(ways) != 1 or not zone_changes(zone, row):
+                    continue
+                if ways == {"sensor"}:
+                    isolated.add("sensor")
+                elif "gpio_pin" in identity and row.get("identity") != identity:
+                    isolated.add("gpio_pin")
+                elif "gpio_pin" not in identity:
+                    isolated.add("firmware_identity")
+    for way, what in (
+        ("gpio_pin", "a local-GPIO actuator by its pin, with its identity changed"),
+        ("firmware_identity", "a firmware actuator by its full identity"),
+        ("sensor", "its sensor"),
+    ):
+        if way not in isolated:
+            fail(
+                f"reject_cases: no stale_proof case finds its retained zone by "
+                f"{what} alone"
+            )
+
+    other_board = False
+    for case in corpus["cases"]:
+        state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        for zone in case["binding"].get("zones", []):
+            identity = zone.get("actuator", {}).get("identity", {})
+            if "channel" not in identity:
+                continue
+            for zone_id, row in state.items():
+                was = row.get("identity", {})
+                if (
+                    was.get("channel") == identity.get("channel")
+                    and was != identity
+                    and not match_ways(zone, zone_id, row)
+                ):
+                    other_board = True
+    if not other_board:
+        fail(
+            "cases: no accepted case shows a firmware channel of the same name "
+            "on another board matching nothing"
+        )
+
+
+def check_published_description(corpus: dict) -> None:
+    """The contract publishes the corpus's digest and counts; they must be true.
+
+    A consumer pins the corpus by the digest the contract prints, so a stale
+    digest is a pin that looks authoritative and names a file that no longer
+    exists. The counts are derived here for the same reason.
+    """
+    import hashlib
+    import re
+
+    text = (ROOT / "commissioned-safety-binding" / "v1.md").read_text(encoding="utf-8")
+    digest = hashlib.sha256(CORPUS.read_bytes()).hexdigest()
+    # Exactly one of each: a second, contradictory description would otherwise
+    # pass behind a correct first one.
+    published = re.findall(r"SHA-256 is\s+`([0-9a-f]{64})`", text)
+    if published != [digest]:
+        fail(
+            "v1.md: the published corpus SHA-256 is not the corpus's own "
+            f"({digest})"
+        )
+    counts = re.findall(r"(\d+) accept and (\d+) reject binding cases", text)
+    want = (len(corpus["cases"]), len(corpus["reject_cases"]))
+    if [(int(a), int(b)) for a, b in counts] != [want]:
+        fail(f"v1.md: the published binding case counts are not {want[0]} and {want[1]}")
+    tail = re.findall(
+        r"(\d+) accept and (\d+)\s+reject firmware-profile cases, (\d+) "
+        r"envelope reject cases[\s\S]*?(\d+) raw byte-level reject cases",
+        text,
+    )
+    want_tail = (
+        len(corpus["firmware_profile_cases"]),
+        len(corpus["firmware_profile_reject_cases"]),
+        len(corpus["envelope_reject_cases"]),
+        len(corpus["raw_reject_cases"]),
+    )
+    if [tuple(int(g) for g in match) for match in tail] != [want_tail]:
+        fail(f"v1.md: the published profile, envelope and raw counts are not {want_tail}")
+
+
 def check_control_legs(label: str, binding: Any) -> None:
     """The leg's own grammar, where it is present at all."""
     for index, zone in enumerate(binding.get("zones", [])):
@@ -648,6 +771,8 @@ def main() -> int:
         check_stage(case, PROFILE_VERDICT_STAGE, profile_order, label)
 
     check_retained_sensor(corpus)
+    check_retained_matching(corpus)
+    check_published_description(corpus)
 
     for case in corpus["envelope_reject_cases"]:
         label = f"envelope_reject_cases/{case['name']}"
