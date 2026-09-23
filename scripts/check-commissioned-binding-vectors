@@ -21,6 +21,10 @@ repository that owns it:
   canonical form of what they decode to, or must not decode at all. An entry
   that is already canonical proves nothing a decoded case could not.
 
+It also holds the corpus to a table of misreadings of the revision rule: each
+revision vector is decided under the rule and under every misreading, and each
+misreading must decide some vector against its declared verdict.
+
 It is deliberately **not** a third implementation of the twelve stages. The
 runtime's verifier is the first implementation and ori-cli's Go verifier is the
 independent second; this script checks that the fixture those two are held to
@@ -40,6 +44,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import types
 from typing import Any
 
 try:
@@ -569,67 +574,555 @@ def match_ways(zone: Any, zone_id: str, row: Any) -> set:
     return ways
 
 
-def check_retained_matching(corpus: dict) -> None:
-    """A revision is held to every retained zone it shares a name, an actuator or
-    a sensor with, and the corpus must show each way of finding one on its own.
+def claimed_circuit(zone: Any) -> bool:
+    return zone.get("proof", {}).get("method") not in (None, "undemonstrated")
 
-    A stale-proof case whose zone keeps its name is refused by a consumer that
-    matches on the name alone, so it proves nothing about the other ways. Three
-    isolations are required, each refused with a real change: a local-GPIO
-    actuator found by its pin while its identity as a whole differs, so a
-    consumer comparing whole identities finds nothing; a firmware actuator
-    found by its full identity; and a zone found by its sensor. An accepted
-    case must also show that a firmware channel of the same name on another
-    board is not a match, so a consumer comparing channels alone is refused.
+
+def stale_against(zone: Any, row: Any) -> bool:
+    """A change against this retained zone that a claimed leg does not follow."""
+    if not zone_changes(zone, row):
+        return False
+    circuit = zone.get("proof", {}).get("performed_at_ms")
+    if claimed_circuit(zone) and whole(circuit) and circuit <= row.get("proof_at_ms", 0):
+        return True
+    leg = control_leg(zone)
+    at = row.get("control_proof_at_ms")
+    return (
+        isinstance(leg, dict)
+        and leg.get("method") == "commanded_and_observed"
+        and whole(at)
+        and leg.get("performed_at_ms", 0) <= at
+    )
+
+
+def matches(case: dict, zone: Any) -> list:
+    """Every retained zone this one is held to, in the retained record's order."""
+    state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+    return [
+        (zone_id, row)
+        for zone_id, row in state.items()
+        if match_ways(zone, zone_id, row)
+    ]
+
+
+def check_retained_matching(corpus: dict) -> None:
+    """Hold the corpus to every clause of the revision rule, each on its own.
+
+    A refused revision is credited only on the retained zone that decides it,
+    and there must be exactly one: crediting any matching zone lets a padded
+    case satisfy an isolation it does not exercise. From that one pair the
+    checker requires, each at least once:
+
+    - the zone found by its name alone, by a GPIO pin alone while the identity
+      differs as a whole, by a firmware identity alone, and by its sensor alone,
+      once while the sensor otherwise differs, so a consumer matching the whole
+      sensor finds nothing;
+    - a change to a GPIO identity, a firmware identity, the mapping and the
+      sensor, each alone with legs carried;
+    - a change that is not to the actuator decided by a stale control leg
+      behind a fresh circuit leg;
+    - a zone held to every match: the deciding zone neither the first nor the
+      last of three or more matches.
+
+    Accepted revisions must show a pure rename carrying its proof, a changed
+    zone after a record with no control time, an unclaimed stale leg left
+    provisional, and firmware actuators on the same board or channel that
+    match nothing. Every retained record must itself be disambiguated.
     """
-    isolated: set = set()
+    for case in corpus["cases"] + corpus["reject_cases"]:
+        state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        pins, firmware, sensors = [], [], []
+        for row in state.values():
+            identity = row.get("identity", {})
+            if "gpio_pin" in identity:
+                pins.append(identity["gpio_pin"])
+            else:
+                firmware.append(json.dumps(identity, sort_keys=True))
+            sensors.append(row.get("sensor", {}).get("sensor_id"))
+        for label, values in (("pin", pins), ("firmware identity", firmware), ("sensor_id", sensors)):
+            if len(values) != len(set(values)):
+                fail(f"{case['name']}: accepted_zone_state repeats a {label}")
+
+    found: set = set()
     for case in corpus["reject_cases"]:
         if case.get("reason") != "stale_proof":
             continue
-        state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        if not case.get("verifier_context", {}).get("accepted_zone_state"):
+            continue
+        decisive = []
         for zone in case["binding"].get("zones", []):
-            identity = zone.get("actuator", {}).get("identity", {})
-            for zone_id, row in state.items():
-                ways = match_ways(zone, zone_id, row)
-                if len(ways) != 1 or not zone_changes(zone, row):
-                    continue
-                if ways == {"sensor"}:
-                    isolated.add("sensor")
-                elif "gpio_pin" in identity and row.get("identity") != identity:
-                    isolated.add("gpio_pin")
-                elif "gpio_pin" not in identity:
-                    isolated.add("firmware_identity")
-    for way, what in (
-        ("gpio_pin", "a local-GPIO actuator by its pin, with its identity changed"),
-        ("firmware_identity", "a firmware actuator by its full identity"),
-        ("sensor", "its sensor"),
-    ):
-        if way not in isolated:
+            held = matches(case, zone)
+            for index, (zone_id, row) in enumerate(held):
+                if stale_against(zone, row):
+                    decisive.append((zone, zone_id, row, index, len(held)))
+        if len(decisive) != 1:
             fail(
-                f"reject_cases: no stale_proof case finds its retained zone by "
-                f"{what} alone"
+                f"{case['name']}: {len(decisive)} retained zones decide this "
+                "case; exactly one must, so each isolation is credited once"
             )
+            continue
+        zone, zone_id, row, index, count = decisive[0]
+        ways = match_ways(zone, zone_id, row)
+        identity = zone.get("actuator", {}).get("identity", {})
+        gpio = "gpio_pin" in identity
+        if ways == {"name"}:
+            found.add("found by name alone")
+        elif ways == {"sensor"}:
+            found.add("found by sensor alone")
+            if row.get("sensor") != zone.get("sensor"):
+                found.add("found by sensor_id while the sensor differs")
+        elif ways == {"actuator"} and gpio and row.get("identity") != identity:
+            found.add("found by a GPIO pin alone")
+        elif ways == {"actuator"} and not gpio:
+            found.add("found by a firmware identity alone")
+        changes = zone_changes(zone, row)
+        if len(changes) == 1 and legs_carried(zone, row):
+            (only,) = changes
+            if only == "identity":
+                only = "a GPIO identity" if gpio else "a firmware identity"
+            found.add(f"{only} changed alone")
+        circuit = zone.get("proof", {}).get("performed_at_ms", 0)
+        if "identity" not in changes and claimed_circuit(zone) and circuit > row.get("proof_at_ms", 0):
+            found.add("decided by the control leg for a change not to the actuator")
+        if count >= 3 and 0 < index < count - 1:
+            found.add("held to every match")
+    for need in (
+        "found by name alone",
+        "found by sensor alone",
+        "found by sensor_id while the sensor differs",
+        "found by a GPIO pin alone",
+        "found by a firmware identity alone",
+        "a GPIO identity changed alone",
+        "a firmware identity changed alone",
+        "mapping changed alone",
+        "sensor changed alone",
+        "decided by the control leg for a change not to the actuator",
+        "held to every match",
+    ):
+        if need not in found:
+            fail(f"reject_cases: no stale_proof case is {need}")
 
-    other_board = False
+    accepted: set = set()
     for case in corpus["cases"]:
         state = case.get("verifier_context", {}).get("accepted_zone_state") or {}
+        if not state:
+            continue
         for zone in case["binding"].get("zones", []):
             identity = zone.get("actuator", {}).get("identity", {})
-            if "channel" not in identity:
-                continue
-            for zone_id, row in state.items():
-                was = row.get("identity", {})
+            held = matches(case, zone)
+            for zone_id, row in held:
+                ways = match_ways(zone, zone_id, row)
+                changes = zone_changes(zone, row)
+                if "name" not in ways and not changes:
+                    accepted.add("a pure rename carrying its proof")
+                if changes and "control_proof_at_ms" not in row and control_leg(zone):
+                    accepted.add("a change after a record with no control time")
                 if (
-                    was.get("channel") == identity.get("channel")
-                    and was != identity
-                    and not match_ways(zone, zone_id, row)
+                    changes
+                    and not claimed_circuit(zone)
+                    and zone.get("proof", {}).get("performed_at_ms", 0)
+                    <= row.get("proof_at_ms", 0)
                 ):
-                    other_board = True
-    if not other_board:
-        fail(
-            "cases: no accepted case shows a firmware channel of the same name "
-            "on another board matching nothing"
+                    accepted.add("an unclaimed stale leg left provisional")
+            if held or "channel" not in identity:
+                continue
+            for row in state.values():
+                was = row.get("identity", {})
+                if was.get("channel") == identity.get("channel") and was != identity:
+                    accepted.add("the same channel on another board matching nothing")
+                if (
+                    was.get("firmware_device_id") == identity.get("firmware_device_id")
+                    and was != identity
+                ):
+                    accepted.add("another channel on the same board matching nothing")
+    for need in (
+        "a pure rename carrying its proof",
+        "a change after a record with no control time",
+        "an unclaimed stale leg left provisional",
+        "the same channel on another board matching nothing",
+        "another channel on the same board matching nothing",
+    ):
+        if need not in accepted:
+            fail(f"cases: no accepted revision shows {need}")
+
+
+# ── misreadings of the revision rule ─────────────────────────────────────────
+#
+# The rule as the contract states it, and a table of ways a consumer could read
+# it wrongly. Each revision vector is decided under the rule and under every
+# misreading, and each misreading must decide some vector against its declared
+# verdict. A structural requirement on the corpus says a case of some shape
+# exists; this says the case actually separates the right reading from a wrong
+# one, which an edit to a retained time or order can silently undo.
+
+
+class Stale(Exception):
+    """The revision rule refuses the document as stale_proof."""
+
+
+MISREADINGS = ROOT / "commissioned-safety-binding" / "revision-misreadings-v1.json"
+
+
+def rule_switches(raw: dict) -> dict:
+    """A rule from the published table, with its collections made comparable."""
+    rule = dict(raw)
+    rule["exempt"] = tuple(tuple(pair) for pair in raw.get("exempt", ()))
+    rule["exempt_sets"] = tuple(
+        (leg, frozenset(fields)) for leg, fields in raw.get("exempt_sets", ())
+    )
+    rule["exempt_at_least"] = tuple(tuple(pair) for pair in raw.get("exempt_at_least", ()))
+    rule["exempt_postures"] = tuple(tuple(pair) for pair in raw.get("exempt_postures", ()))
+    rule["exempt_kind_change"] = tuple(raw.get("exempt_kind_change", ()))
+    return rule
+
+
+TABLE = json.loads(MISREADINGS.read_text())
+REFERENCE = rule_switches(TABLE["reference"])
+CHANGE_EVENTS = {name: frozenset(fields) for name, fields in TABLE["change_events"].items()}
+MUTANTS = TABLE["misreadings"]
+
+
+def _same_actuator(retained: dict, identity: dict, rule: dict) -> bool:
+    if "gpio_pin" in retained and "gpio_pin" in identity:
+        if rule["gpio_match"] == "whole":
+            return retained == identity
+        return bool(retained["gpio_pin"] == identity["gpio_pin"])
+    if rule["firmware_match"] == "board":
+        return retained.get("firmware_device_id") == identity.get("firmware_device_id")
+    if rule["firmware_match"] == "channel":
+        return retained.get("channel") == identity.get("channel")
+    return retained == identity
+
+
+def _same_sensor(was: Any, sensor: dict, rule: dict) -> bool:
+    if rule["sensor_match"] == "whole":
+        return bool(was.sensor == sensor)
+    if rule["sensor_match"].startswith("id_and:"):
+        field = rule["sensor_match"].removeprefix("id_and:")
+        return bool(
+            was.sensor.get("sensor_id") == sensor["sensor_id"]
+            and was.sensor.get(field) == sensor.get(field)
         )
+    return bool(was.sensor.get("sensor_id") == sensor["sensor_id"])
+
+
+def _ways(zone_id: str, was: Any, zone: dict, rule: dict) -> set:
+    ways = set()
+    if rule["match_name"] and zone_id == zone["zone_id"]:
+        ways.add("name")
+    if rule["match_actuator"] and _same_actuator(
+        was.identity, zone["actuator"]["identity"], rule
+    ):
+        ways.add("actuator")
+    if rule["match_sensor"] and _same_sensor(was, zone["sensor"], rule):
+        ways.add("sensor")
+    return ways
+
+
+def _identity_differs(was: dict, now: dict, rule: dict) -> bool:
+    if rule["identity_compare"] == "ignore_board":
+        was = {k: v for k, v in was.items() if k != "firmware_device_id"}
+        now = {k: v for k, v in now.items() if k != "firmware_device_id"}
+    if rule["identity_compare"] == "ignore_channel":
+        was = {k: v for k, v in was.items() if k != "channel"}
+        now = {k: v for k, v in now.items() if k != "channel"}
+    return was != now
+
+
+def _changes(zone_id: str, was: Any, zone: dict, rule: dict) -> set:
+    changed = set()
+    if rule["change_identity"] and _identity_differs(
+        was.identity, zone["actuator"]["identity"], rule
+    ):
+        changed.add("identity")
+    if (
+        rule["change_mapping"]
+        and was.mapping != zone["actuator"]["commissioned_mapping"]
+    ):
+        changed.add("mapping")
+    sensor = zone["sensor"]
+    if rule["change_sensor"] == "sensor_id":
+        differs = was.sensor.get("sensor_id") != sensor["sensor_id"]
+    elif rule["change_sensor"] == "id_and_calibration":
+        differs = was.sensor.get("sensor_id") != sensor["sensor_id"] or was.sensor.get(
+            "calibration_ref"
+        ) != sensor.get("calibration_ref")
+    elif rule["change_sensor"].startswith("ignore:"):
+        field = rule["change_sensor"].removeprefix("ignore:")
+        skip = {"range_min", "range_max"} if field == "range" else {field}
+        differs = {k: v for k, v in was.sensor.items() if k not in skip} != {
+            k: v for k, v in sensor.items() if k not in skip
+        }
+    else:
+        differs = was.sensor != sensor
+    if differs:
+        changed.add("sensor")
+    if rule["proof_change_is_change"]:
+        leg = zone["proof"].get("control_path")
+        if zone["proof"]["performed_at_ms"] != was.proof_at_ms or (
+            isinstance(leg, dict)
+            and leg.get("performed_at_ms") != was.control_proof_at_ms
+        ):
+            changed.add("proof")
+    if rule["rename_is_change"] and zone_id != zone["zone_id"]:
+        changed.add("name")
+    return changed
+
+
+def _field_changes(zone: dict, was: Any) -> set:
+    """The individual fields a revision changed against one retained zone."""
+    fields = set()
+    now = zone["actuator"]["identity"]
+    for key in set(was.identity) | set(now):
+        if was.identity.get(key) != now.get(key):
+            fields.add(key)
+    if was.mapping != zone["actuator"]["commissioned_mapping"]:
+        fields.add("mapping")
+    for key in set(was.sensor) | set(zone["sensor"]):
+        if was.sensor.get(key) != zone["sensor"].get(key):
+            fields.add(key)
+    return fields
+
+
+def _exempt(leg: str, zone: dict, was: Any, rule: dict, posture: str) -> bool:
+    fields = _field_changes(zone, was)
+    if len(fields) == 1 and (leg, next(iter(fields))) in rule["exempt"]:
+        return True
+    if (leg, frozenset(fields)) in rule["exempt_sets"]:
+        return True
+    if any(leg == at and len(fields) >= k for at, k in rule["exempt_at_least"]):
+        return True
+    if (leg, posture) in rule["exempt_postures"]:
+        return True
+    if leg == "circuit":
+        was_gpio = "gpio_pin" in was.identity
+        now_gpio = "gpio_pin" in zone["actuator"]["identity"]
+        if was_gpio and not now_gpio and "firmware" in rule["exempt_kind_change"]:
+            return True
+        if now_gpio and not was_gpio and "GPIO" in rule["exempt_kind_change"]:
+            return True
+    if (
+        leg == "control"
+        and rule["exempt_control_behind_pre_energisation"]
+        and zone["proof"]["method"] == "pre_energisation"
+    ):
+        return True
+    return False
+
+
+def _stale(
+    zone: dict,
+    was: Any,
+    changed: set,
+    single: bool,
+    rule: dict,
+    posture: str = "production",
+) -> bool:
+    proof = zone["proof"]
+    leg = proof.get("control_path")
+    if rule["claimed_methods"] == "actuate_and_observe":
+        unclaimed = proof["method"] != "actuate_and_observe"
+    else:
+        unclaimed = proof["method"] == "undemonstrated"
+    control_fresh = (
+        isinstance(leg, dict)
+        and leg["method"] == "commanded_and_observed"
+        and was.control_proof_at_ms is not None
+        and leg["performed_at_ms"] > was.control_proof_at_ms
+    )
+    check_circuit = not (rule["circuit_unclaimed_exempt"] and unclaimed)
+    if (
+        rule["circuit_skip_if_control_unclaimed"]
+        and isinstance(leg, dict)
+        and leg["method"] == "undemonstrated"
+    ):
+        check_circuit = False
+    if _exempt("circuit", zone, was, rule, posture):
+        check_circuit = False
+    circuit_retained = was.proof_at_ms
+    if (
+        rule["circuit_retained_time"] == "earlier"
+        and was.control_proof_at_ms is not None
+    ):
+        circuit_retained = min(was.proof_at_ms, was.control_proof_at_ms)
+    if rule["single_retained_time"] and was.control_proof_at_ms is not None:
+        circuit_retained = max(was.proof_at_ms, was.control_proof_at_ms)
+    if rule["circuit_skip_if_control_fresh"] and control_fresh:
+        check_circuit = False
+    if rule["circuit_only_single_match"] and not single:
+        check_circuit = False
+    if check_circuit:
+        at = proof["performed_at_ms"]
+        if (
+            (at < circuit_retained)
+            if rule["circuit_strict"]
+            else (at <= circuit_retained)
+        ):
+            return True
+    if not isinstance(leg, dict):
+        return bool(
+            rule["control_absent_stale"]
+            and not unclaimed
+            and was.control_proof_at_ms is not None
+        )
+    if rule["control_only_single_match"] and not single:
+        return False
+    if _exempt("control", zone, was, rule, posture):
+        return False
+    if rule["control_requires_claim"] and leg["method"] != "commanded_and_observed":
+        return False
+    if rule["control_skip_if_circuit_unclaimed"] and unclaimed:
+        return False
+    if rule["control_on"] == "identity" and "identity" not in changed:
+        return False
+    if rule["control_on"] == "identity_or_mapping" and not changed & {
+        "identity",
+        "mapping",
+    }:
+        return False
+    retained = was.control_proof_at_ms
+    if (
+        rule["single_retained_time"] or rule["control_retained_time"] == "later"
+    ) and retained is not None:
+        retained = max(was.proof_at_ms, retained)
+    if retained is None:
+        if rule["control_missing"] == "stale":
+            return True
+        if rule["control_missing"] == "circuit_time":
+            retained = was.proof_at_ms
+        else:
+            return False
+    at = leg["performed_at_ms"]
+    return (at < retained) if rule["control_strict"] else (at <= retained)
+
+
+def _rule(rule: dict):
+    def st_proof_consistency(b: dict[str, Any], ctx: Any) -> None:
+        consumed: set = set()
+        for zone in b["zones"]:
+            held = [
+                (zone_id, was, ways)
+                for zone_id, was in ctx.accepted_zone_state.items()
+                if (ways := _ways(zone_id, was, zone, rule))
+                and not (rule["one_to_one"] and zone_id in consumed)
+            ]
+            if rule["one_to_one"]:
+                consumed |= {zone_id for zone_id, _was, _ways_found in held}
+            if rule["fresh_against_every_match_once_changed"] and any(
+                _changes(zone_id, was, zone, rule) for zone_id, was, _ in held
+            ):
+                for _zone_id, was, _ in held:
+                    if _stale(
+                        zone,
+                        was,
+                        {"identity"},
+                        len(held) == 1,
+                        rule,
+                        ctx.deployment_posture,
+                    ):
+                        raise Stale
+                continue
+            if rule["visit"] == "first":
+                held = held[:1]
+            elif rule["visit"] == "last":
+                held = held[-1:]
+            elif rule["visit"] == "latest_proof" and held:
+                held = [max(held, key=lambda h: h[1].proof_at_ms)]
+            elif rule["visit"] == "sensor_first":
+                sensor = [h for h in held if "sensor" in h[2]]
+                held = sensor[:1] or held[:1]
+            elif rule["visit"] == "name_if_no_actuator":
+                if any("actuator" in h[2] for h in held):
+                    held = [h for h in held if h[2] != {"name"}]
+            for zone_id, was, _ways_found in held:
+                changed = _changes(zone_id, was, zone, rule)
+                if not changed:
+                    if rule["visit"] == "break_on_unchanged":
+                        break
+                    continue
+                if _stale(
+                    zone, was, changed, len(held) == 1, rule, ctx.deployment_posture
+                ):
+                    raise Stale
+                if rule["visit"] == "stop_after_pass":
+                    break
+
+    return st_proof_consistency
+
+
+
+def decides_stale(rule: dict, case: dict) -> bool:
+    ctx = case.get("verifier_context", {})
+    state = {
+        zone_id: types.SimpleNamespace(
+            identity=row.get("identity", {}),
+            mapping=row.get("mapping"),
+            sensor=row.get("sensor", {}),
+            proof_at_ms=row.get("proof_at_ms"),
+            control_proof_at_ms=row.get("control_proof_at_ms"),
+        )
+        for zone_id, row in (ctx.get("accepted_zone_state") or {}).items()
+    }
+    context = types.SimpleNamespace(
+        accepted_zone_state=state,
+        deployment_posture=ctx.get("deployment_posture"),
+    )
+    try:
+        _rule(rule)(case["binding"], context)
+    except Stale:
+        return True
+    return False
+
+
+def revision_verdicts(corpus: dict) -> list:
+    """Every case the revision rule decides, with whether it must find it stale.
+
+    A refusal at a stage before the rule, or at its own stage for another
+    reason, never reaches it; a case refused after it, or accepted, passed it.
+    """
+    order = corpus["acceptance_order"]
+    after = set(order[order.index("proof_consistency") + 1 :])
+    decided = []
+    for case in corpus["cases"]:
+        if case.get("verifier_context", {}).get("accepted_zone_state"):
+            decided.append((case, False))
+    for case in corpus["reject_cases"]:
+        if not case.get("verifier_context", {}).get("accepted_zone_state"):
+            continue
+        if case.get("reason") == "stale_proof":
+            decided.append((case, True))
+        elif case.get("stage") in after:
+            decided.append((case, False))
+    return decided
+
+
+def check_misreadings(corpus: dict) -> None:
+    decided = revision_verdicts(corpus)
+    if not decided or not MUTANTS:
+        fail(
+            f"{MISREADINGS.name}: no revision case or no misreading to decide; the "
+            "misreading check would pass by measuring nothing"
+        )
+    if set(TABLE["reference"]) != set(REFERENCE) or any(
+        set(change) - set(TABLE["reference"]) for change in MUTANTS.values()
+    ):
+        fail(f"{MISREADINGS.name}: a misreading sets a switch the reference lacks")
+    for case, stale in decided:
+        if decides_stale(REFERENCE, case) != stale:
+            fail(
+                f"{case['name']}: the revision rule does not reach the declared "
+                "verdict, so no misreading can be measured against it"
+            )
+    for name, change in MUTANTS.items():
+        rule = rule_switches({**TABLE["reference"], **change})
+        if all(decides_stale(rule, case) == stale for case, stale in decided):
+            fail(
+                f"no vector refuses the misreading {name!r}: a consumer that read "
+                "the revision rule this way would pass every case. Only the "
+                "misreadings in MUTANTS are checked, and of the exemptions keyed "
+                "on a set of fields only the sets in CHANGE_EVENTS "
+                f"({', '.join(CHANGE_EVENTS)})"
+            )
 
 
 def check_published_description(corpus: dict) -> None:
@@ -669,6 +1162,17 @@ def check_published_description(corpus: dict) -> None:
     )
     if [tuple(int(g) for g in match) for match in tail] != [want_tail]:
         fail(f"v1.md: the published profile, envelope and raw counts are not {want_tail}")
+    table = hashlib.sha256(MISREADINGS.read_bytes()).hexdigest()
+    listed = re.findall(
+        r"revision-misreadings-v1\.json\)[\s\S]*?lists (\d+) misreadings[\s\S]*?"
+        r"SHA-256 digest is\s+`([0-9a-f]{64})`",
+        text,
+    )
+    if listed != [(str(len(MUTANTS)), table)]:
+        fail(
+            f"v1.md: the published misreading count and SHA-256 are not "
+            f"{len(MUTANTS)} and {table}"
+        )
 
 
 def check_control_legs(label: str, binding: Any) -> None:
@@ -772,6 +1276,7 @@ def main() -> int:
 
     check_retained_sensor(corpus)
     check_retained_matching(corpus)
+    check_misreadings(corpus)
     check_published_description(corpus)
 
     for case in corpus["envelope_reject_cases"]:

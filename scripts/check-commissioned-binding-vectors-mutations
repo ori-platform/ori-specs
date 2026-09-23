@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Prove `check-commissioned-binding-vectors` fails when the misreadings check would not.
+
+The misreading check passes by measuring nothing if its table is emptied, a
+misreading is neutered, the check is no longer called, or a vector is edited
+until it no longer separates the rule from a misreading. Each is applied to a
+scratch copy of the contract directory and must produce a failure naming it.
+
+Run from the repository root:
+
+    python3 scripts/check-commissioned-binding-vectors-mutations
+
+Exits non-zero if any mutation goes uncaught.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CHECKER = "check-commissioned-binding-vectors"
+CONTRACT = ROOT / "commissioned-safety-binding"
+TABLE = "revision-misreadings-v1.json"
+CORPUS = "binding-vectors-v1.json"
+
+
+def _run(target: str, mutate: Callable[[dict], None]) -> str:
+    with tempfile.TemporaryDirectory() as tmp:
+        work = pathlib.Path(tmp) / "repo"
+        (work / "scripts").mkdir(parents=True)
+        shutil.copytree(CONTRACT, work / "commissioned-safety-binding")
+        shutil.copy(ROOT / "scripts" / CHECKER, work / "scripts" / CHECKER)
+        path = work / "commissioned-safety-binding" / target
+        document = json.loads(path.read_text(encoding="utf-8"))
+        mutate(document)
+        path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, f"scripts/{CHECKER}"],
+            cwd=work,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.stderr + result.stdout if result.returncode else ""
+
+
+def _case(document: dict, name: str) -> dict:
+    for case in document["cases"] + document["reject_cases"]:
+        if case["name"] == name:
+            return case
+    raise AssertionError(f"no case named {name}")
+
+
+def empty_the_table(document: dict) -> None:
+    document["misreadings"].clear()
+
+
+def neuter_a_misreading(document: dict) -> None:
+    document["misreadings"]["first match only"] = {"visit": "all"}
+
+
+def add_an_unknown_switch(document: dict) -> None:
+    document["misreadings"]["first match only"] = {"visit": "first", "invented": True}
+
+
+def reverse_the_retained_order(document: dict) -> None:
+    case = _case(document, "name_taken_from_a_retained_zone")
+    state = case["verifier_context"]["accepted_zone_state"]
+    case["verifier_context"]["accepted_zone_state"] = dict(reversed(list(state.items())))
+
+
+def backdate_a_retained_firmware_proof(document: dict) -> None:
+    case = _case(document, "another_channel_on_the_same_board_is_not_its_predecessor")
+    case["verifier_context"]["accepted_zone_state"]["borehole-pump"]["proof_at_ms"] = (
+        1799999999999
+    )
+
+
+MUTATIONS: list[tuple[str, str, Callable[[dict], None], str]] = [
+    ("table emptied", TABLE, empty_the_table, "measuring nothing"),
+    (
+        "misreading neutered",
+        TABLE,
+        neuter_a_misreading,
+        "no vector refuses the misreading 'first match only'",
+    ),
+    ("unknown switch", TABLE, add_an_unknown_switch, "a switch the reference lacks"),
+    (
+        "retained order reversed",
+        CORPUS,
+        reverse_the_retained_order,
+        "no vector refuses the misreading 'stop at the first unchanged match'",
+    ),
+    (
+        "retained firmware proof backdated",
+        CORPUS,
+        backdate_a_retained_firmware_proof,
+        "no vector refuses the misreading 'firmware matched by board only'",
+    ),
+]
+
+
+def main() -> int:
+    missed = []
+    for label, target, mutate, expect in MUTATIONS:
+        output = _run(target, mutate)
+        if expect not in output:
+            missed.append(label)
+            print(f"UNCAUGHT {label}: expected a failure naming {expect!r}", file=sys.stderr)
+    print(f"{len(MUTATIONS) - len(missed)} of {len(MUTATIONS)} mutations caught")
+    return 1 if missed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
