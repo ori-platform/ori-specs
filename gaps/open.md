@@ -103,17 +103,17 @@ accurate description of what a repo implements.
 
 ## evidence/v1 design targets
 
-- **Anchor registry** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+- **Anchor registry** ([evidence-exchange/v2.md](../evidence-exchange/v2.md)):
   the authority retains registrations and resolves them against held
   authorisations on main; the runtime produces no registration on main (it
   reports `pending_authorisation`), and no registration has crossed end to
   end.
 - **Commissioning reference ingress and authorisation path**
-  ([evidence-exchange/v1.md](../evidence-exchange/v1.md)): the contract now
+  ([evidence-exchange/v2.md](../evidence-exchange/v2.md)): the contract now
   fixes that the authorisation reaches the authority through the
   organisational commissioning path and the device holds only its digest,
   delivered by the local bridge command in
-  [cli-commands/v1.md](../cli-commands/v1.md). The evidence authority resolves
+  [operator-socket/v1.md](../operator-socket/v1.md). The evidence authority resolves
   a registration against held authorisations and refuses a courier-submitted
   authorisation at the transport. The device side is open:
   `ori-runtime` still models a `CommissioningAuthorisationSource` that would
@@ -124,7 +124,7 @@ accurate description of what a repo implements.
   [evidence-commissioning-ingest/v1.md](../evidence-commissioning-ingest/v1.md);
   the authority holds a library function that verifies a signed
   authorisation, with no ingest endpoint and no revocation path.
-- **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+- **Evidence export ingestion** ([evidence-exchange/v2.md](../evidence-exchange/v2.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies all eight artifacts. The runtime now
   verifies and applies three of the four inbound ones, all but the evidence
@@ -134,7 +134,7 @@ accurate description of what a repo implements.
   surface, including the fourth inbound type, is
   [gateway-evidence-carriage/v1.md](../gateway-evidence-carriage/v1.md), which
   no side implements yet. The separate
-  [evidence-transport/v1.md](../evidence-transport/v1.md) fixes authenticated
+  [evidence-transport/v2.md](../evidence-transport/v2.md) fixes authenticated
   gateway-to-authority ingest. The gateway courier and the
   authority ingest are implemented on main, and the runtime
   now carries envelopes and checkpoints to the courier.
@@ -182,10 +182,10 @@ accurate description of what a repo implements.
   ceiling, the same-outcome block evaluated at proposal creation and again at
   reply admission (`proposal_blocked_uncertain_outcome`), and reconciliation
   are specified with a corpus and a model checker; the runtime implementation
-  is in progress and not on main, and `action_records` in `runtime-health/v2`
+  is in progress and not on main, and `action_records` in `runtime-health/v3`
   is not yet reported. The authenticated local operator reconciliation is
   closed at contract level: `evidence reconcile-tier-c` in
-  [cli-commands/v1.md](../cli-commands/v1.md) is submitted to the running
+  [operator-socket/v1.md](../operator-socket/v1.md) is submitted to the running
   runtime over its local operator socket and authorized from kernel-provided
   peer credentials, with a closed reason and refusal set,
   root-or-installed-operator admission and an `identical_repeat` audit record,
@@ -219,7 +219,7 @@ accurate description of what a repo implements.
   `evidence_delivery` projection.
 - **Firmware-backed safety actuators in an in-force safety zone**
   ([device-provisioning/v1.md](../device-provisioning/v1.md),
-  [evidence-exchange/v1.md](../evidence-exchange/v1.md)): a capability that
+  [evidence-exchange/v2.md](../evidence-exchange/v2.md)): a capability that
   depends on an unconfirmed provisioning grant is refused before a Tier C
   proposal is created and MUST NOT be admitted into an in-force commissioned
   safety binding, zone, or safety profile, and once one is in force evidence
@@ -266,7 +266,7 @@ accurate description of what a repo implements.
   consumer checks are mandatory. A host-state Tier C action stays on events/v1 semantics
   and emits no events/v2 approval record until a resource-scoped approval
   contract exists.
-- **Stopped-local evidence counts** ([runtime-health/v2.md](../runtime-health/v2.md)):
+- **Stopped-local evidence counts** ([runtime-health/v3.md](../runtime-health/v3.md)):
   `stopped_local_artifact_count`, `stopped_local_bytes` and
   `oldest_stopped_local_since_ms` are specified with a corpus and a model
   checker in the evidence-disposition corpus, including the handoff-time proof
@@ -278,7 +278,7 @@ accurate description of what a repo implements.
   credential, authorisation, pagination and neutral refusal boundary. What
   remains open is its implementation and deployment proof; it must not be
   grafted onto the courier credential merely to claim that work is complete.
-- **Epoch confirmation has no path back yet** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
+- **Epoch confirmation has no path back yet** ([evidence-exchange/v2.md](../evidence-exchange/v2.md)):
   the runtime confirms an epoch only from a signed epoch confirmation arriving
   through ingest, and artifacts now cross to the courier; but with no
   authority-key registry shipped and no authority reachable from a deployed
@@ -287,7 +287,7 @@ accurate description of what a repo implements.
 
 - **Mixed-deployment return path** (`ori-gateway`;
   [gateway-evidence-carriage/v1.md](../gateway-evidence-carriage/v1.md),
-  [gateway-config/v1.md](../gateway-config/v1.md)): authority artifacts are
+  [gateway-config/v2.md](../gateway-config/v2.md)): authority artifacts are
   ordered per runtime device, each device declares its inbound carriage
   contract in `evidence.device_carriage` (absent is `gateway-api/v1`), an
   artifact the declared contract cannot carry is kept outside every lane and
