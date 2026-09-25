@@ -22,6 +22,7 @@ below are checked against those records.
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `implemented-unreleased`, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `pending` |
 | Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `pending` |
+| Event schema | [events/v2.md](events/v2.md) | `draft` | none recorded | `amendable` |
 | Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | `draft` | runtime `shipped` in v2.1.0, `unassessed`, producer (evidence-authority) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-24), audit `pending` |
 | Evidence chain | [evidence/v2.md](evidence/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, `unassessed`, verifier (evidence-authority) `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `complete` |
 | Evidence chain | [evidence/v3.md](evidence/v3.md) | `draft` | none recorded | `amendable` |
@@ -38,8 +39,10 @@ below are checked against those records.
 | Gateway API | [gateway-api/v2.md](gateway-api/v2.md) | `draft` | none recorded | `amendable` |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed current snapshot `4c28c93` (1 divergence) | `frozen` (2026-06-09), audit `complete` |
 | Gateway config surface | [gateway-config/v2.md](gateway-config/v2.md) | `draft` | none recorded | `amendable` |
+| Gateway Evidence Carriage | [gateway-evidence-carriage/v1.md](gateway-evidence-carriage/v1.md) | `draft` | none recorded | `amendable` |
 | Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `pending` |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
+| Offline Tier C tokens | [offline-tokens/v2.md](offline-tokens/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
 | Runtime config surface (closed) | [runtime-config/v2.md](runtime-config/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime configuration orchestration | [runtime-config-orchestration/v1.md](runtime-config-orchestration/v1.md) | `draft` | none recorded | `amendable` |
@@ -65,6 +68,7 @@ below are checked against those records.
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | `draft` | consumer (runtime) `shipped` in v2.4.0-rc.3, `unassessed` | `frozen` (2026-08-17), audit `pending` |
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | verifier (evidence-authority) `implemented-unreleased`, `unassessed` | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
+| Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | none recorded | `amendable` |
 
 Companion documents carry no record of their own; see
 [VERSIONING.md](VERSIONING.md#companion-documents):

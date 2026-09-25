@@ -354,6 +354,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
 | events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
+| events | v2 | `draft` | `amendable` | — |
 | evidence | v1 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit pending |
 | evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
 | evidence | v3 | `draft` | `amendable` | — |
@@ -370,8 +371,10 @@ Validated against `status/`; the records carry adoption and proof in full.
 | gateway-api | v2 | `draft` | `amendable` | — |
 | gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit complete |
 | gateway-config | v2 | `draft` | `amendable` | — |
+| gateway-evidence-carriage | v1 | `draft` | `amendable` | — |
 | gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
+| offline-tokens | v2 | `draft` | `amendable` | — |
 | operator-socket | v1 | `draft` | `amendable` | — |
 | runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-config | v2 | `draft` | `amendable` | — |
@@ -398,6 +401,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit pending |
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |
+| tier-c-approval | v1 | `draft` | `amendable` | — |
 
 ## Deprecation
 
