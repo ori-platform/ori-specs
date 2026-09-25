@@ -25,31 +25,35 @@ A contract change can break multiple repositories. Treat every PR as potentially
 
 ## Versioning Rules
 
-A new major contract version (`v1` -> `v2`) is required for:
+The freeze rule, the status model and the changes a frozen version admits are
+defined once, in [VERSIONING.md](VERSIONING.md). Read them there rather than
+restating them, so the two documents cannot drift. In short:
 
-- removing or renaming fields
-- changing field type or semantics
-- changing required/optional status
-- tightening accepted enum values in a way that rejects previously valid payloads
+- A version is frozen from the first conformance-claiming implementation
+  merged to a repository's default branch, protected or not, or from
+  shipment, whichever comes first, and never unfreezes.
+- A frozen version admits only additive optional changes and errata as
+  VERSIONING defines them, each classified in its status record's
+  `baseline_audit`; anything else needs a new version directory. A frozen
+  version whose audit is pending takes no normative edit at all.
+- A draft version whose record says `amendable` may change in any way.
 
-Same-version updates are allowed for:
-
-- additive optional fields
-- additive enum values (backward-compatible)
-- clarifications that do not change behavior
-- marking already-implemented gaps as resolved
-
-**Pre-ratification exception.** A contract whose status is `Design Target` may
-be amended in place, including in the breaking ways listed above, until it has
-a shipped consumer claiming conformance. The rule and its limits are in
-[VERSIONING.md](VERSIONING.md#pre-ratification-exception) — read it there
-rather than restating it, so the two documents cannot drift. A contract amended
-this way must be recorded in the versioning baseline as pre-ratification.
+`status/<contract>/<version>.json` is the source of truth for a version's
+maturity, adoption, compatibility and proof. A PR that adds a version, lands an
+implementation, cuts a release or ratifies a contract updates the record, then
+runs `scripts/check-contract-status --write-status-lines --write-rows` to
+re-render the contract's `Status:` paragraph and its README and VERSIONING
+rows.
 
 ## Writing Rules
 
 - Do not describe planned behavior as implemented.
-- Every section must label status clearly: `Implemented`, `Design Target`, or `Open Gap`.
+- A contract's `Status:` paragraph is rendered from its record; do not edit it
+  by hand.
+- Section-level labels such as `Implemented`, `Design Target` or `Open Gap`
+  describe that section only and never contradict the record. *Design target*
+  and *pre-ratification* carry no status of their own; see
+  [VERSIONING.md](VERSIONING.md#status-model).
 - Keep field names and types exactly aligned with source repos.
 - If behavior is ambiguous, mark it explicitly in a `Notes` or `Ambiguity` subsection.
 
@@ -60,3 +64,4 @@ A contract PR is ready only if:
 - runtime behavior and spec text match
 - internal links resolve
 - no contradictory status statements remain
+- `scripts/check-contract-status` passes

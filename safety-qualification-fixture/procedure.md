@@ -1,11 +1,11 @@
 # Qualification Session Procedure
 
-> Status: Design target, pre-ratification. Companion to
+> Status: Companion to
 > [safety-qualification-fixture/v1.md](v1.md), which owns the artifact and the
 > authority; this document owns how a session is conducted and what it
 > establishes. No session has been run under it, and none can be until that
-> contract's exposure ceilings are ratified. Amendable in place under the
-> [pre-ratification exception](../VERSIONING.md#pre-ratification-exception).
+> contract's exposure ceilings are ratified. It has no status record of its own; see
+> [companion documents](../VERSIONING.md#companion-documents).
 
 A qualification session puts an unratified Tier D condition in charge of a real
 circuit for a bounded window. This document is the procedure that makes that

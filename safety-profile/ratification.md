@@ -1,10 +1,10 @@
 # Safety Profile Ratification
 
-> Status: Design target, pre-ratification. Companion to
+> Status: Companion to
 > [safety-profile/v1.md](v1.md), which owns what a profile is; this document
 > owns what licenses one to become `ratified`. No profile has been ratified
-> under it. Amendable in place under the
-> [pre-ratification exception](../VERSIONING.md#pre-ratification-exception).
+> under it. It has no status record of its own; see
+> [companion documents](../VERSIONING.md#companion-documents).
 
 [safety-profile/v1.md](v1.md) fixes that ratification is a contract change,
 that it flips `status` in `profiles.json`, that it moves every consumer's
