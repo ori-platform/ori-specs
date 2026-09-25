@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""Check the retained-refusal vectors against evidence-transport/v2.
+
+`evidence-transport/vectors/retention-v2.json` fixes the authority side of a
+retained refusal: the retention attestation's exact bytes and MAC, and what the
+authority answers, retains and covers as terminal refusals arrive. The rules
+are read from the contract text, never from the corpus:
+
+- the *Retained refusals* and *Retention bounds* sections are pinned: every
+  sentence and table row must equal `evidence-transport-retention-pinned-units.json`
+  beside this script, so no edit to them can pass until the pin changes with
+  the corpus;
+- the retention's field set is read from its table, and its MAC domain from
+  the sentence that defines it, and the golden attestation is recomputed under
+  the published ingest secret;
+- each sequence is replayed through the authority model those sections and
+  evidence-exchange/v2's coverage paragraph state — atomic retention before any
+  response, idempotent retry, the `503` on a failed commit, the per-identity
+  allowance and its reservation for the first identity-scoped refusal, the
+  global reservation, `507` before `503`, restart persistence, checkpoint
+  rollback under one identity, and that a refused artifact covers nothing — and
+  every expectation must equal the model's.
+
+    python3 scripts/check-evidence-transport-retention-vectors
+    python3 scripts/check-evidence-transport-retention-vectors --mutations
+    python3 scripts/check-evidence-transport-retention-vectors --print-units
+
+`--mutations` corrupts every expectation and the attestation, drops every
+required sequence, deletes every pinned unit, and rewords every sentence the
+model hard-codes, and requires every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "evidence-transport" / "v2.md"
+EXCHANGE = ROOT / "evidence-exchange" / "v2.md"
+VECTORS = ROOT / "evidence-transport" / "vectors" / "retention-v2.json"
+PINNED = ROOT / "scripts" / "evidence-transport-retention-pinned-units.json"
+BLOCK = ("### Retained refusals", "### Refusal policy")
+COVERAGE = ("**A refused artifact covers nothing.**", "### Epoch confirmation")
+DOMAIN_RULE = re.compile(r'over\s+`"([a-z_.0-9]+)" \|\| NUL \|\| canonical\(retention without mac\)`')
+
+# The sentences the model below hard-codes, each beside the rule it backs.
+MODEL_SENTENCES = {
+    # replay(): no response before the retention commit; a failed commit is 503.
+    "atomic": (
+        "Before it answers, the authority commits the exact request body, the retention record below, "
+        "and the audit record it already writes, in one transaction; no response is sent before that "
+        "commit, and if the commit fails the authority answers `503 unavailable`."
+    ),
+    # replay(): an identical retransmission under an unchanged carriage capability returns the stored decision
+    # and retains nothing new.
+    "idempotent": (
+        "A retransmission of the identical bytes, including after the response was lost before the "
+        "gateway received it, returns, for a credential whose carriage capability has not changed, the same "
+        "decision, the same `decided_at_ms`, and the same "
+        "authority artifacts, without retaining another copy; its response bytes differ from the first only in "
+        "the retention's `key_id` and `mac`."
+    ),
+    # replay(): the three per-identity partitions and the global reservation.
+    "partitions": (
+        "The authority holds retained refusals within a hard per-identity ordinary allowance, a per-identity "
+        "registration-repair reservation, and a hard global bound."
+    ),
+    "identity_reserve": (
+        "It reserves, per identity, the space for that identity's first identity-scoped refusal, and, within "
+        "the global bound, the space needed to commit and deliver dispositions;"
+    ),
+    "counts": (
+        "Bounds and counts are durable and survive restart, and an identical retransmission of a "
+        "retained refusal never counts twice."
+    ),
+    # replay(): every terminally refused registration, cancellations included, uses the repair reservation.
+    "repair": (
+        "Every terminally refused anchor registration, whether refused during courier ingest, commissioning "
+        "resolution, or cancellation, consumes the registration-repair reservation rather than the ordinary "
+        "evidence-refusal allowance."
+    ),
+    "repair_partitioned": (
+        "That reservation MUST be partitioned per identity so one identity cannot consume another identity's "
+        "repair capacity."
+    ),
+    # replay(): before an identity disposition, exhaustion is 503 and audited.
+    "pre_disposition": (
+        "Before an identity-scoped disposition has been durably issued, inability to retain a terminal refusal "
+        "within the applicable ordinary allowance is answered `503 retention_capacity_unavailable`; the "
+        "authority accepts no custody, retains no partial state, and audits `retention_capacity_unavailable`."
+    ),
+    "no_manufacture": "Capacity exhaustion alone MUST NOT issue or imply an identity disposition.",
+    "identity_507": (
+        "`507 retention_capacity_exhausted` is permitted only for an identity already subject to a durably "
+        "issued identity-scoped disposition."
+    ),
+    "spent": (
+        "Once that disposition has been issued, the identity's reservation for its first identity-scoped "
+        "refusal is spent, and a terminal refusal beyond the applicable allowance is refused `507`, which "
+        "explicitly accepts no custody."
+    ),
+    "order": "The identity's allowance is decided before the global capacity.",
+    "global_503": (
+        "A terminal refusal the global unreserved capacity cannot hold is answered `503 unavailable`, "
+        "accepts no custody, and is audited as authority-wide degraded capacity."
+    ),
+    "no_eviction": "No bound is ever met by evicting earlier evidence.",
+    # replay(): one identity's count never moves another's.
+    "no_consumption": "no identity's retention consumes another identity's allowance or any reservation.",
+    "early_warning": "Each bound carries an early-warning threshold below its limit, audited when crossed.",
+    "no_coverage": (
+        "A retained refusal is custody of forensic bytes: it contributes to no receipt and to no "
+        "contiguous frontier, later accepted ranges never erase it, and an envelope fork it records stays "
+        "a retained security finding."
+    ),
+}
+# evidence-exchange/v2's coverage and rollback rules the model applies.
+EXCHANGE_SENTENCES = {
+    "frontier": (
+        "so an envelope accepted at N+1 is receipted on its own run and never extends the frontier "
+        "through N,"
+    ),
+    "fork": (
+        "A valid envelope at a `local_seq` already accepted with a different `chain_row_digest` is a "
+        "fork: it is refused and retained, the accepted envelope is never overwritten,"
+    ),
+    "rollback": (
+        "A checkpoint whose `high_water_seq` is lower than one already accepted for the same `device_id` "
+        "MUST be rejected as rollback regardless of `boot_id`, and a `boot_id` lower than one already "
+        "accepted MUST be rejected likewise."
+    ),
+    "reset": (
+        "A restored or reset evidence store MUST NOT reuse the same `device_id` with counters below "
+        "those it has already issued: its checkpoints are refused as rollback, retained, and answered "
+        "with an `identity`-scoped disposition where the emission mapping below makes a rollback "
+        "identity-scoped,"
+    ),
+}
+REQUIRED_SEQUENCES = (
+    "a terminal refusal is retained atomically and answered with its digest",
+    "no response is sent before the retention commit",
+    "a lost response is answered on retry with the same decision and no second copy",
+    "a failed retention commit answers 503 and retains nothing",
+    "ordinary exhaustion before an identity disposition answers 503, not 507, while another identity continues",
+    "the ordinary allowance is exact at the boundary",
+    "a fresh registration still reaches its repair reservation after an evidence flood",
+    "one device cannot consume another device's repair reservation",
+    "after an identity disposition, excess terminal refusals are refused 507",
+    "the identity reservation admits the first identity-scoped refusal",
+    "the global reservation is kept for reserved retentions",
+    "bounds and counts survive restart",
+    "a retained refusal extends no receipt or frontier",
+    "an envelope fork is retained without overwriting the accepted envelope",
+    "a same-identity counter reset stays refused",
+    "a replacement identity starts independently",
+    "capacity restored by the authority operator permits later retention; elapsed time does not",
+    "a generic 503 remains generic",
+    "a 79-refusal incident is retained digest by digest",
+)
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith("|"):
+            units.extend(_norm(line) for line in lines if line.strip())
+            continue
+        if lines[0].lstrip().startswith("```"):
+            units.append(_norm(paragraph))
+            continue
+        prose = _norm(paragraph)
+        units.extend(s for s in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if s)
+    return units
+
+
+def _block(text: str, start: str, end: str) -> str:
+    a = text.find(start)
+    b = text.find(end, a)
+    if a < 0 or b < a:
+        raise CheckError(f"the contract lacks the block starting {start[:40]!r}")
+    return text[a:b]
+
+
+def pinned_units(text: str) -> list[str]:
+    return _units(_block(text, *BLOCK))
+
+
+def canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def load_contract(text: str, exchange: str, check_pin: bool = True) -> dict:
+    units = pinned_units(text)
+    if check_pin:
+        pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+        if units != pinned:
+            added = sorted(set(units) - set(pinned))
+            removed = sorted(set(pinned) - set(units))
+            raise CheckError(
+                "the retention sections differ from the pinned units; a deliberate change updates "
+                "scripts/evidence-transport-retention-pinned-units.json with this corpus\n"
+                + "".join(f"  + {u}\n" for u in added)
+                + "".join(f"  - {u}\n" for u in removed)
+            )
+    joined = _norm(" ".join(units))
+    for key, sentence in MODEL_SENTENCES.items():
+        if _norm(sentence) not in joined:
+            raise CheckError(
+                f"evidence-transport/v2 no longer states the {key} rule this model hard-codes: "
+                f"{sentence[:70]!r}; change the model and MODEL_SENTENCES together"
+            )
+    coverage = _norm(exchange)
+    for key, sentence in EXCHANGE_SENTENCES.items():
+        if _norm(sentence) not in coverage:
+            raise CheckError(f"evidence-exchange/v2 no longer states the {key} rule this model applies")
+    block = _block(text, *BLOCK)
+    table = block[block.find("| Field | Rule |"):]
+    fields = re.findall(r"^\| `(\w+)` \|", table.split("\n\n", 1)[0], re.MULTILINE)
+    domain = DOMAIN_RULE.search(_norm(block))
+    if not fields or domain is None:
+        raise CheckError("the contract no longer states the retention fields or its MAC domain")
+    return {"fields": fields, "domain": domain.group(1).encode() + b"\0"}
+
+
+def check_attestation(contract: dict, document: dict) -> None:
+    attestation = document["attestation"]
+    retention = attestation["retention"]
+    if list(retention) != contract["fields"]:
+        raise CheckError(f"the retention carries {list(retention)}, the contract defines {contract['fields']}")
+    body = {k: v for k, v in retention.items() if k != "mac"}
+    preimage = contract["domain"] + canonical(body)
+    if attestation["preimage_hex"] != preimage.hex():
+        raise CheckError("the retention preimage does not reproduce from the contract's domain")
+    mac = "hmac-sha256:" + hmac.new(document["secret"].encode(), preimage, hashlib.sha256).hexdigest()
+    if retention["mac"] != mac:
+        raise CheckError("the retention MAC does not reproduce under the published ingest secret")
+    salt, info = b"ori.evidence_ingest_key_id.v1", b"evidence_ingest"
+    prk = hmac.new(salt, document["secret"].encode(), hashlib.sha256).digest()
+    derived = "hkdf-sha256:" + hmac.new(prk, info + b"\x01", hashlib.sha256).digest()[:16].hex()
+    if retention["key_id"] != derived:
+        raise CheckError("the retention key_id is not the ingest key derived from the published secret")
+    if retention["refusal_status"] != attestation["response"]["status"] or retention["reason"] != attestation["response"]["reason"]:
+        raise CheckError("the retention does not bind the response's status and reason")
+    if retention["artifact_digest"] != attestation["response"]["artifact_digest"]:
+        raise CheckError("the retention does not bind the response's digest")
+    for case in attestation["defects"]:
+        bad = copy.deepcopy(retention)
+        bad.update(case["change"])
+        bad_body = {k: v for k, v in bad.items() if k != "mac"}
+        recomputed = "hmac-sha256:" + hmac.new(
+            document["secret"].encode(), contract["domain"] + canonical(bad_body), hashlib.sha256
+        ).hexdigest()
+        if case["expected"] != "unrecognised" or recomputed == bad["mac"]:
+            raise CheckError(f"attestation defect {case['name']}: a changed retention must fail its MAC")
+    if len(attestation["defects"]) < 6:
+        raise CheckError("the attestation defects must cover digest, device, status, reason, type and domain")
+
+
+def replay(document: dict, sequence: dict) -> None:
+    bounds = sequence.get("bounds", document["bounds"])
+    ordinary_allowance, repair_reserve, global_bound, global_reserve = (
+        bounds["ordinary_allowance"], bounds["registration_repair"], bounds["global_bound"],
+        bounds["global_reserve"])
+    identities: dict[str, dict] = {}
+    decisions: dict[tuple, dict] = {}
+    global_count = 0
+    checkpoints: dict[str, dict] = {}
+    envelopes: dict[str, dict[int, str]] = {}
+    name = sequence["name"]
+
+    def identity(device: str) -> dict:
+        return identities.setdefault(
+            device, {"ordinary": set(), "repair": set(), "identity": set(), "issued": False})
+
+    def capacity(step: dict, scope: str) -> tuple[str | None, bool]:
+        """The partition a terminal refusal falls in, or None when it has no room; and whether it is reserved."""
+        state = identity(step["device"])
+        if scope == "identity" and not state["issued"]:
+            return ("identity" if not state["identity"] else None), True
+        if step["artifact_type"] == "anchor_registration":
+            return ("repair" if len(state["repair"]) < repair_reserve else None), True
+        return ("ordinary" if len(state["ordinary"]) < ordinary_allowance else None), False
+
+    def terminal(step: dict, scope: str) -> dict:
+        nonlocal global_count
+        key = (step["device"], step["artifact_type"], step["digest"])
+        if key in decisions:
+            # The stored decision, and no second copy.
+            return {**decisions[key], "retained": False}
+        if not step.get("commit", True):
+            return {"http": 503, "outcome": "pending", "reason": "unavailable", "retained": False}
+        state = identity(step["device"])
+        partition, reserved = capacity(step, scope)
+        if partition is None:
+            if state["issued"]:
+                return {"http": 507, "outcome": "refused", "reason": "retention_capacity_exhausted", "retained": False}
+            return {"http": 503, "outcome": "pending", "reason": "retention_capacity_unavailable", "retained": False,
+                    "audit": "retention_capacity_unavailable"}
+        global_limit = global_bound if reserved else global_bound - global_reserve
+        if global_count >= global_limit:
+            return {"http": 503, "outcome": "pending", "reason": "unavailable", "retained": False}
+        state[partition].add(step["digest"])
+        global_count += 1
+        if scope == "identity":
+            state["issued"] = True
+        decision = {"http": step["status"], "outcome": "refused_retained", "reason": step["reason"],
+                    "retained": True}
+        decisions[key] = decision
+        return decision
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        if event == "terminal":
+            got = dict(terminal(step, step["scope"]))
+        elif event == "retry":
+            key = (step["device"], step["artifact_type"], step["digest"])
+            if key not in decisions:
+                raise CheckError(f"{where}: a retry of bytes that were never retained is a new terminal event")
+            got = {**decisions[key], "retained": False}
+        elif event == "cancellation_retention":
+            # A registration removed by a cancellation is a terminally refused registration.
+            got = dict(terminal({**step, "artifact_type": "anchor_registration", "status": 422,
+                                 "reason": "commissioning_digest_mismatch"}, "artifact"))
+        elif event == "capacity_restored":
+            # Authority-operator action raises the allowance; nothing retained is evicted.
+            if step["ordinary_allowance"] <= ordinary_allowance:
+                raise CheckError(f"{where}: a restored capacity only ever grows")
+            ordinary_allowance = step["ordinary_allowance"]
+            got = {}
+        elif event == "time_elapsed":
+            # Elapsed time does not itself resolve the condition.
+            got = {}
+        elif event == "restart":
+            got = {}
+        elif event == "checkpoint":
+            seen = checkpoints.get(step["device"])
+            rollback = seen is not None and (
+                step["high_water_seq"] < seen["high_water_seq"] or step["boot_id"] < seen["boot_id"])
+            if rollback:
+                got = dict(terminal({**step, "artifact_type": "checkpoint", "status": 409, "reason": "conflict"}, "identity"))
+            else:
+                checkpoints[step["device"]] = {"high_water_seq": step["high_water_seq"], "boot_id": step["boot_id"]}
+                got = {"http": 200, "outcome": "accepted", "reason": "", "retained": False}
+        elif event == "envelope":
+            accepted = envelopes.setdefault(step["device"], {})
+            seq = step["local_seq"]
+            if step.get("defect") == "malformed":
+                got = dict(terminal({**step, "artifact_type": "delivery_envelope", "status": 400,
+                                     "reason": "malformed"}, "artifact"))
+            elif seq in accepted and accepted[seq] != step["digest"]:
+                got = dict(terminal({**step, "artifact_type": "delivery_envelope", "status": 409,
+                                     "reason": "conflict"}, "identity"))
+            else:
+                accepted[seq] = step["digest"]
+                got = {"http": 200, "outcome": "accepted", "reason": "", "retained": False}
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        device = step.get("device")
+        state = identity(device) if device else None
+        observed = dict(got)
+        observed.setdefault("audit", None)
+        observed["global_retained"] = global_count
+        if device is not None:
+            observed["device_retained"] = len(state["ordinary"]) + len(state["repair"]) + len(state["identity"])
+            observed["repair_retained"] = len(state["repair"])
+            accepted = envelopes.get(device, {})
+            frontier = 0
+            while frontier + 1 in accepted:
+                frontier += 1
+            observed["frontier"] = frontier
+            observed["accepted_digests"] = {str(k): v for k, v in sorted(accepted.items())}
+        want = step["expect"]
+        for key, value in want.items():
+            if key not in observed:
+                raise CheckError(f"{where}: expectation {key!r} is not something this event decides")
+            if observed[key] != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed[key]!r}")
+
+
+def check(document: dict, contract: dict) -> None:
+    check_attestation(contract, document)
+    sequences = document["sequences"]
+    for prefix in REQUIRED_SEQUENCES:
+        if not any(s["name"].startswith(prefix) for s in sequences):
+            raise CheckError(f"no sequence for: {prefix}")
+    for sequence in sequences:
+        replay(document, sequence)
+    incident = next(s for s in sequences if s["name"].startswith(REQUIRED_SEQUENCES[-1]))
+    digests = {s["digest"] for s in incident["steps"] if s["event"] == "terminal"}
+    if len(digests) != 79:
+        raise CheckError("the 79-refusal sequence does not retain 79 distinct digests")
+
+
+def corpus_mutants(document: dict):
+    for i, sequence in enumerate(document["sequences"]):
+        bad = copy.deepcopy(document)
+        del bad["sequences"][i]
+        yield f"without {sequence['name']!r}", bad
+        for j, step in enumerate(sequence["steps"]):
+            for key, value in step["expect"].items():
+                bad = copy.deepcopy(document)
+                target = bad["sequences"][i]["steps"][j]["expect"]
+                if value is None:
+                    target[key] = "retention_capacity_unavailable"
+                elif isinstance(value, bool):
+                    target[key] = not value
+                elif isinstance(value, int):
+                    target[key] = value + 1
+                elif isinstance(value, str):
+                    target[key] = {"refused_retained": "refused", "refused": "refused_retained",
+                                   "pending": "refused", "accepted": "refused"}.get(value, value + "x")
+                elif isinstance(value, dict):
+                    target[key] = {**value, "999": "sha256:" + "0" * 64}
+                yield f"{sequence['name']!r} step {j} {key}", bad
+    for field in ("artifact_digest", "device_id", "refusal_status", "reason", "decided_at_ms", "anchor_epoch_id"):
+        bad = copy.deepcopy(document)
+        value = bad["attestation"]["retention"][field]
+        bad["attestation"]["retention"][field] = value + 1 if isinstance(value, int) else value + "0"
+        yield f"attestation {field} altered", bad
+    bad = copy.deepcopy(document)
+    bad["bounds"]["ordinary_allowance"] += 1
+    yield "ordinary allowance altered", bad
+    bad = copy.deepcopy(document)
+    bad["bounds"]["registration_repair"] += 1
+    yield "registration repair reservation altered", bad
+    bad = copy.deepcopy(document)
+    bad["bounds"]["global_reserve"] += 1
+    yield "global reserve altered", bad
+
+
+def text_mutants(text: str):
+    block = _block(text, *BLOCK)
+    for unit in _units(block):
+        pattern = r"\s+".join(re.escape(w) for w in unit.split())
+        edited, count = re.subn(pattern, "", block, count=1)
+        if count == 1:
+            yield f"delete {unit[:60]!r}", text.replace(block, edited, 1)
+
+
+def main() -> int:
+    text = CONTRACT.read_text(encoding="utf-8")
+    exchange = EXCHANGE.read_text(encoding="utf-8")
+    if "--print-units" in sys.argv[1:]:
+        print(json.dumps(pinned_units(text), indent=2, ensure_ascii=False))
+        return 0
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        contract = load_contract(text, exchange)
+        check(document, contract)
+    except (CheckError, KeyError) as error:
+        print(f"check-evidence-transport-retention-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(document):
+            total += 1
+            try:
+                check(bad, contract)
+            except (CheckError, KeyError, StopIteration):
+                continue
+            survived.append(label)
+        edits = list(text_mutants(text))
+        for label, edited in edits:
+            total += 1
+            try:
+                check(document, load_contract(edited, exchange))
+            except (CheckError, KeyError):
+                continue
+            survived.append(f"contract text: {label}")
+        for key, sentence in {**MODEL_SENTENCES, **EXCHANGE_SENTENCES}.items():
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+            source_text, source_exchange = text, exchange
+            if key in EXCHANGE_SENTENCES:
+                source_exchange, count = re.subn(pattern, reworded, exchange, count=1)
+            else:
+                source_text, count = re.subn(pattern, reworded, text, count=1)
+            total += 1
+            if count != 1:
+                survived.append(f"re-pin mutant for {key} matches nothing")
+                continue
+            try:
+                check(document, load_contract(source_text, source_exchange, check_pin=False))
+            except (CheckError, KeyError):
+                continue
+            survived.append(f"re-pin: {key} reworded")
+        edited = text.replace('"ori.evidence_ingest_retention.v1"', '"ori.evidence_ingest_retention.v2"')
+        total += 1
+        try:
+            check(document, load_contract(edited, exchange, check_pin=False))
+            survived.append("re-pin: retention domain changed")
+        except (CheckError, KeyError):
+            pass
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"retention mutations: {total} refused, {len(edits)} of them contract-text edits")
+    print(f"retention vectors: the attestation and {len(document['sequences'])} sequences hold to evidence-transport/v2")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

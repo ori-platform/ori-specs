@@ -1,0 +1,571 @@
+#!/usr/bin/env python3
+"""Check the handoff-order and stop-projection vectors against the evidence contracts.
+
+`evidence-transport/vectors/handoff-order-v2.json` fixes two rules neither the
+refusal-policy corpus nor the retention corpus can express, and every rule is
+read from the contract text, never from the corpus:
+
+- checkpoint order: for one identity the runtime hands off a checkpoint only
+  when every earlier-produced checkpoint has a verified `queued`
+  acknowledgement, envelopes are never held behind a checkpoint, and the
+  gateway keeps admitted checkpoints in handoff order across its restart, a
+  repeated checkpoint keeping its first position (evidence-exchange/v2 and
+  evidence-transport/v2);
+- stop projections: the exact MAC of each projection under the published
+  ingest secret and the contract's domain, whether the gateway may act on it,
+  and which queued entries a verified stop covers, retained in order, never
+  archived, across restart (evidence-transport/v2, stopped scopes); a later
+  admission the stop covers enters stopped custody only within the bounds,
+  durably, with a delivery envelope's custody acknowledgement staged before
+  `queued` is published, and beyond a bound receives neither acknowledgement,
+  while an entry already in custody moves to stopped custody even beyond a
+  bound.
+
+    python3 scripts/check-evidence-handoff-vectors
+    python3 scripts/check-evidence-handoff-vectors --mutations
+
+`--mutations` corrupts every expectation, alters every projection, drops each
+required sequence, and removes or rewords each sentence the model hard-codes,
+and requires every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TRANSPORT = ROOT / "evidence-transport" / "v2.md"
+EXCHANGE = ROOT / "evidence-exchange" / "v2.md"
+VECTORS = ROOT / "evidence-transport" / "vectors" / "handoff-order-v2.json"
+DOMAIN_RULE = re.compile(r'over\s+`"([a-z_.0-9]+)" \|\| NUL \|\| canonical\(stop without mac\)`')
+
+EXCHANGE_SENTENCES = {
+    "fifo": (
+        "The runtime MUST NOT hand off checkpoint N+1 while an earlier-produced checkpoint N lacks a verified "
+        "gateway `queued` acknowledgement."
+    ),
+    "no_overtake": (
+        "Retry eligibility does not permit a later checkpoint to pass an earlier unacknowledged checkpoint."
+    ),
+    "not_predecessor": (
+        "A checkpoint stops being a predecessor only after the runtime durably records a verified `queued` "
+        "acknowledgement, a covering verified stop disposition, or a verified terminal gateway-admission refusal "
+        "`malformed` or `binding_mismatch`, or after it durably moves the checkpoint's stored copy into damaged or "
+        "foreign-identity custody as below."
+    ),
+    # replay_checkpoints(): `custody_move`.
+    "custody_release": (
+        "A checkpoint also stops being a predecessor when the runtime durably moves its stored copy out of the "
+        "active offer loop into durable damaged custody or into durable foreign-identity custody."
+    ),
+    "custody_never_offered": "a copy moved so is never offered again under this identity.",
+    "failure_kept": (
+        "For a terminal refusal it preserves the exact bytes in durable failed-delivery state before releasing "
+        "the successor."
+    ),
+    "queue_full_predecessor": (
+        "`queue_full`, an unauthenticated acknowledgement and absence of an acknowledgement leave it a predecessor."
+    ),
+    "queue_full_retry": "A checkpoint refused `queue_full` is retried with the runtime's existing bounded back-off.",
+    "other_epoch": (
+        "So a stopped epoch's checkpoint never holds a checkpoint of another epoch, and handoff under any other "
+        "epoch continues."
+    ),
+    "only_checkpoints": (
+        "This ordering applies only among checkpoints and MUST NOT delay Tier C or Tier D execution, local "
+        "evidence sealing, or envelope handoff."
+    ),
+}
+TRANSPORT_SENTENCES = {
+    "gateway_order": (
+        "The gateway durably admits checkpoints for one device in runtime handoff order and MUST NOT reorder "
+        "them within the evidence lane."
+    ),
+    "repeat_position": "A repeated checkpoint is idempotent and retains its original queue position.",
+    "stop_retains": (
+        "Stopping retains every queued byte and its order, performs no archive, and changes no custody the runtime "
+        "already holds."
+    ),
+    # replay_stops(): `admit` in a stopped scope, within and beyond a bound, and its `effects`.
+    "stop_admission": (
+        "An admission covered by a stop enters stopped custody only within the applicable bounds. After the "
+        "stopped bytes and their return obligation are durable, the gateway publishes `queued`. For a "
+        "`delivery_envelope`, it also durably stages and subsequently delivers the custody acknowledgement; that "
+        "acknowledgement is what permits the runtime to release its local copy. Beyond an applicable bound, the "
+        "gateway accepts no custody and publishes neither acknowledgement."
+    ),
+    "stop_admission_order": (
+        "The custody acknowledgement is staged durably before `queued` is published, so `queued` never leads the "
+        "runtime to expect proof of custody that is not yet durable."
+    ),
+    # replay_stops(): a `response` moves every covered entry, whatever the bound.
+    "stop_in_custody": (
+        "An entry already in gateway custody when a later verified stop arrives moves to stopped custody even "
+        "beyond a bound, because custody cannot be revoked retrospectively."
+    ),
+    "no_origination": "The gateway does not originate, widen or clear the stop.",
+    "verification": (
+        "The gateway acts on it only when it carries exactly these fields, `mac` verifies under the secret the "
+        "request was signed with, `device_id` is the request's, and `disposition_digest` names an artifact the "
+        "same response carries; it never reads the disposition's fields to decide the stop."
+    ),
+    "unrecognised": "Anything else is an unrecognised outcome and stops nothing.",
+    "replay_binding": (
+        "`artifact_digest` must also equal the response's, so a projection replayed from another response binds "
+        "nothing."
+    ),
+    "claim_boundary": "It is sufficient only to place gateway-custodied bytes into stopped custody.",
+    "capacity": (
+        "An artifact covered by a verified epoch or identity stop leaves active delivery ordering and "
+        "active-delivery capacity only after it is durably moved to stopped local custody or stopped gateway "
+        "custody."
+    ),
+    "custody_durable": "Its bytes, digest, original order and stop scope remain durable.",
+    "reservation": (
+        "A stopped registration does not occupy the active anchor-registration reservation; that reservation "
+        "remains available to an unstopped epoch."
+    ),
+    "move": (
+        "The move is between durable states, never a deletion: an interrupted move leaves the artifact in exactly "
+        "one of them, and stopped custody counts toward the stopped-custody bounds of `gateway-config/v2`, never "
+        "toward active-delivery capacity."
+    ),
+    # replay_stops(): a later admission in a stopped scope enters stopped custody.
+    "later_admissions": (
+        "The durable stop record covers later admissions in its scope: an artifact admitted after a verified stop "
+        "covers it enters stopped custody directly and never becomes sendable,"
+    ),
+    "epoch_admission": (
+        "the gateway refuses `malformed` at admission an outbound anchor registration, delivery envelope or "
+        "checkpoint whose `anchor_epoch_id` is missing or outside its routing-projection domain."
+    ),
+    "coverage": (
+        "An `identity` stop covers every queued entry for that device, in both lanes; an `epoch` stop covers the "
+        "queued entries whose routing-projection `anchor_epoch_id` is that epoch."
+    ),
+    "stopped_entry": (
+        "A stopped entry is never sent, archived, or retired, survives restart in order, and is reported as "
+        "stopped custody in `gateway-evidence-carriage/v1`."
+    ),
+}
+REQUIRED_SEQUENCES = (
+    "a lost acknowledgement holds the next checkpoint local until the first is acknowledged",
+    "a retry followed by the next checkpoint reaches the gateway in order",
+    "a gateway restart preserves checkpoint order",
+    "envelopes continue while a checkpoint waits",
+    "an identity stop keeps every queued entry in order and archives nothing",
+    "an epoch stop covers only that epoch's entries",
+    "a forged or widened stop projection stops nothing",
+    "a stopped epoch's checkpoint holds no checkpoint of another epoch",
+    "a terminally refused checkpoint stops being a predecessor",
+    "a queue_full refusal keeps the checkpoint a predecessor",
+    "a stopped registration frees the reserved registration slot",
+    "a binding_mismatch refusal releases the next checkpoint only after its durable failure record",
+    "a crash before the durable failure record leaves the refused checkpoint a predecessor",
+    "a checkpoint moved to damaged custody releases its successor",
+    "a checkpoint moved to foreign-identity custody releases its successor",
+    "a crash before the durable custody move leaves the checkpoint a predecessor",
+    "a forged acknowledgement releases nothing",
+    "stopped custody counts toward its own bound, never active capacity",
+    "a later admission in a stopped scope enters stopped custody",
+    "an admission beyond a stopped-custody bound receives no custody and evicts nothing",
+    "a courier opening above a lowered bound opens, reports the fault and delivers unrelated lanes",
+    "a crash during the move to stopped custody leaves each artifact in exactly one durable state",
+    "a stopped-custody envelope admission stages its custody acknowledgement before queued",
+    "an entry already in custody moves to stopped custody even beyond the bound",
+)
+# Implementation defects the corpus must catch; each is switched on alone under --mutations.
+MODEL_MUTANTS = {
+    "drain_skips_unacknowledged": False,
+    "stopped_checkpoint_holds": False,
+    "unrecorded_refusal_releases": False,
+    "unauthenticated_ack_releases": False,
+    "queue_full_releases": False,
+    "custody_move_holds": False,
+    "custody_move_reoffered": False,
+    "undurable_custody_move_releases": False,
+    "stop_ignores_artifact_digest": False,
+    "stopped_bytes_dropped": False,
+    "move_all_or_nothing_on_crash": False,
+    "later_admission_uncovered": False,
+    "bound_evicts": False,
+    "bound_admits_beyond": False,
+    "over_bound_refuses_to_open": False,
+    "over_bound_unreported": False,
+    "stopped_envelope_without_custody_ack": False,
+    "custody_ack_after_queued": False,
+    "queued_before_durable": False,
+    "beyond_bound_acknowledged": False,
+    "stop_move_capped_at_bound": False,
+}
+STOP_FIELDS = [
+    "v", "device_id", "scope", "anchor_epoch_id", "artifact_digest", "disposition_digest", "decided_at_ms",
+    "key_id", "mac",
+]
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def load_contract(transport: str, exchange: str) -> dict:
+    for source, sentences in ((exchange, EXCHANGE_SENTENCES), (transport, TRANSPORT_SENTENCES)):
+        prose = _norm(source)
+        for key, sentence in sentences.items():
+            if _norm(sentence) not in prose:
+                raise CheckError(f"the contract no longer states the {key} rule this model hard-codes")
+    domain = DOMAIN_RULE.search(_norm(transport))
+    block = transport[transport.find("**Stopped scopes.**"):]
+    table = block[block.find("| Field | Rule |"):]
+    fields = re.findall(r"^\| `(\w+)` \|", table.split("\n\n", 1)[0], re.MULTILINE)
+    if domain is None or fields != STOP_FIELDS:
+        raise CheckError("the contract no longer states the stop projection's fields or MAC domain")
+    return {"domain": domain.group(1).encode() + b"\0"}
+
+
+def stop_verdict(contract: dict, document: dict, case: dict) -> str:
+    """`applies` or `unrecognised`, from the projection, the request and the response."""
+    stop = case["stop"]
+    if not isinstance(stop, dict) or list(stop) != STOP_FIELDS or stop["v"] != 1:
+        return "unrecognised"
+    if stop["scope"] not in ("epoch", "identity"):
+        return "unrecognised"
+    body = {k: v for k, v in stop.items() if k != "mac"}
+    mac = "hmac-sha256:" + hmac.new(document["secret"].encode(), contract["domain"] + canonical(body), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, stop["mac"]) or stop["key_id"] != document["key_id"]:
+        return "unrecognised"
+    if stop["device_id"] != case["request_device_id"]:
+        return "unrecognised"
+    if stop["disposition_digest"] not in case["response_artifact_digests"]:
+        return "unrecognised"
+    if stop["artifact_digest"] != case["response_artifact_digest"] and not MODEL_MUTANTS["stop_ignores_artifact_digest"]:
+        return "unrecognised"
+    return "applies"
+
+
+def replay_checkpoints(sequence: dict) -> None:
+    produced: list[tuple[str, str, str]] = []
+    acked: set[str] = set()
+    refused: set[str] = set()
+    moved: set[str] = set()
+    stopped_epochs: set[str] = set()
+    identity_stopped = False
+    gateway: list[str] = []
+    name = sequence["name"]
+
+    def stopped(epoch: str) -> bool:
+        return identity_stopped or epoch in stopped_epochs
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        observed: dict = {}
+        if event == "produce":
+            produced.append((step["kind"], step["id"], step.get("epoch", "E1")))
+        elif event == "drain":
+            handed = []
+            waiting_checkpoint = False
+            for kind, ident, epoch in produced:
+                if ident in acked or ident in refused:
+                    continue
+                if ident in moved:
+                    # Out of the active offer loop: never offered again, and no longer a predecessor.
+                    if MODEL_MUTANTS["custody_move_holds"] and kind == "checkpoint":
+                        waiting_checkpoint = True
+                    if not MODEL_MUTANTS["custody_move_reoffered"]:
+                        continue
+                if stopped(epoch) and not MODEL_MUTANTS["stopped_checkpoint_holds"]:
+                    # Nothing new is handed off in a stopped scope, and it holds nothing back.
+                    continue
+                if kind == "checkpoint":
+                    if waiting_checkpoint and not MODEL_MUTANTS["drain_skips_unacknowledged"]:
+                        continue
+                    # The earliest unacknowledged checkpoint may be handed off or retried; nothing later may pass it.
+                    waiting_checkpoint = True
+                if stopped(epoch):
+                    continue
+                handed.append(ident)
+                if ident not in gateway:
+                    gateway.append(ident)
+            observed["handed_off"] = handed
+        elif event == "ack":
+            if step.get("authenticated", True) or MODEL_MUTANTS["unauthenticated_ack_releases"]:
+                if step["id"] not in gateway:
+                    raise CheckError(f"{where}: an acknowledgement for bytes the gateway never admitted")
+                acked.add(step["id"])
+        elif event == "gateway_refused":
+            if not step.get("authenticated", True):
+                # An unverified refusal is no refusal: the checkpoint stays where it was.
+                pass
+            elif step["reason"] in ("malformed", "binding_mismatch"):
+                # Released only once the exact bytes are durably recorded as a delivery failure.
+                if step["recorded"] or MODEL_MUTANTS["unrecorded_refusal_releases"]:
+                    refused.add(step["id"])
+            elif step["reason"] == "queue_full":
+                if MODEL_MUTANTS["queue_full_releases"]:
+                    refused.add(step["id"])
+            else:
+                raise CheckError(f"{where}: {step['reason']!r} is not an outbound admission refusal")
+            if step.get("authenticated", True) and step["id"] in gateway:
+                gateway.remove(step["id"])
+        elif event == "custody_move":
+            if step["custody"] not in ("damaged", "foreign_identity"):
+                raise CheckError(f"{where}: {step['custody']!r} is not a custody the contract names")
+            if step["durable"] or MODEL_MUTANTS["undurable_custody_move_releases"]:
+                moved.add(step["id"])
+        elif event == "stop_epoch":
+            stopped_epochs.add(step["epoch"])
+        elif event == "stop_identity":
+            identity_stopped = True
+        elif event in ("ack_lost", "gateway_restart", "runtime_restart"):
+            # None of these moves an artifact: order and custody are durable.
+            pass
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        observed["gateway_order"] = list(gateway)
+        observed["local_waiting"] = [
+            i for k, i, e in produced
+            if k == "checkpoint" and i not in gateway and i not in refused and i not in moved and not stopped(e)]
+        observed["local_stopped"] = [i for _, i, e in produced if stopped(e) and i not in acked]
+        observed["delivery_failures"] = sorted(refused)
+        observed["moved_custody"] = sorted(moved)
+        for key, value in step["expect"].items():
+            if observed.get(key, object()) != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed.get(key)!r}")
+
+
+def replay_stops(contract: dict, document: dict, sequence: dict) -> None:
+    queue = [dict(entry, state="queued") for entry in sequence["queue"]]
+    name = sequence["name"]
+    stops: list[dict] = []
+    bound = dict(sequence.get("stopped_bound", {"device_items": 10 ** 9, "total_items": 10 ** 9}))
+    opened = True
+    admission = None
+    effects: list[str] | None = None
+
+    def stopped_effects(entry: dict) -> list[str]:
+        """What a stopped-custody admission makes durable and publishes, in order."""
+        out = ["stopped_bytes_durable"]
+        if entry.get("artifact_type") == "delivery_envelope" and not MODEL_MUTANTS[
+                "stopped_envelope_without_custody_ack"]:
+            out.append("custody_acknowledgement_staged")
+        out.append("queued")
+        if MODEL_MUTANTS["custody_ack_after_queued"] and "custody_acknowledgement_staged" in out:
+            out.remove("custody_acknowledgement_staged")
+            out.append("custody_acknowledgement_staged")
+        if MODEL_MUTANTS["queued_before_durable"]:
+            out.remove("queued")
+            out.insert(0, "queued")
+        return out
+
+    def covers(stop: dict, entry: dict) -> bool:
+        return entry["device_id"] == stop["device_id"] and (
+            stop["scope"] == "identity" or entry["anchor_epoch_id"] == stop["anchor_epoch_id"])
+
+    def at_bound(device: str) -> bool:
+        stopped = [e for e in queue if e["state"] == "stopped"]
+        return (len([e for e in stopped if e["device_id"] == device]) >= bound["device_items"]
+                or len(stopped) >= bound["total_items"])
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        effects = None
+        if event == "admit":
+            entry = dict(step["entry"], state="queued")
+            covered = any(covers(s, entry) for s in stops) and not MODEL_MUTANTS["later_admission_uncovered"]
+            if covered and at_bound(entry["device_id"]) and not MODEL_MUTANTS["bound_admits_beyond"]:
+                if MODEL_MUTANTS["bound_evicts"]:
+                    victim = next(e for e in queue if e["state"] == "stopped")
+                    queue.remove(victim)
+                    entry["state"] = "stopped"
+                    queue.append(entry)
+                    admission = "stopped_custody"
+                    effects = stopped_effects(entry)
+                else:
+                    # Beyond the bound: no gateway custody and neither acknowledgement; the runtime keeps the bytes.
+                    admission = "no_custody"
+                    effects = ["queued"] if MODEL_MUTANTS["beyond_bound_acknowledged"] else []
+            else:
+                entry["state"] = "stopped" if covered else "queued"
+                queue.append(entry)
+                admission = "stopped_custody" if covered else "queued"
+                if covered:
+                    effects = stopped_effects(entry)
+        elif event == "gateway_restart" and "stopped_bound" in step:
+            bound = dict(step["stopped_bound"])
+            opened = not (MODEL_MUTANTS["over_bound_refuses_to_open"]
+                          and any(at_bound(e["device_id"]) for e in queue if e["state"] == "stopped"))
+        elif event == "response":
+            case = next(c for c in document["stop_cases"] if c["name"] == step["stop_case"])
+            if stop_verdict(contract, document, case) == "applies":
+                stop = case["stop"]
+                stops.append(stop)
+                # Each covered entry moves on its own durable commit; a crash stops the move between entries.
+                budget = step.get("interrupt_after")
+                if budget is not None and MODEL_MUTANTS["move_all_or_nothing_on_crash"]:
+                    budget = 0
+                for entry in queue:
+                    covered = entry["device_id"] == stop["device_id"] and (
+                        stop["scope"] == "identity" or entry["anchor_epoch_id"] == stop["anchor_epoch_id"])
+                    if covered and entry["state"] != "stopped":
+                        if MODEL_MUTANTS["stop_move_capped_at_bound"] and at_bound(entry["device_id"]):
+                            continue
+                        if budget is not None:
+                            if budget == 0:
+                                break
+                            budget -= 1
+                        entry["state"] = "stopped"
+        elif event not in ("gateway_restart", "delivery_interval"):
+            raise CheckError(f"{where}: unknown event {event!r}")
+        kept = [e for e in queue if not (e["state"] == "stopped" and MODEL_MUTANTS["stopped_bytes_dropped"])]
+        full = any(at_bound(e["device_id"]) for e in queue if e["state"] == "stopped") and not MODEL_MUTANTS[
+            "over_bound_unreported"]
+        observed = {
+            "retained_bytes": [sum(e.get("bytes", 0) for e in kept)],
+            "active_bytes": [sum(e.get("bytes", 0) for e in kept if e["state"] != "stopped")],
+            "stopped_bytes": [sum(e.get("bytes", 0) for e in kept if e["state"] == "stopped")],
+            "entries": [len(kept)],
+            "stopped": [e["id"] for e in queue if e["state"] == "stopped"],
+            "order": [e["id"] for e in queue],
+            "archived": [],
+            "sendable": [e["id"] for e in queue if e["state"] != "stopped"] if opened else [],
+            "admission": admission,
+            "effects": effects,
+            "faults": ["stopped_custody_full"] if full else [],
+            # Stopped entries leave active-delivery capacity, so the reserved registration slot is free.
+            "registration_slot_free": sorted({
+                e["device_id"] for e in queue
+                if not any(o["device_id"] == e["device_id"] and o["lane"] == "registration" and o["state"] != "stopped"
+                           for o in queue)}),
+        }
+        for key, value in step["expect"].items():
+            if observed.get(key, object()) != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed.get(key)!r}")
+
+
+def check(contract: dict, document: dict) -> None:
+    names = [s["name"] for s in document["checkpoint_sequences"] + document["stop_sequences"]]
+    for prefix in REQUIRED_SEQUENCES:
+        if not any(n.startswith(prefix) for n in names):
+            raise CheckError(f"no sequence for: {prefix}")
+    for case in document["stop_cases"]:
+        got = stop_verdict(contract, document, case)
+        if got != case["expected"]:
+            raise CheckError(f"stop case {case['name']}: declares {case['expected']}, the contract gives {got}")
+    for want in ("applies", "unrecognised"):
+        if not any(c["expected"] == want for c in document["stop_cases"]):
+            raise CheckError(f"no stop case that {want}")
+    for sequence in document["checkpoint_sequences"]:
+        replay_checkpoints(sequence)
+    for sequence in document["stop_sequences"]:
+        replay_stops(contract, document, sequence)
+
+
+def corpus_mutants(document: dict):
+    for group in ("checkpoint_sequences", "stop_sequences"):
+        for i, sequence in enumerate(document[group]):
+            bad = copy.deepcopy(document)
+            del bad[group][i]
+            yield f"without {sequence['name']!r}", bad
+            for j, step in enumerate(sequence["steps"]):
+                for key, value in step["expect"].items():
+                    bad = copy.deepcopy(document)
+                    target = bad[group][i]["steps"][j]["expect"]
+                    target[key] = list(reversed(value)) if len(value) > 1 else (value[:-1] if value else ["x"])
+                    yield f"{sequence['name']!r} step {j} {key}", bad
+    for i, case in enumerate(document["stop_cases"]):
+        bad = copy.deepcopy(document)
+        bad["stop_cases"][i]["expected"] = "unrecognised" if case["expected"] == "applies" else "applies"
+        yield f"stop case {case['name']} verdict", bad
+        if case["expected"] == "applies":
+            for field, value in (("scope", "identity" if case["stop"]["scope"] == "epoch" else "epoch"),
+                                 ("device_id", "site-b-edge-02"), ("decided_at_ms", 1),
+                                 ("artifact_digest", "sha256:" + "0" * 64)):
+                bad = copy.deepcopy(document)
+                bad["stop_cases"][i]["stop"][field] = value
+                yield f"stop case {case['name']} {field} altered after the MAC", bad
+
+
+def text_mutants(transport: str, exchange: str):
+    for key, sentence in {**EXCHANGE_SENTENCES, **TRANSPORT_SENTENCES}.items():
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+        if key in EXCHANGE_SENTENCES:
+            edited, count = re.subn(pattern, reworded, exchange, count=1)
+            yield f"reword {key}", transport, edited, count
+        else:
+            edited, count = re.subn(pattern, reworded, transport, count=1)
+            yield f"reword {key}", edited, exchange, count
+    yield ("change the stop domain",
+           transport.replace('"ori.evidence_ingest_stop.v1"', '"ori.evidence_ingest_stop.v2"'), exchange, 1)
+
+
+def main() -> int:
+    transport = TRANSPORT.read_text(encoding="utf-8")
+    exchange = EXCHANGE.read_text(encoding="utf-8")
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        contract = load_contract(transport, exchange)
+        check(contract, document)
+    except (CheckError, KeyError, StopIteration) as error:
+        print(f"check-evidence-handoff-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(document):
+            total += 1
+            try:
+                check(contract, bad)
+            except (CheckError, KeyError, StopIteration):
+                continue
+            survived.append(label)
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                check(contract, document)
+                survived.append(f"model mutant {flag}")
+            except CheckError:
+                pass
+            finally:
+                MODEL_MUTANTS[flag] = False
+        for label, edited_transport, edited_exchange, count in text_mutants(transport, exchange):
+            total += 1
+            if count != 1:
+                survived.append(f"{label}: matches nothing")
+                continue
+            try:
+                check(load_contract(edited_transport, edited_exchange), document)
+            except (CheckError, KeyError, StopIteration):
+                continue
+            survived.append(label)
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"handoff mutations: {total} refused")
+    print(
+        f"handoff vectors: {len(document['checkpoint_sequences'])} checkpoint sequences, "
+        f"{len(document['stop_cases'])} stop projections and {len(document['stop_sequences'])} stop sequences "
+        "hold to evidence-transport/v2 and evidence-exchange/v2"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
