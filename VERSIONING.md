@@ -366,7 +366,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
 | firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit pending |
 | firmware-telemetry | v1 | `draft` | `frozen` | claiming-merge, runtime `8aefc63`, 2026-07-16; audit pending |
-| gateway-api | v1 | `draft` | `frozen` | claiming-merge, gateway `663c99f`, 2026-06-04; audit pending |
+| gateway-api | v1 | `draft` | `frozen` | claiming-merge, gateway `663c99f`, 2026-06-04; audit complete |
+| gateway-api | v2 | `draft` | `amendable` | — |
 | gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit complete |
 | gateway-config | v2 | `draft` | `amendable` | — |
 | gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
