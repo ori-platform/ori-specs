@@ -274,6 +274,7 @@ pending audit is never shown as `amendable`.
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
+| `appended_files` | When `complete`, optional: each file added to the version after its freeze, with `path`, its `sha256`, `classification` (only `additive` is admitted), a `justification` of why no conforming consumer's accepted input changes, the `clause` it exercises quoted exactly, and `clause_basis`: `freeze_revision`, the clause is in the contract at `freeze_revision`, or `additive_hunk`, it is in the recorded additive hunk named by `hunk_sha256`. A new negative vector for a frozen version cites a `freeze_revision` clause and introduces no new reason, precedence, vocabulary, canonicalisation or strictness. |
 
 While an audit is **pending**, the version takes no normative edit.
 `scripts/check-contract-status` refuses any change to the contract text other
@@ -304,7 +305,10 @@ history, confirms the recorded contract and vector hashes, and compares the
 current text with the baseline. Every difference must be a recorded
 `erratum` or `additive` hunk; an unrecorded difference is drift, a recorded
 `semantic` hunk must not remain, and its destination must exist. Frozen vector
-files must still match their recorded hashes. `--draft-audit
+files must still match their recorded hashes. An appended file must be absent at
+`freeze_revision`, match its recorded hash, and quote a clause that exists where
+its basis says; the check cannot tell whether the file is really additive, and
+review does. `--draft-audit
 <contract>/<version>` prints the hashes and net hunks for a reviewer to
 classify.
 

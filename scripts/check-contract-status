@@ -90,7 +90,12 @@ FROZEN_KEYS = {"event", "repository", "commit", "date", "release", "contract_rev
 AUDIT_STATES = ("pending", "complete")
 AUDIT_KEYS = {"status", "freeze_revision", "changes_since_freeze", "issue", "pinned_sha256", "pinned_files",
               "contract_sha256",
-              "vectors", "role_commits", "hunks"}
+              "vectors", "role_commits", "hunks", "appended_files"}
+# A file added to a frozen version after its freeze: recorded with its hash, its additive classification, why it is
+# additive, and the normative clause it exercises, which must exist at the freeze revision or inside a recorded
+# additive hunk.
+APPENDED_KEYS = {"path", "sha256", "classification", "justification", "clause", "clause_basis", "hunk_sha256"}
+CLAUSE_BASES = ("freeze_revision", "additive_hunk")
 HUNK_CLASSES = ("erratum", "additive", "semantic")
 HUNK_KEYS = {"hunk_sha256", "commit", "classification", "summary", "destination", "optional",
              "unknown_field_compatible"}
@@ -117,7 +122,9 @@ PROOF_TEXT = {"end_to_end": "end-to-end", "hil": "HIL", "production": "productio
 
 LIMITS = (
     "Limits: this check reads text, not intent. It cannot tell whether a recorded conformance claim is true, "
-    "whether a change classified additive is really optional, or whether an implementation it has no record of "
+    "whether a change classified additive is really optional, whether an appended file is really additive (it "
+    "proves only that the file is new since the freeze, unchanged since it was recorded, and names a clause that "
+    "exists where it says), or whether an implementation it has no record of "
     "exists; it pins a version's own vN.md and every file attributed to it, vectors and companion documents alike. "
     "Its "
     "wording guard is a heuristic over the status block and the summary rows: it matches listed phrasings only, "
@@ -835,6 +842,39 @@ def check_audit_record(rec: dict, adoption: list, bad: Callable[[str, str], None
                                                           and h.get("unknown_field_compatible") is True):
             bad("additive-not-optional", f"{w}: an additive change to a frozen version must be optional and safe "
                                          "for a consumer that ignores unknown fields")
+    apps = ba.get("appended_files", [])
+    if not isinstance(apps, list):
+        bad("bad-value", "baseline_audit.appended_files is a list of {path, sha256, classification, justification, "
+                         "clause, clause_basis[, hunk_sha256]}")
+        return
+    additive_hunks = {h["hunk_sha256"] for h in hunks if isinstance(h, dict) and h.get("classification") == "additive"}
+    for i, a in enumerate(apps):
+        w = f"baseline_audit.appended_files[{i}]"
+        if not isinstance(a, dict) or set(a) - APPENDED_KEYS or not {"path", "sha256", "classification",
+                                                                       "justification", "clause",
+                                                                       "clause_basis"} <= set(a):
+            bad("bad-value", f"{w} needs path, sha256, classification, justification, clause and clause_basis, and "
+                             f"no other fields than {sorted(APPENDED_KEYS)}")
+            continue
+        if not (isinstance(a["path"], str) and a["path"].startswith(prefix) and ".." not in a["path"].split("/")):
+            bad("bad-value", f"{w}.path is a file inside {prefix}")
+        if not SHA256.match(str(a["sha256"])):
+            bad("bad-value", f"{w}.sha256 is the appended file's hash")
+        if a["classification"] != "additive":
+            bad("bad-value", f"{w}: an appended file is admitted only as additive; anything else belongs to a "
+                             "successor version")
+        if not (isinstance(a["justification"], str) and a["justification"].strip()):
+            bad("bad-value", f"{w}.justification says why the file changes nothing a conforming consumer accepted")
+        if not (isinstance(a["clause"], str) and a["clause"].strip()):
+            bad("bad-value", f"{w}.clause quotes the normative clause the file exercises")
+        if a["clause_basis"] not in CLAUSE_BASES:
+            bad("bad-value", f"{w}.clause_basis is one of {CLAUSE_BASES}")
+        elif a["clause_basis"] == "additive_hunk":
+            if a.get("hunk_sha256") not in additive_hunks:
+                bad("appended-clause-missing", f"{w} cites hunk {str(a.get('hunk_sha256', ''))[:12]}, which is not a "
+                                               "recorded additive hunk of this audit")
+        elif "hunk_sha256" in a:
+            bad("bad-value", f"{w} names a hunk but its clause basis is the freeze revision")
 
 
 def git_blob(rev: str, path: str) -> bytes | None:
@@ -861,6 +901,18 @@ def net_hunks(baseline: str, current: str) -> list[tuple[str, str]]:
             continue
         body = "\n".join(["-" + ln for ln in a[i1:i2]] + ["+" + ln for ln in b[j1:j2]])
         out.append((hashlib.sha256(body.encode("utf-8")).hexdigest(), (a[i1:i2] + b[j1:j2] + [""])[0][:80]))
+    return out
+
+
+def net_hunk_added(baseline: str, current: str) -> dict[str, str]:
+    """{sha256: the lines a hunk adds} for each difference, keyed as net_hunks keys them."""
+    a, b = normative_lines(baseline), normative_lines(current)
+    out = {}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        body = "\n".join(["-" + ln for ln in a[i1:i2]] + ["+" + ln for ln in b[j1:j2]])
+        out[hashlib.sha256(body.encode("utf-8")).hexdigest()] = "\n".join(b[j1:j2])
     return out
 
 
@@ -904,10 +956,35 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
         findings.append(Finding("baseline-hash-mismatch", where,
                                 "contract_sha256 is not the hash of the contract at freeze_revision"))
     attributed = set(version_files(root, key[0], key[1], versions_in(root, key[0])))
-    for path in sorted(attributed ^ set(ba["vectors"])):
+    appended = [a for a in ba.get("appended_files", []) if isinstance(a, dict) and isinstance(a.get("path"), str)]
+    for path in sorted(attributed ^ (set(ba["vectors"]) | {a["path"] for a in appended})):
         findings.append(Finding("vector-drift", path,
                                 "the files attributed to this version differ from the complete audit's recorded set; "
                                 "a vector or companion document was added, removed or re-attributed"))
+    baseline_text = base.decode("utf-8", errors="replace")
+    added = net_hunk_added(baseline_text, current)
+    for a in appended:
+        path = a["path"]
+        if git_blob(ba["freeze_revision"], path) is not None:
+            findings.append(Finding("appended-file-at-baseline", path,
+                                    f"recorded as appended, but the file exists at {ba['freeze_revision']}; a file of "
+                                    "the freeze revision is recorded in vectors, and its bytes stay with the version"))
+        now = root / path
+        if not now.is_file() or hashlib.sha256(now.read_bytes()).hexdigest() != a.get("sha256"):
+            findings.append(Finding("appended-file-drift", path,
+                                    "an appended file differs from the hash the audit recorded for it; an appended "
+                                    "file is admitted once, as recorded, and a change to it is a new audit entry"))
+        clause = norm(str(a.get("clause", "")))
+        if a.get("clause_basis") == "freeze_revision":
+            where_text = norm(" ".join(normative_lines(baseline_text)))
+            source = f"the contract at {ba['freeze_revision']}"
+        else:
+            where_text = norm(added.get(str(a.get("hunk_sha256")), "").replace("\n", " "))
+            source = f"the additive hunk {str(a.get('hunk_sha256', ''))[:12]}"
+        if clause and clause not in where_text:
+            findings.append(Finding("appended-clause-missing", path,
+                                    f"the clause this appended file claims to exercise is not in {source}; an "
+                                    "appended file proves nothing about text that does not exist"))
     for path, digest in sorted(ba["vectors"].items()):
         old = git_blob(ba["freeze_revision"], path)
         if old is None or hashlib.sha256(old).hexdigest() != digest:
@@ -1453,7 +1530,6 @@ def mutations() -> int:
     audited = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
                      and r["baseline_audit"].get("pinned_files")
                      and any(e["lifecycle"] != "unimplemented" for e in r["adoption"]))
-
     def complete_audit(root: pathlib.Path, adjust: Callable[[dict], None] | None = None, rel: str = "") -> None:
         """Complete the audit of one frozen record: every net hunk admitted, vectors restored to the baseline."""
         rel = rel or audited
@@ -1493,6 +1569,39 @@ def mutations() -> int:
         assert BASE_OVERRIDE is not None
         BASE_OVERRIDE[tuple(audited.split("/"))] = json.loads(  # type: ignore[index]
             (root / f"status/{audited}.json").read_text(encoding="utf-8"))
+
+    def append_file(root: pathlib.Path, record: bool = True, existing: bool = False, then_edit: bool = False,
+                    clause: str | None = None, basis: str = "freeze_revision", hunk: str | None = None,
+                    classification: str = "additive", justification: str = "Exercises an existing rule.") -> None:
+        """Complete the audit, then append a vector file to the version and record it as the case says."""
+        complete_audit(root)
+        c, v = audited.split("/")
+        rec = json.loads((root / f"status/{audited}.json").read_text(encoding="utf-8"))
+        if existing:
+            path = sorted(rec["baseline_audit"]["vectors"])[0]
+        else:
+            path = f"{c}/appended-vectors-{v}.json"
+            (root / path).write_text('{"cases": []}\n', encoding="utf-8")
+        base_text = git_blob(rec["baseline_audit"]["freeze_revision"], f"{audited}.md")
+        assert base_text is not None
+        if clause is None:
+            clause = next(ln for ln in normative_lines(base_text.decode("utf-8")) if len(ln) > 40
+                          and ln[0] not in "#|>-`" and not ln.startswith("    "))
+        digest = hashlib.sha256((root / path).read_bytes()).hexdigest()
+        entry = {"path": path, "sha256": digest, "classification": classification, "justification": justification,
+                 "clause": clause, "clause_basis": basis}
+        if hunk is not None:
+            entry["hunk_sha256"] = hunk
+
+        def edit(r: dict) -> None:
+            ba = r["baseline_audit"]
+            if existing:
+                ba["vectors"].pop(path)
+            if record:
+                ba["appended_files"] = [entry]
+        _edit_json(root, f"status/{audited}.json", edit)
+        if then_edit:
+            (root / path).write_text('{"cases": [1]}\n', encoding="utf-8")
 
     def attack_a(root: pathlib.Path) -> None:
         """Edit a completed version, re-pin every revision to a later one, and clear the hunks."""
@@ -2021,6 +2130,20 @@ def mutations() -> int:
                        _edit_json(root, f"status/{audited}.json", lambda r: (
                            r["frozen_by"].update(contract_revision="0000000"),
                            r["frozen_by"].pop("pinned_revision", None))))),
+        ("an appended additive file recorded with its clause passes", None, append_file),
+        ("an appended file left unrecorded", "vector-drift", lambda root: append_file(root, record=False)),
+        ("an appended file that existed at the freeze revision", "appended-file-at-baseline",
+         lambda root: append_file(root, existing=True)),
+        ("an appended file changed after it was recorded", "appended-file-drift",
+         lambda root: append_file(root, then_edit=True)),
+        ("an appended file whose clause is not in the frozen text", "appended-clause-missing",
+         lambda root: append_file(root, clause="A consumer MUST also refuse an empty body.")),
+        ("an appended file citing a hunk that is not recorded additive", "appended-clause-missing:not a recorded",
+         lambda root: append_file(root, basis="additive_hunk", hunk="0" * 64)),
+        ("an appended file classified other than additive", "bad-value:admitted only as additive",
+         lambda root: append_file(root, classification="semantic")),
+        ("an appended file with no justification", "bad-value:justification",
+         lambda root: append_file(root, justification="")),
         ("a recorded vector hash that is not the freeze revision's", "baseline-hash-mismatch:vector hash",
          lambda root: complete_audit(root, lambda a: a["vectors"].update(
              {sorted(a["vectors"])[0]: "0" * 64}))),
