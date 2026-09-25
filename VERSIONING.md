@@ -350,7 +350,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
 | events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
 | evidence | v1 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit pending |
-| evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
+| evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
+| evidence | v3 | `draft` | `amendable` | — |
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
 | evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
