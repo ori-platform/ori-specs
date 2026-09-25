@@ -32,7 +32,7 @@ below are checked against those records.
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | `draft` | runtime `shipped` in v1.0.0, `unassessed`, gateway `implemented-unreleased`, claimed, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed` | `frozen` (2026-06-04), audit `pending` |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | `draft` | gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-06-09), audit `pending` |
 | Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `pending` |
-| Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `pending` |
+| Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
 | Runtime config surface (closed) | [runtime-config/v2.md](runtime-config/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime configuration orchestration | [runtime-config-orchestration/v1.md](runtime-config-orchestration/v1.md) | `draft` | none recorded | `amendable` |
