@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""Check the site-health evidence_delivery vectors against gateway-evidence-carriage/v1.
+
+The projection rules are pinned: every sentence and table row of the
+`evidence_delivery` paragraphs, and of the outbound acknowledgement section
+that bounds admission, acknowledgement and custody, must equal the set held in
+`gateway-site-health-pinned-units.json` beside this script, so no edit to
+those rules can pass until the pin is updated in the same change. The field
+sets, the device states, the incident coalescing key and the outbound artifact
+vocabulary are read from the pinned text. Which statuses hold or archive, and
+at which reasons, are read from evidence-transport/v2.md through that
+contract's own checker, so a held projection cannot name a pair at which the
+transport never holds, and an incident cannot name a pair that never archives.
+
+Each case is validated strictly (exact field sets, exact types, no defaults)
+and must be accepted or refused exactly as it declares, refused cases for the
+rule they name. Each incident sequence is replayed through the incident model
+the pinned sentences state — coalescing, distinct-member counting,
+acknowledgement, reopening and restart — and every projection it expects must
+equal the model's and pass the static rules.
+
+    python3 scripts/check-gateway-site-health-evidence-vectors
+    python3 scripts/check-gateway-site-health-evidence-vectors --mutations
+    python3 scripts/check-gateway-site-health-evidence-vectors --print-units
+
+gateway-api/v1 must point at gateway-evidence-carriage/v1 and carry none of the
+terms only the versioned surface introduces; that guard sees only those terms.
+
+`--mutations` flips each case's verdict, removes each rule's refused cases,
+corrupts each incident expectation, deletes each pinned unit of the contract
+text in turn, and rewords each model sentence, and requires every mutant to be
+refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+from importlib.machinery import SourceFileLoader
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-evidence-carriage" / "v1.md"
+VECTORS = ROOT / "gateway-evidence-carriage" / "vectors" / "site-health-evidence-delivery.json"
+PINNED = ROOT / "scripts" / "gateway-site-health-pinned-units.json"
+GATEWAY_API = ROOT / "gateway-api" / "v1.md"
+# gateway-api/v1 keeps the evidence carriage it shipped; the surface changes only in
+# gateway-evidence-carriage/v1. These are terms only the versioned surface introduces.
+GATEWAY_API_FROZEN = ("evidence_disposition", "`superseded`", "device_unconfigured", "store_probe_interval_s",
+                      "`incidents`", "`faults`", "admission_failed", "for a configured device", "retention_capacity",
+                      "an artifact this runtime never sealed")
+CARRIAGE_POINTER = (
+    "[gateway-api/v1.md](../gateway-api/v1.md) keeps the evidence carriage it shipped, on the same topics and with "
+    "the same artifact bytes, and nothing here changes what that contract means."
+)
+FROZEN_LIMIT = (
+    "this guard sees only the named terms and the pointer; a change to gateway-api/v1's evidence sections phrased "
+    "without them is not seen, and `git diff main -- gateway-api/v1.md` is the complete check"
+)
+BLOCKS = (
+    ("When the durable evidence courier is enabled, gateway operational posture MUST",
+     "## Compatibility with gateway-api/v1"),
+    ("MQTT PUBACK is not proof the gateway durably stored the bytes.", "| Property | Value |"),
+    ("`artifact_digest` is SHA-256 over the decoded exact artifact bytes.",
+     "Persistent MQTT sessions are required on the gateway subscriber."),
+)
+
+
+def _load_transport():
+    path = ROOT / "scripts" / "check-evidence-transport-refusal-policy-vectors"
+    loader = SourceFileLoader("transport_policy", str(path))
+    spec = importlib.util.spec_from_loader("transport_policy", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+TRANSPORT = _load_transport()
+
+RULES = (
+    "pending", "blocked", "degraded", "held_presence", "reason", "state",
+    "refusal_status", "queue_record", "artifact_type", "device_id", "fields",
+    "first_held_at_ms", "acknowledged", "faults", "last_error", "delivery_impaired",
+    "lane", "incident", "stopped_custody", "reprovisioning",
+)
+DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+DEVICE = re.compile(r"[^\s/+#\x00-\x1f\x7f-\x9f]{1,128}")
+
+
+# The sentences this checker's model implements. `--print-units` regenerates
+# the pin; it cannot regenerate these, so rewording one fails until the model
+# and this list change together.
+MODEL_SENTENCES = {
+    # validate(): the blocked formula.
+    "blocked": (
+        "`blocked` is true exactly when `pending` is positive, `devices` is present, "
+        "every pending artifact is represented by `devices`, and every represented "
+        "lane is held."
+    ),
+    # validate(): stopped custody is outside pending and blocked, and degrades.
+    "pending_scope": (
+        "`pending` counts artifacts eligible for delivery or waiting for an active handoff. Artifacts under a "
+        "verified epoch or identity stop are excluded from `pending` and `blocked` and reported separately as "
+        "stopped custody. Stopped custody continues to degrade evidence health and reports "
+        "`reprovisioning_required`."
+    ),
+    # validate(): stopped custody entries.
+    "stopped": (
+        "A stopped entry is never in `devices`, never counted in `pending`, and never makes `blocked` true:"
+    ),
+    "stopped_never_blocks": (
+        "Stopped custody never makes `blocked` true, and a lane whose only queued entries are stopped has no entry "
+        "in `devices`."
+    ),
+    # validate(): reprovisioning_required is raised exactly while stopped custody is held.
+    "reprovisioning": (
+        "The `scope` of each `stopped_custody` entry says which; the runtime's `delivery_stop_status` says it for "
+        "the runtime. It is raised exactly when `stopped_custody` would be non-empty, and it clears only when no "
+        "stopped custody is held."
+    ),
+    # _validate_stopped(): `scope` is required and closed; its values are read from the table.
+    "stopped_scope": (
+        "`scope` is required and is exactly `epoch` or `identity`, copied from the verified stop projection "
+        "governing the stopped custody."
+    ),
+    # validate(): the degraded formula.
+    "degraded": (
+        "`degraded` is true exactly when `faults` is non-empty, `devices` is present and non-empty, `incidents` is "
+        "present and non-empty, or `stopped_custody` is present and non-empty."
+    ),
+    # validate(): archived refusals stay out of devices, pending and blocked.
+    "archived": (
+        "An archived refusal is never in `devices`, never counted in `pending`, and "
+        "never makes `blocked` true:"
+    ),
+    # _validate_incidents(), replay(): the coalescing key, read from this sentence.
+    "coalesce": (
+        "refusals that differ in any of them never coalesce, and no two entries share all five."
+    ),
+    # replay(): identical members change nothing.
+    "identical": (
+        "Archiving a digest that is already a member, such as an identical retry or a "
+        "re-offer of the same bytes, changes no field."
+    ),
+    # replay(): an incident survives restart.
+    "restart": "Timestamps are the gateway's clock at archive and survive restarts, as does every incident.",
+    # replay(): acknowledgement hides and changes nothing else.
+    "acknowledge": (
+        "Acknowledgement changes alert visibility only: an acknowledged incident leaves "
+        "`incidents` and stops degrading the gateway, and nothing else changes"
+    ),
+    # replay(): a distinct member after acknowledgement reopens the same incident.
+    "reopen": (
+        "A distinct member archived after acknowledgement reopens that incident: it "
+        "returns to `incidents` unacknowledged, with `count`, `last_refused_at_ms` and "
+        "`latest_digest` advanced and its first fields unchanged."
+    ),
+    # validate(): the last_error vocabulary is read from the text; this is its mapping.
+    "last_error_map": (
+        "A terminal refusal, whether archived on a verified retention or held without one, is recorded as "
+        "`channel_permanent_refusal`, and a `507 retention_capacity_exhausted` as `channel_capacity_exhausted`."
+    ),
+    # last_error_verdict(): a capacity 503 has its own last_error, never the generic one's.
+    "last_error_capacity": (
+        "A `503 retention_capacity_unavailable` is recorded as `authority_retention_capacity_unavailable`, "
+        "distinct from a generic `503`."
+    ),
+    "queue_full": (
+        "`queue_full` is an acknowledgement only for a configured device whose reserved "
+        "queue share cannot presently accept the artifact; it is retriable and MUST NOT "
+        "be flattened into a drop."
+    ),
+    "unconfigured": (
+        "a gateway MUST reject an outbound-carriage topic whose device is not configured "
+        "before invoking admission: it does not admit the artifact, issue custody, or "
+        "publish an outbound acknowledgement,"
+    ),
+}
+LAST_ERROR_MAP = re.compile(r"`(\d{3}) (\w+)`(?: is recorded)? as `(\w+)`")
+SIZE_RULE = re.compile(r"An artifact larger than the evidence-transport maximum, ([\d,]+) bytes, is")
+KEY_RULE = re.compile(
+    r"An incident coalesces the archived refusals that share ((?:`\w+`,?\s*(?:and\s*)?)+);"
+)
+
+
+class Refused(Exception):
+    def __init__(self, rule: str, detail: str) -> None:
+        super().__init__(f"{rule}: {detail}")
+        self.rule = rule
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith("|"):
+            units.extend(_norm(line) for line in lines if line.strip())
+            continue
+        prose = _norm(paragraph)
+        units.extend(s for s in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if s)
+    return units
+
+
+def _block(text: str, start: str, end: str) -> tuple[int, int]:
+    a = text.find(start)
+    b = text.find(end, a)
+    if a < 0 or b < a:
+        raise CheckError(f"gateway-evidence-carriage/v1.md lacks the block starting {start[:50]!r}")
+    return a, b
+
+
+def pinned_units(text: str) -> list[str]:
+    units: list[str] = []
+    for start, end in BLOCKS:
+        a, b = _block(text, start, end)
+        units.extend(_units(text[a:b]))
+    return units
+
+
+def load_contract(text: str, check_pin: bool = True) -> dict:
+    units = pinned_units(text)
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    if check_pin and units != pinned:
+        added = sorted(set(units) - set(pinned))
+        removed = sorted(set(pinned) - set(units))
+        raise CheckError(
+            "the projection rules differ from the pinned units; a deliberate change "
+            "updates scripts/gateway-site-health-pinned-units.json in the same commit\n"
+            + "".join(f"  + {u}\n" for u in added)
+            + "".join(f"  - {u}\n" for u in removed)
+        )
+    a, b = _block(text, *BLOCKS[0])
+    block = text[a:b]
+    tables = [t for t in re.split(r"\n\s*\n", block) if t.strip().startswith("| Field |")]
+    if len(tables) != 4:
+        raise CheckError("the projection block does not carry exactly four field tables")
+    fields = [set(re.findall(r"^\| `(\w+)` \|", t, re.MULTILINE)) for t in tables]
+    # The devices entry, its held object, an incident and a stopped-custody entry, in that order.
+    states = re.search(r"\| `state` \| ((?:`\w+`,? (?:or )?)+`\w+`) \|", block)
+    vocabulary = re.search(r"The closed outbound vocabulary is `(\w+)`, `(\w+)`,\s+and `(\w+)`", text)
+    fault_list = re.search(r"entry is one of ((?:`\w+`,?\s*(?:or\s*)?)+)", block)
+    faults = re.findall(r"`(\w+)`", fault_list.group(1)) if fault_list else []
+    last_errors = re.search(r"`last_error` is one of ((?:`\w+`,?\s*(?:or\s*)?)+)", block)
+    if last_errors is None:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the last_error vocabulary")
+    if states is None or vocabulary is None:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the device states or the outbound vocabulary")
+    key_rule = KEY_RULE.search(_norm(block))
+    if key_rule is None:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the incident coalescing key")
+    key = tuple(re.findall(r"`(\w+)`", key_rule.group(1)))
+    if not key or not set(key) <= fields[2]:
+        raise CheckError(f"the coalescing key {key} names fields the incident table does not define")
+    policy = TRANSPORT.load_policy(TRANSPORT.CONTRACT.read_text(encoding="utf-8"))
+    pinned_text = " ".join(units)
+    for name, sentence in MODEL_SENTENCES.items():
+        if _norm(sentence) not in pinned_text:
+            raise CheckError(
+                f"gateway-evidence-carriage/v1 no longer states the {name} rule this checker's model hard-codes: "
+                f"{sentence[:70]!r}. Change the model and MODEL_SENTENCES with it, never only the pin"
+            )
+    size = SIZE_RULE.search(pinned_text)
+    if size is None or int(size.group(1).replace(",", "")) != policy["max_artifact_bytes"]:
+        raise CheckError("gateway-evidence-carriage/v1 and evidence-transport/v2 state different artifact size bounds")
+    holds: dict[int, set[str]] = {}
+    archives: dict[int, set[str]] = {}
+    for status, reasons in policy["table"].items():
+        # A terminal row holds when the refusal was not retained, and archives when it was.
+        at = {r for r, klass in reasons.items() if klass in ("hold", "archive")}
+        if policy["fallback"][status] == "hold":
+            at.add(TRANSPORT.UNRECOGNISED)
+        if at:
+            holds[status] = at
+        archived = {r for r, klass in reasons.items() if klass == "archive"}
+        if archived:
+            archives[status] = archived
+    exclusive = "so a projection never carries both `delivery_impaired` and `devices`" in _norm(block)
+    lanes = re.search(r"\| `lane` \| `(\w+)` or `(\w+)`:", block)
+    if lanes is None:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the lanes")
+    unique_lane = "No two entries share a `device_id` and `lane`." in _norm(block)
+    scopes = re.search(r"^\| `scope` \| `(\w+)` or `(\w+)` \|$", tables[3], re.MULTILINE)
+    if scopes is None:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the stopped-custody scopes")
+    lane_type = re.search(
+        r"its `artifact_type` is `(\w+)` in the `(\w+)` lane and never in the `(\w+)` lane", _norm(block)
+    )
+    if len(faults) != 7:
+        raise CheckError("gateway-evidence-carriage/v1 no longer states the seven courier faults")
+    mapped = {(int(s), r): e for s, r, e in LAST_ERROR_MAP.findall(pinned_text)}
+    terminal = re.search(r"A terminal refusal, whether archived on a verified retention or held without one, is "
+                         r"recorded as `(\w+)`", pinned_text)
+    if terminal is None or not mapped:
+        raise CheckError("gateway-evidence-carriage/v1 no longer maps refusals to last_error")
+    return {
+        "last_error_map": mapped,
+        "last_error_terminal": terminal.group(1),
+        "last_errors": set(re.findall(r"`(\w+)`", last_errors.group(1))),
+        "faults": set(faults),
+        "impaired_excludes_devices": exclusive,
+        "lanes": set(lanes.groups()),
+        "unique_lane": unique_lane,
+        "lane_type": _lane_type(lane_type, set(lanes.groups())),
+        "entry_fields": fields[0],
+        "held_fields": fields[1],
+        "incident_fields": fields[2],
+        "stopped_fields": fields[3],
+        "stopped_scopes": set(scopes.groups()),
+        "incident_key": key,
+        "states": set(re.findall(r"`(\w+)`", states.group(1))),
+        "types": set(vocabulary.groups()),
+        "holds": holds,
+        "archives": archives,
+    }
+
+
+def _lane_type(match, lanes: set[str]):
+    """The lane an artifact type heads, which must name both lanes the table declares."""
+    if match is None:
+        return None
+    if {match.group(2), match.group(3)} != lanes:
+        raise CheckError("the lane rule for artifact_type names lanes the lane table does not declare")
+    return match.groups()
+
+
+def _is_int(value, minimum: int) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def validate(contract: dict, projection: dict) -> None:
+    for key in ("pending", "degraded", "blocked"):
+        if key not in projection:
+            raise Refused("fields", f"projection lacks {key}")
+    allowed = {
+        "pending", "degraded", "blocked", "last_failure_at_ms", "last_error", "faults",
+        "devices", "incidents", "stopped_custody",
+    }
+    if set(projection) - allowed:
+        raise Refused("fields", f"projection carries {sorted(set(projection) - allowed)}")
+    if "last_error" in projection and projection["last_error"] not in contract["last_errors"]:
+        raise Refused("last_error", f"last_error {projection['last_error']!r}")
+    if "last_failure_at_ms" in projection and not _is_int(projection["last_failure_at_ms"], 1):
+        raise Refused("fields", "last_failure_at_ms is a positive integer")
+    faults = projection.get("faults")
+    if faults is not None:
+        if not isinstance(faults, list) or any(f not in contract["faults"] for f in faults):
+            raise Refused("faults", f"faults {faults!r} outside the closed vocabulary")
+        if len(set(faults)) != len(faults):
+            raise Refused("faults", "a fault repeats")
+    has_devices = "devices" in projection
+    if has_devices and faults and "delivery_impaired" in faults and contract["impaired_excludes_devices"]:
+        raise Refused("delivery_impaired", "a present devices is complete, so delivery is not impaired")
+    devices = projection.get("devices", [])
+    if not isinstance(devices, list):
+        raise Refused("fields", "devices is not a list")
+    if type(projection["degraded"]) is not bool or type(projection["blocked"]) is not bool:
+        raise Refused("fields", "degraded and blocked are booleans")
+    seen: set[tuple] = set()
+    for entry in devices:
+        if not isinstance(entry, dict):
+            raise Refused("fields", "a device entry is not an object")
+        if entry.get("state") not in contract["states"]:
+            raise Refused("state", f"state {entry.get('state')!r}")
+        expected = contract["entry_fields"] if entry["state"] == "held" else contract["entry_fields"] - {"held"}
+        if "held" in entry and entry["state"] != "held" or entry["state"] == "held" and "held" not in entry:
+            raise Refused("held_presence", "held present exactly when the state is held")
+        if set(entry) != expected:
+            raise Refused("fields", f"entry fields {sorted(entry)}")
+        device = entry["device_id"]
+        if not isinstance(device, str) or not DEVICE.fullmatch(device):
+            raise Refused("device_id", f"device_id {device!r}")
+        if entry["lane"] not in contract["lanes"]:
+            raise Refused("lane", f"lane {entry['lane']!r}")
+        key = (device, entry["lane"]) if contract["unique_lane"] else (device, None)
+        if key in seen:
+            raise Refused("device_id", f"device {device!r} lane {entry['lane']!r} listed twice")
+        seen.add(key)
+        if not _is_int(entry["pending"], 1):
+            raise Refused("pending", "an entry's pending is a positive integer")
+        if entry["state"] != "held":
+            continue
+        held = entry["held"]
+        if not isinstance(held, dict) or set(held) != contract["held_fields"]:
+            raise Refused("fields", f"held fields {sorted(held) if isinstance(held, dict) else held}")
+        if type(held["queue_record"]) is not str or not re.fullmatch(r"[0-9a-f]{64}", held["queue_record"]):
+            raise Refused("queue_record", "queue_record is not 64 lowercase hex")
+        if type(held["artifact_digest"]) is not str or not DIGEST.fullmatch(held["artifact_digest"]):
+            raise Refused("fields", "artifact_digest is not sha256 hex")
+        if held["artifact_type"] not in contract["types"]:
+            raise Refused("artifact_type", f"artifact_type {held['artifact_type']!r}")
+        if contract["lane_type"] is not None:
+            lane_artifact, own_lane, _ = contract["lane_type"]
+            if (entry["lane"] == own_lane) != (held["artifact_type"] == lane_artifact):
+                raise Refused("lane", f"{held['artifact_type']!r} cannot head the {entry['lane']!r} lane")
+        status = held["refusal_status"]
+        if type(status) is not int or status not in contract["holds"]:
+            raise Refused("refusal_status", f"status {status!r} never holds")
+        if held["reason"] not in contract["holds"][status]:
+            raise Refused("reason", f"{status} does not hold at {held['reason']!r}")
+        if not _is_int(held["first_held_at_ms"], 1):
+            raise Refused("first_held_at_ms", "first_held_at_ms is a positive integer")
+        if held["acknowledged"] is not False:
+            raise Refused("acknowledged", "acknowledged is false until an acknowledgement surface exists")
+    total = projection["pending"]
+    listed = sum(e["pending"] for e in devices)
+    if not _is_int(total, 0) or listed > total:
+        raise Refused("pending", "the entries' pending exceed the gateway-level pending")
+    blocked = (has_devices and total > 0 and listed == total
+               and all(e["state"] == "held" for e in devices))
+    if projection["blocked"] is not blocked:
+        raise Refused("blocked", f"blocked must be {blocked}")
+    incidents = projection.get("incidents")
+    if incidents is not None:
+        _validate_incidents(contract, incidents)
+    stopped = projection.get("stopped_custody")
+    if stopped is not None:
+        _validate_stopped(contract, stopped)
+    if faults is not None or has_devices or incidents is not None or stopped is not None:
+        degraded = bool(faults) or bool(devices) or bool(incidents) or bool(stopped)
+        if projection["degraded"] is not degraded:
+            raise Refused("degraded", f"degraded must be {degraded}")
+    if faults is not None and stopped is not None and ("reprovisioning_required" in faults) != bool(stopped):
+        raise Refused("reprovisioning", "reprovisioning_required is raised exactly while stopped custody is held")
+
+
+def _validate_stopped(contract: dict, stopped) -> None:
+    if not isinstance(stopped, list):
+        raise Refused("stopped_custody", "stopped_custody is not a list")
+    seen: set[tuple] = set()
+    for entry in stopped:
+        if not isinstance(entry, dict) or set(entry) != contract["stopped_fields"]:
+            raise Refused("stopped_custody", f"stopped fields {sorted(entry) if isinstance(entry, dict) else entry}")
+        device = entry["device_id"]
+        if not isinstance(device, str) or not DEVICE.fullmatch(device):
+            raise Refused("device_id", f"device_id {device!r}")
+        if entry["lane"] not in contract["lanes"]:
+            raise Refused("lane", f"lane {entry['lane']!r}")
+        if not _is_int(entry["count"], 1):
+            raise Refused("stopped_custody", "count is a positive integer")
+        if not isinstance(entry["scope"], str) or entry["scope"] not in contract["stopped_scopes"]:
+            raise Refused("stopped_custody", f"scope {entry['scope']!r} is not {sorted(contract['stopped_scopes'])}")
+        key = (device, entry["lane"])
+        if key in seen:
+            raise Refused("stopped_custody", f"device {device!r} lane {entry['lane']!r} listed twice")
+        seen.add(key)
+
+
+def _validate_incidents(contract: dict, incidents) -> None:
+    if not isinstance(incidents, list):
+        raise Refused("incident", "incidents is not a list")
+    seen: set[tuple] = set()
+    for entry in incidents:
+        if not isinstance(entry, dict) or set(entry) != contract["incident_fields"]:
+            raise Refused("incident", f"incident fields {sorted(entry) if isinstance(entry, dict) else entry}")
+        device = entry["device_id"]
+        if not isinstance(device, str) or not DEVICE.fullmatch(device):
+            raise Refused("device_id", f"device_id {device!r}")
+        epoch = entry["anchor_epoch_id"]
+        if type(epoch) is not str or not (epoch == "" or DIGEST.fullmatch(epoch)):
+            raise Refused("incident", f"anchor_epoch_id {epoch!r}")
+        if entry["artifact_type"] not in contract["types"]:
+            raise Refused("artifact_type", f"artifact_type {entry['artifact_type']!r}")
+        status = entry["refusal_status"]
+        if type(status) is not int or status not in contract["archives"]:
+            raise Refused("refusal_status", f"status {status!r} never archives")
+        if entry["reason"] not in contract["archives"][status]:
+            raise Refused("reason", f"{status} does not archive at {entry['reason']!r}")
+        if not _is_int(entry["count"], 1):
+            raise Refused("incident", "count is a positive integer")
+        first, last = entry["first_refused_at_ms"], entry["last_refused_at_ms"]
+        if not _is_int(first, 1) or not _is_int(last, 1) or last < first:
+            raise Refused("incident", "refusal times are positive and ordered")
+        for name in ("first_digest", "latest_digest"):
+            if type(entry[name]) is not str or not DIGEST.fullmatch(entry[name]):
+                raise Refused("incident", f"{name} is not sha256 hex")
+        if (entry["first_digest"] == entry["latest_digest"]) != (entry["count"] == 1):
+            raise Refused("incident", "latest equals first exactly when count is 1")
+        key = tuple(entry[k] for k in contract["incident_key"])
+        if key in seen:
+            raise Refused("incident", f"two incidents share the coalescing key {key}")
+        seen.add(key)
+
+
+def last_error_verdict(contract: dict, case: dict) -> bool:
+    """Whether recording `last_error` for this refusal is conforming: a mapped refusal has exactly its value, and
+    no other refusal may borrow a value the mapping reserves for another condition."""
+    status, reason, value = case["status"], case["reason"], case["last_error"]
+    if value not in contract["last_errors"]:
+        return False
+    required = contract["last_error_map"].get((status, reason))
+    if required is None and reason in contract["archives"].get(status, set()):
+        required = contract["last_error_terminal"]
+    reserved = set(contract["last_error_map"].values()) | {contract["last_error_terminal"]}
+    return value == required if required is not None else value not in reserved
+
+
+def replay_incidents(contract: dict, sequence: dict) -> None:
+    """The incident model the pinned sentences state, replayed step by step."""
+    name = sequence["name"]
+    incidents: dict[tuple, dict] = {}
+    key_fields = contract["incident_key"]
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        if event == "archive":
+            key = tuple(step[k] for k in key_fields)
+            incident = incidents.get(key)
+            if incident is None:
+                incidents[key] = {
+                    "members": [step["digest"]], "first_at": step["at_ms"], "last_at": step["at_ms"],
+                    "acknowledged": False,
+                }
+            elif step["digest"] not in incident["members"]:
+                incident["members"].append(step["digest"])
+                incident["last_at"] = step["at_ms"]
+                incident["acknowledged"] = False
+        elif event == "acknowledge":
+            key = tuple(step["key"])
+            if key not in incidents:
+                raise CheckError(f"{where}: acknowledges an incident that does not exist")
+            incidents[key]["acknowledged"] = True
+        elif event == "restart":
+            pass
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        if "expect" not in step:
+            continue
+        projected = []
+        for key, incident in sorted(incidents.items()):
+            if incident["acknowledged"]:
+                continue
+            members = incident["members"]
+            entry = dict(zip(key_fields, key))
+            entry.update({
+                "count": len(members), "first_refused_at_ms": incident["first_at"],
+                "last_refused_at_ms": incident["last_at"], "first_digest": members[0],
+                "latest_digest": members[-1],
+            })
+            projected.append(entry)
+        expect = step["expect"]
+        got = sorted(expect["incidents"], key=lambda e: tuple(e[k] for k in key_fields))
+        if got != projected:
+            raise CheckError(f"{where}: expected incidents {got}, the model gives {projected}")
+        members = sorted([list(k), len(v["members"])] for k, v in incidents.items())
+        if sorted(expect["members"]) != members:
+            raise CheckError(f"{where}: expected member counts {expect['members']}, the model gives {members}")
+        try:
+            validate(contract, {"pending": 0, "blocked": False, "degraded": bool(projected),
+                                "faults": [], "devices": [], "incidents": expect["incidents"]})
+        except Refused as refusal:
+            raise CheckError(f"{where}: the expected projection is refused for {refusal}") from refusal
+
+
+REQUIRED_SEQUENCES = (
+    "79 distinct refusals coalesce into one incident",
+    "an identical retry never increments the count",
+    "restart preserves aggregation",
+    "acknowledgement changes alert visibility only",
+    "a new refusal after acknowledgement reopens the incident",
+    "a different epoch, type or class never coalesces",
+)
+
+
+def check(document: dict, contract: dict) -> None:
+    names = set()
+    for case in document["cases"]:
+        name = case["name"]
+        if name in names:
+            raise CheckError(f"duplicate case {name!r}")
+        names.add(name)
+        try:
+            validate(contract, case["projection"])
+        except Refused as refusal:
+            if case["valid"]:
+                raise CheckError(f"{name}: declared valid, refused for {refusal}")
+            if refusal.rule != case.get("rule"):
+                raise CheckError(f"{name}: refused for {refusal.rule}, declared {case.get('rule')}")
+            continue
+        if not case["valid"]:
+            raise CheckError(f"{name}: declared refused for {case.get('rule')}, accepted")
+    for rule in RULES:
+        if not any(not c["valid"] and c.get("rule") == rule for c in document["cases"]):
+            raise CheckError(f"no refused case for rule {rule}")
+    if not any(
+        c["valid"] and not c["projection"]["blocked"]
+        and any(e.get("state") == "held" for e in c["projection"].get("devices", []))
+        for c in document["cases"]
+    ):
+        raise CheckError("no accepted case of a held device that does not block the gateway")
+    if not any(
+        c["valid"] and c["projection"]["degraded"] and not c["projection"]["blocked"]
+        and c["projection"].get("incidents") and not c["projection"].get("devices")
+        and not c["projection"].get("faults")
+        for c in document["cases"]
+    ):
+        raise CheckError("no accepted case of an unacknowledged incident degrading without blocking")
+    for case in document["last_error_cases"]:
+        if last_error_verdict(contract, case) is not case["valid"]:
+            raise CheckError(f"last_error case {case['name']!r}: declared {case['valid']}, the contract disagrees")
+    for status, reason in contract["last_error_map"]:
+        if not any(c["valid"] and (c["status"], c["reason"]) == (status, reason) for c in document["last_error_cases"]):
+            raise CheckError(f"no accepted last_error case for {status} {reason}")
+    capacity = contract["last_error_map"].get((503, "retention_capacity_unavailable"))
+    if not any(not c["valid"] and c["reason"] != "retention_capacity_unavailable" and c["last_error"] == capacity
+               for c in document["last_error_cases"]):
+        raise CheckError("no refused case recording a generic 503 as the capacity last_error")
+    sequences = document["incident_sequences"]
+    for prefix in REQUIRED_SEQUENCES:
+        if not any(s["name"].startswith(prefix) for s in sequences):
+            raise CheckError(f"no incident sequence for: {prefix}")
+    seventy_nine = next(s for s in sequences if s["name"].startswith(REQUIRED_SEQUENCES[0]))
+    if len({s["digest"] for s in seventy_nine["steps"] if s["event"] == "archive"}) != 79:
+        raise CheckError("the 79-refusal sequence does not archive 79 distinct digests")
+    for sequence in sequences:
+        replay_incidents(contract, sequence)
+
+
+def corpus_mutants(document: dict):
+    for i, case in enumerate(document["cases"]):
+        bad = copy.deepcopy(document)
+        bad["cases"][i]["valid"] = not case["valid"]
+        yield f"case {case['name']!r} verdict flipped", bad
+    for rule in RULES:
+        bad = copy.deepcopy(document)
+        bad["cases"] = [c for c in document["cases"] if c.get("rule") != rule]
+        yield f"without rule {rule}", bad
+    for i, case in enumerate(document["last_error_cases"]):
+        bad = copy.deepcopy(document)
+        bad["last_error_cases"][i]["valid"] = not case["valid"]
+        yield f"last_error case {case['name']!r} verdict flipped", bad
+    for i, sequence in enumerate(document["incident_sequences"]):
+        bad = copy.deepcopy(document)
+        del bad["incident_sequences"][i]
+        yield f"without sequence {sequence['name']!r}", bad
+        for j, step in enumerate(sequence["steps"]):
+            if "expect" not in step:
+                continue
+            for label, edit in (
+                ("count +1", lambda e: [x.update(count=x["count"] + 1) for x in e["incidents"][:1]]),
+                ("incident dropped", lambda e: e["incidents"].pop() if e["incidents"] else e["incidents"].append({})),
+                ("member count +1", lambda e: [m.__setitem__(1, m[1] + 1) for m in e["members"][:1]]),
+                ("latest is first", lambda e: [x.update(latest_digest=x["first_digest"]) for x in e["incidents"][:1]]),
+            ):
+                bad = copy.deepcopy(document)
+                edit(bad["incident_sequences"][i]["steps"][j]["expect"])
+                if bad["incident_sequences"][i]["steps"][j]["expect"] != step["expect"]:
+                    yield f"sequence {sequence['name']!r} step {j} {label}", bad
+
+
+def check_gateway_api(text: str, carriage: str) -> None:
+    """The versioned surface names gateway-api/v1 as the shipped carriage it succeeds, and gateway-api/v1 carries none
+    of the terms only that surface introduces; a frozen predecessor takes no pointer of its own."""
+    if _norm(CARRIAGE_POINTER) not in _norm(carriage):
+        raise CheckError(f"gateway-evidence-carriage/v1 no longer names gateway-api/v1 as the shipped carriage it "
+                         f"succeeds; {FROZEN_LIMIT}")
+    for term in GATEWAY_API_FROZEN:
+        if term in text:
+            raise CheckError(f"gateway-api/v1 carries {term!r}, which only gateway-evidence-carriage/v1 defines; the "
+                             f"shipped evidence carriage stays frozen, and {FROZEN_LIMIT}")
+
+
+def text_mutants(text: str):
+    for start, end in BLOCKS:
+        a, b = _block(text, start, end)
+        block = text[a:b]
+        for unit in _units(block):
+            pattern = r"\s+".join(re.escape(w) for w in unit.split())
+            edited, count = re.subn(pattern, "", block, count=1)
+            if count != 1:
+                raise CheckError(f"pinned unit could not be removed: {unit[:60]!r}")
+            yield f"contract text: delete {unit[:60]!r}", text[:a] + edited + text[b:]
+
+
+def main() -> int:
+    text = CONTRACT.read_text(encoding="utf-8")
+    if "--print-units" in sys.argv[1:]:
+        print(json.dumps(pinned_units(text), indent=2, ensure_ascii=False))
+        return 0
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    gateway_api = GATEWAY_API.read_text(encoding="utf-8")
+    try:
+        check_gateway_api(gateway_api, text)
+        contract = load_contract(text)
+        check(document, contract)
+    except (CheckError, TRANSPORT.CheckError) as error:
+        print(f"check-gateway-site-health-evidence-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(document):
+            total += 1
+            if _passes(lambda bad=bad: check(bad, contract)):
+                survived.append(label)
+        edits = list(text_mutants(text))
+        for label, edited in edits:
+            total += 1
+            if _passes(lambda e=edited: check(document, load_contract(e))):
+                survived.append(label)
+        # Re-pin mutants: each model sentence reworded and the pin regenerated.
+        for key, sentence in MODEL_SENTENCES.items():
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+            edited, count = re.subn(pattern, reworded, text, count=1)
+            total += 1
+            if count != 1:
+                survived.append(f"re-pin mutant for {key} matches nothing")
+            elif _passes(lambda e=edited: check(document, load_contract(e, check_pin=False))):
+                survived.append(f"re-pin: {key} reworded")
+        # A coalescing key that loses a field, re-pinned, must fail the sequences.
+        edited = text.replace("`anchor_epoch_id`, `artifact_type`, `refusal_status` and `reason`;",
+                              "`artifact_type`, `refusal_status` and `reason`;", 1)
+        total += 1
+        if edited == text or _passes(lambda e=edited: check(document, load_contract(e, check_pin=False))):
+            survived.append("re-pin: coalescing key without anchor_epoch_id")
+        for term in GATEWAY_API_FROZEN:
+            total += 1
+            if _passes(lambda e=gateway_api + f"\n\nA runtime may receive {term}.\n": check_gateway_api(e, text)):
+                survived.append(f"gateway-api/v1 gains {term!r}")
+        pattern = r"\s+".join(re.escape(w) for w in CARRIAGE_POINTER.split())
+        edited, count = re.subn(pattern, "", text, count=1)
+        total += 1
+        if count != 1 or _passes(lambda e=edited: check_gateway_api(gateway_api, e)):
+            survived.append("gateway-evidence-carriage/v1 without its pointer to gateway-api/v1")
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"site-health mutations: {total} refused, {len(edits)} of them contract-text edits")
+    print(
+        f"site-health vectors: {len(document['cases'])} cases and "
+        f"{len(document['incident_sequences'])} incident sequences hold to gateway-evidence-carriage/v1"
+    )
+    return 0
+
+
+def _passes(run) -> bool:
+    try:
+        run()
+    except (CheckError, TRANSPORT.CheckError, KeyError, IndexError, TypeError, StopIteration):
+        return False
+    return True
+
+
+if __name__ == "__main__":
+    sys.exit(main())

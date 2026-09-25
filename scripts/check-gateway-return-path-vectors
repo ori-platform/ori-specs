@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""Check the return-path vectors against gateway-evidence-carriage/v1 and gateway-config/v2.
+
+`gateway-evidence-carriage/vectors/return-path.json` replays a site gateway's
+return queue: authority artifacts staged for runtime devices, publications,
+the runtimes' ingest acknowledgements, and changes to a device's declared
+inbound carriage contract. The model is the one the contract states:
+
+- authority artifacts are ordered per runtime device, each device's lane with
+  its own head, so an unacknowledged or refused artifact for one device never
+  delays publication to another;
+- each device's inbound carriage contract is declared as exactly
+  `gateway-api/v1` or `gateway-evidence-carriage/v1`, absence meaning
+  `gateway-api/v1`;
+- an artifact the declared contract cannot carry is never staged into that
+  device's lane: it is kept outside every lane, never forwarded or discarded,
+  raises `return_path_incompatible`, and enters the lane in the order received
+  once the device's declaration changes to `gateway-evidence-carriage/v1`;
+- kept artifacts are idempotent by artifact digest, keep their arrival order,
+  count toward the return store's item and byte capacity, are never evicted,
+  and survive the device's removal from configuration until it is restored
+  under a compatible declaration;
+- a response carrying an artifact the return store cannot durably keep is not
+  durably staged: its originating lane entry is neither advanced nor retired,
+  the request is retried, and no other device's return lane is blocked.
+
+The artifact types each contract carries are read from the two contracts'
+vocabulary tables, and the sentences the model hard-codes are held word for
+word in gateway-evidence-carriage/v1 and gateway-config/v2.
+
+    python3 scripts/check-gateway-return-path-vectors
+    python3 scripts/check-gateway-return-path-vectors --mutations
+
+`--mutations` corrupts every expectation, drops each sequence, rewords each
+hard-coded sentence, and switches on each model defect a conforming gateway
+must not have, and requires every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CARRIAGE = ROOT / "gateway-evidence-carriage" / "v1.md"
+GATEWAY_API = ROOT / "gateway-api" / "v1.md"
+CONFIG = ROOT / "gateway-config" / "v2.md"
+VECTORS = ROOT / "gateway-evidence-carriage" / "vectors" / "return-path.json"
+LEGACY = "gateway-api/v1"
+CARRIAGE_V1 = "gateway-evidence-carriage/v1"
+
+SENTENCES = {
+    "per_device": (
+        "carriage",
+        "Authority artifacts are ordered independently per runtime device. An unacknowledged or refused artifact "
+        "for one device MUST NOT delay publication to another device.",
+    ),
+    "declared": (
+        "carriage",
+        "Gateway configuration declares each device's inbound evidence-carriage contract as exactly "
+        "`gateway-api/v1` or `gateway-evidence-carriage/v1`. Absence defaults to `gateway-api/v1`. The gateway MUST "
+        "NOT stage an `evidence_disposition`, or another artifact unavailable in the declared contract, into a "
+        "legacy device's ordered return lane.",
+    ),
+    "incompatible": (
+        "carriage",
+        "An authority artifact incompatible with the device's declared contract raises `return_path_incompatible` "
+        "for that device. It does not enter that device's lane and cannot block another device.",
+    ),
+    "kept": (
+        "carriage",
+        "The gateway keeps it durably outside every return lane, neither forwarding nor discarding it; the fault "
+        "stays raised while it keeps one, and a later change of that device's declaration to "
+        "`gateway-evidence-carriage/v1` stages the kept artifacts, after the entries already in its lane, in the "
+        "order the gateway received them.",
+    ),
+    "config": (
+        "config",
+        "`device_carriage` declares each device's inbound evidence-carriage contract as exactly `gateway-api/v1` or "
+        "`gateway-evidence-carriage/v1`. Absence defaults to `gateway-api/v1`.",
+    ),
+    # replay(): `stage` and `response` deduplicate kept artifacts by digest, keep arrival order, and count them.
+    "kept_rules": (
+        "carriage",
+        "Kept artifacts are idempotent by artifact digest, retain original arrival order, count toward the return "
+        "store's item and byte capacity, and are never evicted.",
+    ),
+    # replay(): `remove`, then `declare` restoring the device.
+    "kept_removed": (
+        "carriage",
+        "Removing a device from configuration does not delete its kept artifacts; they remain associated with that "
+        "retired device identity until it is restored under a compatible declaration or an explicit future "
+        "recovery procedure removes them.",
+    ),
+    # replay(): `response` whose artifact does not fit.
+    "unkeepable": (
+        "carriage",
+        "If an authority response artifact cannot be durably kept, the gateway has not durably staged that "
+        "response. It does not advance or retire the originating lane entry and treats that response as "
+        "unavailable for that device's lane, causing the idempotent authority request to be retried. It MUST NOT "
+        "block another device's return lane.",
+    ),
+    "config_capacity": (
+        "config",
+        "Kept artifacts count toward the return store's item and byte capacity and are never evicted; they count "
+        "toward neither `max_items` and `max_bytes` nor the stopped-custody bounds, and a retired device "
+        "identity's kept artifacts count until they leave the store.",
+    ),
+}
+MODEL_MUTANTS = {
+    "global_head": False,
+    "disposition_staged_legacy": False,
+    "absence_is_carriage": False,
+    "incompatible_dropped": False,
+    "incompatible_heads_lane": False,
+    "declaration_change_drops_kept": False,
+    "declaration_change_prepends_kept": False,
+    "fault_cleared_while_kept": False,
+    "kept_not_deduplicated": False,
+    "kept_reordered": False,
+    "kept_not_counted": False,
+    "kept_evicted_at_capacity": False,
+    "removal_deletes_kept": False,
+    "unstaged_response_retires": False,
+    "unstaged_response_blocks_site": False,
+}
+REQUIRED = (
+    "a mixed site: legacy device A never acknowledges and device B still receives its receipt and confirmation",
+    "a disposition for a legacy device is kept outside its lane and raises return_path_incompatible",
+    "an undeclared device is gateway-api/v1",
+    "a declaration changed to gateway-evidence-carriage/v1 stages the kept artifacts in order",
+    "a refused head holds only its own device's lane",
+    "kept artifacts are idempotent by digest",
+    "kept artifacts keep their arrival order",
+    "a removed device's kept artifacts are retained until it is restored under a compatible declaration",
+    "a response that cannot be kept leaves its lane entry unadvanced and retried, and another device is unaffected",
+)
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _vocabulary(text: str) -> list[str]:
+    at = text.find("### Artifact Type Vocabulary")
+    table = text[at:].split("\n\n", 2)[1] if at >= 0 else ""
+    return re.findall(r"^\| `(\w+)`\s+\|", table, re.MULTILINE)
+
+
+def load_contract(texts: dict[str, str]) -> dict:
+    for key, (name, sentence) in SENTENCES.items():
+        if _norm(sentence) not in _norm(texts[name]):
+            raise CheckError(f"{name} no longer states the {key} rule this model hard-codes")
+    carried = {CARRIAGE_V1: set(_vocabulary(texts["carriage"])), LEGACY: set(_vocabulary(texts["gateway-api"]))}
+    if "evidence_disposition" not in carried[CARRIAGE_V1] or "evidence_disposition" in carried[LEGACY]:
+        raise CheckError("the vocabularies no longer put evidence_disposition in gateway-evidence-carriage/v1 alone")
+    if not carried[LEGACY] or not carried[LEGACY] < carried[CARRIAGE_V1]:
+        raise CheckError("gateway-api/v1's inbound vocabulary is not a strict subset of gateway-evidence-carriage/v1's")
+    return {"carried": carried}
+
+
+def replay(contract: dict, sequence: dict) -> None:
+    declared = dict(sequence["declared"])
+    devices = sequence["devices"]
+    lanes: dict[str, list[dict]] = {d: [] for d in devices}
+    kept: dict[str, list[dict]] = {d: [] for d in devices}
+    held: dict[str, set[str]] = {d: set() for d in devices}  # every digest staged for the identity's life
+    outbound: dict[str, list[str]] = {d: list(sequence.get("outbound", {}).get(d, [])) for d in devices}
+    retrying: list[str] = []
+    capacity = sequence.get("capacity", {"items": 10 ** 9, "bytes": 10 ** 12})
+    order: list[tuple[str, dict]] = []  # arrival order, for the global-head defect
+    name = sequence["name"]
+
+    def stored() -> list[int]:
+        """The return store's items and bytes: every lane, and every kept artifact, retired devices' included."""
+        held_now = [a for d in devices for a in lanes[d]]
+        if not MODEL_MUTANTS["kept_not_counted"]:
+            held_now += [a for d in devices for a in kept[d]]
+        return [len(held_now), sum(a["bytes"] for a in held_now)]
+
+    def stage(device: str, step: dict) -> bool:
+        """Stage one authority artifact durably; False when the return store cannot keep it."""
+        artifact = {"id": step["id"], "type": step["artifact_type"], "digest": step.get("digest", step["id"]),
+                    "bytes": step.get("bytes", 1)}
+        if artifact["type"] not in contract["carried"][CARRIAGE_V1]:
+            raise CheckError(f"{name}: {artifact['type']!r} is no authority artifact this contract carries")
+        compatible = carries(device, artifact["type"])
+        duplicate = artifact["digest"] in held[device]
+        if duplicate and (compatible or not MODEL_MUTANTS["kept_not_deduplicated"]):
+            return True  # already staged: neither staged nor forwarded again
+        items, size = stored()
+        if items + 1 > capacity["items"] or size + artifact["bytes"] > capacity["bytes"]:
+            if not MODEL_MUTANTS["kept_evicted_at_capacity"]:
+                return False
+            victim = next((d for d in devices if kept[d]), None)
+            if victim is None:
+                return False
+            kept[victim].pop(0)
+        held[device].add(artifact["digest"])
+        if compatible:
+            lanes[device].append(artifact)
+            order.append((device, artifact))
+        elif MODEL_MUTANTS["incompatible_heads_lane"]:
+            lanes[device].insert(0, artifact)
+            order.append((device, artifact))
+        elif not MODEL_MUTANTS["incompatible_dropped"]:
+            kept[device].append(artifact)
+            if MODEL_MUTANTS["kept_reordered"]:
+                kept[device].sort(key=lambda a: a["id"])
+        return True
+
+    def contract_of(device: str) -> str:
+        default = CARRIAGE_V1 if MODEL_MUTANTS["absence_is_carriage"] else LEGACY
+        return declared.get(device, default)
+
+    def carries(device: str, artifact_type: str) -> bool:
+        if MODEL_MUTANTS["disposition_staged_legacy"]:
+            return True
+        return artifact_type in contract["carried"][contract_of(device)]
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        published: list[str] = []
+        if event == "stage":
+            if not stage(step["device_id"], step):
+                raise CheckError(f"{where}: a bare stage that does not fit; a full store is a `response` outcome")
+        elif event == "response":
+            # One authority response for the head of that device's outbound lane, staged artifact by artifact.
+            device, entry = step["device_id"], step["entry"]
+            if not outbound[device] or outbound[device][0] != entry:
+                raise CheckError(f"{where}: a response for an entry not at the head of its device's outbound lane")
+            staged = all(stage(device, artifact) for artifact in step["artifacts"])
+            if staged or MODEL_MUTANTS["unstaged_response_retires"]:
+                outbound[device].pop(0)
+                if entry in retrying:
+                    retrying.remove(entry)
+            elif entry not in retrying:
+                retrying.append(entry)
+        elif event == "remove":
+            # The device leaves configuration; its identity is retired, and its kept artifacts stay with it.
+            declared.pop(step["device_id"], None)
+            if MODEL_MUTANTS["removal_deletes_kept"]:
+                kept[step["device_id"]] = []
+        elif event == "publish":
+            if MODEL_MUTANTS["unstaged_response_blocks_site"] and retrying:
+                pass
+            elif MODEL_MUTANTS["global_head"]:
+                live = [(d, a) for d, a in order if a in lanes[d]]
+                if live:
+                    published.append(live[0][1]["id"])
+            else:
+                for device in devices:
+                    if lanes[device]:
+                        published.append(lanes[device][0]["id"])
+        elif event == "ack":
+            device = step["device_id"]
+            if not lanes[device] or lanes[device][0]["id"] != step["id"]:
+                raise CheckError(f"{where}: an acknowledgement for an artifact not at the head of its device's lane")
+            lanes[device].pop(0)
+        elif event == "declare":
+            if step["contract"] not in (LEGACY, CARRIAGE_V1):
+                raise CheckError(f"{where}: a declaration outside the two contracts is refused at load")
+            declared[step["device_id"]] = step["contract"]
+            device = step["device_id"]
+            if contract_of(device) == CARRIAGE_V1 and not MODEL_MUTANTS["declaration_change_drops_kept"]:
+                for position, artifact in enumerate(kept[device]):
+                    if MODEL_MUTANTS["declaration_change_prepends_kept"]:
+                        lanes[device].insert(position, artifact)
+                    else:
+                        lanes[device].append(artifact)
+                    order.append((device, artifact))
+            if contract_of(device) == CARRIAGE_V1:
+                kept[device] = []
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        raised = any(kept.values()) or (MODEL_MUTANTS["incompatible_dropped"] and event == "stage"
+                                         and not carries(step["device_id"], step["artifact_type"]))
+        if MODEL_MUTANTS["fault_cleared_while_kept"] and event == "publish":
+            raised = False
+        observed = {
+            "published": published,
+            "lanes": {d: [a["id"] for a in lanes[d]] for d in devices},
+            "kept": {d: [a["id"] for a in kept[d]] for d in devices},
+            "faults": ["return_path_incompatible"] if raised else [],
+            "outbound": {d: list(outbound[d]) for d in devices},
+            "retrying": list(retrying),
+            "stored": stored(),
+        }
+        for key, value in step["expect"].items():
+            if key not in observed:
+                raise CheckError(f"{where}: expectation {key!r} is not something this step decides")
+            if observed[key] != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed[key]!r}")
+
+
+def check(contract: dict, document: dict) -> None:
+    names = [s["name"] for s in document["sequences"]]
+    for required in REQUIRED:
+        if required not in names:
+            raise CheckError(f"no sequence for: {required}")
+    for sequence in document["sequences"]:
+        replay(contract, sequence)
+
+
+def corpus_mutants(document: dict):
+    for i, sequence in enumerate(document["sequences"]):
+        bad = copy.deepcopy(document)
+        del bad["sequences"][i]
+        yield f"without {sequence['name']!r}", bad
+        for j, step in enumerate(sequence["steps"]):
+            for key, value in step["expect"].items():
+                bad = copy.deepcopy(document)
+                target = bad["sequences"][i]["steps"][j]["expect"]
+                if key == "faults":
+                    target[key] = [] if value else ["return_path_incompatible"]
+                elif key in ("published", "retrying"):
+                    target[key] = value[:-1] if value else ["phantom"]
+                elif key == "stored":
+                    target[key] = [value[0] + 1, value[1]]
+                else:
+                    target[key] = {d: (ids[:-1] if ids else ["phantom"]) for d, ids in value.items()}
+                yield f"{sequence['name']!r} step {j} {key}", bad
+
+
+def text_mutants(texts: dict[str, str]):
+    for key, (name, sentence) in SENTENCES.items():
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        edited, count = re.subn(pattern, sentence.rsplit(" ", 1)[0].replace("\\", "\\\\"), texts[name], count=1)
+        yield f"reword {key}", {**texts, name: edited}, count
+    api = texts["gateway-api"]
+    at = api.find("| `epoch_confirmation`")
+    row = "| `evidence_disposition`    | Evidence disposition            | An authority key |\n"
+    yield "gateway-api/v1 gains evidence_disposition", {**texts, "gateway-api": api[:at] + row + api[at:]}, int(at > 0)
+
+
+def main() -> int:
+    texts = {"carriage": CARRIAGE.read_text(encoding="utf-8"), "gateway-api": GATEWAY_API.read_text(encoding="utf-8"),
+             "config": CONFIG.read_text(encoding="utf-8")}
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        contract = load_contract(texts)
+        check(contract, document)
+    except (CheckError, KeyError) as error:
+        print(f"check-gateway-return-path-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(document):
+            total += 1
+            try:
+                check(contract, bad)
+            except (CheckError, KeyError):
+                continue
+            survived.append(label)
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                check(contract, document)
+                survived.append(f"model defect {flag}")
+            except (CheckError, KeyError):
+                pass
+            finally:
+                MODEL_MUTANTS[flag] = False
+        for label, edited, count in text_mutants(texts):
+            total += 1
+            if count != 1:
+                survived.append(f"{label}: matches nothing")
+                continue
+            try:
+                check(load_contract(edited), document)
+            except (CheckError, KeyError):
+                continue
+            survived.append(label)
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"return-path mutations: {total} refused")
+    print(f"return-path vectors: {len(document['sequences'])} sequences hold to gateway-evidence-carriage/v1")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

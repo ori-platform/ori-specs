@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Check the routing-projection vectors against evidence-exchange/v2.
+
+The section "Stable routing projection across versions" is pinned, in order,
+against `evidence-exchange-routing-pinned-units.json` beside this script, and
+the fields each artifact type must carry are read from its sentences, never
+from the vector file. Every case is decided from those fields alone: a declared
+version, or fields a later version adds, must never change whether an artifact
+is routable, which is the property a courier's opacity depends on.
+
+    python3 scripts/check-evidence-routing-projection-vectors
+    python3 scripts/check-evidence-routing-projection-vectors --mutations
+    python3 scripts/check-evidence-routing-projection-vectors --print-units
+
+`--mutations` deletes each pinned unit, flips each case's verdict, and removes
+every case missing each field, and requires every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "evidence-exchange" / "v2.md"
+VECTORS = ROOT / "evidence-exchange" / "vectors" / "routing-projection-v2.json"
+PINNED = ROOT / "scripts" / "evidence-exchange-routing-pinned-units.json"
+START = "### Stable routing projection across versions"
+END = "### Anchor registration"
+# Artifact type names as the section spells them.
+TYPE_NAMES = {
+    "delivery envelopes": "delivery_envelope",
+    "delivery receipts": "delivery_receipt",
+    "anchor registrations": "anchor_registration",
+    "checkpoints": "checkpoint",
+}
+EPOCH_DOMAIN = re.compile(r"sha256:[0-9a-f]{64}")
+ALL_TYPES = (
+    "anchor_registration", "delivery_envelope", "checkpoint",
+    "delivery_receipt", "epoch_confirmation", "evidence_disposition",
+)
+EXACT_NAMES = (
+    "It reads each routing field by its exact member name, compared byte for byte: a member whose name differs "
+    "only in letter case is not that field, and an artifact that names any member twice is not routable."
+)
+DISPOSITIONS = "The projection holds for evidence dispositions as for every other carried artifact."
+MODEL_MUTANTS = {"case_folded": False, "duplicates_last_wins": False}
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def units(text: str) -> list[str]:
+    start = text.find(START)
+    end = text.find(END, start)
+    if start < 0 or end < start:
+        raise CheckError("evidence-exchange/v2.md lacks the stable routing projection section")
+    prose = _norm(text[start + len(START):end])
+    return [u for u in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if u]
+
+
+def domains(section: str) -> tuple[re.Pattern, int]:
+    """The routing fields' value domains, as the section states them."""
+    device = re.search(
+        r"`device_id` is a string of (\d+) to (\d+) Unicode scalar values, none of them a control "
+        r"character \(general category `Cc`\), a character with the Unicode `White_Space` property, "
+        r"`/`, `\+`, or `#`",
+        section,
+    )
+    seq = re.search(r"`local_seq`, `from_seq` and `to_seq` are integers of at least (\d+)", section)
+    if device is None or seq is None:
+        raise CheckError("the section no longer states the routing fields' value domains")
+    # `\s` is Python's Unicode whitespace, which with the Cc ranges is White_Space plus Cc.
+    domain = rf"[^\s/+#\x00-\x1f\x7f-\x9f]{{{device.group(1)},{device.group(2)}}}"
+    return re.compile(domain), int(seq.group(1))
+
+
+def required_fields(text: str) -> tuple[dict[str, set[str]], tuple[re.Pattern, int]]:
+    found = units(text)
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    if found != pinned:
+        raise CheckError(
+            "the routing section differs from the pinned units, in content or order; a deliberate "
+            "change updates scripts/evidence-exchange-routing-pinned-units.json in the same commit"
+        )
+    section = " ".join(found)
+    required = {t: set() for t in ALL_TYPES}
+    every = re.search(r"For every version of an artifact carried on the evidence hop, `(\w+)` remains present", section)
+    if every is None:
+        raise CheckError("the section no longer states the field every artifact carries")
+    for t in ALL_TYPES:
+        required[t].add(every.group(1))
+    for clause in re.finditer(r"((?:`\w+`(?: and )?)+) remains? present with (?:its|their) v1 meanings? on ([a-z ,]+?)(?:;|\.)", section):
+        fields = set(re.findall(r"`(\w+)`", clause.group(1)))
+        for name in re.split(r",\s*|\s+and\s+", clause.group(2).strip()):
+            if name not in TYPE_NAMES:
+                raise CheckError(f"the section names an artifact type this checker does not know: {name!r}")
+            required[TYPE_NAMES[name]] |= fields
+    epoch_domain = "Its v1 domain is `sha256:` followed by 64 lowercase hexadecimal characters."
+    purpose = (
+        "It MUST NOT use it to infer confirmation, validity, ordering, authority state or artifact acceptance."
+    )
+    stop_only = (
+        "`anchor_epoch_id` is part of the stable routing projection for every carried device artifact. The "
+        "courier may read it only to bind queue entries to a verified epoch-scoped stop projection."
+    )
+    if purpose not in section or stop_only not in section:
+        raise CheckError("the section no longer bounds what a courier may use anchor_epoch_id for")
+    if any("anchor_epoch_id" in r for r in required.values()) and epoch_domain not in section:
+        raise CheckError("the section requires anchor_epoch_id but no longer states its domain")
+    if "MUST NOT repurpose or remove these routing fields" not in section:
+        raise CheckError("the section no longer forbids repurposing the routing fields")
+    if EXACT_NAMES not in section or DISPOSITIONS not in section:
+        raise CheckError("the section no longer fixes exact member names, or no longer covers evidence dispositions")
+    return required, domains(section)
+
+
+def _artifact(case: dict) -> tuple[dict, set[str]]:
+    """The artifact as a courier decodes it, and the member names it carries more than once."""
+    if "artifact_json" not in case:
+        return case["artifact"], set()
+    repeated: set[str] = set()
+
+    def pairs(items: list) -> dict:
+        names = [k for k, _ in items]
+        repeated.update(n for n in names if names.count(n) > 1)
+        return dict(items)
+
+    return json.loads(case["artifact_json"], object_pairs_hook=pairs), repeated
+
+
+def routable(contract: tuple, case: dict) -> tuple[bool, str | None]:
+    required, (device_pattern, least_seq) = contract
+    artifact, repeated = _artifact(case)
+    if MODEL_MUTANTS["case_folded"]:
+        artifact = {k.lower(): v for k, v in artifact.items()}
+    for field in sorted(required[case["artifact_type"]]):
+        if field in repeated and not MODEL_MUTANTS["duplicates_last_wins"]:
+            return False, field
+        value = artifact.get(field)
+        if field == "device_id":
+            ok = type(value) is str and device_pattern.fullmatch(value) is not None
+        elif field == "anchor_epoch_id":
+            ok = type(value) is str and EPOCH_DOMAIN.fullmatch(value) is not None
+        else:
+            ok = type(value) is int and value >= least_seq
+        if not ok:
+            return False, field
+    return True, None
+
+
+def check(document: dict, contract: tuple) -> None:
+    required = contract[0]
+    names = set()
+    for case in document["cases"]:
+        if case["name"] in names:
+            raise CheckError(f"duplicate case {case['name']!r}")
+        names.add(case["name"])
+        if case["artifact_type"] not in required:
+            raise CheckError(f"{case['name']}: unknown artifact type")
+        ok, missing = routable(contract, case)
+        if ok != case["routable"] or (not ok and missing != case.get("missing")):
+            raise CheckError(f"{case['name']}: declared {case['routable']}/{case.get('missing')}, the contract gives {ok}/{missing}")
+    for t in ALL_TYPES:
+        if not any(c["artifact_type"] == t and c["routable"] for c in document["cases"]):
+            raise CheckError(f"no routable case for {t}")
+        for field in required[t]:
+            if not any(c["artifact_type"] == t and c.get("missing") == field for c in document["cases"]):
+                raise CheckError(f"no {t} case missing {field}")
+    for label, predicate in (
+        ("a device_id a topic segment cannot carry", lambda a: isinstance(a.get("device_id"), str) and "/" in a["device_id"]),
+        ("a sequence of zero", lambda a: any(a.get(f) == 0 for f in ("local_seq", "from_seq", "to_seq"))),
+    ):
+        if not any(not c["routable"] and predicate(c.get("artifact", {})) for c in document["cases"]):
+            raise CheckError(f"no unroutable case with {label}")
+    for label, predicate in (
+        ("a case-variant routing member", lambda c: "artifact" in c and any(
+            k != k.lower() and k.lower() in ("device_id", "local_seq", "anchor_epoch_id") for k in c["artifact"])),
+        ("a routing member named twice", lambda c: "artifact_json" in c),
+    ):
+        if not any(not c["routable"] and predicate(c) for c in document["cases"]):
+            raise CheckError(f"no unroutable case with {label}")
+    if not any(c["routable"] and not isinstance(c.get("artifact", {}).get("v"), int) for c in document["cases"]):
+        raise CheckError("no case shows that a non-integer or absent version is still routable")
+    if not any(c["routable"] and c.get("artifact", {}).get("v", 1) != 1 for c in document["cases"]):
+        raise CheckError("no case shows that a later version is still routable")
+
+
+def mutants(document: dict, text: str):
+    for i, case in enumerate(document["cases"]):
+        bad = copy.deepcopy(document)
+        bad["cases"][i]["routable"] = not case["routable"]
+        yield f"verdict of {case['name']!r}", bad, text
+    for field in {c.get("missing") for c in document["cases"]} - {None}:
+        bad = copy.deepcopy(document)
+        bad["cases"] = [c for c in document["cases"] if c.get("missing") != field]
+        yield f"without cases missing {field}", bad, text
+    for pair in {(c["artifact_type"], c.get("missing")) for c in document["cases"]} - {(t, None) for t in ALL_TYPES}:
+        bad = copy.deepcopy(document)
+        bad["cases"] = [c for c in document["cases"] if (c["artifact_type"], c.get("missing")) != pair]
+        yield f"without {pair[0]} cases missing {pair[1]}", bad, text
+    for label, old, new in (
+        ("widen the device_id length", "1 to 128 Unicode", "1 to 1024 Unicode"),
+        ("admit a zero sequence", "integers of at least 1", "integers of at least 0"),
+        ("drop the epoch from checkpoints", "delivery envelopes and checkpoints. Its v1",
+         "delivery envelopes. Checkpoints carry it too. Its v1"),
+    ):
+        yield f"contract text: {label}", document, text.replace(old, new, 1)
+    start = text.find(START)
+    end = text.find(END, start)
+    block = text[start:end]
+    for unit in units(text):
+        pattern = r"\s+".join(re.escape(w) for w in unit.split())
+        edited, _count = re.subn(pattern, "", block, count=1)
+        yield f"contract text: delete {unit[:50]!r}", document, text[:start] + edited + text[end:]
+
+
+def main() -> int:
+    text = CONTRACT.read_text(encoding="utf-8")
+    if "--print-units" in sys.argv[1:]:
+        print(json.dumps(units(text), indent=2, ensure_ascii=False))
+        return 0
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        check(document, required_fields(text))
+    except CheckError as error:
+        print(f"check-evidence-routing-projection-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad, edited in mutants(document, text):
+            total += 1
+            try:
+                check(bad, required_fields(edited))
+            except CheckError:
+                continue
+            survived.append(label)
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                check(document, required_fields(text))
+                survived.append(f"model defect {flag}")
+            except CheckError:
+                pass
+            finally:
+                MODEL_MUTANTS[flag] = False
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"routing-projection mutations: {total} refused")
+    print(f"routing-projection vectors: {len(document['cases'])} cases hold to evidence-exchange/v2")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

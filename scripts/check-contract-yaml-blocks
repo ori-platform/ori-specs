@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""Parse every fenced YAML block in the repository's Markdown with `yaml.safe_load`.
+
+A contract's example configuration is read as the contract: an implementer
+copies it, and a block that does not parse illustrates nothing. A mis-indented
+key inside a mapping of scalars is a parse error, so it is refused here rather
+than discovered by the first reader who pastes it.
+
+    python3 scripts/check-contract-yaml-blocks
+    python3 scripts/check-contract-yaml-blocks --mutations
+
+A block fenced as ```yaml or ```yml is checked; a block in any other fence is
+not. This proves each block is well-formed YAML, and nothing about whether its
+keys, types or values agree with the contract's tables: that is each contract
+checker's job. `--mutations` over-indents one key in a scratch copy of a
+checked block and requires the check to refuse it.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("check-contract-yaml-blocks: PyYAML is required (scripts/vector-check-requirements.txt)", file=sys.stderr)
+    sys.exit(2)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OPEN = re.compile(r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})[ \t]*(?P<lang>ya?ml)\b[^\n]*$", re.IGNORECASE)
+MUTANT_KEY = re.compile(r"^(?P<indent>[ ]*)[A-Za-z_][\w-]*:[ ]+\S")
+
+
+def markdown_files() -> list[pathlib.Path]:
+    return sorted(p for p in ROOT.rglob("*.md") if ".git" not in p.relative_to(ROOT).parts)
+
+
+def yaml_blocks(text: str) -> list[tuple[int, str]]:
+    """Each fenced YAML block as (1-based line of its opening fence, dedented body)."""
+    lines = text.splitlines()
+    blocks: list[tuple[int, str]] = []
+    i = 0
+    while i < len(lines):
+        match = OPEN.match(lines[i])
+        if not match:
+            i += 1
+            continue
+        indent, fence = match.group("indent"), match.group("fence")
+        close = re.compile(rf"^[ \t]*{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
+        body: list[str] = []
+        j = i + 1
+        while j < len(lines) and not close.match(lines[j]):
+            body.append(lines[j][len(indent):] if lines[j].startswith(indent) else lines[j])
+            j += 1
+        if j == len(lines):
+            raise ValueError(f"line {i + 1}: a YAML fence is never closed")
+        blocks.append((i + 1, "\n".join(body) + "\n"))
+        i = j + 1
+    return blocks
+
+
+def failures(files: dict[str, str]) -> list[str]:
+    found: list[str] = []
+    for name, text in files.items():
+        try:
+            blocks = yaml_blocks(text)
+        except ValueError as error:
+            found.append(f"{name}: {error}")
+            continue
+        for line, body in blocks:
+            try:
+                list(yaml.safe_load_all(body))
+            except yaml.YAMLError as error:
+                detail = " ".join(str(error).split())
+                found.append(f"{name}:{line}: a ```yaml block does not parse: {detail}")
+    return found
+
+
+def mutants(files: dict[str, str]):
+    """Over-indent the second key of a two-key mapping at one level, in each file that has one."""
+    for name, text in files.items():
+        for _, body in yaml_blocks(text):
+            lines = body.splitlines()
+            for k in range(1, len(lines)):
+                a, b = MUTANT_KEY.match(lines[k - 1]), MUTANT_KEY.match(lines[k])
+                if a and b and a.group("indent") == b.group("indent"):
+                    target = lines[k]
+                    if text.count(target) != 1:
+                        continue
+                    yield f"{name}: over-indented {target.strip()!r}", {**files, name: text.replace(target, "  " + target)}
+                    break
+            else:
+                continue
+            break
+
+
+def main() -> int:
+    files = {str(p.relative_to(ROOT)): p.read_text(encoding="utf-8") for p in markdown_files()}
+    found = failures(files)
+    if found:
+        for line in found:
+            print(f"check-contract-yaml-blocks: {line}", file=sys.stderr)
+        print("check-contract-yaml-blocks: this checks parsing only, not agreement with any contract table",
+              file=sys.stderr)
+        return 1
+    count = sum(len(yaml_blocks(t)) for t in files.values())
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in mutants(files):
+            total += 1
+            if not failures(bad):
+                survived.append(label)
+        if total == 0 or survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            if total == 0:
+                print("check-contract-yaml-blocks: no mutant could be built", file=sys.stderr)
+            return 1
+        print(f"yaml-block mutations: {total} refused")
+    print(f"yaml blocks: {count} fenced blocks in {len(files)} Markdown files parse")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

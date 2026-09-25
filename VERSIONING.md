@@ -274,6 +274,7 @@ pending audit is never shown as `amendable`.
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
+| `appended_files` | When `complete`, optional: each file added to the version after its freeze, with `path`, its `sha256`, `classification` (only `additive` is admitted), a `justification` of why no conforming consumer's accepted input changes, the `clause` it exercises quoted exactly, and `clause_basis`: `freeze_revision`, the clause is in the contract at `freeze_revision`, or `additive_hunk`, it is in the recorded additive hunk named by `hunk_sha256`. A new negative vector for a frozen version cites a `freeze_revision` clause and introduces no new reason, precedence, vocabulary, canonicalisation or strictness. |
 
 While an audit is **pending**, the version takes no normative edit.
 `scripts/check-contract-status` refuses any change to the contract text other
@@ -304,7 +305,10 @@ history, confirms the recorded contract and vector hashes, and compares the
 current text with the baseline. Every difference must be a recorded
 `erratum` or `additive` hunk; an unrecorded difference is drift, a recorded
 `semantic` hunk must not remain, and its destination must exist. Frozen vector
-files must still match their recorded hashes. `--draft-audit
+files must still match their recorded hashes. An appended file must be absent at
+`freeze_revision`, match its recorded hash, and quote a clause that exists where
+its basis says; the check cannot tell whether the file is really additive, and
+review does. `--draft-audit
 <contract>/<version>` prints the hashes and net hunks for a reviewer to
 classify.
 
@@ -343,32 +347,45 @@ Validated against `status/`; the records carry adoption and proof in full.
 | --- | --- | --- | --- | --- |
 | capability-grant | v1 | `draft` | `amendable` | — |
 | capability-grant-issuance | v1 | `draft` | `amendable` | — |
-| cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
-| commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
+| cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
+| cli-commands | v2 | `draft` | `amendable` | — |
+| commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit complete |
+| commissioned-safety-binding | v2 | `draft` | `frozen` | shipment, runtime `332754b`, 2026-09-23; audit pending |
 | device-configuration | v1 | `draft` | `amendable` | — |
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
 | events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
+| events | v2 | `draft` | `amendable` | — |
 | evidence | v1 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit pending |
-| evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
+| evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
+| evidence | v3 | `draft` | `amendable` | — |
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
-| evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit pending |
-| evidence-transport | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit pending |
+| evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
+| evidence-exchange | v2 | `draft` | `amendable` | — |
+| evidence-transport | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
+| evidence-transport | v2 | `draft` | `amendable` | — |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
 | firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit pending |
 | firmware-telemetry | v1 | `draft` | `frozen` | claiming-merge, runtime `8aefc63`, 2026-07-16; audit pending |
-| gateway-api | v1 | `draft` | `frozen` | claiming-merge, gateway `663c99f`, 2026-06-04; audit pending |
-| gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit pending |
+| gateway-api | v1 | `draft` | `frozen` | claiming-merge, gateway `663c99f`, 2026-06-04; audit complete |
+| gateway-api | v2 | `draft` | `amendable` | — |
+| gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit complete |
+| gateway-config | v2 | `draft` | `amendable` | — |
+| gateway-evidence-carriage | v1 | `draft` | `amendable` | — |
 | gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
-| offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
+| offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
+| offline-tokens | v2 | `draft` | `amendable` | — |
+| operator-socket | v1 | `draft` | `amendable` | — |
 | runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-config | v2 | `draft` | `amendable` | — |
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
 | runtime-config-signing | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
-| runtime-evidence-anchor | v1 | `draft` | `frozen` | claiming-merge, runtime `b5ab285`, 2026-08-23; audit pending |
+| runtime-evidence-anchor | v1 | `draft` | `frozen` | claiming-merge, runtime `b5ab285`, 2026-08-23; audit complete |
+| runtime-evidence-anchor | v2 | `draft` | `amendable` | — |
 | runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
-| runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
+| runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
+| runtime-health | v3 | `draft` | `amendable` | — |
 | runtime-mobile | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit pending |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
@@ -378,12 +395,14 @@ Validated against `status/`; the records carry adoption and proof in full.
 | safety-qualification-fixture | v1 | `draft` | `amendable` | — |
 | schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit pending |
 | sensor-configuration | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit pending |
-| signing | v1 | `draft` | `frozen` | shipment, runtime `1411814`, 2026-06-12; audit pending |
+| signing | v1 | `draft` | `frozen` | shipment, runtime `1411814`, 2026-06-12; audit complete |
+| signing | v2 | `draft` | `amendable` | — |
 | skill-hook-isolation | v1 | `draft` | `amendable` | — |
 | skills-package | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
 | skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit pending |
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |
+| tier-c-approval | v1 | `draft` | `amendable` | — |
 
 ## Deprecation
 

@@ -1,0 +1,1111 @@
+#!/usr/bin/env python3
+"""Check the evidence-disposition vectors against evidence-exchange/v2.
+
+`evidence-exchange/vectors/evidence-disposition-v2.json` carries three things, and
+every rule each is held to is read from the contract text, never from the
+corpus:
+
+- wire cases: every disposition's canonical bytes reproduce, and its Ed25519
+  signature is verified under the key its `key_id` selects in the corpus's
+  published registry, by purpose and without trial verification; each case's
+  outcome is recomputed from the value table and the verification order, so a
+  rejection is refused for the reason it names;
+- mapping cases: one per row of the emission mapping, plus refusals the mapping
+  does not name, each recomputed from the mapping table, which closes the
+  vocabulary: a trigger it does not name emits nothing;
+- the re-offer schedule: every due, delay and overdue case recomputed from the
+  constants the contract's schedule sentence states, at the boundaries it
+  names, across restarts;
+- runtime sequences: sealed artifacts, dispositions, confirmations, restarts,
+  fresh references, epoch changes, identity replacement and Tier C / Tier D
+  executions, replayed through the runtime model the contract's verification
+  order, effects and re-offer rules state, with every expectation compared.
+
+The *Evidence disposition* section and the *Registration status at the
+runtime* block are pinned to `evidence-exchange-disposition-pinned-units.json`
+beside this script, and the sentences the model hard-codes are held word for
+word.
+
+    python3 scripts/check-evidence-disposition-vectors
+    python3 scripts/check-evidence-disposition-vectors --mutations
+    python3 scripts/check-evidence-disposition-vectors --print-units
+
+Requires the `cryptography` package; the check refuses to run without it.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print("check-evidence-disposition-vectors: the cryptography package is required", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "evidence-exchange" / "v2.md"
+HEALTH = ROOT / "runtime-health" / "v3.md"
+VECTORS = ROOT / "evidence-exchange" / "vectors" / "evidence-disposition-v2.json"
+PINNED = ROOT / "scripts" / "evidence-exchange-disposition-pinned-units.json"
+BLOCKS = (
+    ("### Evidence disposition", "## Three state models"),
+    ("**Registration status at the runtime**", "**Evidence findings**"),
+)
+PURPOSE = "evidence_authority_disposition"
+DOMAIN_RULE = re.compile(r"\| Evidence disposition \| `([a-z_.0-9]+)\\0` \| Ed25519 \| `(\w+)` \|")
+
+MODEL_SENTENCES = {
+    "malformed": (
+        "A value outside this table, a scope outside `artifact`, `epoch` and `identity`, and a value paired "
+        "with a scope other than its own are each refused `malformed` and change nothing."
+    ),
+    "order": "A runtime verifies a disposition in this order, and a disposition refused at any step changes nothing:",
+    "step1": (
+        "The object is exactly the fields above, `v` is `1`, its value and scope are a pair the value table "
+        "permits, and `anchor_epoch_id` is `\"\"` only under `artifact` scope; otherwise `malformed`."
+    ),
+    "step2": (
+        "`key_id` is selected by `(evidence_authority_disposition, key_id)` without trial verification; "
+        "`unknown_key`, `wrong_purpose` or `retired_key` as for every other artifact."
+    ),
+    "step3": "The signature verifies over the disposition domain; otherwise `bad_authenticator`.",
+    "step4": "`device_id` is the runtime's own; otherwise `binding_mismatch`.",
+    "step5": (
+        "`triggering_digest` names an artifact this runtime sealed for delivery, and `anchor_epoch_id` is the "
+        "epoch that artifact names, or `\"\"` under `artifact` scope; a `retained_pending` names an anchor "
+        "registration."
+    ),
+    "step6": (
+        "Its effect is not already in force: a disposition for a registration already confirmed or already "
+        "closed, and an `epoch` or `identity` disposition whose stop is already in force, are refused "
+        "`superseded`."
+    ),
+    "repeat": "A byte-identical repetition of an applied disposition is applied again with no new state.",
+    "durable": "A verified disposition is durable, survives restart, and has exactly this effect:",
+    "retained_pending": (
+        "`retained_pending` bound to an epoch's sealed registration suspends identical re-offers of it, "
+        "per *Registration status at the runtime*."
+    ),
+    "artifact_terminal": (
+        "`artifact_terminal` bound to an epoch's sealed registration closes that registration attempt, "
+        "which then requires operator repair."
+    ),
+    "artifact_other": (
+        "Bound to any other artifact, it is recorded and has no delivery effect: later checkpoints and "
+        "envelopes continue."
+    ),
+    "epoch": (
+        "`epoch_reprovisioning_required` stops new handoff of every artifact of that epoch — registration "
+        "re-offers, periodic checkpoints and envelopes — and `delivery_stop_status` is `epoch_stopped` while that "
+        "epoch is current."
+    ),
+    "identity": (
+        "`identity_replacement_required` stops all new handoff for the identity, under every epoch, and "
+        "`delivery_stop_status` is `identity_stopped`."
+    ),
+    # replay(): sealing continues, and an unacknowledged artifact in a stopped scope stays local as stopped.
+    "stopped_local": (
+        "Under an epoch- or identity-scoped disposition, the runtime continues sealing Tier C and Tier D "
+        "evidence locally but MUST NOT newly hand off an artifact within the stopped scope."
+    ),
+    "stopped_state": (
+        "An already sealed, unacknowledged artifact remains durably local with delivery state `stopped`; it is "
+        "neither discarded nor rewritten."
+    ),
+    # replay(): custody acknowledged stays at the gateway.
+    "custody_forward": "Custody does not move backward.",
+    "identity_permanent": (
+        "No restart, acknowledgement, configuration change, commissioning reference or new epoch clears it; "
+        "only a replacement identity starts afresh."
+    ),
+    "no_gating": (
+        "No disposition, and no state it produces, gates, delays, suppresses, or marks unavailable an approved "
+        "Tier C action, any Tier D execution, or an in-force commissioned safety binding, zone, or safety profile."
+    ),
+    "recording": "Under every disposition the runtime keeps recording Tier C and Tier D evidence locally",
+    "unclassified": (
+        "A refusal this table does not name, including a quarantined registration, any other `409 conflict`, "
+        "a transport refusal, and any reason a later revision adds, produces no disposition."
+    ),
+    "suspend": (
+        "It suspends identical re-offers and leaves the confirmation obligation and the overdue diagnostic open,"
+    ),
+    "no_renewal": (
+        "No disposition value in this revision requests renewed offer, so that exit is not reachable until a "
+        "later revision defines one."
+    ),
+    "repair": (
+        "The repair is a fresh commissioning reference, whose newly sealed registration starts a new attempt; a "
+        "reference never lifts an `epoch` or `identity` disposition in force for that epoch."
+    ),
+    "checkpoints_continue": (
+        "while re-offers are suspended the runtime keeps issuing periodic checkpoints under that epoch, unless "
+        "an `epoch` or `identity` disposition has stopped them;"
+    ),
+    "independent": "Each epoch's confirmation obligation is independent.",
+    # replay(): no disposition confers or withdraws authority.
+    "no_authority": "it never records delivery, never confirms an epoch, and never changes action authority.",
+    "terminal_no_authority": "it never confirms the epoch and never changes action authority.",
+    # check_mapping(): the mapping emits no epoch scope in this revision.
+    "epoch_scope": (
+        "Epoch scope is emitted only under a separately specified authority decision, such as an epoch revoked or "
+        "compromised, and never because an epoch is unknown, pending or superseded;"
+    ),
+    # replay(): stop records are durable and nothing in this revision removes one.
+    "stop_record": (
+        "The runtime derives an artifact's `stopped` delivery state from the durable stop record for its epoch or "
+        "identity, never from a mutable flag on the artifact."
+    ),
+    "no_lifting": "This revision defines no operation that deletes, clears, supersedes or weakens a stop record.",
+    "no_later_lift": "A later disposition cannot lift one.",
+    "epoch_and_replacement": (
+        "A new epoch leaves an earlier epoch stop intact, and identity replacement starts a new identity while "
+        "retaining the retired identity's stop and evidence records."
+    ),
+    "schedule_constant": "The re-offer schedule is a release-owned constant and is not configurable.",
+    "unbounded": "The number of re-offers is unbounded.",
+    "restart_schedule": (
+        "Restart preserves the obligation and does not reset its pending-since time or permit a delay greater than "
+        "the ceiling."
+    ),
+    "due_boundary": (
+        "A re-offer is due once its delay has elapsed since the previous attempted offer, so at 59 seconds the "
+        "first is not due and at 60 seconds it is; a doubling that would pass 3,600 seconds is 3,600 seconds."
+    ),
+    # check_schedule(): the anchor each delay is measured from.
+    "anchor": (
+        "The first re-offer is measured from the first attempted offer, and each later re-offer from the previous "
+        "attempted offer. The runtime persists the time of each attempted offer, and a restart measures from that "
+        "persisted time. Sealing time is not the anchor, unless sealing and the first offer are one atomic "
+        "operation."
+    ),
+    # check_rollbacks(): which rollbacks are identity-scoped.
+    "rollback_scope": (
+        "A checkpoint rollback is identity-scoped only when the checkpoint's epoch declares a carriage capability "
+        "that requires FIFO checkpoint handoff and the authority received it through that conforming path. For an "
+        "epoch without that declaration, a lower checkpoint is refused artifact-scoped and MUST NOT produce "
+        "`identity_replacement_required`."
+    ),
+    "rollback_purpose": (
+        "The `evidence_authority_disposition` purpose declares nothing about handoff order, and its presence never "
+        "makes a rollback identity-scoped."
+    ),
+    "rollback_retained": "Either way the refusal is `409 conflict`, and the refused bytes are retained.",
+    "overdue_boundary": (
+        "The obligation is overdue once the confirmation-overdue bound has elapsed since its pending-since time, so "
+        "it is not overdue at 7,199 seconds and is at 7,200 seconds."
+    ),
+    "old_epoch": (
+        "An epoch change leaves the previous epoch's open obligation in force, re-offered under the same rules "
+        "until it resolves,"
+    ),
+}
+HEALTH_SENTENCES = {
+    "offer": (
+        "`offering` while it is re-offered with bounded delay; `suspended` while a verified `retained_pending` "
+        "disposition holds re-offers; `closed` when a verified terminal disposition closed the attempt, while "
+        "`registration_status` stays `pending_confirmation`, or when an `epoch` or `identity` disposition stopped "
+        "offers; `not_applicable` when `registration_status` is `disabled`, `pending_authorisation` or `confirmed`."
+    ),
+    "delivery": (
+        "`delivery_stop_status` reports only verified stop-disposition state: `not_stopped` when no verified stop "
+        "disposition is in force, `epoch_stopped` when `epoch_reprovisioning_required` applies to the current "
+        "epoch, and `identity_stopped` when `identity_replacement_required` applies to the device identity."
+    ),
+    # replay(): the stopped-local counts, across every epoch of the current identity.
+    "stopped_count": (
+        "`stopped_local_artifact_count` is the total number of locally retained artifacts whose epoch or identity "
+        "is covered by a durable stop, across current and historical epochs."
+    ),
+    "stopped_count_restart": "It survives restart and is zero only when no such local artifacts exist.",
+    "stopped_bytes": "`stopped_local_bytes` is the total encoded bytes occupied by those artifacts.",
+    "stopped_since": (
+        "`oldest_stopped_local_since_ms` is the runtime-observed time at which the oldest currently retained "
+        "stopped-local artifact entered stopped custody, or null when the count is zero."
+    ),
+    "stopped_diagnostic": (
+        "All three are evidence diagnostics only. They MUST NOT gate, delay or suppress an approved Tier C action "
+        "or any Tier D execution."
+    ),
+    # replay(): a queued acknowledgement lowers local counts only for bytes handed off before the stop.
+    "stopped_lawful": (
+        "A stopped-local artifact leaves local counts only when the runtime verifies a `queued` acknowledgement "
+        "for the identical bytes and can prove that their handoff began before the covering stop disposition was "
+        "durably applied."
+    ),
+    "stopped_inconsistent": (
+        "An acknowledgement for a handoff initiated after durable stop application is refused as inconsistent "
+        "state and does not reduce local counts."
+    ),
+    # replay(): a retired identity's stopped-local artifacts are kept and queryable, and counted only under it.
+    "retired_kept": (
+        "Identity replacement retains the retired identity's stop and evidence records under that retired "
+        "identity. They remain queryable in its retirement/archive record but do not contribute to the "
+        "replacement identity's `stopped_local_*` fields. Historical epochs of the current identity do contribute."
+    ),
+    "not_availability": (
+        "It does not assert connectivity, queue progress, authority reachability or successful delivery."
+    ),
+}
+SCHEDULE_RULE = re.compile(
+    r"In v2\.5\.0 the first re-offer occurs after ([\d,]+) seconds; each later delay doubles until it reaches "
+    r"([\d,]+) seconds; subsequent delays remain ([\d,]+) seconds\. The confirmation-overdue bound is ([\d,]+) "
+    r"seconds\."
+)
+UNCLASSIFIED_REQUIRED = {
+    "Registration quarantined for a conflicting active epoch",
+    "`401 bad_authenticator`",
+    "`403 not_authorized`",
+    "`429 rate_limited`",
+    "`503 unavailable`",
+    "`507 retention_capacity_exhausted`",
+    "`422 wrong_purpose`, a reason a later revision adds",
+}
+FIELDS = ["v", "device_id", "anchor_epoch_id", "triggering_digest", "scope", "disposition", "decided_at_ms",
+          "key_id", "signature"]
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith(("|", "```")):
+            units.extend(_norm(line) for line in lines if line.strip())
+            continue
+        for chunk in re.split(r"\n(?=- |\d\. )", paragraph.strip()):
+            prose = _norm(re.sub(r"^(- |\d\. )", "", chunk))
+            units.extend(s for s in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if s)
+    return units
+
+
+def _block(text: str, start: str, end: str) -> str:
+    a = text.find(start)
+    b = text.find(end, a)
+    if a < 0 or b < a:
+        raise CheckError(f"evidence-exchange/v2.md lacks the block starting {start[:40]!r}")
+    return text[a:b]
+
+
+def pinned_units(text: str) -> list[str]:
+    return [u for start, end in BLOCKS for u in _units(_block(text, start, end))]
+
+
+def canonical(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def digest(obj) -> str:
+    return "sha256:" + hashlib.sha256(canonical(obj)).hexdigest()
+
+
+def load_contract(text: str, health: str, check_pin: bool = True) -> dict:
+    units = pinned_units(text)
+    if check_pin:
+        pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+        if units != pinned:
+            added = sorted(set(units) - set(pinned))
+            removed = sorted(set(pinned) - set(units))
+            raise CheckError(
+                "the disposition text differs from the pinned units; a deliberate change updates "
+                "scripts/evidence-exchange-disposition-pinned-units.json with this corpus\n"
+                + "".join(f"  + {u}\n" for u in added) + "".join(f"  - {u}\n" for u in removed)
+            )
+    joined = _norm(" ".join(units))
+    for key, sentence in MODEL_SENTENCES.items():
+        if _norm(sentence) not in joined:
+            raise CheckError(
+                f"evidence-exchange/v2 no longer states the {key} rule this model hard-codes: {sentence[:70]!r}; "
+                "change the model and MODEL_SENTENCES together"
+            )
+    health_text = _norm(health)
+    for key, sentence in HEALTH_SENTENCES.items():
+        if _norm(sentence) not in health_text:
+            raise CheckError(f"runtime-health/v3 no longer states the {key} rule this model reports")
+    section = _block(text, *BLOCKS[0])
+    fields = re.findall(r"^\| `(\w+)` \| `(?:int|string)` \|", section, re.MULTILINE)
+    values: dict[str, tuple[str, bool]] = {}
+    for scope_value in re.finditer(r"^\| `(\w+)` \| `(\w+)` \| (yes|no) \|", section, re.MULTILINE):
+        values[scope_value.group(1)] = (scope_value.group(2), scope_value.group(3) == "yes")
+    mapping: dict[str, tuple[str, str] | None] = {}
+    start = section.find("| Trigger | `scope` | `disposition` |")
+    if start < 0:
+        raise CheckError("evidence-exchange/v2 no longer carries the emission mapping")
+    for line in section[start:].splitlines()[2:]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 3:
+            raise CheckError(f"emission row is not trigger | scope | disposition: {cells}")
+        if cells[1:] == ["none", "none"]:
+            mapping[cells[0]] = None
+        else:
+            named = [re.fullmatch(r"`(\w+)`", c) for c in cells[1:]]
+            if not all(named):
+                raise CheckError(f"emission row names no scope and disposition: {cells}")
+            pair = (named[0].group(1), named[1].group(1))
+            if values.get(pair[1], (None,))[0] != pair[0]:
+                raise CheckError(f"emission row {cells[0]!r} pairs a value with a scope the value table does not permit")
+            mapping[cells[0]] = pair
+    domain = DOMAIN_RULE.search(text)
+    if fields != FIELDS or not values or domain is None or domain.group(2) != PURPOSE:
+        raise CheckError("the disposition fields, values, or domain and purpose differ from the model")
+    if f"| `{PURPOSE}` | runtime |" not in text:
+        raise CheckError("the key purposes table no longer holds the disposition purpose at the runtime")
+    schedule = SCHEDULE_RULE.search(joined)
+    if schedule is None:
+        raise CheckError("evidence-exchange/v2 no longer states the re-offer schedule and the overdue bound")
+    first, ceiling, remain, overdue = (int(g.replace(",", "")) for g in schedule.groups())
+    if remain != ceiling:
+        raise CheckError("evidence-exchange/v2 states a ceiling the later delays do not remain at")
+    return {"values": values, "mapping": mapping, "domain": domain.group(1).encode() + b"\0",
+            "schedule": {"first_s": first, "ceiling_s": ceiling, "overdue_s": overdue}}
+
+
+def reoffer_delay(contract: dict, attempt: int) -> int:
+    """The delay before re-offer `attempt`: the first delay, doubling, held at the ceiling."""
+    s = contract["schedule"]
+    if MODEL_MUTANTS["no_doubling"]:
+        return s["first_s"]
+    delay = s["first_s"] * 2 ** (attempt - 1)
+    return delay if MODEL_MUTANTS["ceiling_unbounded"] else min(delay, s["ceiling_s"])
+
+
+def reoffer_due(contract: dict, attempt: int, since_previous_s: int) -> bool:
+    if MODEL_MUTANTS["bounded_attempts"] and attempt > 20:
+        return False
+    if MODEL_MUTANTS["due_after_boundary"]:
+        return since_previous_s > reoffer_delay(contract, attempt)
+    return since_previous_s >= reoffer_delay(contract, attempt)
+
+
+def check_schedule(contract: dict, document: dict) -> None:
+    schedule = document["reoffer_schedule"]
+    got = [reoffer_delay(contract, n) for n in range(1, len(schedule["delays_s"]) + 1)]
+    if got != schedule["delays_s"]:
+        raise CheckError(f"reoffer delays: declares {schedule['delays_s']}, the contract gives {got}")
+    ceiling = contract["schedule"]["ceiling_s"]
+    if schedule["delays_s"].count(ceiling) < 2 or schedule["delays_s"][-1] != ceiling:
+        raise CheckError("the reoffer delays must show the ceiling reached and held")
+    for case in schedule["due_cases"]:
+        got_due = reoffer_due(contract, case["attempt"], case["since_previous_offer_s"])
+        if got_due != case["expected_due"]:
+            raise CheckError(f"reoffer case {case['name']!r}: declares due {case['expected_due']}, the contract gives "
+                             f"{got_due}")
+    for case in schedule["restart_cases"]:
+        start = case["restart_s"] if MODEL_MUTANTS["restart_measures_from_restart"] else case["previous_offer_s"]
+        got_due = reoffer_due(contract, case["attempt"], case["now_s"] - start)
+        if got_due != case["expected_due"]:
+            raise CheckError(f"restart case {case['name']!r}: declares due {case['expected_due']}, the contract gives "
+                             f"{got_due}")
+    for case in schedule["overdue_cases"]:
+        since = case["pending_since_s"]
+        if MODEL_MUTANTS["restart_resets_pending_since"] and case["restarts_at_s"]:
+            since = max(case["restarts_at_s"])
+        elapsed = case["now_s"] - since
+        bound = contract["schedule"]["overdue_s"]
+        got_overdue = elapsed > bound if MODEL_MUTANTS["overdue_after_boundary"] else elapsed >= bound
+        if got_overdue != case["expected_overdue"]:
+            raise CheckError(f"overdue case {case['name']!r}: declares {case['expected_overdue']}, the contract gives "
+                             f"{got_overdue}")
+    first, bound = contract["schedule"]["first_s"], contract["schedule"]["overdue_s"]
+    needed = {
+        "the first re-offer one second early": lambda c: c["attempt"] == 1 and c["since_previous_offer_s"] == first - 1,
+        "the first re-offer on time": lambda c: c["attempt"] == 1 and c["since_previous_offer_s"] == first,
+        "a delay at the ceiling": lambda c: reoffer_delay(contract, c["attempt"]) == ceiling
+        and c["since_previous_offer_s"] == ceiling,
+        "a re-offer past any bounded count": lambda c: c["attempt"] > 100,
+    }
+    for why, test in needed.items():
+        if not any(test(c) for c in schedule["due_cases"]):
+            raise CheckError(f"no reoffer case for {why}")
+    elapsed = {c["now_s"] - c["pending_since_s"] for c in schedule["overdue_cases"]}
+    if not {bound - 1, bound} <= elapsed or not any(c["restarts_at_s"] for c in schedule["overdue_cases"]):
+        raise CheckError("no overdue case one second before the bound, at it, or across a restart")
+    for case in schedule["anchor_cases"]:
+        got_due = reoffer_due(contract, len(case["attempted_offers_s"]),
+                              case["now_s"] - reoffer_anchor(case))
+        if got_due != case["expected_due"]:
+            raise CheckError(f"anchor case {case['name']!r}: declares due {case['expected_due']}, the contract gives "
+                             f"{got_due}")
+    if not any(c["sealed_s"] != c["attempted_offers_s"][0] for c in schedule["anchor_cases"]):
+        raise CheckError("no anchor case whose first attempted offer follows its sealing")
+    for kind, names in REQUIRED_SCHEDULE.items():
+        missing = set(names) - {c["name"] for c in schedule[kind]}
+        if missing:
+            raise CheckError(f"no {kind} for {sorted(missing)}")
+
+
+def reoffer_anchor(case: dict) -> int:
+    """The persisted time a re-offer's delay runs from: the previous attempted offer, never the sealing time."""
+    if MODEL_MUTANTS["anchor_at_sealing"]:
+        return case["sealed_s"] if len(case["attempted_offers_s"]) == 1 else case["attempted_offers_s"][-1]
+    if MODEL_MUTANTS["anchor_at_first_offer_always"]:
+        return case["attempted_offers_s"][0]
+    return case["attempted_offers_s"][-1]
+
+
+def check_rollbacks(document: dict) -> None:
+    """Replay checkpoints as the authority receives them, against the highest counters ever accepted."""
+    for sequence in document["rollback_sequences"]:
+        epoch = sequence["epoch"]
+        fifo = "checkpoint_fifo_handoff_v1" in epoch.get("carriage_capabilities", [])
+        if MODEL_MUTANTS["rollback_identity_on_disposition_purpose"]:
+            fifo = fifo or "evidence_authority_disposition" in epoch["artifact_purposes"]
+        if MODEL_MUTANTS["rollback_ignores_capability"]:
+            fifo = True
+        conforming = sequence["credential_conforming"] or MODEL_MUTANTS["rollback_ignores_path"]
+        accepted: dict[str, tuple[int, int]] = {}
+        high = (0, 0)
+        latest = (0, 0)
+        for index, step in enumerate(sequence["steps"]):
+            where = f"rollback sequence {sequence['name']!r} step {index}"
+            counters = (step["high_water_seq"], step["boot_id"])
+            baseline = latest if MODEL_MUTANTS["rollback_latest_baseline"] else high
+            if step["id"] in accepted and accepted[step["id"]] == counters and not MODEL_MUTANTS["rollback_replay_refused"]:
+                got = {"outcome": "accepted", "disposition": None}
+            elif counters[0] < baseline[0] or counters[1] < baseline[1]:
+                scope = ("identity", "identity_replacement_required") if fifo and conforming else (
+                    "artifact", "artifact_terminal")
+                got = {"outcome": "refused_409_conflict", "disposition": {"scope": scope[0], "disposition": scope[1]}}
+            else:
+                accepted[step["id"]] = counters
+                high = (max(high[0], counters[0]), max(high[1], counters[1]))
+                got = {"outcome": "accepted", "disposition": None}
+            latest = counters
+            if got != step["expect"]:
+                raise CheckError(f"{where}: expected {step['expect']}, the contract gives {got}")
+    kinds = {(("checkpoint_fifo_handoff_v1" in s["epoch"].get("carriage_capabilities", [])),
+              s["credential_conforming"]) for s in document["rollback_sequences"]}
+    if not {(True, True), (False, True), (True, False)} <= kinds:
+        raise CheckError("the rollback sequences must cover a declaring epoch on a conforming path, a legacy epoch, "
+                         "and a declaring epoch on a legacy path")
+    names = {s["name"] for s in document["rollback_sequences"]}
+    for required in REQUIRED_ROLLBACKS:
+        if required not in names:
+            raise CheckError(f"no rollback sequence for: {required}")
+
+
+def verify_wire(contract: dict, document: dict, artifact: dict) -> str | None:
+    """The refusal a runtime verifier gives before any receiver state, or None."""
+    if not isinstance(artifact, dict) or sorted(artifact) != sorted(FIELDS) or artifact.get("v") != 1:
+        return "malformed"
+    pair = contract["values"].get(artifact["disposition"])
+    if pair is None or pair[0] != artifact["scope"]:
+        return "malformed"
+    if artifact["anchor_epoch_id"] == "" and artifact["scope"] != "artifact":
+        return "malformed"
+    entry = document["registry"].get(artifact["key_id"])
+    if entry is None:
+        return "unknown_key"
+    if entry["purpose"] != PURPOSE:
+        return "wrong_purpose"
+    if entry["status"] == "retired":
+        return "retired_key"
+    body = {k: v for k, v in artifact.items() if k != "signature"}
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(entry["public_key_hex"])).verify(
+            base64.b64decode(artifact["signature"].removeprefix("ed25519:"), validate=True),
+            contract["domain"] + canonical(body),
+        )
+    except (InvalidSignature, ValueError):
+        return "bad_authenticator"
+    return None
+
+
+def check_wire(contract: dict, document: dict) -> dict:
+    by_name = {}
+    for case in document["wire_cases"]:
+        name = case["name"]
+        if name in by_name:
+            raise CheckError(f"duplicate wire case {name}")
+        by_name[name] = case
+        body = {k: v for k, v in case["artifact"].items() if k != "signature"}
+        if canonical(body).hex() != case["canonical_hex"]:
+            raise CheckError(f"{name}: canonical_hex does not reproduce")
+        got = verify_wire(contract, document, case["artifact"])
+        if case["reject_reason"] != got or case["expected"] != ("reject" if got else "accept"):
+            raise CheckError(f"{name}: declares {case['expected']}/{case['reject_reason']}, the contract gives {got}")
+    for public in document["registry"].values():
+        seed = public.get("seed_hex")
+        if seed is not None:
+            derived = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed)).public_key().public_bytes_raw().hex()
+            if derived != public["public_key_hex"]:
+                raise CheckError("a registry public key does not derive from its published seed")
+    for value, (scope, _) in contract["values"].items():
+        if not any(c["expected"] == "accept" and c["artifact"]["disposition"] == value for c in document["wire_cases"]):
+            raise CheckError(f"no accepted wire case for {value}")
+        for other in ("artifact", "epoch", "identity"):
+            if other != scope and not any(
+                c["artifact"]["disposition"] == value and c["artifact"]["scope"] == other
+                and c["reject_reason"] == "malformed" for c in document["wire_cases"]
+            ):
+                raise CheckError(f"no refused wire case pairing {value} with {other}")
+    for reason in ("unknown_key", "wrong_purpose", "bad_authenticator", "retired_key"):
+        if not any(c["reject_reason"] == reason for c in document["wire_cases"]):
+            raise CheckError(f"no wire case refused {reason}")
+    widened = [c for c in document["wire_cases"] if c["name"].startswith("scope_widened")]
+    if not widened or any(c["reject_reason"] != "bad_authenticator" for c in widened):
+        raise CheckError("a scope widened after signing must be refused bad_authenticator")
+    return by_name
+
+
+def check_mapping(contract: dict, document: dict) -> None:
+    seen = set()
+    for case in document["mapping_cases"]:
+        trigger = case["trigger"]
+        want = contract["mapping"].get(trigger)
+        got = None if case["emits"] is None else (case["emits"]["scope"], case["emits"]["disposition"])
+        if got != want:
+            raise CheckError(f"mapping case {trigger!r}: declares {got}, the contract gives {want}")
+        seen.add(trigger)
+    missing = set(contract["mapping"]) - seen
+    if missing:
+        raise CheckError(f"no mapping case for {sorted(missing)}")
+    for trigger, pair in contract["mapping"].items():
+        if "rollback" in trigger and "`checkpoint_fifo_handoff_v1`" not in trigger and pair is not None and (
+                pair[0] != "artifact"):
+            raise CheckError(f"emission row {trigger!r} makes a rollback under an epoch that does not declare "
+                             "checkpoint_fifo_handoff_v1 identity-scoped; such a rollback MUST NOT produce "
+                             "identity_replacement_required")
+    # The refusals the unclassified sentence names: a quarantined registration,
+    # every transport refusal, capacity, and a reason a later revision adds.
+    unnamed = {c["trigger"] for c in document["mapping_cases"] if c["trigger"] not in contract["mapping"]}
+    missing = UNCLASSIFIED_REQUIRED - unnamed
+    if missing:
+        raise CheckError(f"no mapping case for the unclassified refusals {sorted(missing)}")
+
+
+def replay(contract: dict, document: dict, wire: dict, sequence: dict) -> None:
+    sealed: dict[str, dict] = {}
+    epochs: dict[str, dict] = {}
+    applied: set[str] = set()
+    custodied: set[str] = set()
+    # Durable stop records, keyed (identity, scope, epoch) with the runtime time each was recorded. This
+    # revision defines no operation that removes one, so the model never deletes from it.
+    stops: dict[tuple[str, str, str], int | None] = {}
+    state = {"device": sequence["device"], "current": None, "last": None}
+    name = sequence["name"]
+
+    def epoch_state(epoch: str) -> dict:
+        return epochs.setdefault(epoch, {"registration": None, "status": "pending_authorisation", "offer": None})
+
+    def identity_stopped(device: str | None = None) -> bool:
+        return (device or state["device"], "identity", "") in stops
+
+    def epoch_stopped(epoch: str, device: str | None = None) -> bool:
+        return (device or state["device"], "epoch", epoch) in stops
+
+    def in_stopped_scope(epoch: str, device: str | None = None) -> bool:
+        return identity_stopped(device) or epoch_stopped(epoch, device)
+
+    def stop_time(entry: dict) -> int | None:
+        """When a sealed artifact entered stopped custody: its stop's record time, or its own sealing if later."""
+        keys = ((entry["device"], "identity", ""), (entry["device"], "epoch", entry["epoch"]))
+        recorded = [stops[k] for k in keys if k in stops]
+        if any(x is None for x in recorded) or entry["at"] is None:
+            return None
+        return max(min(recorded), entry["at"])
+
+    def health() -> dict:
+        current = state["current"]
+        ep = epoch_state(current)
+        stopped = in_stopped_scope(current)
+        if ep["status"] in ("pending_authorisation", "confirmed"):
+            offer = "not_applicable"
+        elif stopped:
+            offer = "closed"
+        else:
+            offer = ep["offer"]
+        local = [e for d, e in sealed.items() if d not in custodied and in_stopped_scope(e["epoch"], e["device"])
+                 and (e["device"] == state["device"] or MODEL_MUTANTS["count_retired_identity"])]
+        if MODEL_MUTANTS["count_current_epoch_only"]:
+            local = [e for e in local if e["epoch"] == current and e["device"] == state["device"]]
+        sizes = [e["bytes"] for e in local]
+        since = [stop_time(e) for e in local]
+        return {
+            "registration_status": ep["status"],
+            "registration_offer": offer,
+            "delivery_stop_status": (
+                "identity_stopped" if identity_stopped()
+                else "epoch_stopped" if epoch_stopped(current) else "not_stopped"),
+            "last_disposition": state["last"],
+            "stopped_local_artifact_count": len(local),
+            "stopped_local_bytes": None if None in sizes else sum(sizes),
+            "oldest_stopped_local_since_ms": None if not local else (None if None in since else min(since)),
+        }
+
+    def retired_local() -> dict:
+        """Each retired identity's stopped-local artifacts, queryable under that identity only."""
+        out: dict = {}
+        for d, e in sealed.items():
+            if e["device"] != state["device"] and d not in custodied and in_stopped_scope(e["epoch"], e["device"]):
+                entry = out.setdefault(e["device"], {"count": 0, "bytes": 0})
+                entry["count"] += 1
+                entry["bytes"] = None if entry["bytes"] is None or e["bytes"] is None else entry["bytes"] + e["bytes"]
+        return out
+
+    def handed_before_stop(entry: dict) -> bool:
+        """Whether the runtime can prove this artifact's handoff began before every stop now covering it."""
+        if not entry["handed"]:
+            return MODEL_MUTANTS["ack_of_unhanded_off_moves"]
+        keys = ((entry["device"], "identity", ""), (entry["device"], "epoch", entry["epoch"]))
+        covering = [stops[k] for k in keys if k in stops]
+        if not covering or MODEL_MUTANTS["ack_ignores_handoff_time"]:
+            return True
+        start = entry["handoff_at"]
+        return start is not None and None not in covering and all(start < at for at in covering)
+
+    def local_counts() -> dict:
+        unacknowledged = [d for d in sealed if d not in custodied]
+        return {
+            "local_stopped": sum(1 for d in unacknowledged if in_stopped_scope(sealed[d]["epoch"], sealed[d]["device"])),
+            "gateway_custodied": len(custodied),
+        }
+
+    def reoffers(epoch: str) -> bool:
+        ep = epoch_state(epoch)
+        return (ep["status"] == "pending_confirmation" and ep["offer"] == "offering"
+                and not in_stopped_scope(epoch))
+
+    def disposition(artifact: dict, at_ms: int | None) -> tuple[str, str]:
+        refusal = verify_wire(contract, document, artifact)
+        if refusal:
+            return "refused", refusal
+        if artifact["device_id"] != state["device"]:
+            return "refused", "binding_mismatch"
+        subject = sealed.get(artifact["triggering_digest"])
+        if subject is None or subject["device"] != state["device"] or (
+                artifact["anchor_epoch_id"] != subject["epoch"] and not (
+                artifact["anchor_epoch_id"] == "" and artifact["scope"] == "artifact")):
+            return "refused", "binding_mismatch"
+        if artifact["disposition"] == "retained_pending" and subject["kind"] != "registration":
+            return "refused", "binding_mismatch"
+        signed = digest(artifact)
+        if signed in applied:
+            return "applied", ""
+        value, scope = artifact["disposition"], artifact["scope"]
+        epoch = subject["epoch"]
+        ep = epoch_state(epoch)
+        is_registration = subject["kind"] == "registration" and ep["registration"] == artifact["triggering_digest"]
+        if scope == "identity":
+            if identity_stopped():
+                return "refused", "superseded"
+            stops[(state["device"], "identity", "")] = at_ms
+        elif scope == "epoch":
+            if in_stopped_scope(epoch):
+                return "refused", "superseded"
+            stops[(state["device"], "epoch", epoch)] = at_ms
+        else:
+            if MODEL_MUTANTS["later_disposition_lifts"]:
+                for key in [k for k in stops if k[0] == state["device"]]:
+                    del stops[key]
+            if is_registration:
+                if ep["status"] == "confirmed" or ep["offer"] == "closed":
+                    return "refused", "superseded"
+                if value == "retained_pending":
+                    ep["offer"] = "suspended"
+                else:
+                    ep["offer"] = "closed"
+        applied.add(signed)
+        state["last"] = {"disposition": value, "scope": scope}
+        return "applied", ""
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        observed: dict = {}
+        if event == "seal":
+            stopped_now = in_stopped_scope(step["epoch"])
+            # `handoff_deferred`: sealed, but its handoff had not begun (for example, held behind a predecessor).
+            handed = not stopped_now and not step.get("handoff_deferred", False)
+            sealed[step["digest"]] = {
+                "kind": step["kind"], "epoch": step["epoch"], "device": state["device"],
+                "bytes": step.get("bytes"), "at": step.get("at_ms"), "handed": handed,
+                # `handoff_unrecorded`: handed off, but with no durable record of when its handoff began.
+                "handoff_at": step.get("at_ms") if handed and not step.get("handoff_unrecorded", False) else None,
+            }
+            if step["kind"] == "registration":
+                ep = epoch_state(step["epoch"])
+                ep["registration"], ep["status"], ep["offer"] = step["digest"], "pending_confirmation", "offering"
+            state["current"] = state["current"] or step["epoch"]
+            # Sealing always continues; only the handoff stops within a stopped scope.
+            observed["delivery_state"] = "stopped" if stopped_now else "handed_off"
+        elif event == "queued_ack":
+            # A verified `queued` acknowledgement moves custody to the gateway, and nothing moves it back. It
+            # names the identical bytes by digest, and lowers local counts only for bytes whose handoff provably
+            # began before every stop covering them; anything else is inconsistent state.
+            entry = sealed.get(step["digest"])
+            if entry is None or not handed_before_stop(entry):
+                observed["ack"] = "refused:inconsistent_state"
+            else:
+                custodied.add(step["digest"])
+                observed["ack"] = "applied"
+        elif event == "gateway_disconnected":
+            pass
+        elif event == "epoch_change":
+            state["current"] = step["epoch"]
+            epoch_state(step["epoch"])
+            if MODEL_MUTANTS["new_epoch_clears_stops"]:
+                stops.clear()
+        elif event == "disposition":
+            artifact = wire[step["wire_case"]]["artifact"]
+            outcome, reason = disposition(artifact, step.get("at_ms"))
+            observed["ack"] = outcome if not reason else f"{outcome}:{reason}"
+        elif event == "confirmation":
+            ep = epoch_state(step["epoch"])
+            if ep["registration"] is None:
+                observed["ack"] = "refused:binding_mismatch"
+            else:
+                ep["status"], ep["offer"] = "confirmed", None
+                observed["ack"] = "applied"
+        elif event == "fresh_reference":
+            ep = epoch_state(step["epoch"])
+            sealed[step["digest"]] = {
+                "kind": "registration", "epoch": step["epoch"], "device": state["device"],
+                "bytes": step.get("bytes"), "at": step.get("at_ms"), "handed": not in_stopped_scope(step["epoch"]),
+                "handoff_at": None if in_stopped_scope(step["epoch"]) else step.get("at_ms"),
+            }
+            ep["registration"], ep["status"], ep["offer"] = step["digest"], "pending_confirmation", "offering"
+            if MODEL_MUTANTS["reference_lifts_epoch_stop"]:
+                stops.pop((state["device"], "epoch", step["epoch"]), None)
+        elif event == "restart":
+            if MODEL_MUTANTS["restart_clears_stops"]:
+                stops.clear()
+        elif event == "configuration_change":
+            if MODEL_MUTANTS["configuration_clears_stops"]:
+                stops.clear()
+        elif event == "identity_replacement":
+            # A new identity starts afresh; the retired identity's stop records and sealed artifacts are kept.
+            if MODEL_MUTANTS["replacement_drops_retired"]:
+                retired = state["device"]
+                for key in [k for k in stops if k[0] == retired]:
+                    del stops[key]
+                for d in [d for d, e in sealed.items() if e["device"] == retired]:
+                    del sealed[d]
+            state["device"] = step["device"]
+            epochs.clear()
+            state["current"], state["last"] = step["epoch"], None
+            epoch_state(step["epoch"])
+        elif event in ("tier_c_approved", "tier_d_condition"):
+            # The contract's no-gating rule: execution never depends on disposition state.
+            observed["executes"] = True
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        if state["current"] is not None:
+            observed.update(health())
+            current = state["current"]
+            observed["reoffers"] = reoffers(current)
+            observed["checkpoints"] = not in_stopped_scope(current)
+            observed["envelopes"] = not in_stopped_scope(current)
+            observed["records_locally"] = True
+            observed.update(local_counts())
+            observed["retired_identity_stopped"] = sorted(
+                {k[0] for k in stops if k[1] == "identity" and k[0] != state["device"]})
+            observed["retired_stopped_local"] = retired_local()
+        if "reoffers_epoch" in step["expect"]:
+            observed["reoffers_epoch"] = {e: reoffers(e) for e in step["expect"]["reoffers_epoch"]}
+        for key, value in step["expect"].items():
+            if key not in observed:
+                raise CheckError(f"{where}: expectation {key!r} is not something this step decides")
+            if observed[key] != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed[key]!r}")
+
+
+# Implementation defects the corpus must catch; each is switched on alone under --mutations.
+MODEL_MUTANTS = {
+    "restart_clears_stops": False,
+    "configuration_clears_stops": False,
+    "new_epoch_clears_stops": False,
+    "reference_lifts_epoch_stop": False,
+    "later_disposition_lifts": False,
+    "replacement_drops_retired": False,
+    "count_current_epoch_only": False,
+    "count_retired_identity": False,
+    "ack_of_unhanded_off_moves": False,
+    "ack_ignores_handoff_time": False,
+    "no_doubling": False,
+    "ceiling_unbounded": False,
+    "bounded_attempts": False,
+    "due_after_boundary": False,
+    "overdue_after_boundary": False,
+    "restart_resets_pending_since": False,
+    "restart_measures_from_restart": False,
+    "anchor_at_sealing": False,
+    "anchor_at_first_offer_always": False,
+    "rollback_ignores_capability": False,
+    "rollback_ignores_path": False,
+    "rollback_identity_on_disposition_purpose": False,
+    "rollback_latest_baseline": False,
+    "rollback_replay_refused": False,
+}
+
+
+REQUIRED_ROLLBACKS = (
+    "a legacy release that reorders checkpoints is refused artifact-scoped, never identity-scoped",
+    "a legacy epoch verifying dispositions is still refused artifact-scoped",
+    "a FIFO epoch on a conforming path is refused identity-scoped",
+    "a FIFO epoch on a legacy path is refused artifact-scoped",
+    "a rollback is measured against the highest counters ever accepted",
+)
+REQUIRED_SCHEDULE = {
+    "due_cases": (
+        "the first re-offer one second early", "the first re-offer on time",
+        "the second re-offer before its doubled delay", "the second re-offer at its doubled delay",
+        "the sixth re-offer at 1,920 seconds",
+        "the seventh re-offer, whose doubling would pass the ceiling, one second early",
+        "the seventh re-offer at the ceiling", "a later re-offer held at the ceiling, one second early",
+        "a later re-offer held at the ceiling", "the thousandth re-offer, past any bounded count",
+    ),
+    "restart_cases": ("a restart between offers does not extend a ceiling delay",),
+    "anchor_cases": (
+        "the first re-offer runs from the first attempted offer, not from sealing, one second early",
+        "the first re-offer runs from the first attempted offer, not from sealing, on time",
+        "sealing and the first offer in one atomic operation",
+        "a later re-offer runs from the previous attempted offer",
+        "a restart measures from the persisted previous attempted offer",
+    ),
+    "overdue_cases": (
+        "one second before the overdue bound", "at the overdue bound",
+        "a restart does not reset the pending-since time",
+        "a restart one second before the bound leaves it one second before",
+    ),
+}
+REQUIRED_SEQUENCES = (
+    "retained_pending suspends re-offers and a later confirmation completes them",
+    "a terminal disposition closes the registration attempt and a fresh reference repairs it",
+    "an artifact-scoped disposition on a checkpoint does not stop later checkpoints",
+    "an epoch-scoped disposition stops offers only for that epoch",
+    "an identity-scoped disposition stops offers and checkpoints and survives restart",
+    "an invalid, wrong-purpose, stale or wrong-device disposition changes nothing",
+    "a disposition never changes Tier C or Tier D execution",
+    "a replacement identity starts an independent lifecycle",
+    "a confirmation for an epoch this device never registered changes nothing",
+    "an epoch change leaves the previous epoch's obligation re-offered",
+    "an identity stop keeps sealing locally, hands off nothing new, and keeps custody where it is",
+    "an epoch stop leaves another epoch's handoff running",
+    "delivery_stop_status asserts nothing about connectivity",
+    "stopped-local counts are zero and null before any stop",
+    "a historical stopped epoch stays stopped and counted",
+    "an identity stop is lifted by no later disposition and survives identity replacement",
+    "an acknowledgement for bytes whose handoff had not begun before the stop is inconsistent state",
+    "a new stop on the replacement identity counts only the replacement identity's artifacts",
+)
+
+
+def check(contract: dict, document: dict) -> None:
+    wire = check_wire(contract, document)
+    check_mapping(contract, document)
+    check_schedule(contract, document)
+    check_rollbacks(document)
+    sequences = document["runtime_sequences"]
+    for prefix in REQUIRED_SEQUENCES:
+        if not any(s["name"].startswith(prefix) for s in sequences):
+            raise CheckError(f"no runtime sequence for: {prefix}")
+    for sequence in sequences:
+        replay(contract, document, wire, sequence)
+
+
+def corpus_mutants(document: dict):
+    for i, case in enumerate(document["wire_cases"]):
+        bad = copy.deepcopy(document)
+        bad["wire_cases"][i]["expected"] = "accept" if case["expected"] == "reject" else "reject"
+        yield f"wire {case['name']} verdict", bad
+        bad = copy.deepcopy(document)
+        bad["wire_cases"][i]["reject_reason"] = "malformed" if case["reject_reason"] != "malformed" else "bad_authenticator"
+        yield f"wire {case['name']} reason", bad
+        if case["expected"] == "accept":
+            bad = copy.deepcopy(document)
+            bad["wire_cases"][i]["artifact"]["decided_at_ms"] += 1
+            bad["wire_cases"][i]["canonical_hex"] = canonical(
+                {k: v for k, v in bad["wire_cases"][i]["artifact"].items() if k != "signature"}).hex()
+            yield f"wire {case['name']} signed body altered", bad
+    for i, case in enumerate(document["mapping_cases"]):
+        bad = copy.deepcopy(document)
+        bad["mapping_cases"][i]["emits"] = None if case["emits"] else {"scope": "identity", "disposition": "identity_replacement_required"}
+        yield f"mapping {case['trigger']!r}", bad
+        bad = copy.deepcopy(document)
+        del bad["mapping_cases"][i]
+        yield f"without mapping {case['trigger']!r}", bad
+    schedule = document["reoffer_schedule"]
+    for i in range(len(schedule["delays_s"])):
+        bad = copy.deepcopy(document)
+        bad["reoffer_schedule"]["delays_s"][i] += 1
+        yield f"reoffer delay {i + 1}", bad
+    for kind, key in (("due_cases", "expected_due"), ("restart_cases", "expected_due"),
+                      ("overdue_cases", "expected_overdue"), ("anchor_cases", "expected_due")):
+        for i, case in enumerate(schedule[kind]):
+            bad = copy.deepcopy(document)
+            bad["reoffer_schedule"][kind][i][key] = not case[key]
+            yield f"{kind} {case['name']!r}", bad
+            bad = copy.deepcopy(document)
+            del bad["reoffer_schedule"][kind][i]
+            yield f"without {kind} {case['name']!r}", bad
+    for i, sequence in enumerate(document["rollback_sequences"]):
+        bad = copy.deepcopy(document)
+        del bad["rollback_sequences"][i]
+        yield f"without rollback {sequence['name']!r}", bad
+        for j, step in enumerate(sequence["steps"]):
+            bad = copy.deepcopy(document)
+            target = bad["rollback_sequences"][i]["steps"][j]["expect"]
+            if target["disposition"] is None:
+                target["outcome"] = "refused_409_conflict"
+            else:
+                target["disposition"] = {"scope": "identity", "disposition": "identity_replacement_required"} if (
+                    target["disposition"]["scope"] == "artifact") else {"scope": "artifact",
+                                                                          "disposition": "artifact_terminal"}
+            yield f"rollback {sequence['name']!r} step {j}", bad
+    for i, sequence in enumerate(document["runtime_sequences"]):
+        bad = copy.deepcopy(document)
+        del bad["runtime_sequences"][i]
+        yield f"without {sequence['name']!r}", bad
+        for j, step in enumerate(sequence["steps"]):
+            for key, value in step["expect"].items():
+                bad = copy.deepcopy(document)
+                target = bad["runtime_sequences"][i]["steps"][j]["expect"]
+                if isinstance(value, bool):
+                    target[key] = not value
+                elif isinstance(value, int):
+                    target[key] = value + 1
+                elif isinstance(value, list):
+                    target[key] = value[:-1] if value else ["energy-monitor-ikeja-01"]
+                elif isinstance(value, dict) and key == "reoffers_epoch":
+                    target[key] = {e: not v for e, v in value.items()}
+                elif value is None:
+                    target[key] = {"disposition": "artifact_terminal", "scope": "artifact"}
+                elif isinstance(value, dict):
+                    target[key] = {**value, "scope": "epoch" if value.get("scope") != "epoch" else "identity"}
+                else:
+                    target[key] = {
+                        "offering": "suspended", "suspended": "offering", "closed": "offering",
+                        "not_applicable": "offering", "not_stopped": "epoch_stopped",
+                        "epoch_stopped": "identity_stopped", "identity_stopped": "not_stopped",
+                        "stopped": "handed_off", "handed_off": "stopped",
+                        "pending_confirmation": "pending_authorisation",
+                        "confirmed": "pending_confirmation", "applied": "refused:superseded",
+                    }.get(value, "applied")
+                yield f"{sequence['name']!r} step {j} {key}", bad
+
+
+def text_mutants(text: str):
+    for start, end in BLOCKS:
+        block = _block(text, start, end)
+        for unit in _units(block):
+            pattern = r"\s+".join(re.escape(w) for w in unit.split())
+            edited, count = re.subn(pattern, "", block, count=1)
+            if count == 1:
+                yield f"delete {unit[:60]!r}", text.replace(block, edited, 1)
+    for old, new, label in (
+        ("| `retained_pending` | `artifact` | no |", "| `retained_pending` | `epoch` | no |", "retained_pending at epoch scope"),
+        ("| `epoch_reprovisioning_required` | `epoch` | yes |", "| `epoch_reprovisioning_required` | `identity` | yes |", "epoch value at identity scope"),
+        ("| `400 malformed` | `artifact` | `artifact_terminal` |", "| `400 malformed` | none | none |", "malformed emits nothing"),
+        ("| `pending_registration_conflict`, `pending_registration_limit` | none | none |",
+         "| `pending_registration_conflict`, `pending_registration_limit` | `artifact` | `artifact_terminal` |",
+         "pending conflict emits a terminal disposition"),
+        ("`ori.evidence_disposition.v1\\0`", "`ori.evidence_disposition.v2\\0`", "domain changed"),
+        ("first re-offer occurs after 60 seconds", "first re-offer occurs after 30 seconds", "first delay shortened"),
+        ("doubles\nuntil it reaches 3,600 seconds; subsequent delays remain 3,600 seconds",
+         "doubles\nuntil it reaches 7,200 seconds; subsequent delays remain 7,200 seconds", "ceiling raised"),
+        ("confirmation-overdue bound is 7,200 seconds", "confirmation-overdue bound is 14,400 seconds",
+         "overdue bound raised"),
+        ("subsequent delays remain 3,600 seconds", "subsequent delays remain 7,200 seconds", "delays leave the ceiling"),
+        ("| Checkpoint refused as `high_water_seq` rollback, otherwise | `artifact` | `artifact_terminal` |",
+         "| Checkpoint refused as `high_water_seq` rollback, otherwise | `identity` | `identity_replacement_required` |",
+         "a legacy rollback made identity-scoped"),
+    ):
+        yield f"re-pin: {label}", text.replace(old, new, 1)
+
+
+def main() -> int:
+    text = CONTRACT.read_text(encoding="utf-8")
+    health = HEALTH.read_text(encoding="utf-8")
+    if "--print-units" in sys.argv[1:]:
+        print(json.dumps(pinned_units(text), indent=2, ensure_ascii=False))
+        return 0
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        contract = load_contract(text, health)
+        check(contract, document)
+    except (CheckError, KeyError) as error:
+        print(f"check-evidence-disposition-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(document):
+            total += 1
+            try:
+                check(contract, bad)
+            except (CheckError, KeyError):
+                continue
+            survived.append(label)
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                check(contract, document)
+                survived.append(f"model mutant {flag}")
+            except (CheckError, KeyError):
+                pass
+            finally:
+                MODEL_MUTANTS[flag] = False
+        edits = list(text_mutants(text))
+        for label, edited in edits:
+            total += 1
+            try:
+                check(load_contract(edited, health, check_pin=not label.startswith("re-pin")), document)
+            except (CheckError, KeyError):
+                continue
+            survived.append(f"contract text: {label}")
+        for key, sentence in {**MODEL_SENTENCES, **HEALTH_SENTENCES}.items():
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+            source_text, source_health = text, health
+            if key in HEALTH_SENTENCES:
+                source_health, count = re.subn(pattern, reworded, health, count=1)
+            else:
+                source_text, count = re.subn(pattern, reworded, text, count=1)
+            total += 1
+            if count != 1:
+                survived.append(f"re-pin mutant for {key} matches nothing")
+                continue
+            try:
+                check(load_contract(source_text, source_health, check_pin=False), document)
+            except (CheckError, KeyError):
+                continue
+            survived.append(f"re-pin: {key} reworded")
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"disposition mutations: {total} refused, {len(edits)} of them contract-text edits")
+    print(
+        f"disposition vectors: {len(document['wire_cases'])} wire cases, {len(document['mapping_cases'])} mapping "
+        f"cases, {len(document['runtime_sequences'])} runtime sequences and "
+        f"{sum(len(document['reoffer_schedule'][k]) for k in REQUIRED_SCHEDULE)} re-offer schedule cases hold to "
+        "evidence-exchange/v2"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Check the evidence configuration vectors against gateway-config/v2.
+
+The defaults are read from the `evidence` table in `gateway-config/v2.md`, and
+every rule this model applies must appear there word for word, so a contract
+that changes a default or a rule fails here until the model changes with it.
+Each case is a `gateway.device_ids` list and an `evidence` block; a valid case
+also names the effective values after defaults, and a refused case names the
+rule it breaks.
+
+    python3 scripts/check-gateway-config-evidence-vectors
+    python3 scripts/check-gateway-config-evidence-vectors --mutations
+
+`--mutations` flips each verdict, removes each rule's refused cases, changes
+each default in the table, and drops the last word of each model sentence, and
+requires every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-config" / "v2.md"
+VECTORS = ROOT / "gateway-config" / "vectors" / "evidence-config-v2.json"
+START = "## `evidence`"
+END = "## `provider`"
+MAX_ARTIFACT = 1_048_576
+
+MODEL_SENTENCES = {
+    "backoff": "The back-off MUST satisfy `backoff_max_s >= backoff_base_s >= retry_interval_s`.",
+    "share": (
+        "Each share MUST hold the registration reserve of "
+        "[`evidence-transport/v2.md`](../evidence-transport/v2.md) plus one maximum "
+        "encoded evidence record: at least two items, and at least the encoded bytes of "
+        "one maximum-size registration record plus one maximum-size evidence record,"
+    ),
+    "disabled": "Disabled, the other keys are not validated.",
+    "absolute": "Absolute path of the durable outbound queue.",
+    "distinct": "Absolute path of the durable return queue; distinct from `queue_directory`.",
+    "probe": "300 through 900.",
+    "domain": (
+        "1 to 128 Unicode scalar values, none of them a control character (general "
+        "category `Cc`), a character with the Unicode `White_Space` property, `/`, `+`, or `#`."
+    ),
+    "opt_in": (
+        "The rules below apply exactly when at least one configured device declares `gateway-evidence-carriage/v1` "
+        "in `device_carriage`, and a configuration that breaks one is refused at load, before any lane opens:"
+    ),
+    "legacy": "`enabled: true` on its own activates none of the rules below.",
+    "legacy_keys": (
+        "the directories are absolute and distinct, the bounds and the interval are positive, and each environment "
+        "variable name is a name, containing no whitespace or `=`."
+    ),
+    "domain_scope": "A device on `gateway-api/v1` carriage is held only to the `gateway.device_ids` rule above;",
+    "restore": (
+        "Removing every declaration restores the courier's own validation; the gateway migrates and deletes nothing "
+        "it retains when a declaration is added or removed."
+    ),
+    "carriage": (
+        "`device_carriage` declares each device's inbound evidence-carriage contract as exactly `gateway-api/v1` or "
+        "`gateway-evidence-carriage/v1`. Absence defaults to `gateway-api/v1`. Every key MUST be one of "
+        "`gateway.device_ids`, and every value one of those two strings; any other key or value is refused."
+    ),
+    "stopped_apart": (
+        "Stopped custody is bounded apart from active-delivery capacity: it counts toward the stopped-custody bounds "
+        "and never toward `max_items` or `max_bytes`."
+    ),
+    "stopped_device": "Positive, and at most `stopped_max_items`.",
+    "stopped_device_bytes": "Positive, and at most `stopped_max_bytes`.",
+    "stopped_start": "A bound is therefore never a reason to refuse to start.",
+}
+RULES = ("directories", "bounds", "probe", "backoff", "share", "env", "device_id", "carriage", "stopped")
+CARRIAGE = ("gateway-api/v1", "gateway-evidence-carriage/v1")
+MODEL_MUTANTS = {"carriage_default_v1": False, "carriage_unknown_device_ok": False, "stopped_device_unbounded": False,
+                 "opt_in_ignored": False, "domain_on_legacy": False}
+LEGACY_DEVICE_FORBIDDEN = "/+#|"
+OPT_IN = "gateway-evidence-carriage/v1"
+OPT_IN_RULES = ("probe", "backoff", "share", "stopped")
+ENV_KEYS = ("endpoint_env", "client_id_env", "secret_env")
+DEVICE = re.compile(r"[^\s/+#\x00-\x1f\x7f-\x9f]{1,128}")
+ENV_NAME = re.compile(r"[^\s=]+")
+
+
+class CheckError(Exception):
+    pass
+
+
+class Refused(Exception):
+    def __init__(self, rule: str) -> None:
+        super().__init__(rule)
+        self.rule = rule
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_contract(text: str) -> dict:
+    start = text.find(START)
+    end = text.find(END, start)
+    if start < 0 or end < start:
+        raise CheckError("gateway-config/v2.md lacks the evidence section")
+    section = text[start:end]
+    whole = _norm(text)
+    for key, sentence in MODEL_SENTENCES.items():
+        if _norm(sentence) not in whole:
+            raise CheckError(
+                f"gateway-config/v2 no longer states the {key} rule this model hard-codes; "
+                "change the model and MODEL_SENTENCES with it"
+            )
+    defaults: dict[str, str] = {}
+    for line in section.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 5 and cells[0].startswith("`") and cells[0] != "Key":
+            defaults[cells[0].strip("`")] = cells[2]
+    wanted = {"max_items", "max_bytes", "retry_interval_s", "store_probe_interval_s",
+              "backoff_base_s", "backoff_max_s", "device_carriage", "stopped_max_items", "stopped_max_bytes",
+              "stopped_device_max_items", "stopped_device_max_bytes"}
+    if not wanted <= set(defaults):
+        raise CheckError(f"the evidence table lacks {sorted(wanted - set(defaults))}")
+    try:
+        numbers = {k: int(defaults[k].strip("`")) for k in
+                   ("max_items", "max_bytes", "retry_interval_s", "store_probe_interval_s", "stopped_max_items",
+                    "stopped_max_bytes")}
+    except ValueError as error:
+        raise CheckError(f"an evidence default is not an integer: {error}") from None
+    if defaults["backoff_base_s"] != "`retry_interval_s`":
+        raise CheckError("the backoff_base_s default is not the model's")
+    bound = re.fullmatch(r"`(\d+)`, or `backoff_base_s` if longer", defaults["backoff_max_s"])
+    if bound is None:
+        raise CheckError("the backoff_max_s default is not the model's")
+    numbers["backoff_max_floor"] = int(bound.group(1))
+    if defaults["device_carriage"] != "`{}`":
+        raise CheckError("the device_carriage default is not the model's")
+    for key, total in (("stopped_device_max_items", "stopped_max_items"), ("stopped_device_max_bytes", "stopped_max_bytes")):
+        if defaults[key] != f"`{total}` divided equally across `gateway.device_ids`":
+            raise CheckError(f"the {key} default is not the model's")
+    return numbers
+
+
+def effective(defaults: dict, evidence: dict, devices: list | None = None) -> dict:
+    retry = evidence.get("retry_interval_s", defaults["retry_interval_s"])
+    base = evidence.get("backoff_base_s", retry)
+    devices = devices or []
+    stopped_items = evidence.get("stopped_max_items", defaults["stopped_max_items"])
+    stopped_bytes = evidence.get("stopped_max_bytes", defaults["stopped_max_bytes"])
+    absent = "gateway-evidence-carriage/v1" if MODEL_MUTANTS["carriage_default_v1"] else "gateway-api/v1"
+    declared = evidence.get("device_carriage", {})
+    return {
+        "device_carriage": {d: declared.get(d, absent) if isinstance(declared, dict) else absent for d in devices},
+        "stopped_max_items": stopped_items,
+        "stopped_max_bytes": stopped_bytes,
+        "stopped_device_max_items": evidence.get("stopped_device_max_items",
+                                                 stopped_items // len(devices) if devices and type(stopped_items) is int
+                                                 else stopped_items),
+        "stopped_device_max_bytes": evidence.get("stopped_device_max_bytes",
+                                                 stopped_bytes // len(devices) if devices and type(stopped_bytes) is int
+                                                 else stopped_bytes),
+        "max_items": evidence.get("max_items", defaults["max_items"]),
+        "max_bytes": evidence.get("max_bytes", defaults["max_bytes"]),
+        "retry_interval_s": retry,
+        "backoff_base_s": base,
+        "backoff_max_s": evidence.get("backoff_max_s", max(defaults["backoff_max_floor"], base)),
+        "store_probe_interval_s": evidence.get("store_probe_interval_s", defaults["store_probe_interval_s"]),
+    }
+
+
+def validate(defaults: dict, devices: list, evidence: dict) -> dict | None:
+    """The courier's own rules whenever it is enabled; the opt-in rules only when a device declares the carriage."""
+    if not evidence.get("enabled", False):
+        return None
+    for device in devices:
+        if not isinstance(device, str) or not device or any(ch in device for ch in LEGACY_DEVICE_FORBIDDEN):
+            raise Refused("device_id")
+    out, back = evidence.get("queue_directory", ""), evidence.get("return_queue_directory", "")
+    if not (out.startswith("/") and back.startswith("/")) or out.rstrip("/") == back.rstrip("/"):
+        raise Refused("directories")
+    values = effective(defaults, evidence, devices)
+    for key in ("max_items", "max_bytes", "retry_interval_s"):
+        if type(values[key]) is not int or values[key] <= 0:
+            raise Refused("bounds")
+    for key in ENV_KEYS:
+        if not ENV_NAME.fullmatch(evidence.get(key, "")):
+            raise Refused("env")
+    carriage = evidence.get("device_carriage", {})
+    if not isinstance(carriage, dict) or any(v not in CARRIAGE for v in carriage.values()) or (
+            set(carriage) - set(devices) and not MODEL_MUTANTS["carriage_unknown_device_ok"]):
+        raise Refused("carriage")
+    if MODEL_MUTANTS["carriage_unknown_device_ok"]:
+        values["device_carriage"] = {**values["device_carriage"], **carriage}
+    opted = [d for d in devices if values["device_carriage"].get(d) == OPT_IN]
+    if MODEL_MUTANTS["opt_in_ignored"]:
+        opted = list(devices)
+    if not opted:
+        return values
+    for device in (devices if MODEL_MUTANTS["domain_on_legacy"] else opted):
+        if not DEVICE.fullmatch(device):
+            raise Refused("device_id")
+    if not 300 <= values["store_probe_interval_s"] <= 900:
+        raise Refused("probe")
+    if not values["backoff_max_s"] >= values["backoff_base_s"] >= values["retry_interval_s"]:
+        raise Refused("backoff")
+    items, share = values["max_items"] // len(devices), values["max_bytes"] // len(devices)
+    if items < 2 or share < 2 * MAX_ARTIFACT:
+        raise Refused("share")
+    if share < 4 * MAX_ARTIFACT:
+        # Between two bare artifacts and four, whether two encoded records fit
+        # depends on record framing the contract leaves to the implementation.
+        raise CheckError("a case sits in the framing-dependent band of the share rule; move it")
+    for total, device in (("stopped_max_items", "stopped_device_max_items"),
+                          ("stopped_max_bytes", "stopped_device_max_bytes")):
+        if type(values[total]) is not int or values[total] <= 0 or type(values[device]) is not int or values[device] <= 0:
+            raise Refused("stopped")
+        if values[device] > values[total] and not MODEL_MUTANTS["stopped_device_unbounded"]:
+            raise Refused("stopped")
+    return values
+
+
+def check(document: dict, defaults: dict) -> None:
+    names = set()
+    for case in document["cases"]:
+        if case["name"] in names:
+            raise CheckError(f"duplicate case {case['name']!r}")
+        names.add(case["name"])
+        try:
+            values = validate(defaults, case["device_ids"], case["evidence"])
+        except Refused as refusal:
+            if case["valid"] or refusal.rule != case.get("rule"):
+                raise CheckError(f"{case['name']}: refused for {refusal.rule}, declared {case.get('rule')}")
+            continue
+        if not case["valid"]:
+            raise CheckError(f"{case['name']}: declared refused for {case.get('rule')}, accepted")
+        if values != case.get("effective"):
+            raise CheckError(f"{case['name']}: effective values {values}, declared {case.get('effective')}")
+    for rule in RULES:
+        if not any(not c["valid"] and c.get("rule") == rule for c in document["cases"]):
+            raise CheckError(f"no refused case for rule {rule}")
+    if not any(c["valid"] and c["effective"] is None for c in document["cases"]):
+        raise CheckError("no case shows a disabled courier accepted without validation")
+    if not any(c["valid"] and c["effective"] and set(c["evidence"]) <= {"enabled", "queue_directory",
+               "return_queue_directory", *ENV_KEYS} for c in document["cases"]):
+        raise CheckError("no case shows every default applied")
+    if not any(c["valid"] and c["effective"] and "gateway-evidence-carriage/v1" in c["effective"]["device_carriage"].values()
+               and "gateway-api/v1" in c["effective"]["device_carriage"].values() for c in document["cases"]):
+        raise CheckError("no case shows a mixed site, one device declared and another defaulted to gateway-api/v1")
+    # The opt-in conditions: a legacy site keeps what the shipped loader accepts, and every opt-in refusal
+    # disappears with the declaration.
+    def legacy(c: dict) -> bool:
+        return c["valid"] and c["effective"] and OPT_IN not in c["effective"]["device_carriage"].values()
+    if not any(legacy(c) and c["effective"]["backoff_max_s"] < c["effective"]["backoff_base_s"] for c in document["cases"]):
+        raise CheckError("no case shows a legacy site accepted with a back-off bound below its base")
+    if not any(legacy(c) and c["effective"]["max_items"] < 2 * len(c["device_ids"]) for c in document["cases"]):
+        raise CheckError("no case shows a legacy site accepted with a queue too small for the registration reserve")
+    if not any(c["valid"] and c["effective"] and any(v == OPT_IN for v in c["effective"]["device_carriage"].values())
+               and any(v != OPT_IN and not DEVICE.fullmatch(d) for d, v in c["effective"]["device_carriage"].items())
+               for c in document["cases"]):
+        raise CheckError("no case shows a legacy device outside the routing domain accepted beside an opted-in device")
+    empties = [c for c in document["cases"] if c["valid"] and c["evidence"].get("device_carriage") == {}]
+    if not any(any(o["valid"] and "device_carriage" not in o["evidence"] and o["effective"] == e["effective"]
+                   and o["device_ids"] == e["device_ids"] for o in document["cases"]) for e in empties):
+        raise CheckError("no case shows an empty device_carriage map accepted as the absent map")
+    for c in document["cases"]:
+        if not c["valid"] and c.get("rule") in OPT_IN_RULES + ("device_id",) and "device_carriage" in c["evidence"]:
+            twin = {k: v for k, v in c["evidence"].items() if k != "device_carriage"}
+            try:
+                if validate(defaults, c["device_ids"], twin) is None:
+                    raise CheckError(f"{c['name']}: the twin without its declaration is not an enabled courier")
+            except Refused as refusal:
+                if refusal.rule in OPT_IN_RULES or (refusal.rule == "device_id" and all(
+                        not any(ch in d for ch in LEGACY_DEVICE_FORBIDDEN) for d in c["device_ids"])):
+                    raise CheckError(f"{c['name']}: still refused for {refusal.rule} without any declaration; the opt-in "
+                                     "rules must fall away with it")
+    if not any(not c["valid"] and c.get("rule") == "device_id" and "device_carriage" in c["evidence"] for c in document["cases"]):
+        raise CheckError("no case shows the routing domain refusing an opted-in device")
+
+
+def main() -> int:
+    text = CONTRACT.read_text(encoding="utf-8")
+    document = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        check(document, load_contract(text))
+    except CheckError as error:
+        print(f"check-gateway-config-evidence-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+
+        def refused(doc: dict, contract_text: str) -> bool:
+            try:
+                check(doc, load_contract(contract_text))
+            except CheckError:
+                return True
+            return False
+
+        for i, case in enumerate(document["cases"]):
+            bad = copy.deepcopy(document)
+            bad["cases"][i]["valid"] = not case["valid"]
+            total += 1
+            if not refused(bad, text):
+                survived.append(f"verdict of {case['name']}")
+        for rule in RULES:
+            bad = copy.deepcopy(document)
+            bad["cases"] = [c for c in document["cases"] if c.get("rule") != rule]
+            total += 1
+            if not refused(bad, text):
+                survived.append(f"without rule {rule}")
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                if not refused(document, text):
+                    survived.append(f"model defect {flag}")
+            finally:
+                MODEL_MUTANTS[flag] = False
+        for old, new in (("| `max_items`              | `int`    | `10000` |", "| `max_items`              | `int`    | `20000` |"),
+                         ("| `max_bytes`              | `int`    | `268435456` |",
+                          "| `max_bytes`              | `int`    | `134217728` |"),
+                         ("| `stopped_max_items`      | `int`    | `10000` |",
+                          "| `stopped_max_items`      | `int`    | `20000` |"),
+                         ("| `stopped_max_bytes`      | `int`    | `268435456` |",
+                          "| `stopped_max_bytes`      | `int`    | `134217728` |"),
+                         ("| `map` | `{}` |", "| `map` | `{\"*\": \"gateway-evidence-carriage/v1\"}` |"),
+                         ("`stopped_max_items` divided equally across", "`max_items` divided equally across"),
+                         ("| `5`     |", "| `10`    |"), ("| `900`   |", "| `600`   |"),
+                         ("`300`, or `backoff_base_s` if longer", "`600`, or `backoff_base_s` if longer")):
+            total += 1
+            start = text.find(START)
+            end = text.find(END, start)
+            section = text[start:end]
+            if section.count(old) != 1:
+                survived.append(f"default mutant {old!r} matches {section.count(old)} places")
+            elif not refused(document, text[:start] + section.replace(old, new) + text[end:]):
+                survived.append(f"default changed: {old!r}")
+        for key, sentence in MODEL_SENTENCES.items():
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            edited, count = re.subn(pattern, sentence.rsplit(" ", 1)[0].replace("\\", "\\\\"), text, count=1)
+            total += 1
+            if count != 1 or not refused(document, edited):
+                survived.append(f"re-pin: {key} reworded")
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"evidence-config mutations: {total} refused")
+    print(f"evidence-config vectors: {len(document['cases'])} cases hold to gateway-config/v2")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

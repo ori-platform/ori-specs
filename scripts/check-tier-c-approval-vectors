@@ -1,0 +1,2687 @@
+#!/usr/bin/env python3
+"""Check the Tier C approval vectors against tier-c-approval/v1 and the contracts it binds.
+
+Three corpora replay one Tier C proposal through replies, commits, dispatches,
+outcome writes, crashes, restarts, binding and authority changes,
+reconciliations and later proposals, all through the one model
+tier-c-approval/v1 states:
+
+- `tier-c-approval/vectors/admission.json`: admission, dispatch, restart,
+  reconciliation and the safe default;
+- `offline-tokens/vectors/tier-c-binding-v2.json`: the offline-tokens/v2 binding,
+  and a v1 token parsed as v1 and refused as Tier C authority;
+- `operator-socket/vectors/tier-c-reconcile.json`: `evidence reconcile-tier-c`,
+  the authenticated local operator reconciliation in operator-socket/v1.
+
+A fourth, `offline-tokens/vectors/signing-domain-v2.json`, carries real Ed25519
+signatures under a published test key, and each is verified here: a v1
+verifier over the unprefixed preimage, and a v2 verifier that selects the
+domain it reads from offline-tokens/v2 by the exact `token_version` before
+verifying, with no trial verification and no fallback.
+
+The model:
+
+- every proposal binds, among the fields tier-c-approval/v1 names, the
+  commissioned zone it commands;
+- a reply becomes an approval only on its durable commit, and only while the
+  commissioned binding and authority snapshot byte-match the proposal's;
+- expiry is decided against the creating process's monotonic deadline, never
+  the wall clock, and an open proposal does not survive a restart;
+- dispatch begins in the same live attempt and waits on nothing;
+- the approval commit reserves a terminal uncertainty record: an outcome that
+  cannot be appended, a timeout, a lost response, a partial or indeterminate
+  result, or a dispatch that finds the pending-outcome ceiling reached turns
+  that record into `dispatch_outcome_unknown` with no delay and no replay, and
+  only an executor that affirms the commanded outcome did not occur yields
+  `dispatch_failed`;
+- a contention refusal applies the safe default and never retries, and neither
+  it nor a failure replays;
+- after a restart nothing is replayed: a durable dispatch-start marker without
+  an outcome is `dispatch_outcome_unknown`, an approval is
+  `approval_aborted_undispatched` only on affirmative durable proof that
+  dispatch was never invoked, and every other approval without an outcome is
+  `dispatch_not_proven`;
+- closing a proposal `proposal_aborted_restart` or `approval_binding_changed`
+  applies the non-actuating safe default;
+- a proposal creates at most one durable safe-default intent, keyed by its
+  `proposal_id`: an alert is retried through the outbox at least once, each
+  attempt carrying the identifier, and may be duplicated after an ambiguous
+  provider result, local logging is idempotent by the identifier, and no
+  restart, repeated reply or later refusal creates a second intent;
+- a proposal row that cannot be committed is never sent, approves nothing and
+  claims no durable safe default, and Tier D is unaffected;
+- an outcome the live runtime cannot append is `pending`, or `unknown_live` at
+  the ceiling, and never a durable `dispatch_outcome_unknown` until written;
+  after restart it is `dispatch_outcome_unknown` with a durable marker and
+  `dispatch_not_proven` without one;
+- a safe default is admitted only at Tier A, classified informational by the
+  guard, with a registry entry whose consequence class is `informational` and
+  that is `safe_default_eligible` and not `physical`; an action with no
+  registry entry is refused, and the pinned actuating actions are each refused;
+- a Tier C action able to change physical state is governed only with a
+  commissioned zone and outcome, a generic `coap_command` is refused as a Tier
+  C proposal, and a host-state Tier C action or a Tier B action requiring
+  approval is outside the contract, neither governed nor refused by it;
+- the authority snapshot is one closed canonical object whose exact bytes the
+  proposal binds;
+- an uncertain dispatch blocks only a later Tier C proposal for the same
+  outcome on the same commissioned zone, at its creation and again when a
+  reply to an already-open proposal is admitted, inside the commit, where an
+  approval of the same outcome and zone still in flight also blocks it, which
+  then closes `proposal_blocked_uncertain_outcome` with the safe default; it
+  is reconciled only by the authenticated local command or commissioned
+  feedback, appended and never rewriting the uncertainty;
+- the command is submitted to the running runtime over its local operator
+  socket, and the bridge opens no store and creates no file, and trusts an
+  answer only from a peer it verified as the runtime service identity,
+  whatever `--socket` names, reporting any other `runtime_unavailable`; a
+  request naming `operation` twice is `invalid_arguments`; the runtime
+  admits only root or the installed operator identity from the connection's
+  kernel peer credentials by effective user ID alone, never from a request
+  field, reads that identity only from a trusted `operator-uid` file, needs no
+  store permission from the caller, refuses an unauthorized peer before any
+  state and a request naming a member twice, records the audit login user ID
+  only for a peer it pinned, records the entry point `local_operator_socket`,
+  compares `--device-id` with its own device, audits each other
+  principal's identical repeat, owns cancellation and idempotency, and commits
+  nothing on an operational outcome; its reasons, refusal codes and their
+  order, and its note bound and excluded code points are read from
+  operator-socket/v1;
+- a v2 offline token approves only the proposal, device, action, target and
+  zone it names, never through a wildcard, never beyond the proposal's
+  deadline, and its `token_id` is consumed only with a durable approval; a
+  payload naming a member twice is malformed; a v1 token
+  is never Tier C approval, including for a host-state Tier C action on the
+  existing workflow, which no token of either version approves and whose
+  token is not consumed; `token_version` is an integer only by its number
+  token as written, and the preimage is signing/v2 Profile 2, which escapes
+  only `"`, backslash and U+0000-U+001F;
+- `approval_timeout_seconds` lies between the schema minimum and the release
+  maximum (runtime-config/v2).
+
+Every sentence the model hard-codes is held word for word, the
+`decision_state` vocabulary is read from the text and every state in it must be
+reached, and `action_records` is read from runtime-health/v3. gateway-api/v1
+must carry its pointer to tier-c-approval/v1, and neither it nor
+gateway-evidence-carriage/v1 may carry the Tier C vocabulary that contract
+defines.
+
+events/v1 and offline-tokens/v1 are held to their published approval semantics:
+each must keep its v1 sentences and carry none of the terms v2 introduces. That
+text guard proves only that the published v1 prose was not edited and that
+proposed v2 vocabulary did not enter v1. It does not prove wire compatibility
+or consumer behavior; before events/v2 ratification or implementation, a data
+vector and independent v1/v2 consumer checks are mandatory.
+
+    python3 scripts/check-tier-c-approval-vectors
+    python3 scripts/check-tier-c-approval-vectors --mutations
+
+`--mutations` corrupts every expectation, drops each required sequence, flips
+each configuration and safe-default case, re-signs and re-types tokens, rewords
+each hard-coded sentence, removes each state from the vocabulary, removes each
+reason and refusal code, swaps each adjacent pair in the refusal order, changes
+the note bound and the signature domain, writes v2 terms into each v1 contract,
+and switches on model defects a conforming runtime must not have, and requires
+every mutant to be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import base64
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+FILES = {
+    "tier-c-approval": ROOT / "tier-c-approval" / "v1.md",
+    "gateway-api": ROOT / "gateway-api" / "v1.md",
+    "gateway-evidence-carriage": ROOT / "gateway-evidence-carriage" / "v1.md",
+    "events": ROOT / "events" / "v2.md",
+    "events-v1": ROOT / "events" / "v1.md",
+    "offline-tokens": ROOT / "offline-tokens" / "v2.md",
+    "offline-tokens-v1": ROOT / "offline-tokens" / "v1.md",
+    "offline-tokens-v2": ROOT / "offline-tokens" / "v2.md",
+    "runtime-config": ROOT / "runtime-config" / "v2.md",
+    "runtime-config-v1": ROOT / "runtime-config" / "v1.md",
+    "runtime-health": ROOT / "runtime-health" / "v3.md",
+    "cli": ROOT / "operator-socket" / "v1.md",
+    "skills-package": ROOT / "skills-package" / "v2.md",
+    "signing": ROOT / "signing" / "v2.md",
+}
+CONFIG_SCHEMA = ROOT / "runtime-config" / "vectors" / "schema.json"
+LEGACY_ACTIONS = ROOT / "safety-profile" / "vectors" / "legacy-actions.json"
+VECTORS = {
+    "admission": ROOT / "tier-c-approval" / "vectors" / "admission.json",
+    "tokens": ROOT / "offline-tokens" / "vectors" / "tier-c-binding-v2.json",
+    "reconcile": ROOT / "operator-socket" / "vectors" / "tier-c-reconcile.json",
+}
+SIGNING = ROOT / "offline-tokens" / "vectors" / "signing-domain-v2.json"
+PUBLISHED_SEED = ROOT / "evidence" / "vectors" / "chain-row-v3.json"
+SECTION = ("# Tier C Approval Contract v1", "## Vectors")
+CLI_SECTION = ("## Tier C Reconciliation", "## Vectors")
+CLI_COMMISSION_SECTION = ("## Commissioning Reference Delivery", "## Tier C Reconciliation")
+EVENTS_PROPOSAL = "## Proposal: Tier C approval record (awaiting ratification)"
+# offline-tokens/v2 names Profile 2 of signing/v2 as its canonical form; the profile must keep these parameters.
+PROFILE_2 = ("## Profile 2: Canonical Skill Manifest", "### Runtime Verification")
+PROFILE_2_PARAMETERS = ("sort_keys=True,", 'separators=(",", ":"),', "ensure_ascii=False,", "allow_nan=False,")
+
+# (file, sentence) pairs the model hard-codes; the tier-c-approval ones must sit in SECTION and the cli ones in
+# CLI_SECTION.
+SENTENCES = {
+    "admission": (
+        "tier-c-approval",
+        "An operator reply becomes an approved Tier C decision only when the runtime has durably committed the "
+        "decision, proposal identifier, authenticated ingress identity, and the in-force authority and "
+        "commissioned binding under which execution is permitted.",
+    ),
+    "not_before": ("tier-c-approval", "Before that commit it is a received reply, not an approval."),
+    "commit_fails": ("tier-c-approval", "A reply whose commit fails is not an approval:"),
+    "same_boundary": (
+        "tier-c-approval",
+        "Remote replies, the local console and offline tokens reach approval through this same durable "
+        "admission, and a duplicate reply for an admitted decision is idempotent.",
+    ),
+    "token_version": (
+        "tier-c-approval",
+        "An offline token reaches it only as [offline-tokens/v2.md](../offline-tokens/v2.md) binds it to the "
+        "proposal; a v1 token is not Tier C approval.",
+    ),
+    "late_reply": ("tier-c-approval", "A reply received after expiry is not an approval:"),
+    "monotonic": (
+        "tier-c-approval",
+        "At proposal creation the runtime records `created_at_ms` and `expires_at_ms` for audit, and establishes "
+        "a monotonic deadline in the creating process. Admission and dispatch expiry are decided exclusively "
+        "against that monotonic deadline. Wall-clock movement MUST NOT shorten or extend execution authority. An "
+        "open proposal does not regain a monotonic deadline after process restart: it is closed as "
+        "`proposal_aborted_restart`, the operator is notified, and a fresh proposal derived from current "
+        "observations is required.",
+    ),
+    "binding": (
+        "tier-c-approval",
+        "At approval admission, the current commissioned binding identity and authority snapshot MUST byte-match "
+        "those bound into the proposal. A mismatch means the reply is not an approval: the runtime records "
+        "`approval_binding_changed`, notifies the operator, applies no physical action, and requires a fresh "
+        "proposal under the current binding and authority.",
+    ),
+    "no_wait": (
+        "tier-c-approval",
+        "Once the approval commit succeeds, dispatch MUST proceed without waiting for evidence signing, evidence "
+        "delivery, action-log persistence, Tier C decision export, gateway availability or any further "
+        "state-store write.",
+    ),
+    "expiry_undispatched": (
+        "tier-c-approval",
+        "If dispatch has not begun before expiry, the runtime records `approval_expired_undispatched`, applies "
+        "the non-actuating safe default, and requires a fresh proposal.",
+    ),
+    "outcome_unknown": (
+        "tier-c-approval", "The durable approval remains, and the outcome is reported as unknown until reconciled."),
+    "restart_before": (
+        "tier-c-approval",
+        "If that process terminates before dispatch begins, restart MUST NOT execute or replay the approved action.",
+    ),
+    "aborted": (
+        "tier-c-approval",
+        "Only where the runtime possesses affirmative durable proof that dispatch was never invoked, it durably "
+        "records `approval_aborted_undispatched` with reason `runtime_restart`, performs the proposal's "
+        "non-actuating safe default, alerts the operator, and requires a fresh proposal derived from current "
+        "observations if the condition persists; absence of `dispatch_started` is not such proof.",
+    ),
+    "restart_after": (
+        "tier-c-approval", "Once dispatch has begun, absence of a durable outcome MUST NOT cause automatic replay."),
+    "unknown": (
+        "tier-c-approval",
+        "The runtime records `dispatch_outcome_unknown`, raises a CRITICAL operator and audit event, and requires "
+        "observation or operator reconciliation before another equivalent Tier C action is admitted.",
+    ),
+    "equivalent": (
+        "tier-c-approval",
+        "An equivalent Tier C action is one commanding the same physical outcome on the same commissioned zone,",
+    ),
+    "not_proven": (
+        "tier-c-approval",
+        "The dispatch-start marker is diagnostic evidence, not the actuation boundary. After restart, absence of "
+        "that marker does not prove that dispatch did not begin. A durable approval with neither a durable outcome "
+        "nor affirmative proof that dispatch was never invoked becomes `dispatch_not_proven`; it MUST NOT be "
+        "replayed, raises a CRITICAL operator and audit event, and requires the same reconciliation as "
+        "`dispatch_outcome_unknown`.",
+    ),
+    "block_at_reply": (
+        "tier-c-approval",
+        "An unresolved `dispatch_outcome_unknown` or `dispatch_not_proven` prevents creation of a later Tier C "
+        "proposal commanding the same physical outcome on the same commissioned zone. The runtime evaluates the "
+        "block again when admitting an operator reply, because an uncertainty may arise after the proposal was "
+        "created. A reply against a now-blocked outcome and zone is not an approval: the runtime durably closes the "
+        "proposal as `proposal_blocked_uncertain_outcome`, applies its non-actuating safe default, notifies the "
+        "operator, and requires a fresh proposal after reconciliation. The block does not affect another outcome, "
+        "another zone, Tier A/B, or any Tier D evaluation or execution.",
+    ),
+    "reservation": (
+        "tier-c-approval",
+        "The durable approval-admission commit reserves capacity for a terminal uncertainty record before the reply "
+        "becomes an approval. If the complete outcome cannot be appended after dispatch, including because the "
+        "pending-outcome ceiling has been reached, the reserved record resolves as follows. Reaching the ceiling MUST "
+        "NOT delay dispatch, discard the approval, or cause replay. The resulting uncertainty blocks the same "
+        "physical outcome on the same commissioned zone until reconciliation under this contract.",
+    ),
+    "failed_affirmed": (
+        "tier-c-approval",
+        "`dispatch_failed` is permitted only when the executor can affirm that the commanded physical outcome did "
+        "not occur. A timeout, lost response, partial execution, or any result that cannot establish the physical "
+        "outcome is `dispatch_outcome_unknown`, not `dispatch_failed`.",
+    ),
+    "severity_contention": (
+        "tier-c-approval",
+        "| An admitted approval refused before actuation because an opposing action holds the resource | "
+        "`dispatch_refused_contention`: not evidence loss; a CRITICAL operational event; apply the proposal's "
+        "non-actuating safe default through its one safe-default intent, perform no automatic retry, and require a "
+        "fresh evaluation",
+    ),
+    "severity_failed": (
+        "tier-c-approval",
+        "| An admitted approval whose executor definitively reports that the commanded physical outcome did not "
+        "occur | `dispatch_failed`: not evidence loss; a CRITICAL operational event; no automatic replay, and a "
+        "fresh evaluation is required",
+    ),
+    "health_ceiling": (
+        "runtime-health",
+        "`ceiling` the release-defined bound on `pending`; `unknown_live` the number of dispatched outcomes the live "
+        "runtime could neither append nor hold in `pending` because `pending` is at `ceiling`, an in-memory "
+        "unknown-outcome diagnostic that is not a durable `dispatch_outcome_unknown` and resolves through the "
+        "terminal uncertainty record reserved when the approval was admitted, per tier-c-approval/v1, and reaching "
+        "`ceiling` never delays dispatch;",
+    ),
+    "events_blocked": (
+        "events",
+        "Proposed, awaiting ratification: a proposal closed `proposal_blocked_uncertain_outcome` keeps "
+        "`approval_admitted=false`; its `approved_action_outcome` is `not_dispatched`, and `safe_default_outcome` "
+        "reports the proposal's one safe-default intent.",
+    ),
+    "blocks_only": (
+        "tier-c-approval",
+        "An unresolved `dispatch_outcome_unknown` or `dispatch_not_proven` blocks only a later Tier C proposal "
+        "commanding the same physical outcome on the same commissioned zone. It does not block another outcome, "
+        "another zone, Tier A/B, or any Tier D evaluation or execution.",
+    ),
+    "reconciliation": (
+        "tier-c-approval",
+        "Reconciliation is either: (a) an authenticated local operator command recording an observed terminal "
+        "outcome; or (b) a deterministic observation from commissioned feedback for that zone whose mapping proves "
+        "the commanded outcome. Reconciliation appends a record linked to the uncertain dispatch; it never "
+        "rewrites the original uncertainty. An uncommissioned sensor, model inference, gateway response or "
+        "absence of an alarm cannot reconcile it.",
+    ),
+    "reconciled_states": (
+        "tier-c-approval",
+        "It moves `dispatch_outcome_unknown` or `dispatch_not_proven` to `reconciled_executed` or "
+        "`reconciled_not_executed`.",
+    ),
+    "form_a": ("tier-c-approval", "Form (a) is `evidence reconcile-tier-c` in"),
+    "safe_default": (
+        "tier-c-approval",
+        "A Tier C safe default MUST be Tier A and non-actuating. It MUST NOT invoke any executor, command or "
+        "transport capable of changing relay, contactor, valve, protected-circuit, supply-transfer or other physical "
+        "state. The runtime MUST additionally refuse any safe default whose action-registry entry is marked "
+        "`physical`. Registry metadata is a redundant enforcement check, not the definition of physicality.",
+    ),
+    "safe_default_pinned": (
+        "tier-c-approval",
+        "are a pinned instance of this rule: each is refused as a safe default. The list is an instance, not the "
+        "definition. An action outside it that can change physical state is refused by the rule above, whatever its "
+        "registry entry says.",
+    ),
+    "safe_default_guard": (
+        "tier-c-approval",
+        "This repository cannot read the runtime's action registry, so the rule is enforced in `ori-runtime` by a "
+        "guard that: - exports or enumerates every action the runtime can execute; - classifies every one of them "
+        "exhaustively by physicality: `informational`, `host_state`, `physical`; - fails on a new action it has not "
+        "classified; - rejects as a safe default every action it does not classify `informational`, and every "
+        "physically capable "
+        "action whatever its tier or registry entry; - rejects as a safe default every action with no registry "
+        "entry, and every entry whose consequence class is not `informational` or that is not "
+        "`safe_default_eligible`; - is independent of the registry: its classification table is pinned in the "
+        "guard, not read from the registry it checks; - detects a mutation that falsely changes a "
+        "physical action's `physical` flag.",
+    ),
+    "not_gateway_authority": (
+        "tier-c-approval",
+        "Tier C approval is runtime authority. The runtime admits an approval and dispatches the approved action; "
+        "no gateway grants or replaces that authority; a gateway may relay an operator reply, which is not an "
+        "approval.",
+    ),
+    "export_unchanged": (
+        "tier-c-approval",
+        "Exporting either, or any other state this contract defines, changes that wire surface and needs "
+        "gateway-api/v2 or a separately versioned export contract.",
+    ),
+    "close_safe_default": (
+        "tier-c-approval",
+        "Closing an open proposal as `proposal_aborted_restart` or `approval_binding_changed` applies its "
+        "non-actuating safe default, records that outcome separately from the proposed action, notifies the "
+        "operator and requires a fresh proposal. Neither state authorizes the proposed physical action.",
+    ),
+    "executed": (
+        "tier-c-approval",
+        "`executed` means the outcome was durably recorded as executed; `dispatch_failed` means the outcome was "
+        "durably recorded and the executor reported that the actuation failed.",
+    ),
+    "contention": (
+        "tier-c-approval",
+        "`dispatch_refused_contention` means the dispatcher refused the approved act before actuation because an "
+        "opposing act already held its resource; the runtime applies the non-actuating safe default, alerts the "
+        "operator, and requires a fresh proposal.",
+    ),
+    "proposal_binds": (
+        "tier-c-approval",
+        "Every Tier C proposal binds at least `proposal_id`, `device_id`, the action and its target, the "
+        "commissioned zone it commands, the observation or event identity it was derived from, the commissioned "
+        "binding identity, the authority snapshot under which execution would be permitted, `created_at_ms`, and "
+        "`expires_at_ms`.",
+    ),
+    "lifetime": (
+        "tier-c-approval",
+        "The lifetime is the release-defined maximum, shortened by `approval_timeout_seconds` where "
+        "runtime-config/v2 permits.",
+    ),
+    "safe_default_load": (
+        "skills-package", "Only non-actuating actions may be a `safe_default_action`."),
+    "coap_executor": ("runtime-config-v1", "Named command map for `coap_command` executor"),
+    # host_state_token_verdict(): no token of either version approves a host-state Tier C action.
+    "token_legacy": (
+        "offline-tokens",
+        "`offline-tokens/v1` remains the implemented legacy format. A runtime conforming to this revision MUST NOT "
+        "accept a v1 token as approval for any Tier C action. This includes host-state Tier C actions that remain "
+        "on the existing approval workflow. Because offline-tokens/v2 requires a commissioned zone, a host-state "
+        "Tier C action has no offline-token approval path until a resource-scoped approval contract defines one. "
+        "`offline-tokens/v2` binds one open proposal, device, exact action, target and commissioned zone and "
+        "permits no wildcard Tier C scope.",
+    ),
+    "token_legacy_v1": (
+        "offline-tokens-v2",
+        "`offline-tokens/v1` remains the implemented legacy format. A runtime conforming to "
+        "this revision MUST NOT accept a v1 token as approval for any Tier C action. This includes "
+        "host-state Tier C actions that remain on the existing approval workflow. Because offline-tokens/v2 "
+        "requires a commissioned zone, a host-state Tier C action has no offline-token approval path until a "
+        "resource-scoped approval contract defines one.",
+    ),
+    "token_legacy_scope": (
+        "tier-c-approval",
+        "A runtime conforming to this contract MUST NOT accept a v1 token as approval for any Tier C action. This "
+        "includes host-state Tier C actions that remain on the existing approval workflow. Because "
+        "[offline-tokens/v2.md](../offline-tokens/v2.md) requires a commissioned zone, a host-state Tier C action "
+        "has no offline-token approval path until a resource-scoped approval contract defines one.",
+    ),
+    "token_version_type": (
+        "offline-tokens",
+        "`token_version` MUST have JSON integer type and value `2`; Boolean values are not integers for this purpose.",
+    ),
+    "token_number": (
+        "offline-tokens",
+        "A verifier decides integer type from the JSON number token, not from a decoded numeric value, so `2.0`, "
+        "`2e0` and `2E0` are malformed even where a decoder maps them to the same value as `2`.",
+    ),
+    "token_canonical": (
+        "offline-tokens",
+        "`canonical(payload_without_signature)` is the Profile 2 canonical form of [signing/v2.md](../signing/v2.md) "
+        "applied to the payload without `signature`: Python `json.dumps(sort_keys=True, separators=(\",\", \":\"), "
+        "ensure_ascii=False, allow_nan=False)` semantics, in which only `\"`, `\\` and U+0000–U+001F are escaped and "
+        "integers are written in decimal without exponent.",
+    ),
+    "token_signature": (
+        "offline-tokens",
+        "A v2 token signature is Ed25519 over `\"ori.offline_token.v2\" || NUL || "
+        "canonical(payload_without_signature)`. A v1 verifier, which verifies the unprefixed v1 preimage, therefore "
+        "MUST reject a v2 signature. Implementations MUST select the signature domain from the exact token version "
+        "before verification and MUST NOT use trial verification or fall back between versions.",
+    ),
+    "token_format": (
+        "offline-tokens",
+        "A payload with no `token_version` claim is a v1 token. A payload whose `token_version` is the integer "
+        "`2` is a v2 token. Any other `token_version` value is malformed and approves nothing.",
+    ),
+    "token_binding": (
+        "offline-tokens",
+        "An offline token used for Tier C MUST name `proposal_id`, `device_id`, the exact action, its target and "
+        "commissioned zone. A wildcard action scope does not authorize Tier C.",
+    ),
+    "token_claims": (
+        "offline-tokens",
+        "For Tier C a token therefore carries `proposal_id`, an exact `action_scope`, `target`, and `zone_id`, each "
+        "of which must equal the open proposal's, in addition to the claims above; a token missing any of them, or "
+        "naming another proposal, action, target or zone, approves nothing.",
+    ),
+    "token_expiry": (
+        "offline-tokens",
+        "The token's expiry limits token validity only. It cannot create, extend or revive proposal authority; the "
+        "proposal's monotonic deadline governs admission.",
+    ),
+    "token_transaction": (
+        "offline-tokens",
+        "Claiming the token's `token_id` and committing the Tier C approval are one transaction. If either "
+        "operation fails, neither commits. A token MUST NOT be consumed by a reply that did not become a durable "
+        "approval. A `token_id` already claimed approves nothing.",
+    ),
+    "timeout_bound": (
+        "runtime-config",
+        "`approval_timeout_seconds` MUST be at least 1 and no greater than the release-defined maximum Tier C "
+        "proposal lifetime. Deployment configuration may shorten that lifetime and MUST NOT extend it beyond the "
+        "release maximum.",
+    ),
+    "records_total": (
+        "runtime-health",
+        "`lost` their derived total, always `outcome_unknown` plus `dispatch_unproven`;",
+    ),
+    "events_retains": ("events", "`events/v1` retains its published approval semantics."),
+    "events_incorporates": (
+        "events",
+        "Except for the Tier C approval record expressly defined here, events/v2 incorporates the definitions of "
+        "events/v1 unchanged. This incorporation does not assign v2 semantics to any v1 record or field.",
+    ),
+    "events_guard_limit": (
+        "events",
+        "This guard proves only that the published v1 prose was not edited and that proposed v2 vocabulary did not "
+        "enter v1. It does not prove wire compatibility or consumer behavior. Before events/v2 ratification or "
+        "implementation, a data vector and independent v1/v2 consumer checks are mandatory.",
+    ),
+    "events_no_inference": (
+        "events", "Consumers MUST NOT infer an operator rejection from `approval_admitted=false`."),
+    "events_v1_consumer": (
+        "events",
+        "A v1 consumer is never given v2 semantics: a v1 field keeps its v1 meaning in every record that carries "
+        "it, and v2 approval semantics are carried only in fields v1 does not define.",
+    ),
+    "events_admitted_true": (
+        "events",
+        "`approval_admitted=true`: an operator affirmative reply durably admitted as an approval. A reply whose "
+        "admission commit did not succeed is not an approval,",
+    ),
+    "events_admitted_false": (
+        "events",
+        "`approval_admitted=false`: explicit NO, timeout/no response, a reply after expiry, a reply whose admission "
+        "commit failed, a reply recorded `approval_binding_changed`, a proposal closed `proposal_aborted_restart`, "
+        "or an unrecognized reply.",
+    ),
+    "events_undispatched": (
+        "events",
+        "An approval that was admitted and then recorded `approval_expired_undispatched` or "
+        "`approval_aborted_undispatched` keeps `approval_admitted=true`; its `approved_action_outcome` is "
+        "`not_dispatched`, and `safe_default_outcome` reports only whether that safe default ran.",
+    ),
+    "events_uncertain": (
+        "events",
+        "An approval recorded `dispatch_outcome_unknown` or `dispatch_not_proven` keeps `approval_admitted=true`, "
+        "and its `approved_action_outcome` is `unknown`:",
+    ),
+    "events_contention": (
+        "events",
+        "Proposed, awaiting ratification: an approval recorded `dispatch_refused_contention` keeps "
+        "`approval_admitted=true`; its `approved_action_outcome` is `not_dispatched`,",
+    ),
+    "events_closed_unapproved": (
+        "events",
+        "Proposed, awaiting ratification: a proposal recorded `proposal_expired` or `rejected` keeps "
+        "`approval_admitted=false`; its `approved_action_outcome` is `not_dispatched`,",
+    ),
+    "events_open": (
+        "events",
+        "Proposed, awaiting ratification: a proposal still `proposed` has `approval_admitted=false`, its "
+        "`approved_action_outcome` is `not_dispatched`, and its `safe_default_outcome` is `not_applied`.",
+    ),
+    "cli_local": (
+        "cli",
+        "The command runs locally on the device and MUST NOT be reachable through any remote command, "
+        "configuration document, gateway topic, or fleet API. It has no unauthenticated invocation.",
+    ),
+    "cli_socket": (
+        "cli",
+        "`evidence reconcile-tier-c` submits one reconciliation request to the running runtime over its "
+        "authenticated local operator socket. The bridge never opens or writes the runtime state store. The runtime "
+        "obtains the caller's effective numeric user ID and, where available, audit login user ID from "
+        "kernel-provided peer credentials; no caller-supplied field participates in authentication. Socket "
+        "filesystem permissions are defence in depth and do not replace peer-credential authorization. After "
+        "authorization and semantic validation, the runtime appends the reconciliation through its sole state-store "
+        "writer and returns success only after the append is durable.",
+    ),
+    "cli_bridge_nothing": (
+        "cli",
+        "The bridge reads no configuration document and no state store, creates no file, and relays the runtime's "
+        "answer in the bridge envelope.",
+    ),
+    "cli_identity": (
+        "cli",
+        "The runtime establishes the caller only from the peer credentials the kernel reports for the connection: "
+        "never from an argument, flag, request field, environment variable, configuration document or piped input. "
+        "A request carrying any field beyond those above, including one naming a user ID, account or principal, or "
+        "naming any member twice, is refused `invalid_arguments` and decides nothing.",
+    ),
+    "cli_auth_first": (
+        "cli",
+        "The runtime establishes and authorizes the caller before reporting any state: an unauthorized caller "
+        "receives `unauthenticated` whatever the condition of the runtime's store, the proposal, the device or the "
+        "zone.",
+    ),
+    "cli_no_store_permission": (
+        "cli",
+        "Admission needs no permission on the state store: the installed operator reconciles without being able to "
+        "read or write it.",
+    ),
+    "cli_admission": (
+        "cli",
+        "Two callers are admitted: root, and the installed operator identity. A caller is admitted when the "
+        "peer's effective numeric user ID is `0` or equals the installed operator identity; no group membership "
+        "admits a caller in this version. The numeric user ID and, where the platform keeps one, the Linux audit "
+        "login user ID are authoritative; the account name is diagnostic only, recorded and never compared.",
+    ),
+    "cli_installed": (
+        "cli",
+        "otherwise no operator identity is installed and only root is admitted. The operator identity is never read "
+        "from `ori.yaml`, any other configuration document, the environment, or any file the runtime's service "
+        "account or a remote party can write.",
+    ),
+    "cli_admission_euid": (
+        "cli",
+        "Admission is decided on the effective user ID alone. The audit login user ID is authoritative for the "
+        "recorded principal and for comparing principals, and neither admits nor refuses a caller.",
+    ),
+    "cli_operator_uid": (
+        "cli",
+        "reads it only when the file, the install root and every ancestor directory are owned by user ID `0` and "
+        "writable by no other user or group; the file is opened without following symbolic links and holds one "
+        "decimal user ID without leading zeros, other than `0` and other than the runtime service account's, "
+        "optionally followed by one LF; otherwise no operator identity is installed and only root is admitted.",
+    ),
+    "cli_device": (
+        "cli",
+        "`--device-id` must equal the device identity of the running runtime that answers on the socket,",
+    ),
+    "cli_device_row": (
+        "cli",
+        "| `device_mismatch` | `--device-id` differs from the device identity of the running runtime that answers "
+        "on the socket.",
+    ),
+    "cli_runtime_row": (
+        "cli",
+        "| `runtime_unavailable` | No running runtime answers on the socket, the connection ends before the runtime "
+        "answers, or the socket peer is not verified as the expected runtime service identity. The bridge never "
+        "falls back to the state store.",
+    ),
+    "cli_store_row": (
+        "cli",
+        "| `runtime_store_unavailable` | The runtime's state store cannot serve the records the checks read or the "
+        "durable append. Returned only to an admitted caller.",
+    ),
+    "cli_reason_method": (
+        "cli",
+        "The reason records the observation method, not proof of electrical outcome. `actuator_position_observed` "
+        "proves a protected-circuit outcome only where the commissioned feedback mapping explicitly binds that "
+        "observed position to the outcome.",
+    ),
+    "cli_operational": (
+        "cli",
+        "Argument, authentication and semantic refusals are evaluated in the order below. The bridge decides "
+        "`invalid_arguments` before it connects, and the runtime decides it again. `runtime_unavailable` is "
+        "returned by the bridge when no running runtime answers on the socket, or the connection ends before an "
+        "answer. `runtime_store_unavailable` is returned by the runtime, only to an admitted caller and only after "
+        "`unauthenticated` is decided, when its state store cannot serve the records the checks read or the append. "
+        "`state_store_locked` is returned when the required write transaction cannot be acquired at its execution "
+        "point. `cancelled` may terminate the operation before commit. No operational outcome commits a "
+        "reconciliation.",
+    ),
+    "cli_cancellation": (
+        "cli",
+        "The runtime alone decides cancellation: it may abandon a request before its append begins, answering "
+        "`cancelled`, and an append once begun completes or fails as one transaction whatever the bridge does. A "
+        "bridge that is interrupted or loses the connection cancels nothing already begun; it reports "
+        "`runtime_unavailable`, which does not establish whether the append occurred, and an identical repeat then "
+        "answers `already_recorded` if it did.",
+    ),
+    "cli_reply_admission": (
+        "cli",
+        "The runtime evaluates the reconciliation state when creating a Tier C proposal and again when admitting an "
+        "operator reply, so reconciliation takes effect without restart and an uncertainty arising after proposal "
+        "creation cannot be bypassed by an already-open proposal.",
+    ),
+    "cli_outcome": (
+        "cli", "`--outcome` is `executed` or `not-executed`, recorded as `reconciled_executed` or "
+               "`reconciled_not_executed`."),
+    "cli_append": (
+        "cli",
+        "The append is durable before the command reports success, and a command whose append fails reports "
+        "failure and records nothing. It never rewrites the uncertain record or any evidence.",
+    ),
+    "cli_commands_nothing": (
+        "cli",
+        "Reconciliation only appends: it never rewrites evidence, replays the action or reaches Tier D. It never "
+        "dispatches, repeats or cancels an action and never drives an actuator. A Tier D execution is not a Tier "
+        "C proposal, so a request naming one is refused `unknown_proposal`.",
+    ),
+    "cli_effect": (
+        "cli",
+        "Once recorded, the uncertain dispatch no longer blocks a later Tier C proposal commanding the same "
+        "physical outcome on the same commissioned zone.",
+    ),
+    "cli_idempotent": (
+        "cli",
+        "An identical repeat appends no second reconciliation and returns `already_recorded: true`. If the "
+        "authenticated caller principal differs from the principal on the existing reconciliation, the runtime "
+        "appends a separate audit-attempt record containing the caller, referenced reconciliation, time and "
+        "`identical_repeat`; that audit record does not alter reconciliation state. An identical repeat by the "
+        "principal on the existing reconciliation appends nothing; identical repeats by one other principal may be "
+        "coalesced into a single `identical_repeat` audit-attempt record per principal.",
+    ),
+    "cli_principal": (
+        "cli", "Principals are compared by numeric user ID and audit login user ID, never by account name."),
+    "cli_refusal": ("cli", "Every refusal records nothing and is answered in the bridge error envelope with exit `2`."),
+    "scope": (
+        "tier-c-approval",
+        "`tier-c-approval/v1` requires a commissioned zone and commissioned outcome for Tier C actions capable of "
+        "changing physical state. A generic `coap_command` without that mapping MUST NOT be proposed as Tier C. "
+        "Host-state Tier C actions remain on the existing approval workflow outside this contract for v2.5.0, as do "
+        "Tier B actions requiring approval. A future resource-scoped approval contract may unify those workflows.",
+    ),
+    "scope_clauses": (
+        "tier-c-approval",
+        "A CoAP-backed commissioned actuator participates only through its commissioned zone and outcome, never "
+        "through the generic `coap_command` action. A host-state Tier C action, such as `terminate_process`, is "
+        "neither admitted nor refused by this contract, and its tier is not lowered to fit it:",
+    ),
+    "scope_tokens": (
+        "offline-tokens",
+        "The Tier C binding below applies to Tier C actions capable of changing physical state, which",
+    ),
+    "relay_not_approval": (
+        "tier-c-approval",
+        "no gateway grants or replaces that authority; a gateway may relay an operator reply, which is not an "
+        "approval.",
+    ),
+    "uncommitted_proposal": (
+        "tier-c-approval",
+        "If the proposal row cannot be committed durably, no proposal exists and none is sent to the operator. No "
+        "reply can approve it and no physical action executes. The runtime attempts the configured non-actuating "
+        "safe default and raises a CRITICAL operational notification, but MUST NOT claim that either was durably "
+        "recorded or executed when the store or its relevant writer is unavailable. Tier D remains unaffected.",
+    ),
+    "snapshot_closed": (
+        "tier-c-approval",
+        "The snapshot carries exactly these members, each a string except `v`, and is serialised in the Profile 2 "
+        "canonical form of [signing/v2.md](../signing/v2.md). A snapshot missing a member, carrying another, or "
+        "naming a member twice is malformed, and a proposal cannot be created under it.",
+    ),
+    "safe_default_registry": (
+        "tier-c-approval",
+        "A Tier C proposal is invalid unless its safe-default action has a registered capability classified "
+        "`informational` and `safe_default_eligible`. An absent registry entry is refused. The runtime may emit its "
+        "own release-owned diagnostic log or alert for that refusal, but that diagnostic is not the proposal's safe "
+        "default.",
+    ),
+    "safe_default_intent": (
+        "tier-c-approval",
+        "The runtime durably creates at most one safe-default intent per proposal, keyed by `proposal_id`. "
+        "Execution uses the applicable executor's delivery semantics. Alert delivery is retried at least once "
+        "through the durable alert outbox and may be duplicated after an ambiguous provider result; every attempt "
+        "carries the proposal identifier. Local durable logging is idempotent by that identifier. No safe-default "
+        "intent may actuate.",
+    ),
+    "live_unknown": (
+        "tier-c-approval",
+        "An unknown outcome held in memory is not a durable `dispatch_outcome_unknown`. While the live runtime "
+        "cannot append the outcome, its outcome is counted in `action_records.pending`, or in "
+        "`action_records.unknown_live` once `pending` is at `ceiling`:",
+    ),
+    # replay(): `unknown_live` is never durable, and a restart resolves by the durable marker alone.
+    "unknown_live_local": (
+        "tier-c-approval",
+        "`unknown_live` is process-local diagnostic state. It is never represented as durable "
+        "`dispatch_outcome_unknown` until a durable write succeeds. After process loss, recovery selects "
+        "`dispatch_outcome_unknown` only from a durable dispatch marker and otherwise selects `dispatch_not_proven`.",
+    ),
+    # replay(): each closing state applies the one safe-default intent; `create` with `commit` `failed` claims none.
+    "severity_blocked": (
+        "tier-c-approval",
+        "| A proposal closed `proposal_blocked_uncertain_outcome` | Not evidence loss; a CRITICAL operational event; "
+        "apply its non-actuating safe-default intent, notify the operator, and require reconciliation followed by a "
+        "fresh proposal",
+    ),
+    "severity_binding": (
+        "tier-c-approval",
+        "| A proposal closed `approval_binding_changed` | Not evidence loss; a CRITICAL operational event because the "
+        "approved authority context changed; apply its non-actuating safe-default intent and require a fresh "
+        "proposal under the current binding and authority",
+    ),
+    "severity_restart_open": (
+        "tier-c-approval",
+        "| An open, unapproved proposal closed `proposal_aborted_restart` | Not evidence loss and not an approved "
+        "mitigation failure; an operational warning, the non-actuating safe-default intent, operator notification, "
+        "and fresh evaluation",
+    ),
+    "severity_uncommitted": (
+        "tier-c-approval",
+        "| A proposal row could not be committed | No proposal or evidence record exists; Tier C is operationally "
+        "unavailable for that attempt and a CRITICAL operational notification is attempted. The safe default and "
+        "notification are attempted but neither is claimed durable, and evaluation may resume only after durable "
+        "proposal storage recovers",
+    ),
+    # safe_default_verdict(): both axes are required, and an unclassified or unregistered action is refused.
+    "two_axes": (
+        "tier-c-approval",
+        "Safe-default eligibility requires `informational` under the physicality guard and eligibility under the "
+        "registry. Neither axis may silently default:",
+    ),
+    # host_state_token_verdict() and the events/v2 scope: a host-state Tier C record keeps events/v1 semantics.
+    "events_host_state": (
+        "events",
+        "A host-state Tier C action, which stays on the existing approval workflow outside "
+        "[tier-c-approval/v1.md](../tier-c-approval/v1.md), stays on events/v1 semantics until a resource-scoped "
+        "approval contract exists. Its record keeps the v1 `approved` field with its v1 meaning, and no events/v2 "
+        "approval record is emitted for it.",
+    ),
+    # replay(): `propose` is blocked by an unappended live outcome, and not by one merely in flight.
+    "creation_live_unknown": (
+        "tier-c-approval",
+        "At proposal creation, an approval for the same outcome and zone whose outcome the live runtime could not "
+        "append blocks creation as an unresolved uncertainty does; one merely in flight is caught at reply "
+        "admission.",
+    ),
+    "live_restart": (
+        "tier-c-approval",
+        "After a restart, the reserved record becomes `dispatch_outcome_unknown` only where a durable dispatch "
+        "marker exists, and `dispatch_not_proven` otherwise,",
+    ),
+    "live_written": (
+        "tier-c-approval",
+        "When its store accepts the write while it still runs, it appends the outcome the executor reported, which "
+        "is `dispatch_outcome_unknown` for a result that cannot establish the physical outcome.",
+    ),
+    "no_write_restart": (
+        "tier-c-approval",
+        "A runtime that forbids any write between the approval commit and the executor call can hold no such proof, "
+        "so for it `approval_aborted_undispatched` with reason `runtime_restart` is unreachable,",
+    ),
+    "reply_block_states": (
+        "tier-c-approval",
+        "At reply admission the block is evaluated inside the approval commit transaction. An approval commanding "
+        "the same physical outcome on the same commissioned zone blocks the reply while it is "
+        "`approved_pending_dispatch` or `dispatch_started`, or while it is `dispatch_outcome_unknown` or "
+        "`dispatch_not_proven` and not reconciled.",
+    ),
+    "token_duplicates": (
+        "offline-tokens",
+        "A payload naming any member twice, at any depth, is malformed and approves nothing, whichever occurrence a "
+        "decoder would keep.",
+    ),
+    "token_python": ("offline-tokens", "the rule is `type(v) is int and v == 2`."),
+    "cli_socket_scope": (
+        "cli",
+        "No path is universal: the default is `operator.sock` in the runtime directory of the install the bridge "
+        "belongs to, which is `/run/ori/` for a system install and `/run/user/<uid>/ori/` for a user-scope install,",
+    ),
+    "cli_socket_search": (
+        "cli",
+        "Each time the runtime creates or opens its runtime directory, the runtime grants the installed operator "
+        "identity search permission on it by an access-control entry naming that user ID, and on every ancestor the "
+        "operator cannot otherwise search; if it cannot, it binds no operator socket and reports it.",
+    ),
+    "cli_login_pinned": (
+        "cli",
+        "The kernel's peer credentials carry the effective user ID and not the audit login user ID, which the "
+        "runtime reads for the peer process it pins by `SO_PEERPIDFD` (Linux 6.5 and later); it is `null` when the "
+        "peer cannot be pinned that way,",
+    ),
+    # snapshot_verdict(): every digest member but an empty `safety_profile` is lowercase sha256 hex.
+    "snapshot_digest_form": (
+        "tier-c-approval",
+        "Every digest other than an empty `safety_profile` is `sha256:` followed by 64 lowercase hexadecimal "
+        "characters over the canonical bytes of what it names.",
+    ),
+    "snapshot_policy_inputs": (
+        "tier-c-approval",
+        "| `policy_digest` | The digest of every policy input that can change Tier C admission of this action: the "
+        "release-defined admission policy, any device-policy capability grant governing it, and each deployment "
+        "setting runtime-config/v2 permits to affect admission. |",
+    ),
+    # replay(): `create` with `commit` `failed` attempts the safe default with no intent.
+    "safe_default_uncommitted": (
+        "tier-c-approval",
+        "Every clause of this contract that applies a safe default applies it through that one intent, except where "
+        "the proposal row could not be committed, when no proposal and no intent exists and the attempt is made as "
+        "*The Proposal* states:",
+    ),
+    # reconcile_runtime(): `operation` absent or unknown is `invalid_arguments`.
+    "cli_operation": (
+        "cli",
+        "A request whose `operation` is absent, is not `reconcile_tier_c` or `evidence_commission`, or is named "
+        "more than once is refused `invalid_arguments`.",
+    ),
+    # reconcile_local(): a response from an unverified peer is `runtime_unavailable`, `--socket` or not.
+    "cli_peer": (
+        "cli",
+        "Before trusting a response, the bridge verifies the connected socket peer through kernel-provided "
+        "credentials and requires the expected runtime service identity for that install scope. Socket-path "
+        "ownership and directory permissions are defence in depth. An explicit `--socket` does not waive peer "
+        "verification. A response from an unverified peer is `runtime_unavailable` and causes no reported success.",
+    ),
+    "commission_peer_verified": (
+        "cli-commission",
+        "Before trusting a response, the bridge verifies the connected socket peer through kernel-provided "
+        "credentials and requires the expected runtime service identity for that install scope. Socket-path "
+        "ownership and directory permissions are defence in depth. An explicit `--socket` does not waive peer "
+        "verification. A response from an unverified peer is `runtime_unavailable` and causes no reported success.",
+    ),
+    "cli_entry_point": ("cli", "the entry point `local_operator_socket`, and the runtime-observed time."),
+    "cli_scope": (
+        "cli",
+        "a host-state Tier C action or a Tier B action requiring approval is on the existing approval workflow, which "
+        "records no proposal under that contract, so a request naming one is refused `unknown_proposal`.",
+    ),
+    "commission_socket": (
+        "cli-commission",
+        "`evidence commission` submits one request to the running runtime over its authenticated local operator "
+        "socket,",
+    ),
+    "commission_bridge": (
+        "cli-commission",
+        "The bridge opens and writes neither runtime store, reads no configuration document and no health "
+        "snapshot, creates no file, and relays the runtime's answer in the bridge envelope.",
+    ),
+    "commission_peer": (
+        "cli-commission",
+        "The runtime obtains the caller's effective numeric user ID and, where available, audit login user ID from "
+        "kernel-provided peer credentials; no caller-supplied field participates in authentication.",
+    ),
+    "commission_admission": (
+        "cli-commission",
+        "The callers it admits, the installed operator identity and how it is read, and the rule that it authorizes "
+        "the caller before reporting any state are those of `evidence reconcile-tier-c`.",
+    ),
+    "commission_durable": (
+        "cli-commission",
+        "Admission needs no permission on the state store, and a store that does not exist is never created by this "
+        "command.",
+    ),
+    "commission_store_row": (
+        "cli-commission",
+        "| `runtime_unavailable` | No running runtime answers on the socket, the connection ends before the runtime "
+        "answers, or the socket peer is not verified as the expected runtime service identity. The bridge never "
+        "falls back to the state store or the configuration.",
+    ),
+}
+# The v1 contracts keep their published approval semantics word for word, and carry nothing v2 introduced.
+V1_KEPT = {
+    "events-v1": (
+        "For C: `true` only for affirmative token; otherwise `false`.",
+        "`approved=true`: operator affirmative token.",
+        "`approved=false`: explicit NO, timeout/no response, or unrecognized reply.",
+    ),
+    "offline-tokens-v1": ("| `action_scope` | `string` | Yes | Action name or `*` |",
+                          "`action_scope` matches requested action or wildcard"),
+}
+V2_TERMS = {
+    "events-v1": ("approval_admitted", "durably admitted", "decision_state", "dispatch_not_proven",
+                  "dispatch_outcome_unknown", "reconciled_", "proposal_aborted_restart", "approval_binding_changed",
+                  "approval_expired_undispatched", "approval_aborted_undispatched", "proposal_blocked_uncertain_outcome",
+                  "operator_reply",
+                  "approved_action_outcome", "safe_default_outcome"),
+    "offline-tokens-v1": ("proposal_id", "zone_id", "`target`", "token_version", "monotonic",
+                          "does not authorize Tier C", "one transaction"),
+}
+# gateway-api/v1 keeps its shipped Tier C semantics: none of the vocabulary tier-c-approval/v1 defines enters it.
+GATEWAY_FORBIDDEN = ("decision_state", "expires_at_ms", "approval_admitted", "dispatch_not_proven",
+                     "dispatch_outcome_unknown", "proposal_aborted_restart", "approved_pending_dispatch",
+                     "reconcile-tier-c", "Tier C Approval Admission", "proposal_blocked_uncertain_outcome")
+OPERATIONAL_CODES = {"runtime_unavailable", "runtime_store_unavailable", "state_store_locked", "cancelled"}
+V1_GUARD_LIMIT = (
+    "this guard proves only that the published v1 prose was not edited and that proposed v2 vocabulary did not "
+    "enter v1; it does not prove wire compatibility or consumer behavior, and a data vector and independent v1/v2 "
+    "consumer checks are mandatory before events/v2 ratification or implementation"
+)
+STATE_RULE = re.compile(r"`decision_state` is one of ((?:`\w+`(?:, and |, | and )?)+)\.")
+RECORDS_RULE = re.compile(r"as `\{(pending, outcome_unknown, dispatch_unproven, lost, [\w, ]+)\}`")
+TIMEOUT_MIN = re.compile(r"`approval_timeout_seconds` MUST be at least (\d+) and no greater than")
+REASON_RULE = re.compile(r"`--reason` is one of ((?:`\w+`(?:, and |, | and )?)+)\.")
+ORDER_RULE = re.compile(r"Checks run in this order, and the first that fails is the answer: ((?:`\w+`(?:, and |, | and )?)+)\.")
+NOTE_RULE = re.compile(r"`--note` is optional and at most (\d+) bytes of UTF-8\. A note MUST contain none of ([^.]+)\.")
+CODE_POINTS = re.compile(r"U\+([0-9A-F]{4})(?:–U\+([0-9A-F]{4}))?")
+DOMAIN_RULE = re.compile(r'A v2 token signature is Ed25519 over `"([^"`]+)" \|\| NUL \|\| canonical\(payload_without_signature\)`')
+CODE_ROW = re.compile(r"^\| `(\w+)` \|", re.MULTILINE)
+UNCERTAIN = ("dispatch_outcome_unknown", "dispatch_not_proven")
+# Committed approvals still in flight, which also block a later reply for the same outcome and zone.
+IN_FLIGHT = ("approved_pending_dispatch", "dispatch_started")
+# The proposal fields the `proposal_binds` sentence names, as the corpus spells them.
+PROPOSAL_BINDS = ("proposal_id", "device_id", "action", "target", "zone", "binding", "authority", "created_at_ms",
+                  "expires_at_ms")
+RECONCILED = ("reconciled_executed", "reconciled_not_executed")
+CLOSES_WITH_SAFE_DEFAULT = ("proposal_aborted_restart", "approval_binding_changed")
+REQUIRED_SEQUENCES = {
+    "admission": (
+        "a live approval dispatches immediately",
+        "a held state-store writer leaves the reply unapproved",
+        "a blocked outcome writer never delays or repeats the action",
+        "a reply after the monotonic deadline is not an approval",
+        "expiry between commit and dispatch",
+        "a crash before the executor call with an affirmative non-dispatch record is aborted",
+        "a durable approval with neither marker nor proof is dispatch_not_proven",
+        "a relay that actuated while its marker lost the race is dispatch_not_proven, never aborted",
+        "a durable marker without an outcome is dispatch_outcome_unknown",
+        "a duplicate reply is idempotent",
+        "the local console and an offline token use the same admission",
+        "stopped or disabled evidence never delays dispatch",
+        "an unauthenticated reply changes nothing",
+        "a refused proposal applies only the non-actuating safe default",
+        "a contention refusal at dispatch never actuates",
+        "a failed actuation is recorded dispatch_failed, never executed",
+        "a forward wall-clock jump does not shorten execution authority",
+        "a backward wall-clock jump does not extend execution authority",
+        "a restart with an open proposal closes it proposal_aborted_restart",
+        "a restart repeated after proposal_aborted_restart creates one safe-default intent",
+        "replies after approval_binding_changed create one safe-default intent",
+        "an uncertain dispatch blocks only the same outcome on the same zone",
+        "dispatch_not_proven blocks the same way and Tier D always continues",
+        "an authenticated local operator command reconciles by appending",
+        "unauthenticated operator input and uncommissioned feedback reconcile nothing",
+        "commissioned feedback for the zone reconciles dispatch_not_proven",
+        "a changed commissioned binding makes the reply no approval",
+        "a changed authority snapshot makes the reply no approval",
+        "a binding changed back after a mismatch revives nothing",
+        "a backward wall-clock jump between commit and dispatch does not extend execution authority",
+        "an unchanged binding and authority admit the approval",
+        "a timeout result is dispatch_outcome_unknown, never dispatch_failed",
+        "a lost response result is dispatch_outcome_unknown, never dispatch_failed",
+        "a partial result is dispatch_outcome_unknown, never dispatch_failed",
+        "an indeterminate result is dispatch_outcome_unknown, never dispatch_failed",
+        "the approval commit reserves a terminal uncertainty record",
+        "a reply whose uncertainty record cannot be reserved is not an approval",
+        "a full pending structure leaves a live unknown that is not durable",
+        "a full pending structure without a durable marker is dispatch_not_proven after restart",
+        "an outcome that cannot be appended stays pending while live",
+        "a store that accepts the write while live records the outcome the executor reported",
+        "an approval in flight for the same outcome and zone blocks a later proposal's reply",
+        "one safe-default intent per proposal",
+        "local logging of the safe default is idempotent by proposal id",
+        "a proposal row that cannot be committed is never sent",
+        "a later proposal for a blocked outcome is refused at creation",
+        "an uncertainty arising after a later proposal was created blocks its reply",
+        "reconciliation after a blocked reply revives nothing and admits a fresh proposal",
+    ),
+    "tokens": (
+        "an offline token bound to another proposal, action, target or zone approves nothing",
+        "a wildcard offline token never authorizes Tier C",
+        "a token still valid after the proposal's deadline approves nothing",
+        "a failed approval commit consumes no token_id",
+        "a token_id already claimed approves nothing",
+        "a fresh nonce under a claimed token_id approves nothing",
+        "a token valid longer than the proposal cannot extend it",
+        "a token presented to a proposal whose binding changed is not consumed",
+        "a v1 token parses as v1 and is refused as Tier C authority",
+        "a v1 wildcard token is refused as Tier C authority",
+        "a v1 token carrying every v2 binding claim but no version is still v1 and refused",
+        "a token with an unknown version is malformed",
+    ),
+    "reconcile": (
+        "an authenticated local reconcile is accepted, appended, and unblocks the same outcome on the same zone",
+        "a request whose operation is absent or unknown is refused invalid_arguments",
+        "an identical repeat appends no second reconciliation, and another principal's is audited",
+        "an identical repeat by root from another login is audited",
+        "operational outcomes commit no reconciliation",
+        "a different request after reconciliation is refused already_reconciled",
+        "an unknown proposal is refused",
+        "a device or zone mismatch is refused",
+        "an unauthenticated caller is refused before any record is read",
+        "arguments outside the closed sets or bounds are refused",
+        "an unreachable runtime or unavailable runtime store commits nothing, and the bridge creates no file",
+        "a proposal that is not uncertain is refused not_uncertain",
+        "reconcile never replays the action and never reaches Tier D",
+        "checks run in the contract's order",
+        "the device is the running runtime's own",
+        "spoofed user ID fields in the request do nothing",
+        "an unauthorized peer learns no state",
+        "the installed operator succeeds without database write permission",
+        "a lost connection cancels nothing the runtime began, and a repeat is idempotent",
+        "an admitted caller's audit login user ID neither admits nor refuses",
+        "the installed operator identity is read only from a trusted operator-uid file",
+        "a request naming a member twice is refused invalid_arguments",
+        "an audit login user ID the runtime cannot pin to the peer is recorded null",
+        "a host-state Tier C approval on the existing workflow is not reconciled here",
+        "a request naming operation twice is refused invalid_arguments",
+        "a response from an unverified peer is runtime_unavailable, and an explicit --socket does not waive "
+        "peer verification",
+    ),
+}
+MODEL_MUTANTS = {
+    "replay_after_restart": False,
+    "dispatch_before_commit": False,
+    "actuating_safe_default": False,
+    "actuating_safe_default_admitted": False,
+    "no_safe_default_on_close": False,
+    "safe_default_repeats": False,
+    "absent_marker_is_proof": False,
+    "wall_clock_expiry": False,
+    "deadline_restored_from_expires_at": False,
+    "binding_not_compared": False,
+    "binding_change_back_revives": False,
+    "any_source_reconciles": False,
+    "reconcile_rewrites": False,
+    "reconcile_not_idempotent": False,
+    "reconcile_ignores_device": False,
+    "reconcile_ignores_zone": False,
+    "reconcile_replays": False,
+    "reconcile_reaches_tier_d": False,
+    "reconcile_reason_open": False,
+    "reconcile_note_unbounded": False,
+    "block_whole_zone": False,
+    "block_tier_d": False,
+    "wildcard_authorizes": False,
+    "v1_token_authorizes": False,
+    "v1_token_approves_host_state": False,
+    "v2_token_approves_host_state": False,
+    "host_state_token_consumed": False,
+    "token_version_loose": False,
+    "token_expiry_governs": False,
+    "token_consumed_on_failed_commit": False,
+    "token_id_not_checked": False,
+    "token_keyed_by_nonce": False,
+    "timeout_unbounded": False,
+    "caller_supplied_admits": False,
+    "account_name_admits": False,
+    "group_admits": False,
+    "login_uid_admits": False,
+    "login_uid_refuses": False,
+    "spoofed_fields_admit": False,
+    "store_state_before_auth": False,
+    "caller_needs_store_write": False,
+    "bridge_opens_store": False,
+    "bridge_falls_back_to_store": False,
+    "disconnect_cancels_append": False,
+    "refusal_discloses_state": False,
+    "approval_without_reservation": False,
+    "reservation_skipped": False,
+    "ceiling_delays_dispatch": False,
+    "ceiling_discards_approval": False,
+    "ceiling_holds_pending": False,
+    "unknown_replays_after_restart": False,
+    "timeout_is_failed": False,
+    "live_unknown_durable": False,
+    "live_unknown_not_blocking": False,
+    "operation_unchecked": False,
+    "operation_duplicate_last_wins": False,
+    "unverified_peer_trusted": False,
+    "explicit_socket_waives_peer": False,
+    "reply_block_ignores_in_flight": False,
+    "alert_without_proposal_id": False,
+    "alert_not_retried": False,
+    "log_not_idempotent": False,
+    "uncommitted_proposal_sent": False,
+    "uncommitted_reply_approves": False,
+    "uncommitted_safe_default_recorded": False,
+    "duplicate_members_admitted": False,
+    "login_uid_unpinned_recorded": False,
+    "entry_point_cli_bridge": False,
+    "registry_null_admitted": False,
+    "consequence_class_ignored": False,
+    "consequence_class_defaults": False,
+    "eligibility_ignored": False,
+    "coap_generic_governed": False,
+    "zone_not_required": False,
+    "host_state_refused": False,
+    "tier_b_governed": False,
+    "snapshot_extra_ignored": False,
+    "snapshot_duplicates_last_wins": False,
+    "snapshot_version_loose": False,
+    "snapshot_digest_unchecked": False,
+    "token_duplicates_last_wins": False,
+    "contention_retries": False,
+    "contention_safe_default_repeats": False,
+    "failed_replays": False,
+    "block_not_rechecked_at_reply": False,
+    "blocked_reply_no_safe_default": False,
+    "blocked_safe_default_repeats": False,
+    "reconciliation_revives_blocked": False,
+    "audit_same_principal": False,
+    "audit_coalesced_across_principals": False,
+    "operator_uid_install_root_unchecked": False,
+    "operator_uid_ancestors_unchecked": False,
+    "operator_uid_group_writable_ok": False,
+    "operator_uid_follows_symlink": False,
+    "operator_uid_strips": False,
+    "operator_uid_int_parse": False,
+    "operator_uid_leading_zeros": False,
+    "operator_uid_service_account_ok": False,
+    "root_refused": False,
+    "operator_admitted_uninstalled": False,
+    "audit_never": False,
+    "audit_compares_account": False,
+    "audit_ignores_login_uid": False,
+    "audit_alters_state": False,
+    "operational_commits": False,
+    "note_c1_allowed": False,
+    "safe_default_registry_defines": False,
+    "safe_default_registry_ignored": False,
+    "safe_default_tier_ignored": False,
+    "safe_default_unclassified_admitted": False,
+    "token_trial_verification": False,
+    "token_no_domain_prefix": False,
+    "token_version_truthy": False,
+    "token_version_by_value": False,
+    "token_missing_version_falls_back": False,
+    "token_version_decoded_integral": False,
+    "canonical_ascii_escaped": False,
+    "canonical_html_escaped": False,
+}
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _section(text: str, bounds: tuple[str, str], what: str) -> str:
+    a = text.find(bounds[0])
+    b = text.find(bounds[1], a)
+    if a < 0 or b < a:
+        raise CheckError(f"{what} no longer carries the section {bounds[0]!r}")
+    return text[a:b]
+
+
+def _codes(match: re.Match) -> list[str]:
+    return re.findall(r"`(\w+)`", match.group(1))
+
+
+def load_contract(texts: dict[str, str]) -> dict:
+    scoped = {name: _norm(text) for name, text in texts.items()}
+    scoped["tier-c-approval"] = _norm(_section(texts["tier-c-approval"], SECTION, "tier-c-approval/v1"))
+    for surface in ("gateway-api", "gateway-evidence-carriage"):
+        for term in GATEWAY_FORBIDDEN:
+            if term in texts[surface]:
+                raise CheckError(f"{surface}/v1 carries {term!r}; Tier C admission belongs to tier-c-approval/v1, and "
+                                 "no gateway surface carries it")
+    cli = _section(texts["cli"], CLI_SECTION, "operator-socket/v1")
+    scoped["cli"] = _norm(cli)
+    commission = _section(texts["cli"], CLI_COMMISSION_SECTION, "operator-socket/v1")
+    scoped["cli-commission"] = _norm(commission)
+    for code in ("state_store_unavailable", "health_socket_unavailable", "health_device_mismatch",
+                 "config_validation_error", "state_migration_required"):
+        if f"`{code}`" in commission:
+            raise CheckError(f"operator-socket/v1's `evidence commission` still answers {code!r}; the bridge reads no "
+                             "store, configuration or health snapshot, and the runtime answers over its socket")
+    if re.search(r"--path", commission):
+        raise CheckError("operator-socket/v1's `evidence commission` still takes --path; the bridge reads no "
+                         "configuration and writes no store")
+    if EVENTS_PROPOSAL not in texts["events"]:
+        raise CheckError("events/v2 no longer marks its approval record as a proposal awaiting ratification")
+    for key, (name, sentence) in SENTENCES.items():
+        if _norm(sentence) not in scoped[name]:
+            raise CheckError(f"{name} no longer states the {key} rule this model hard-codes")
+    for name, kept in V1_KEPT.items():
+        for sentence in kept:
+            if _norm(sentence) not in scoped[name]:
+                raise CheckError(f"{name} no longer carries its published sentence {sentence[:60]!r}; {V1_GUARD_LIMIT}")
+        for term in V2_TERMS[name]:
+            if term in texts[name]:
+                raise CheckError(f"{name} carries {term!r}, which only v2 defines; v1 keeps its published semantics, "
+                                 f"and {V1_GUARD_LIMIT}")
+    states = STATE_RULE.search(scoped["tier-c-approval"])
+    if states is None:
+        raise CheckError("tier-c-approval/v1 no longer states the decision_state vocabulary")
+    records = RECORDS_RULE.search(scoped["runtime-health"])
+    if records is None:
+        raise CheckError("runtime-health/v3 no longer states the action_records fields")
+    minimum = TIMEOUT_MIN.search(scoped["runtime-config"])
+    schema = json.loads(CONFIG_SCHEMA.read_text(encoding="utf-8"))
+    schema_min = _find_minimum(schema)
+    if minimum is None or schema_min is None or int(minimum.group(1)) != schema_min:
+        raise CheckError("runtime-config/v2 and its schema state different approval_timeout_seconds minimums")
+    reasons, order, note = REASON_RULE.search(scoped["cli"]), ORDER_RULE.search(scoped["cli"]), NOTE_RULE.search(
+        scoped["cli"])
+    if reasons is None or order is None or note is None:
+        raise CheckError("operator-socket/v1 no longer states the reconcile reasons, refusal order or note bound")
+    order_codes = _codes(order)
+    table = set(CODE_ROW.findall(cli))
+    if len(set(order_codes)) != len(order_codes) or not set(order_codes) <= table or (
+            table - set(order_codes) != OPERATIONAL_CODES):
+        raise CheckError("operator-socket/v1's refusal order and its error.code table disagree")
+    legacy = json.loads(LEGACY_ACTIONS.read_text(encoding="utf-8"))["cases"]
+    actuating = {c["legacy_action"] for c in legacy} | {c["outcome"] for c in legacy} | {"coap_command"}
+    pinned = scoped["tier-c-approval"].split("are a pinned instance of this rule", 1)[0].rsplit("## Safe Defaults", 1)[-1]
+    if {name for name in re.findall(r"`(\w+)`", pinned) if name not in ("physical",)} != actuating:
+        raise CheckError("tier-c-approval/v1's pinned safe-default instance and legacy-actions.json plus coap_command "
+                         "name different actions")
+    excluded: list[tuple[int, int]] = []
+    for low, high in CODE_POINTS.findall(note.group(2)):
+        excluded.append((int(low, 16), int(high or low, 16)))
+    profile = _section(texts["signing"], PROFILE_2, "signing/v2")
+    for parameter in PROFILE_2_PARAMETERS:
+        if parameter not in profile:
+            raise CheckError(f"signing/v2 Profile 2 no longer carries {parameter!r}, which offline-tokens/v2 names as "
+                             "its canonical form")
+    domain = DOMAIN_RULE.search(scoped["offline-tokens"])
+    if domain is None:
+        raise CheckError("offline-tokens/v2 no longer states the v2 signature domain")
+    approval = texts["tier-c-approval"]
+    table = approval[approval.find("| Member | Binds |"):]
+    snapshot_members = re.findall(r"^\| `(\w+)` \|", table.split("\n\n", 1)[0], re.MULTILINE)
+    if not snapshot_members or "v" not in snapshot_members:
+        raise CheckError("tier-c-approval/v1 no longer states the authority snapshot's members")
+    return {
+        "states": set(_codes(states)),
+        "records": [f.strip() for f in records.group(1).split(",")],
+        "timeout_min": schema_min,
+        "reasons": set(_codes(reasons)),
+        "order": order_codes,
+        "note_bytes": int(note.group(1)),
+        "note_excluded": excluded,
+        "actuating": actuating,
+        "domain": domain.group(1).encode("ascii"),
+        "snapshot_members": snapshot_members,
+    }
+
+
+def _find_minimum(node) -> int | None:
+    if isinstance(node, dict):
+        if "approval_timeout_seconds" in node and isinstance(node["approval_timeout_seconds"], dict):
+            return node["approval_timeout_seconds"].get("minimum")
+        for value in node.values():
+            found = _find_minimum(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_minimum(value)
+            if found is not None:
+                return found
+    return None
+
+
+def token_format(token: dict) -> str:
+    if "token_version" not in token:
+        return "v1"
+    version = token["token_version"]
+    if MODEL_MUTANTS["token_version_loose"]:
+        return "v2" if str(version) in ("2", "True") else "malformed"
+    return "v2" if _is_integer_token(version) and int(_number_token(version)) == 2 else "malformed"
+
+
+def replay(contract: dict, document: dict, sequence: dict, coverage: dict) -> set[str]:
+    prop = {**document["proposal"], **sequence.get("proposal", {})}
+    unbound = [k for k in PROPOSAL_BINDS if not prop.get(k)]
+    if unbound:
+        raise CheckError(f"{sequence['name']}: the proposal binds no {unbound}; tier-c-approval/v1 binds every Tier C "
+                         "proposal to its commissioned zone and the other fields it names")
+    if prop["safe_default_action"] in contract["actuating"] and not MODEL_MUTANTS["actuating_safe_default_admitted"]:
+        raise CheckError(f"{sequence['name']}: a proposal carries the actuating safe default "
+                         f"{prop['safe_default_action']!r}")
+    deadline = prop["created_mono_ms"] + (prop["expires_at_ms"] - prop["created_at_ms"])
+    p = {"state": "proposed", "actuations": 0, "safe_default_runs": 0, "events": [], "pending": 0,
+         "unknown_live": 0, "slot": None, "live_unknown": False, "alert_attempts": [], "alert_pending": False,
+         "log_ids": set(), "log_count": 0, "exists": True, "sent": True, "sd_attempted": False, "sd_recorded": None,
+         "consumed_nonces": set(),
+         "outcome_unknown": 0, "dispatch_unproven": 0, "marker": False, "notice": None,
+         "dispatch_refused": False, "proof": False, "records": ["proposed"], "live": True,
+         "binding": prop["binding"], "authority": prop["authority"], "consumed": set(sequence.get("consumed_token_ids", [])),
+         "admitted": None, "mismatched": False, "reconciliation": None, "reconciliations": 0, "result": None,
+         "audit_required": False, "audit_attempts": [], "reserved": 0, "later": {}, "later_safe_default_runs": {},
+         "response": None, "bridge_files": [], "later_proposals": {}}
+    reached = {"proposed"}
+    name = sequence["name"]
+
+    def move(state: str) -> None:
+        p["state"] = state
+        p["records"].append(state)
+        reached.add(state)
+
+    def execute_intent() -> None:
+        """Run the proposal's safe-default intent with its executor's delivery semantics."""
+        if prop["safe_default_action"].startswith("alert_"):
+            carried = None if MODEL_MUTANTS["alert_without_proposal_id"] else prop["proposal_id"]
+            p["alert_attempts"].append(carried)
+            p["alert_pending"] = True
+        else:
+            p["log_ids"].add(prop["proposal_id"])
+            p["log_count"] += 1
+
+    def safe_default() -> None:
+        """Create the proposal's one durable safe-default intent and execute it."""
+        p["safe_default_runs"] += 1
+        execute_intent()
+        if MODEL_MUTANTS["actuating_safe_default"]:
+            p["actuations"] += 1
+
+    def close(state: str) -> None:
+        """Close an open proposal without approval; the safe default runs once, recorded apart from the state."""
+        move(state)
+        p["notice"] = state
+        if not MODEL_MUTANTS["no_safe_default_on_close"]:
+            safe_default()
+
+    def release_slot() -> None:
+        """The live outcome leaves `pending`, or `unknown_live` when it was held there at the ceiling."""
+        if p["slot"] == "pending":
+            p["pending"] -= 1
+        elif p["slot"] == "unknown_live":
+            p["unknown_live"] -= 1
+        p["slot"] = None
+        p["live_unknown"] = False
+
+    def uncertain_now() -> None:
+        """The terminal uncertainty record reserved at admission is written `dispatch_outcome_unknown`."""
+        if p["reserved"] < 1:
+            return  # nothing was reserved, so nothing can record the uncertainty
+        p["reserved"] = 0
+        move("dispatch_outcome_unknown")
+        p["outcome_unknown"] += 1
+        p["events"].append("critical_operator_audit")
+
+    def reply_later(step: dict) -> None:
+        """A reply to a later Tier C proposal: the same-outcome block is evaluated again at its admission."""
+        later = step["proposal"]
+        if later not in p["later"]:
+            raise CheckError(f"{name}: a reply to {later!r}, which no step opened")
+        runs = p["later_safe_default_runs"]
+        if not step["authenticated"]:
+            return
+        if p["later"][later] != "proposed":
+            if p["later"][later] == "proposal_blocked_uncertain_outcome":
+                if MODEL_MUTANTS["blocked_safe_default_repeats"]:
+                    runs[later] = runs.get(later, 0) + 1
+                if MODEL_MUTANTS["reconciliation_revives_blocked"] and p["state"] not in UNCERTAIN:
+                    p["later"][later] = "approved_pending_dispatch"
+            return
+        outcome, zone = p["later_proposals"][later]
+        same = outcome == prop["outcome"] and zone == prop["zone"]
+        if MODEL_MUTANTS["block_whole_zone"]:
+            same = zone == prop["zone"]
+        blocking = UNCERTAIN if MODEL_MUTANTS["reply_block_ignores_in_flight"] else UNCERTAIN + IN_FLIGHT
+        if (p["state"] in blocking or p["live_unknown"]) and same and not MODEL_MUTANTS["block_not_rechecked_at_reply"]:
+            p["later"][later] = "proposal_blocked_uncertain_outcome"
+            reached.add("proposal_blocked_uncertain_outcome")
+            p["notice"] = "proposal_blocked_uncertain_outcome"
+            if not MODEL_MUTANTS["blocked_reply_no_safe_default"]:
+                runs[later] = runs.get(later, 0) + 1
+        elif step["commit"] == "ok" and step["decision"] == "yes":
+            p["later"][later] = "approved_pending_dispatch"
+        elif step["commit"] == "ok":
+            p["later"][later] = "rejected"
+            runs[later] = runs.get(later, 0) + 1
+
+    def expired(step: dict) -> bool:
+        if MODEL_MUTANTS["wall_clock_expiry"]:
+            return step["wall_ms"] > prop["expires_at_ms"]
+        return step["mono_ms"] > deadline
+
+    def reply_expired(step: dict, token: dict | None) -> bool:
+        if token is not None and MODEL_MUTANTS["token_expiry_governs"]:
+            return step["wall_ms"] > token["expires_at"] * 1000
+        if not p["live"]:
+            # Only a model that rebuilds authority from `expires_at_ms` reaches an open proposal after restart.
+            if not MODEL_MUTANTS["deadline_restored_from_expires_at"]:
+                raise CheckError(f"{name}: an open proposal survived a restart")
+            return step["wall_ms"] > prop["expires_at_ms"]
+        return expired(step)
+
+    def token_refusal(token: dict) -> str | None:
+        form = token_format(token)
+        if form == "malformed":
+            return "token_refused"
+        if form == "v1" and not MODEL_MUTANTS["v1_token_authorizes"]:
+            return "token_v1_refused"
+        wildcard = token.get("action_scope") == "*" and MODEL_MUTANTS["wildcard_authorizes"]
+        for claim, want in (("proposal_id", prop["proposal_id"]), ("device_id", prop["device_id"]),
+                            ("target", prop["target"]), ("zone_id", prop["zone"])):
+            if token.get(claim) != want and not (form == "v1" and claim not in token):
+                return "token_refused"
+        if token.get("action_scope") != prop["action"] and not wildcard:
+            return "token_refused"
+        if MODEL_MUTANTS["token_keyed_by_nonce"]:
+            if token["nonce"] in p["consumed_nonces"]:
+                return "token_replayed"
+        elif token["token_id"] in p["consumed"] and not MODEL_MUTANTS["token_id_not_checked"]:
+            return "token_replayed"
+        return None
+
+    def admitted(step: dict) -> bool:
+        """Root or the installed operator identity, from credentials the runtime obtained from the process."""
+        caller = step["caller"]
+        if caller.get("credentials") != "peer" and not (
+                MODEL_MUTANTS["caller_supplied_admits"] and caller.get("credentials") is not None):
+            return False
+        operator = document.get("installed_operator_uid")
+        if "operator_uid_file" in step:
+            operator = operator_uid_verdict(_operator_uid_case(document, step["operator_uid_file"]))
+        if step.get("operator_identity") == "not_installed" and not MODEL_MUTANTS["operator_admitted_uninstalled"]:
+            operator = None
+        uid = caller.get("uid")
+        # The effective user ID alone admits; the audit login user ID neither admits nor refuses.
+        if MODEL_MUTANTS["login_uid_refuses"] and caller.get("login_uid") not in (None, uid):
+            return False
+        if uid == 0 and not MODEL_MUTANTS["root_refused"]:
+            return True
+        if operator is not None and uid == operator:
+            return True
+        if MODEL_MUTANTS["account_name_admits"] and caller.get("account") == "installer":
+            return True
+        if MODEL_MUTANTS["group_admits"] and caller.get("groups"):
+            return True
+        return bool(MODEL_MUTANTS["login_uid_admits"] and operator is not None and caller.get("login_uid") == operator)
+
+    def principal(caller: dict) -> dict:
+        """The recorded principal; an audit login user ID is recorded only for a peer the runtime pinned."""
+        recorded = {k: caller.get(k) for k in ("uid", "account", "login_uid")}
+        if caller.get("pidfd_pinned") is False and not MODEL_MUTANTS["login_uid_unpinned_recorded"]:
+            recorded["login_uid"] = None
+        return recorded
+
+    def same_principal(a: dict, b: dict) -> bool:
+        keys = ["uid", "login_uid"]
+        if MODEL_MUTANTS["audit_compares_account"]:
+            keys.append("account")
+        if MODEL_MUTANTS["audit_ignores_login_uid"]:
+            keys.remove("login_uid")
+        return all(a.get(k) == b.get(k) for k in keys)
+
+    def excluded(c: str) -> bool:
+        ranges = contract["note_excluded"]
+        if MODEL_MUTANTS["note_c1_allowed"]:
+            ranges = [r for r in ranges if r[0] < 0x80]
+        return any(low <= ord(c) <= high for low, high in ranges)
+
+    def device_mismatch(step: dict) -> bool:
+        """`--device-id` against the device identity of the running runtime that answers on the socket."""
+        if MODEL_MUTANTS["reconcile_ignores_device"]:
+            return False
+        return step["device_id"] != step.get("runtime_device", prop["device_id"])
+
+    def reconcile_local(step: dict) -> tuple[str, str]:
+        """`evidence reconcile-tier-c`, submitted over the runtime's operator socket: the bridge's argument check,
+        then the runtime's checks in the contract's order, or the append. The bridge never opens the store."""
+        p["bridge_files"] = []
+        if MODEL_MUTANTS["bridge_opens_store"]:
+            p["bridge_files"] = ["ori_state.db-wal", "ori_state.db-shm"]
+        if step.get("peer") == "unverified" and step.get("operation", "reconcile_tier_c") == "reconcile_tier_c":
+            # The bridge verifies the connected peer from kernel credentials before trusting any answer; an explicit
+            # `--socket` waives nothing. The runtime never received this request, so nothing was decided.
+            waived = MODEL_MUTANTS["explicit_socket_waives_peer"] and step.get("socket") == "explicit"
+            if MODEL_MUTANTS["unverified_peer_trusted"] or waived:
+                return step["peer_answer"], "not_submitted"
+            coverage.add("runtime_unavailable")
+            return "runtime_unavailable", "not_submitted"
+        result = reconcile_runtime(step)
+        if step.get("runtime") == "lost_after_submit" and result != "refused:invalid_arguments":
+            # The runtime decided, but the connection ended first: the bridge cannot tell what happened, and the
+            # runtime's append, once begun, stands.
+            coverage.add("runtime_unavailable")
+            if MODEL_MUTANTS["disconnect_cancels_append"] and result == "recorded":
+                result = "cancelled"
+            return "runtime_unavailable", result
+        return result, result
+
+    def reconcile_runtime(step: dict) -> str:
+        caller = dict(step["caller"])
+        spoofed = step.get("request_fields", {})
+        if spoofed and MODEL_MUTANTS["spoofed_fields_admit"]:
+            caller.update(credentials="peer", **spoofed)
+        note = step.get("note")
+        p["audit_required"] = False
+        identical = p["reconciliation"] is not None and all(
+            p["reconciliation"][k] == v for k, v in (
+                ("proposal_id", step.get("proposal_id")), ("decision_state", _reconciled(step.get("outcome"))),
+                ("reason", step.get("reason")), ("note", note)))
+        checks = {
+            "invalid_arguments": lambda: (
+                (step.get("operation", "reconcile_tier_c") != "reconcile_tier_c"
+                 and not MODEL_MUTANTS["operation_unchecked"])
+                or (bool(spoofed) and not MODEL_MUTANTS["spoofed_fields_admit"])
+                or (bool(step.get("duplicate_members")) and not MODEL_MUTANTS["duplicate_members_admitted"]
+                    and not (MODEL_MUTANTS["operation_duplicate_last_wins"]
+                             and step["duplicate_members"] == ["operation"]))
+                or any(step.get(k) is None for k in ("proposal_id", "device_id", "zone_id", "outcome", "reason"))
+                or step["outcome"] not in ("executed", "not-executed")
+                or (step["reason"] not in contract["reasons"] and not MODEL_MUTANTS["reconcile_reason_open"])
+                or (note is not None and (
+                    (len(note.encode("utf-8")) > contract["note_bytes"] and not MODEL_MUTANTS["reconcile_note_unbounded"])
+                    or any(excluded(c) for c in note)))),
+            "unauthenticated": lambda: not admitted({**step, "caller": caller}) and not MODEL_MUTANTS[
+                "any_source_reconciles"],
+            "device_mismatch": lambda: device_mismatch(step),
+            "unknown_proposal": lambda: step["proposal_id"] != prop["proposal_id"] and not (
+                MODEL_MUTANTS["reconcile_reaches_tier_d"] and step["proposal_id"].startswith("tier-d")),
+            "zone_mismatch": lambda: step["zone_id"] != prop["zone"] and not MODEL_MUTANTS["reconcile_ignores_zone"],
+            "already_reconciled": lambda: p["state"] in RECONCILED and not identical,
+            "not_uncertain": lambda: p["state"] not in UNCERTAIN and not (p["state"] in RECONCILED and identical),
+        }
+        store_unavailable = step.get("runtime_store") == "unavailable" or (
+            MODEL_MUTANTS["caller_needs_store_write"] and step.get("caller_store_access") == "none")
+        for code in contract["order"]:
+            if code not in checks:
+                raise CheckError(f"{name}: the contract orders a refusal {code!r} the model does not decide")
+            if code == "unauthenticated" and MODEL_MUTANTS["store_state_before_auth"] and store_unavailable:
+                coverage.add("runtime_store_unavailable")
+                return "runtime_store_unavailable"
+            if code == "unauthenticated" and step.get("runtime") == "unreachable":
+                # The bridge decided the arguments; nothing answers on the socket, so nothing else is decided.
+                if MODEL_MUTANTS["bridge_falls_back_to_store"]:
+                    p["bridge_files"] = ["ori_state.db", "ori_state.db-wal", "ori_state.db-shm"]
+                else:
+                    coverage.add("runtime_unavailable")
+                    return "runtime_unavailable"
+            if checks[code]():
+                coverage.add(code)
+                return f"refused:{code}"
+            if code == "unauthenticated" and store_unavailable:
+                coverage.add("runtime_store_unavailable")
+                return "runtime_store_unavailable"
+            if code == "already_reconciled" and p["state"] in RECONCILED and identical:
+                if not MODEL_MUTANTS["reconcile_not_idempotent"]:
+                    other = not same_principal(principal(caller), p["reconciliation"]["operator"])
+                    p["audit_required"] = other
+                    if MODEL_MUTANTS["audit_same_principal"]:
+                        other = True
+                    coalesced = MODEL_MUTANTS["audit_coalesced_across_principals"] and p["audit_attempts"]
+                    if other and not MODEL_MUTANTS["audit_never"] and not coalesced:
+                        p["audit_attempts"].append({"kind": "identical_repeat", "caller": principal(caller),
+                                                    "reconciliation": p["reconciliation"]["proposal_id"]})
+                        if MODEL_MUTANTS["audit_alters_state"]:
+                            p["records"].append(p["state"])
+                    return "already_recorded"
+                p["reconciliations"] += 1
+                p["records"].append(p["state"])
+                return "recorded"
+        for code in checks:
+            if code not in contract["order"]:
+                raise CheckError(f"{name}: the model decides {code!r}, which the contract's order does not name")
+        if step.get("operational") and not MODEL_MUTANTS["operational_commits"]:
+            coverage.add(step["operational"])
+            return step["operational"]
+        if step["proposal_id"] != prop["proposal_id"]:
+            # Only a model that lets a reconcile reach a Tier D record gets here.
+            p["actuations"] += 1
+        coverage.add(("reason", step["reason"]))
+        return "recorded"
+
+    for index, step in enumerate(sequence["steps"]):
+        where = f"{name} step {index}"
+        event = step["event"]
+        p["dispatch_refused"] = False
+        p["admitted"] = None
+        p["result"] = None
+        form = None
+        if event == "create":
+            # The proposal row could not be committed: nothing exists to send or approve, the safe default is
+            # attempted and a CRITICAL notification raised, and neither is claimed durable.
+            if step["commit"] != "failed":
+                raise CheckError(f"{where}: a create step models only a proposal row that failed to commit")
+            p["exists"] = False
+            p["sent"] = MODEL_MUTANTS["uncommitted_proposal_sent"]
+            p["sd_attempted"] = True
+            p["sd_recorded"] = False
+            if MODEL_MUTANTS["uncommitted_safe_default_recorded"]:
+                p["sd_recorded"] = True
+                p["safe_default_runs"] += 1
+            p["events"].append("critical_operational")
+        elif event == "reply" and "proposal" in step:
+            reply_later(step)
+        elif event == "reply" and not p["exists"]:
+            if MODEL_MUTANTS["uncommitted_reply_approves"] and step["authenticated"]:
+                move("approved_pending_dispatch")
+                p["reserved"] = 1
+            else:
+                p["notice"] = "no_proposal"
+        elif event == "reply":
+            token = step.get("token")
+            if token is not None:
+                form = token_format(token)
+            if not step["authenticated"]:
+                pass
+            elif p["state"] != "proposed":
+                if MODEL_MUTANTS["safe_default_repeats"] and p["state"] in CLOSES_WITH_SAFE_DEFAULT:
+                    safe_default()
+                # idempotent: the decided state stands, and nothing reopens it
+            elif reply_expired(step, token):
+                move("proposal_expired")
+                p["notice"] = "proposal_expired"
+            elif token is not None and token_refusal(token):
+                p["notice"] = token_refusal(token)
+            elif (p["binding"], p["authority"]) != (prop["binding"], prop["authority"]) and not (
+                    MODEL_MUTANTS["binding_not_compared"]):
+                close("approval_binding_changed")
+                p["mismatched"] = True
+            elif (step["commit"] != "ok" and not MODEL_MUTANTS["dispatch_before_commit"]) or (
+                    step.get("reservation") == "unavailable" and not MODEL_MUTANTS["approval_without_reservation"]):
+                # The commit reserves the terminal uncertainty record; one it cannot reserve is not a commit.
+                p["notice"] = "commit_failed_retry"
+                if token is not None and MODEL_MUTANTS["token_consumed_on_failed_commit"]:
+                    p["consumed"].add(token["token_id"])
+            elif step["decision"] == "no":
+                move("rejected")
+                safe_default()
+                if token is not None:
+                    p["consumed"].add(token["token_id"])
+                    p["consumed_nonces"].add(token["nonce"])
+            else:
+                move("approved_pending_dispatch")
+                if not (MODEL_MUTANTS["reservation_skipped"] or step.get("reservation") == "unavailable"):
+                    p["reserved"] = 1
+                if token is not None:
+                    p["consumed"].add(token["token_id"])
+                    p["consumed_nonces"].add(token["nonce"])
+        elif event == "binding_change":
+            p["binding"] = step.get("binding", p["binding"])
+            p["authority"] = step.get("authority", p["authority"])
+            if MODEL_MUTANTS["binding_change_back_revives"] and p["mismatched"] and (
+                    p["binding"], p["authority"]) == (prop["binding"], prop["authority"]):
+                p["state"], p["mismatched"] = "proposed", False
+        elif event == "dispatch" and not p["exists"] and p["state"] == "proposed":
+            p["dispatch_refused"] = True  # no proposal exists, so nothing was approved
+        elif event == "dispatch":
+            if p["state"] == "dispatch_refused_contention" and MODEL_MUTANTS["contention_retries"]:
+                move("dispatch_started")
+                p["actuations"] += 1
+            elif p["state"] == "dispatch_failed" and MODEL_MUTANTS["failed_replays"]:
+                p["actuations"] += 1
+            elif p["state"] != "approved_pending_dispatch":
+                p["dispatch_refused"] = True
+                if p["state"] == "dispatch_refused_contention" and MODEL_MUTANTS["contention_safe_default_repeats"]:
+                    safe_default()
+            elif expired(step):
+                move("approval_expired_undispatched")
+                p["reserved"] = 0
+                safe_default()
+                p["events"].append("critical_operational")
+            elif step.get("contention", False):
+                move("dispatch_refused_contention")
+                p["reserved"] = 0
+                p["notice"] = "dispatch_refused_contention"
+                safe_default()
+                p["events"].append("critical_operational")
+            elif step.get("pending_at_ceiling", False) and MODEL_MUTANTS["ceiling_delays_dispatch"]:
+                p["dispatch_refused"] = True
+            elif step.get("pending_at_ceiling", False) and MODEL_MUTANTS["ceiling_discards_approval"]:
+                move("approval_expired_undispatched")
+                p["reserved"] = 0
+                safe_default()
+            else:
+                move("dispatch_started")
+                p["actuations"] += 1
+                p["marker"] = step["marker_durable"]
+                if step.get("pending_at_ceiling", False) and not MODEL_MUTANTS["ceiling_holds_pending"]:
+                    # No pending slot is left: the outcome is an in-memory unknown, reported and not durable.
+                    p["slot"] = "unknown_live"
+                    p["unknown_live"] += 1
+                    p["live_unknown"] = True
+                    if MODEL_MUTANTS["live_unknown_durable"]:
+                        release_slot()
+                        uncertain_now()
+                else:
+                    p["slot"] = "pending"
+                    p["pending"] += 1
+        elif event == "outcome":
+            if p["state"] != "dispatch_started":
+                raise CheckError(f"{where}: an outcome with no dispatch")
+            result = step["result"]
+            if step["write"] == "ok" and result in ("executed", "failed"):
+                # Only an executor affirming the commanded outcome did not occur yields `dispatch_failed`.
+                move("executed" if result == "executed" else "dispatch_failed")
+                release_slot()
+                p["reserved"] = 0
+                if result == "failed":
+                    p["events"].append("critical_operational")
+            elif step["write"] == "ok" and MODEL_MUTANTS["timeout_is_failed"]:
+                move("dispatch_failed")
+                release_slot()
+                p["reserved"] = 0
+            elif step["write"] == "ok":
+                # A written result that cannot establish the physical outcome is a durable unknown.
+                release_slot()
+                uncertain_now()
+            elif step["write"] == "failed":
+                # The live runtime cannot append the outcome: it stays pending, an in-memory unknown, never durable.
+                p["live_unknown"] = True
+                if MODEL_MUTANTS["live_unknown_durable"]:
+                    release_slot()
+                    uncertain_now()
+        elif event == "crash":
+            if step.get("non_dispatch_record", False):
+                if p["state"] != "approved_pending_dispatch":
+                    raise CheckError(f"{where}: a non-dispatch record for a proposal that is not undispatched")
+                p["proof"] = True
+            p["live"] = False
+        elif event == "alert_result":
+            if step["result"] == "delivered":
+                p["alert_pending"] = False
+            elif step["result"] == "ambiguous" and not MODEL_MUTANTS["alert_not_retried"]:
+                # The outbox retries; the provider may have delivered, so the retry may duplicate the alert.
+                execute_intent()
+            else:
+                p["alert_pending"] = step["result"] == "ambiguous" and p["alert_pending"]
+        elif event == "restart":
+            p["live"] = False
+            # The durable intent survives; its executor resumes: an undelivered alert is retried, a log write is
+            # idempotent by the proposal identifier.
+            if p["safe_default_runs"] and p["alert_pending"]:
+                execute_intent()
+            elif p["safe_default_runs"] and p["log_ids"] and MODEL_MUTANTS["log_not_idempotent"]:
+                execute_intent()
+            for later, state in p["later"].items():
+                if state == "proposed":
+                    p["later"][later] = "proposal_aborted_restart"
+                    p["later_safe_default_runs"][later] = p["later_safe_default_runs"].get(later, 0) + 1
+            if MODEL_MUTANTS["unknown_replays_after_restart"] and p["state"] == "dispatch_outcome_unknown":
+                p["actuations"] += 1
+            if MODEL_MUTANTS["failed_replays"] and p["state"] == "dispatch_failed":
+                p["actuations"] += 1
+            if MODEL_MUTANTS["contention_safe_default_repeats"] and p["state"] == "dispatch_refused_contention":
+                safe_default()
+            if MODEL_MUTANTS["replay_after_restart"] and p["state"] in ("approved_pending_dispatch", "dispatch_started"):
+                p["actuations"] += 1
+            if MODEL_MUTANTS["safe_default_repeats"] and p["state"] in CLOSES_WITH_SAFE_DEFAULT:
+                safe_default()
+            if p["state"] == "proposed":
+                if not MODEL_MUTANTS["deadline_restored_from_expires_at"]:
+                    close("proposal_aborted_restart")
+            elif p["state"] == "approved_pending_dispatch" and (p["proof"] or MODEL_MUTANTS["absent_marker_is_proof"]):
+                move("approval_aborted_undispatched")
+                p["reserved"] = 0
+                safe_default()
+                p["events"].append("critical_operational")
+            elif p["state"] == "dispatch_started" and not p["marker"] and MODEL_MUTANTS["absent_marker_is_proof"]:
+                move("approval_aborted_undispatched")
+                p["reserved"] = 0
+                release_slot()
+                safe_default()
+                p["events"].append("critical_operational")
+            elif p["state"] == "dispatch_started" and p["marker"]:
+                release_slot()
+                uncertain_now()
+            elif p["state"] in ("approved_pending_dispatch", "dispatch_started"):
+                if p["state"] == "dispatch_started":
+                    release_slot()
+                move("dispatch_not_proven")
+                p["reserved"] = 0
+                p["dispatch_unproven"] += 1
+                p["events"].append("critical_operator_audit")
+        elif event == "reconcile":
+            if step["source"] == "operator_local":
+                result, decided = reconcile_local(step)
+                valid = decided == "recorded" and p["state"] in UNCERTAIN
+                p["result"] = result
+                p["response"] = {} if result != "recorded" and result != "already_recorded" else "reconciliation"
+                if MODEL_MUTANTS["refusal_discloses_state"] and result == "refused:unauthenticated":
+                    p["response"] = {"decision_state": p["state"]}
+                if result.startswith("refused:"):
+                    p["notice"] = "reconcile_refused"
+            else:
+                valid = (step["source"] == "commissioned_feedback" and step["zone"] == prop["zone"]
+                         and step["mapping_proves"]) or MODEL_MUTANTS["any_source_reconciles"]
+                if p["state"] not in UNCERTAIN or not valid:
+                    p["notice"] = "reconcile_refused"
+                    valid = False
+            if valid:
+                was = p["state"]
+                target = "reconciled_executed" if step["outcome"] == "executed" else "reconciled_not_executed"
+                if MODEL_MUTANTS["reconcile_rewrites"]:
+                    p["records"][-1] = target
+                    p["state"] = target
+                    reached.add(target)
+                else:
+                    move(target)
+                if MODEL_MUTANTS["reconcile_replays"] and target == "reconciled_not_executed":
+                    p["actuations"] += 1
+                if was == "dispatch_outcome_unknown":
+                    p["outcome_unknown"] -= 1
+                else:
+                    p["dispatch_unproven"] -= 1
+                if step["source"] == "operator_local":
+                    p["reconciliations"] += 1
+                    p["reconciliation"] = {
+                        "proposal_id": step["proposal_id"], "device_id": step["device_id"],
+                        "zone_id": step["zone_id"], "decision_state": target, "reason": step["reason"],
+                        "note": step.get("note"), "operator": principal(step["caller"]),
+                        "entry_point": "cli_bridge" if MODEL_MUTANTS["entry_point_cli_bridge"] else "local_operator_socket"}
+        elif event == "propose":
+            unresolved = p["state"] in UNCERTAIN or (p["live_unknown"] and not MODEL_MUTANTS["live_unknown_not_blocking"])
+            same = step["outcome"] == prop["outcome"] and step["zone"] == prop["zone"]
+            if MODEL_MUTANTS["block_whole_zone"]:
+                same = step["zone"] == prop["zone"]
+            blocked = unresolved and same and (step["tier"] == "C" or (
+                step["tier"] == "D" and MODEL_MUTANTS["block_tier_d"]))
+            p["admitted"] = not blocked
+            if "opens" in step:
+                if step["tier"] != "C":
+                    raise CheckError(f"{where}: only a Tier C proposal is opened for a reply")
+                if not blocked:
+                    p["later"][step["opens"]] = "proposed"
+                    p["later_proposals"][step["opens"]] = (step["outcome"], step["zone"])
+        elif event in ("evidence_stopped", "evidence_disabled", "gateway_unavailable"):
+            pass  # dispatch waits on none of these
+        else:
+            raise CheckError(f"{where}: unknown event {event!r}")
+        for state in (p["state"], *p["later"].values()):
+            if state not in contract["states"]:
+                raise CheckError(f"{where}: {state} is not in the contract's decision_state vocabulary")
+        lost = p["outcome_unknown"] + p["dispatch_unproven"]
+        records = {"pending": p["pending"], "outcome_unknown": p["outcome_unknown"],
+                   "dispatch_unproven": p["dispatch_unproven"], "lost": lost, "unknown_live": p["unknown_live"]}
+        observed = {
+            "state": p["state"], "actuations": p["actuations"], "safe_default": p["safe_default_runs"] > 0,
+            "safe_default_intents": p["safe_default_runs"], "events": list(p["events"]), "notice": p["notice"],
+            "dispatch_refused": p["dispatch_refused"], "action_records": records,
+            "evidence_status": "degraded" if lost or p["unknown_live"] else "ok", "records": list(p["records"]),
+            "admitted": p["admitted"], "reserved": p["reserved"], "later": dict(p["later"]),
+            "later_safe_default_intents": dict(p["later_safe_default_runs"]),
+            "alert_attempts": list(p["alert_attempts"]),
+            "log_records": p["log_count"] if MODEL_MUTANTS["log_not_idempotent"] else len(p["log_ids"]),
+            "proposal_sent": p["sent"], "safe_default_attempted": p["sd_attempted"],
+            "safe_default_recorded": p["sd_recorded"],
+        }
+        if "token" in step:
+            observed["token_consumed"] = step["token"]["token_id"] in p["consumed"]
+            observed["token_format"] = form
+        if event == "reconcile" and step["source"] == "operator_local":
+            observed.update(result=p["result"], response=p["response"], bridge_files_created=list(p["bridge_files"]),
+                            reconciliations=p["reconciliations"], reconciliation=p["reconciliation"],
+                            audit_required=p["audit_required"], audit_attempts=list(p["audit_attempts"]),
+                            audit_principals=_distinct_principals(p["audit_attempts"]))
+        for key, value in step["expect"].items():
+            if key not in observed:
+                raise CheckError(f"{where}: expectation {key!r} is not something this step decides")
+            if key == "action_records" and set(value) != set(contract["records"]) & set(value):
+                raise CheckError(f"{where}: action_records names a field runtime-health/v3 does not define")
+            if key == "action_records":
+                if {k: observed[key][k] for k in value} != value:
+                    raise CheckError(f"{where}: expected action_records {value!r}, the contract gives {observed[key]!r}")
+                continue
+            if observed[key] != value:
+                raise CheckError(f"{where}: expected {key} {value!r}, the contract gives {observed[key]!r}")
+    return reached
+
+
+def _distinct_principals(attempts: list[dict]) -> list[dict]:
+    """The principals holding an `identical_repeat` audit record, whether or not their own repeats were coalesced."""
+    seen: list[dict] = []
+    for attempt in attempts:
+        key = {k: attempt["caller"].get(k) for k in ("uid", "login_uid")}
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def _operator_uid_case(document: dict, name: str) -> dict:
+    for case in document["operator_uid_cases"]:
+        if case["name"] == name:
+            return case
+    raise CheckError(f"no operator_uid case named {name!r}")
+
+
+OPERATOR_UID = re.compile(r"([1-9][0-9]*)\n?")
+
+
+def operator_uid_verdict(case: dict) -> int | None:
+    """The installed operator identity the `operator-uid` file yields, or None when none is installed."""
+    held = [case["file"]]
+    if not MODEL_MUTANTS["operator_uid_install_root_unchecked"]:
+        held.append(case["install_root"])
+    if not MODEL_MUTANTS["operator_uid_ancestors_unchecked"]:
+        held.extend(case["ancestors"])
+    writable = 0o002 if MODEL_MUTANTS["operator_uid_group_writable_ok"] else 0o022
+    for entry in held:
+        if entry["owner"] != 0 or int(entry["mode"], 8) & writable:
+            return None
+    if case["file"].get("symlink") and not MODEL_MUTANTS["operator_uid_follows_symlink"]:
+        return None
+    content = case["content"]
+    if MODEL_MUTANTS["operator_uid_strips"]:
+        content = content.strip()
+    if MODEL_MUTANTS["operator_uid_int_parse"]:
+        try:
+            uid = int(content)
+        except ValueError:
+            return None
+    else:
+        pattern = re.compile(r"([0-9]+)\n?") if MODEL_MUTANTS["operator_uid_leading_zeros"] else OPERATOR_UID
+        match = pattern.fullmatch(content)
+        if match is None:
+            return None
+        uid = int(match.group(1))
+    if uid == 0 or (uid == case["service_uid"] and not MODEL_MUTANTS["operator_uid_service_account_ok"]):
+        return None
+    return uid
+
+
+def _reconciled(outcome: str | None) -> str | None:
+    return {"executed": "reconciled_executed", "not-executed": "reconciled_not_executed"}.get(outcome or "")
+
+
+def config_verdict(contract: dict, case: dict) -> str:
+    value, maximum = case["approval_timeout_seconds"], case["release_maximum_seconds"]
+    if type(value) is not int or value < contract["timeout_min"]:
+        return "refuse"
+    if value > maximum and not MODEL_MUTANTS["timeout_unbounded"]:
+        return "refuse"
+    return "accept"
+
+
+def safe_default_verdict(contract: dict, case: dict) -> str:
+    """The semantic rule decides; the registry's `physical` flag is a redundant refusal on top of it."""
+    if MODEL_MUTANTS["actuating_safe_default_admitted"]:
+        return "admitted"
+    registry_physical = bool(case["registry"] and case["registry"]["physical"])
+    capability = case["capability"]
+    if MODEL_MUTANTS["safe_default_registry_defines"] and case["registry"] is not None:
+        capability = "physical" if registry_physical else "informational"
+    if MODEL_MUTANTS["safe_default_registry_defines"]:
+        physical = registry_physical
+    elif MODEL_MUTANTS["safe_default_registry_ignored"]:
+        physical = case["capability"] == "physical"
+    else:
+        physical = case["capability"] == "physical" or registry_physical
+    tier_ok = case["tier"] == "A" or MODEL_MUTANTS["safe_default_tier_ignored"]
+    # The runtime guard admits only what it classifies informational; an unclassified or host-state action is refused
+    # even at Tier A.
+    informational = capability == "informational" or (
+        MODEL_MUTANTS["safe_default_unclassified_admitted"] and capability != "physical")
+    # The registry entry is required, and must itself classify the capability informational and safe-default
+    # eligible; it is necessary and not sufficient.
+    registry = case["registry"]
+    if registry is None:
+        registered = MODEL_MUTANTS["registry_null_admitted"]
+    else:
+        # An entry with no consequence class is not informational: the axis never silently defaults.
+        klass = registry.get("consequence_class", "informational" if MODEL_MUTANTS["consequence_class_defaults"] else None)
+        registered = ((klass == "informational" or MODEL_MUTANTS["consequence_class_ignored"])
+                      and (registry["safe_default_eligible"] is True or MODEL_MUTANTS["eligibility_ignored"]))
+    return "admitted" if tier_ok and informational and not physical and registered else "refused"
+
+
+def scope_verdict(case: dict) -> str:
+    """Which Tier C proposals tier-c-approval/v1 governs, refuses, or leaves to the existing workflow."""
+    if case["tier"] == "B":
+        return "governed" if MODEL_MUTANTS["tier_b_governed"] else "outside_contract"
+    if case["capability"] != "physical":
+        return "refused" if MODEL_MUTANTS["host_state_refused"] else "outside_contract"
+    generic = case["action"] == "coap_command" and not MODEL_MUTANTS["coap_generic_governed"]
+    zoned = (case["zone"] is not None and case["commissioned_outcome"] is not None) or MODEL_MUTANTS["zone_not_required"]
+    return "governed" if zoned and not generic else "refused"
+
+
+def host_state_token_verdict(case: dict) -> tuple[str, bool]:
+    """An offline token for a host-state Tier C action on the existing workflow: no v1 token approves any Tier C
+    action, and a v2 token binds a commissioned zone, which a host-state action does not have."""
+    if case["tier"] != "C" or case["capability"] != "host_state":
+        raise CheckError(f"host-state token case {case['name']!r} is not a host-state Tier C action")
+    token = case["token"]
+    form = token_format(token)
+    scoped = token.get("action_scope") in (case["action"], "*")
+    approved = (form == "v1" and scoped and MODEL_MUTANTS["v1_token_approves_host_state"]) or (
+        form == "v2" and token.get("action_scope") == case["action"] and MODEL_MUTANTS["v2_token_approves_host_state"])
+    consumed = approved or MODEL_MUTANTS["host_state_token_consumed"]
+    return ("approved" if approved else "refused"), consumed
+
+
+SNAPSHOT_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _no_duplicates(pairs: list) -> dict:
+    names = [k for k, _ in pairs]
+    if len(set(names)) != len(names) and not MODEL_MUTANTS["snapshot_duplicates_last_wins"]:
+        raise ValueError("a member is named twice")
+    return dict(pairs)
+
+
+def snapshot_verdict(contract: dict, case: dict) -> tuple[str, str | None]:
+    """The authority snapshot is one closed canonical object; returns its verdict and canonical digest."""
+    if "snapshot_text" in case:
+        try:
+            snapshot = json.loads(case["snapshot_text"], object_pairs_hook=_no_duplicates)
+        except ValueError:
+            return "malformed", None
+    else:
+        snapshot = case["snapshot"]
+    members = set(contract["snapshot_members"])
+    if MODEL_MUTANTS["snapshot_extra_ignored"]:
+        snapshot = {k: v for k, v in snapshot.items() if k in members}
+    if set(snapshot) != members:
+        return "malformed", None
+    if not ((type(snapshot["v"]) is int and snapshot["v"] == 1) or (
+            MODEL_MUTANTS["snapshot_version_loose"] and str(snapshot["v"]) == "1")):
+        return "malformed", None
+    for name, value in snapshot.items():
+        if name != "v" and type(value) is not str:
+            return "malformed", None
+        digest_member = name.endswith("_digest") or name == "action_capability" or (
+            name == "safety_profile" and value != "")
+        if digest_member and not SNAPSHOT_DIGEST.fullmatch(value) and not MODEL_MUTANTS["snapshot_digest_unchecked"]:
+            return "malformed", None
+    body = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return "valid", "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def check(contract: dict, documents: dict) -> None:
+    check_signing(contract, documents["signing"])
+    reached: set[str] = set()
+    coverage: set = set()
+    for which, document in documents.items():
+        if which == "signing":
+            continue
+        for prefix in REQUIRED_SEQUENCES[which]:
+            if not any(s["name"].startswith(prefix) for s in document["sequences"]):
+                raise CheckError(f"{which}: no sequence for: {prefix}")
+        for sequence in document["sequences"]:
+            reached |= replay(contract, document, sequence, coverage)
+    missing = contract["states"] - reached
+    if missing:
+        raise CheckError(f"no sequence reaches the decision states {sorted(missing)}")
+    unreached = [code for code in contract["order"] if code not in coverage]
+    if unreached:
+        raise CheckError(f"no reconcile vector is refused {unreached}")
+    if not OPERATIONAL_CODES <= coverage:
+        raise CheckError(f"no reconcile vector ends in the operational outcomes {sorted(OPERATIONAL_CODES - coverage)}")
+    unused = sorted(r for r in contract["reasons"] if ("reason", r) not in coverage)
+    if unused:
+        raise CheckError(f"no reconcile vector records the reasons {unused}")
+    reconcile = documents["reconcile"]
+    for case in reconcile["operator_uid_cases"]:
+        got = operator_uid_verdict(case)
+        if got != case["expected"]:
+            raise CheckError(f"operator-uid case {case['name']!r}: declares {case['expected']}, the contract gives {got}")
+    names = {c["name"] for c in reconcile["operator_uid_cases"]}
+    if not set(REQUIRED_OPERATOR_UID) <= names:
+        raise CheckError(f"no operator-uid case for {sorted(set(REQUIRED_OPERATOR_UID) - names)}")
+    host_state = documents["tokens"]["host_state_token_cases"]
+    for case in host_state:
+        got, consumed = host_state_token_verdict(case)
+        if got != case["expected"] or consumed != case["token_consumed"]:
+            raise CheckError(f"host-state token case {case['name']!r}: declares {case['expected']} with token_consumed "
+                             f"{case['token_consumed']}, the contract gives {got} with {consumed}")
+    present = {c["name"] for c in host_state}
+    if not set(REQUIRED_HOST_STATE_TOKENS) <= present:
+        raise CheckError(f"no host-state token case for {sorted(set(REQUIRED_HOST_STATE_TOKENS) - present)}")
+    admission = documents["admission"]
+    for case in admission["config_cases"]:
+        got = config_verdict(contract, case)
+        if got != case["expected"]:
+            raise CheckError(f"config case {case['name']!r}: declares {case['expected']}, the contract gives {got}")
+    if not any(c["expected"] == "refuse" and c["approval_timeout_seconds"] > c["release_maximum_seconds"]
+               for c in admission["config_cases"]):
+        raise CheckError("no configuration case above the release maximum")
+    for case in admission["safe_default_cases"]:
+        got = safe_default_verdict(contract, case)
+        if got != case["expected"]:
+            raise CheckError(f"safe default {case['safe_default_action']!r}: declares {case['expected']}, "
+                             f"the contract gives {got}")
+    named = {c["safe_default_action"] for c in admission["safe_default_cases"]}
+    if not set(REQUIRED_SAFE_DEFAULTS) <= named:
+        raise CheckError(f"no safe-default case for {sorted(set(REQUIRED_SAFE_DEFAULTS) - named)}")
+    if not contract["actuating"] <= named:
+        raise CheckError(f"no safe-default case for the actuating actions {sorted(contract['actuating'] - named)}")
+    for case in admission["safe_default_cases"]:
+        if case["safe_default_action"] in contract["actuating"] and (
+                case["capability"] != "physical" or (case["registry"] is not None and not case["registry"]["physical"])):
+            raise CheckError(f"pinned actuating action {case['safe_default_action']!r} is not classified physical, or "
+                             "its registry entry is not marked physical; a flag change on a physical action is a "
+                             "defect, not a new classification")
+    for case in admission["safe_default_cases"]:
+        if case["registry"] is None and case["expected"] != "refused":
+            raise CheckError(f"safe default {case['safe_default_action']!r} has no registry entry and is admitted; "
+                             "an absent registry entry is refused")
+    kinds = {(c["tier"] == "A", c["capability"], bool(c["registry"] and c["registry"]["physical"]), c["registry"] is None)
+             for c in admission["safe_default_cases"]}
+    registry_kinds = {(c["registry"].get("consequence_class"), c["registry"]["safe_default_eligible"])
+                      for c in admission["safe_default_cases"] if c["registry"] is not None and c["tier"] == "A"
+                      and c["capability"] == "informational" and not c["registry"]["physical"]}
+    for needed, why in (((("informational", False)), "an informational action its registry marks ineligible"),
+                        ((("soft", True)), "an informational action its registry classes soft"),
+                        (((None, True)), "an informational action its registry gives no consequence class")):
+        if needed not in registry_kinds:
+            raise CheckError(f"no safe-default case for {why}")
+    for case in admission["proposal_scope_cases"]:
+        got = scope_verdict(case)
+        if got != case["expected"]:
+            raise CheckError(f"proposal scope {case['name']!r}: declares {case['expected']}, the contract gives {got}")
+    scope = {(c["action"], c["tier"], c["expected"]) for c in admission["proposal_scope_cases"]}
+    for needed, why in ((("coap_command", "C", "refused"), "a generic coap_command refused as a Tier C proposal"),
+                        (("terminate_process", "C", "outside_contract"), "terminate_process kept at Tier C and outside "
+                         "the contract, never lowered to fit it")):
+        if needed not in scope:
+            raise CheckError(f"no proposal-scope case for {why}")
+    if not {"governed", "refused", "outside_contract"} <= {c["expected"] for c in admission["proposal_scope_cases"]}:
+        raise CheckError("the proposal-scope cases must reach governed, refused and outside_contract")
+    for case in admission["authority_snapshot_cases"]:
+        got, digest = snapshot_verdict(contract, case)
+        if got != case["expected"] or (got == "valid" and digest != case.get("canonical_sha256")):
+            raise CheckError(f"authority snapshot {case['name']!r}: declares {case['expected']} "
+                             f"{case.get('canonical_sha256')}, the contract gives {got} {digest}")
+    for group, required in (("proposal_scope_cases", REQUIRED_SCOPE), ("authority_snapshot_cases", REQUIRED_SNAPSHOT)):
+        present = {c["name"] for c in admission[group]}
+        if not set(required) <= present:
+            raise CheckError(f"no {group} case for {sorted(set(required) - present)}")
+    for needed, why in (((True, "physical", False, False), "a Tier A physical action its registry does not flag"),
+                        ((True, "informational", True, False), "a Tier A informational action its registry flags"),
+                        ((False, "host_state", False, False), "a non-physical action above Tier A"),
+                        ((True, "informational", False, True), "an ungoverned informational action"),
+                        ((True, "host_state", False, False), "a Tier A host-state action"),
+                        ((False, "informational", False, False), "an informational action raised above Tier A"),
+                        ((True, "unclassified", False, True), "a Tier A action the guard has not classified")):
+        if needed not in kinds:
+            raise CheckError(f"no safe-default case for {why}")
+
+
+REQUIRED_SIGNING = (
+    "a valid v2 token",
+    "a valid v1 token",
+    "a v2 token with token_version removed",
+    "a v2 token with token_version changed to 3",
+    "a v2 token with token_version changed to the string \"2\"",
+    "a v2 token with token_version changed to true",
+    "a Boolean token_version signed in the v2 domain",
+    "a string token_version signed in the v2 domain",
+    "token_version 3 signed in the v2 domain",
+    "a v2 token re-signed over the unprefixed preimage",
+    "token_version 2.0 signed in the v2 domain",
+    "a v1 token given token_version 2 under its v1 signature",
+    "a v2 token with its proposal changed under the same signature",
+    "token_version written 2e0 under the valid v2 signature",
+    "token_version written 2E0 under the valid v2 signature",
+    "a valid v2 token whose target carries <, & and U+2028",
+)
+REQUIRED_SCOPE = (
+    "a relay trip on its commissioned zone", "a CoAP-backed actuator through its commissioned zone and outcome",
+    "a generic coap_command with no zone", "a generic coap_command naming a zone",
+    "a generic coap_command naming a zone and an outcome", "a physical action with no commissioned zone",
+    "a host-state Tier C action stays on the existing workflow", "a host-state Tier B action requiring approval",
+    "a physical Tier B action requiring approval",
+)
+REQUIRED_HOST_STATE_TOKENS = (
+    "a v1 token for a host-state Tier C action is refused",
+    "a v1 wildcard token for a host-state Tier C action is refused",
+    "a v2 token for a host-state Tier C action approves nothing, since the action has no commissioned zone",
+)
+REQUIRED_SNAPSHOT = (
+    "a complete snapshot", "a zone with no safety profile in force", "a snapshot missing the policy digest",
+    "a snapshot carrying another member", "a snapshot whose version is a string",
+    "a snapshot whose zone digest is not lowercase sha256 hex", "a snapshot naming a member twice",
+)
+REQUIRED_OPERATOR_UID = (
+    "a root-owned file with one user ID and a trailing LF", "a root-owned file with one user ID and no LF",
+    "a leading zero", "user ID 0", "the service account's user ID", "surrounding whitespace", "a CRLF terminator",
+    "two LFs", "a sign", "an underscore separator", "non-ASCII digits", "an empty file", "two user IDs",
+    "a symbolic link to a valid file", "a group-writable file", "a file owned by another user",
+    "an install root owned by the service account", "a group-writable install root",
+    "an ancestor directory owned by another user", "a world-writable sticky ancestor",
+)
+REQUIRED_SAFE_DEFAULTS = ("log_to_dashboard", "notify_site_supervisor", "terminate_process", "reset_kernel_subsystem",
+                          "unflagged_valve_command", "ungoverned_actuator_command", "flagged_notifier",
+                          "tier_a_host_probe", "unclassified_hook_action", "alert_sms_raised", "ineligible_notifier",
+                          "soft_classed_notifier", "unclassed_notifier")
+
+
+class _RawNumber(float):
+    """A JSON number written with a fraction or an exponent, keeping the token exactly as it was written."""
+
+    raw: str
+
+    def __new__(cls, token: str) -> "_RawNumber":
+        number = super().__new__(cls, token)
+        number.raw = token
+        return number
+
+    def __deepcopy__(self, memo: dict) -> "_RawNumber":
+        return self
+
+
+def _load_raw(text: str):
+    """Decode JSON keeping each non-integer number token; an integer token is a JSON integer, and nothing else is."""
+    return json.loads(text, parse_float=_RawNumber, parse_constant=lambda name: _RawNumber(name))
+
+
+INTEGER_TOKEN = re.compile(r"-?(?:0|[1-9][0-9]*)")
+
+
+def _number_token(value) -> str | None:
+    """The JSON number token a decoded value was written as, or None for a value that is not a number."""
+    if type(value) is int:
+        return str(value)
+    if isinstance(value, _RawNumber):
+        return value.raw
+    return None
+
+
+def _is_integer_token(value) -> bool:
+    token = _number_token(value)
+    return token is not None and INTEGER_TOKEN.fullmatch(token) is not None
+
+
+def _decoded_value(value):
+    """What a decoder that maps an integral number to an integer would hand a verifier."""
+    if isinstance(value, float) and not isinstance(value, bool) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _canonical(token: dict) -> bytes:
+    """Profile 2 of signing/v2: the payload without `signature`, keys sorted, compact, non-ASCII unescaped, UTF-8."""
+    body = {k: v for k, v in token.items() if k != "signature"}
+    if MODEL_MUTANTS["token_version_decoded_integral"] and "token_version" in body:
+        body["token_version"] = _decoded_value(body["token_version"])
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=MODEL_MUTANTS["canonical_ascii_escaped"],
+                      allow_nan=False)
+    if MODEL_MUTANTS["canonical_html_escaped"]:
+        for char in "<>&\u2028\u2029":
+            text = text.replace(char, f"\\u{ord(char):04x}")
+    return text.encode("utf-8")
+
+
+def _verifies(public: Ed25519PublicKey, token: dict, preimage: bytes) -> bool:
+    field = token.get("signature")
+    if not isinstance(field, str) or not field.startswith("ed25519:"):
+        return False
+    encoded = field[len("ed25519:"):]
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return False
+    if len(raw) != 64 or base64.b64encode(raw).decode("ascii") != encoded:
+        return False
+    try:
+        public.verify(raw, preimage)
+    except Exception:
+        return False
+    return True
+
+
+def verify_v1(public: Ed25519PublicKey, token: dict) -> str:
+    """The shipped v1 verifier: the unprefixed preimage, reading no `token_version`."""
+    return "accept" if _verifies(public, token, _canonical(token)) else "refuse:signature"
+
+
+def verify_v2(contract: dict, public: Ed25519PublicKey, token: dict) -> str:
+    """Select the domain from the exact version first; verify in that domain only."""
+    prefixed = contract["domain"] + b"\x00" + _canonical(token)
+    version = token.get("token_version")
+    if "token_version" not in token:
+        if MODEL_MUTANTS["token_missing_version_falls_back"]:
+            return verify_v1(public, token)
+        return "refuse:version"
+    if MODEL_MUTANTS["token_version_truthy"]:
+        selected = bool(version)
+    elif MODEL_MUTANTS["token_version_by_value"]:
+        selected = version == 2
+    elif MODEL_MUTANTS["token_version_decoded_integral"]:
+        selected = type(_decoded_value(version)) is int and _decoded_value(version) == 2
+    else:
+        # Integer type is decided from the number token as written, never from the value it decodes to.
+        selected = _is_integer_token(version) and int(_number_token(version)) == 2
+    if not selected:
+        return "refuse:version"
+    if MODEL_MUTANTS["token_no_domain_prefix"]:
+        prefixed = _canonical(token)
+    if _verifies(public, token, prefixed):
+        return "accept"
+    if MODEL_MUTANTS["token_trial_verification"] and _verifies(public, token, _canonical(token)):
+        return "accept"
+    return "refuse:signature"
+
+
+def check_signing(contract: dict, document: dict) -> None:
+    if document["signature_domain"].encode("ascii") != contract["domain"]:
+        raise CheckError("signing-domain.json and offline-tokens/v2 name different signature domains")
+    published = json.loads(PUBLISHED_SEED.read_text(encoding="utf-8"))["device_seed_hex"]
+    if document["test_seed_hex"] != published:
+        raise CheckError("signing-domain.json signs with a seed that is not the published evidence test seed; the "
+                         "corpus must never carry a key whose private half is not already public")
+    derived = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(document["test_seed_hex"])).public_key()
+    if base64.b64encode(derived.public_bytes_raw()).decode("ascii") != document["public_key_b64"]:
+        raise CheckError("signing-domain.json: the test seed does not derive its listed public key")
+    names = [c["name"] for c in document["cases"]]
+    for name in REQUIRED_SIGNING:
+        if name not in names:
+            raise CheckError(f"signing-domain.json: no case for: {name}")
+    if not any("token_text" in c for c in document["cases"]):
+        raise CheckError("signing-domain.json: no case names a member twice")
+    for case in document["cases"]:
+        duplicated = False
+        if "token_text" in case:
+            pairs_seen: list[list] = []
+
+            def _record(pairs: list) -> dict:
+                pairs_seen.append([k for k, _ in pairs])
+                return dict(pairs)
+
+            token = json.loads(case["token_text"], object_pairs_hook=_record)
+            duplicated = any(len(set(names)) != len(names) for names in pairs_seen)
+        else:
+            token = case["token"]
+        prefixed = contract["domain"] + b"\x00" + _canonical(token)
+        v2 = verify_v2(contract, derived, token)
+        if duplicated and not MODEL_MUTANTS["token_duplicates_last_wins"]:
+            v2 = "refuse:duplicate_member"
+        got = {"v1": verify_v1(derived, token), "v2": v2,
+               "v2_domain_signature": "valid" if _verifies(derived, token, prefixed) else "invalid"}
+        if got != case["expected"]:
+            raise CheckError(f"signing-domain.json {case['name']!r}: declares {case['expected']}, the contract and "
+                             f"the signatures give {got}")
+
+
+FLIPS = {
+    "proposed": "approved_pending_dispatch", "approved_pending_dispatch": "dispatch_started",
+    "dispatch_started": "executed", "executed": "dispatch_outcome_unknown",
+    "dispatch_outcome_unknown": "dispatch_not_proven", "dispatch_not_proven": "approval_aborted_undispatched",
+    "approval_aborted_undispatched": "dispatch_not_proven", "approval_expired_undispatched": "dispatch_started",
+    "proposal_expired": "approved_pending_dispatch", "rejected": "executed", "ok": "degraded", "degraded": "ok",
+    "dispatch_failed": "executed", "dispatch_refused_contention": "dispatch_started",
+    "commit_failed_retry": "proposal_expired", "proposal_aborted_restart": "proposed",
+    "approval_binding_changed": "approved_pending_dispatch", "reconciled_executed": "reconciled_not_executed",
+    "reconciled_not_executed": "reconciled_executed", "reconcile_refused": "commit_failed_retry",
+    "token_refused": "commit_failed_retry", "token_replayed": "token_refused", "token_v1_refused": "token_refused",
+    "v1": "v2", "v2": "v1", "malformed": "v2", "recorded": "already_recorded", "already_recorded": "recorded",
+    "proposal_blocked_uncertain_outcome": "approved_pending_dispatch", "runtime_unavailable": "recorded",
+    "runtime_store_unavailable": "recorded", "reconciliation": {},
+}
+
+
+def _resign(token: dict, seed_hex: str, prefix: bytes | None) -> dict:
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex))
+    preimage = _canonical(token) if prefix is None else prefix + b"\x00" + _canonical(token)
+    return {**token, "signature": "ed25519:" + base64.b64encode(key.sign(preimage)).decode("ascii")}
+
+
+def signing_mutants(documents: dict, domain: bytes):
+    signing = documents["signing"]
+    seed = signing["test_seed_hex"]
+    flip = {"accept": "refuse:signature", "refuse:signature": "accept", "refuse:version": "accept",
+            "refuse:duplicate_member": "accept", "valid": "invalid", "invalid": "valid"}
+    for i, case in enumerate(signing["cases"]):
+        for key, value in case["expected"].items():
+            bad = copy.deepcopy(documents)
+            bad["signing"]["cases"][i]["expected"][key] = flip[value]
+            yield f"signing: {case['name']!r} {key}", bad
+        bad = copy.deepcopy(documents)
+        del bad["signing"]["cases"][i]
+        yield f"signing: without {case['name']!r}", bad
+        if case["expected"]["v1"] != "accept" and case["expected"]["v2_domain_signature"] != "valid":
+            continue  # a signature valid in neither domain cannot be made more invalid
+        if "token_text" in case:
+            continue  # its raw text carries the signature; the duplicate is what it tests
+        bad = copy.deepcopy(documents)
+        sig = case["token"]["signature"]
+        tail = "A" if sig[-3] != "A" else "B"
+        bad["signing"]["cases"][i]["token"]["signature"] = sig[:-3] + tail + sig[-2:]
+        yield f"signing: {case['name']!r} signature altered", bad
+    index = next(i for i, c in enumerate(signing["cases"]) if c["name"] == "a valid v2 token")
+    bad = copy.deepcopy(documents)
+    bad["signing"]["cases"][index]["token"] = _resign(signing["cases"][index]["token"], seed, None)
+    yield "signing: the valid v2 token re-signed without the domain prefix, still declared accepted", bad
+    index = next(i for i, c in enumerate(signing["cases"]) if c["name"] == "a Boolean token_version signed in the v2 domain")
+    bad = copy.deepcopy(documents)
+    bad["signing"]["cases"][index]["expected"]["v2"] = "accept"
+    yield "signing: a Boolean token_version declared accepted under v2", bad
+    for name in ("a valid v2 token",):
+        index = next(i for i, c in enumerate(signing["cases"]) if c["name"] == name)
+        bad = copy.deepcopy(documents)
+        bad["signing"]["cases"][index]["token"] = _resign({**signing["cases"][index]["token"], "token_version": True},
+                                                           seed, domain)
+        yield f"signing: {name!r} re-typed to a Boolean token_version and re-signed, verdicts kept", bad
+    bad = copy.deepcopy(documents)
+    bad["signing"]["signature_domain"] = "ori.offline_token.v3"
+    yield "signing: a different signature domain", bad
+    bad = copy.deepcopy(documents)
+    bad["signing"]["test_seed_hex"] = "43" * 32
+    yield "signing: an unpublished seed", bad
+
+
+def corpus_mutants(documents: dict):
+    for which, document in documents.items():
+        if which == "signing":
+            continue
+        for i, sequence in enumerate(document["sequences"]):
+            bad = copy.deepcopy(documents)
+            del bad[which]["sequences"][i]
+            yield f"{which}: without {sequence['name']!r}", bad
+            for j, step in enumerate(sequence["steps"]):
+                for key, value in step["expect"].items():
+                    bad = copy.deepcopy(documents)
+                    target = bad[which]["sequences"][i]["steps"][j]["expect"]
+                    if isinstance(value, bool):
+                        target[key] = not value
+                    elif isinstance(value, int):
+                        target[key] = value + 1
+                    elif isinstance(value, list):
+                        target[key] = value[:-1] if value else ["critical_operator_audit"]
+                    elif isinstance(value, dict) and key == "reconciliation":
+                        target[key] = {**value, "reason": value["reason"] + "x"}
+                    elif isinstance(value, dict) and key == "later":
+                        target[key] = {k: FLIPS.get(v, v + "x") for k, v in value.items()} or {"P9": "proposed"}
+                    elif isinstance(value, dict) and not value:
+                        target[key] = {"decision_state": "dispatch_outcome_unknown"}
+                    elif isinstance(value, dict):
+                        target[key] = {k: v + 1 for k, v in value.items()}
+                    elif value is None:
+                        target[key] = "proposal_expired"
+                    elif value.startswith("refused:"):
+                        target[key] = "recorded"
+                    else:
+                        target[key] = FLIPS.get(value, value + "x")
+                    yield f"{which}: {sequence['name']!r} step {j} {key}", bad
+    admission = documents["admission"]
+    for i, case in enumerate(admission["config_cases"]):
+        bad = copy.deepcopy(documents)
+        bad["admission"]["config_cases"][i]["expected"] = "accept" if case["expected"] == "refuse" else "refuse"
+        yield f"config case {case['name']!r} verdict", bad
+    for i, case in enumerate(admission["safe_default_cases"]):
+        bad = copy.deepcopy(documents)
+        bad["admission"]["safe_default_cases"][i]["expected"] = (
+            "admitted" if case["expected"] == "refused" else "refused")
+        yield f"safe default {case['safe_default_action']!r} verdict", bad
+        if case["expected"] == "refused":
+            bad = copy.deepcopy(documents)
+            del bad["admission"]["safe_default_cases"][i]
+            yield f"without safe default {case['safe_default_action']!r}", bad
+    for group, flips in (("proposal_scope_cases", {"governed": "refused", "refused": "governed",
+                                                   "outside_contract": "refused"}),
+                         ("authority_snapshot_cases", {"valid": "malformed", "malformed": "valid"})):
+        for i, case in enumerate(admission[group]):
+            bad = copy.deepcopy(documents)
+            bad["admission"][group][i]["expected"] = flips[case["expected"]]
+            yield f"{group} {case['name']!r} verdict", bad
+            bad = copy.deepcopy(documents)
+            del bad["admission"][group][i]
+            yield f"without {group} {case['name']!r}", bad
+    for i, case in enumerate(admission["authority_snapshot_cases"]):
+        if case["expected"] == "valid":
+            bad = copy.deepcopy(documents)
+            bad["admission"]["authority_snapshot_cases"][i]["snapshot"]["zone_id"] = "zone-feeder-b"
+            yield f"authority snapshot {case['name']!r} rebound to another zone, digest kept", bad
+    for i, case in enumerate(admission["safe_default_cases"]):
+        if case["expected"] == "admitted":
+            for field, value in (("consequence_class", "soft"), ("safe_default_eligible", False)):
+                bad = copy.deepcopy(documents)
+                bad["admission"]["safe_default_cases"][i]["registry"][field] = value
+                yield f"safe default {case['safe_default_action']!r} registry {field} {value!r}, still admitted", bad
+            bad = copy.deepcopy(documents)
+            bad["admission"]["safe_default_cases"][i]["registry"] = None
+            yield f"safe default {case['safe_default_action']!r} without a registry entry, still admitted", bad
+    for i, case in enumerate(documents["tokens"]["host_state_token_cases"]):
+        bad = copy.deepcopy(documents)
+        bad["tokens"]["host_state_token_cases"][i]["expected"] = "approved"
+        yield f"host-state token case {case['name']!r} verdict", bad
+        bad = copy.deepcopy(documents)
+        bad["tokens"]["host_state_token_cases"][i]["token_consumed"] = True
+        yield f"host-state token case {case['name']!r} consumes its token", bad
+        bad = copy.deepcopy(documents)
+        del bad["tokens"]["host_state_token_cases"][i]
+        yield f"without host-state token case {case['name']!r}", bad
+    reconcile = documents["reconcile"]
+    for i, case in enumerate(reconcile["operator_uid_cases"]):
+        bad = copy.deepcopy(documents)
+        bad["reconcile"]["operator_uid_cases"][i]["expected"] = None if case["expected"] is not None else 1001
+        yield f"operator-uid case {case['name']!r} verdict", bad
+        bad = copy.deepcopy(documents)
+        del bad["reconcile"]["operator_uid_cases"][i]
+        yield f"without operator-uid case {case['name']!r}", bad
+    for which in ("admission", "tokens", "reconcile"):
+        for key in PROPOSAL_BINDS:
+            bad = copy.deepcopy(documents)
+            del bad[which]["proposal"][key]
+            yield f"{which}: a proposal that binds no {key}", bad
+    bad = copy.deepcopy(documents)
+    bad["admission"]["proposal"]["safe_default_action"] = "trip_relay"
+    yield "a proposal carrying an actuating safe default", bad
+    for i, case in enumerate(admission["safe_default_cases"]):
+        if case["registry"] is not None and case["registry"]["physical"] and case["capability"] == "physical":
+            bad = copy.deepcopy(documents)
+            bad["admission"]["safe_default_cases"][i]["registry"]["physical"] = False
+            yield f"safe default {case['safe_default_action']!r} physical flag cleared", bad
+        if case["capability"] == "physical" and case["registry"] is not None:
+            # A case with no registry entry is refused for that alone, so reclassifying it tests nothing.
+            bad = copy.deepcopy(documents)
+            bad["admission"]["safe_default_cases"][i]["capability"] = "informational"
+            yield f"safe default {case['safe_default_action']!r} reclassified informational", bad
+
+
+def _swap_codes(text: str, order: list[str], i: int) -> tuple[str, int]:
+    a, b = order[i], order[i + 1]
+    pattern = rf"`{a}`(,\s+(?:and\s+)?|\s+and\s+)`{b}`"
+    return re.subn(pattern, rf"`{b}`\1`{a}`", text, count=1)
+
+
+def text_mutants(texts: dict[str, str], contract: dict):
+    for key, (name, sentence) in SENTENCES.items():
+        source = "cli" if name == "cli-commission" else name
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        edited, count = re.subn(pattern, sentence.rsplit(" ", 1)[0].replace("\\", "\\\\"), texts[source], count=1)
+        yield f"reword {key}", {**texts, source: edited}, count
+    for code in ("state_store_unavailable", "health_device_mismatch"):
+        cli = texts["cli"]
+        at = cli.find("| `reference_already_recorded` |")
+        yield (f"commission regains {code}", {**texts, "cli": cli[:at] + f"| `{code}` | The store. |\n" + cli[at:]},
+               1 if at > 0 else 0)
+    cli = texts["cli"]
+    at = cli.find("python -m ori.cli_bridge evidence commission --reference")
+    yield ("commission regains --path", {**texts, "cli": cli[:at] + "`--path` names the store.\n" + cli[at:]},
+           1 if at > 0 else 0)
+    approval = texts["tier-c-approval"]
+    for member in ("policy_digest", "zone_digest"):
+        edited, count = re.subn(rf"^\| `{member}` \|.*\n", "", approval, count=1, flags=re.MULTILINE)
+        yield f"snapshot table without {member}", {**texts, "tier-c-approval": edited}, count
+    approval = texts["tier-c-approval"]
+    match = STATE_RULE.search(_norm(approval))
+    # Edit only the vocabulary sentence, so a state named elsewhere in the text is not what the mutant removes.
+    start = approval.find("`decision_state` is one of")
+    end = approval.find(".", start)
+    sentence = approval[start:end]
+    for state in re.findall(r"`(\w+)`", match.group(1)) if match else []:
+        edited, count = re.subn(rf"`{state}`,(\s+)", "", sentence, count=1)
+        if count != 1:
+            edited, count = re.subn(rf",(\s+)and(\s+)`{state}`", "", sentence, count=1)
+        yield f"vocabulary without {state}", {**texts, "tier-c-approval": approval[:start] + edited + approval[end:]}, count
+    for surface in ("gateway-api", "gateway-evidence-carriage"):
+        for term in GATEWAY_FORBIDDEN:
+            yield (f"{surface}/v1 gains {term!r}",
+                   {**texts, surface: texts[surface] + f"\n\nA Tier C row may carry {term}.\n"}, 1)
+    edited, count = re.subn(r",\s+and\s+`coap_command`\s+are a pinned instance", " are a pinned instance", approval, count=1)
+    yield "pinned safe-default instance without coap_command", {**texts, "tier-c-approval": edited}, count
+    cli = texts["cli"]
+    for reason in sorted(contract["reasons"]):
+        edited, count = re.subn(rf"`{reason}`(?:,\s+(?:and\s+)?|\s+and\s+)(?=`)", "", cli, count=1)
+        if count != 1:
+            edited, count = re.subn(rf"(,|\s+and)\s+`{reason}`\.", ".", cli, count=1)
+        yield f"reasons without {reason}", {**texts, "cli": edited}, count
+    order_sentence = ORDER_RULE.search(_norm(cli))
+    for i in range(len(contract["order"]) - 1):
+        edited, count = _swap_codes(cli, contract["order"], i)
+        yield f"order swaps {contract['order'][i]} and {contract['order'][i + 1]}", {**texts, "cli": edited}, count
+    if order_sentence:
+        for code in contract["order"]:
+            edited, count = re.subn(rf"`{code}`(?:,\s+(?:and\s+)?|\s+and\s+)(?=`)", "", cli, count=1)
+            if count != 1:
+                edited, count = re.subn(rf",?\s+and\s+`{code}`(?=\.)", "", cli, count=1)
+            at = edited.find(CLI_SECTION[0])
+            edited = edited[:at] + re.sub(rf"^\| `{code}` \|.*\n", "", edited[at:], count=1, flags=re.MULTILINE)
+            yield f"refusals without {code}", {**texts, "cli": edited}, count
+    bound = str(contract["note_bytes"])
+    edited, count = re.subn(rf"at most {bound} bytes", f"at most {int(bound) * 10} bytes", cli, count=1)
+    yield "note bound widened", {**texts, "cli": edited}, count
+    for old, new in (("U+0080–U+009F", "U+0080–U+0084"), ("U+0000–U+001F", "U+0001–U+001E"),
+                     ("U+0000–U+001F, U+007F or", "U+0000–U+001F or")):
+        edited, count = re.subn(re.escape(old), new, cli, count=1)
+        yield f"note exclusion {old!r} narrowed", {**texts, "cli": edited}, count
+    edited, count = re.subn(r'"ori\.offline_token\.v2"', '"ori.offline_token.v2x"', texts["offline-tokens"], count=1)
+    yield "signature domain renamed in offline-tokens/v2", {**texts, "offline-tokens": edited}, count
+    for name, terms in V2_TERMS.items():
+        for term in terms:
+            yield (f"{name} gains {term!r}", {**texts, name: texts[name] + f"\n\nA record may carry {term}.\n"}, 1)
+        for sentence in V1_KEPT[name]:
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            edited, count = re.subn(pattern, sentence.replace("`", "", 2).replace("\\", "\\\\"), texts[name], count=1)
+            yield f"{name} rewords {sentence[:40]!r}", {**texts, name: edited}, count
+    for parameter in PROFILE_2_PARAMETERS:
+        edited, count = re.subn(re.escape(parameter), "", texts["signing"], count=1)
+        yield f"signing/v2 Profile 2 without {parameter}", {**texts, "signing": edited}, count
+    edited = texts["events"].replace(EVENTS_PROPOSAL, "## Tier C approval record", 1)
+    yield "events/v2 drops the proposal marker", {**texts, "events": edited}, 1
+
+
+def main() -> int:
+    texts = {name: path.read_text(encoding="utf-8") for name, path in FILES.items()}
+    documents = {which: _load_raw(path.read_text(encoding="utf-8")) for which, path in VECTORS.items()}
+    documents["signing"] = _load_raw(SIGNING.read_text(encoding="utf-8"))
+    try:
+        contract = load_contract(texts)
+        check(contract, documents)
+    except (CheckError, KeyError) as error:
+        print(f"check-tier-c-approval-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in (*corpus_mutants(documents), *signing_mutants(documents, contract["domain"])):
+            total += 1
+            try:
+                check(contract, bad)
+            except (CheckError, KeyError):
+                continue
+            survived.append(label)
+        for flag in MODEL_MUTANTS:
+            total += 1
+            MODEL_MUTANTS[flag] = True
+            try:
+                check(contract, documents)
+                survived.append(f"model defect {flag}")
+            except (CheckError, KeyError):
+                pass
+            finally:
+                MODEL_MUTANTS[flag] = False
+        for label, edited, count in text_mutants(texts, contract):
+            total += 1
+            if count != 1:
+                survived.append(f"{label}: matches nothing")
+                continue
+            try:
+                check(load_contract(edited), documents)
+                survived.append(label)
+            except (CheckError, KeyError):
+                pass
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"tier-c-approval mutations: {total} refused")
+    counts = ", ".join(f"{len(d['sequences'])} {w}" for w, d in documents.items() if w != "signing")
+    print(
+        f"tier-c-approval vectors: sequences ({counts}), {len(documents['admission']['config_cases'])} configuration "
+        f"and {len(documents['admission']['safe_default_cases'])} safe-default, "
+        f"{len(documents['admission']['proposal_scope_cases'])} proposal-scope and "
+        f"{len(documents['admission']['authority_snapshot_cases'])} authority-snapshot cases and "
+        f"{len(documents['signing']['cases'])} signed tokens hold to tier-c-approval/v1, offline-tokens/v2, "
+        "operator-socket/v1, events/v2, gateway-api/v1, runtime-config/v2 and runtime-health/v3, with events/v1 and "
+        "offline-tokens/v1 held to their published prose only: " + V1_GUARD_LIMIT
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

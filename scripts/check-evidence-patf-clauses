@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""Hold the evidence contracts to the rule that evidence never gates an action.
+
+Evidence attests an action's licence after the action and never supplies it,
+so no evidence, delivery, registration or disposition state may gate, delay,
+block, suppress or mark unavailable an approved Tier C action or any Tier D
+execution. That rule is stated in several contracts, and a reversing edit to
+any one of them has been able to pass every other checker. This one:
+
+- requires each clause in CLAUSES, word for word, inside the section it names;
+- scans every sentence of the evidence contracts for one that pairs a gating
+  verb with an action (Tier C, Tier D, an approved, safety or runtime action),
+  and refuses every such sentence that is not one of those clauses, so a new or
+  reworded sentence of that shape fails until a reviewer adds it here.
+
+Nothing here is regenerated from the text: the clause list is the allowlist.
+
+    python3 scripts/check-evidence-patf-clauses
+    python3 scripts/check-evidence-patf-clauses --mutations
+    python3 scripts/check-evidence-patf-clauses --print-units
+
+`--mutations` deletes each clause, reverses each clause's negation, appends a
+reversed sentence to each contract, and re-pins: rebuilds the allowlist from
+reversed text, as a mechanical regeneration would, and requires every mutant
+to be refused. `--print-units` prints the sentences the scan matches.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+FILES = (
+    "evidence-transport/v2.md",
+    "evidence-exchange/v2.md",
+    "evidence-commissioning-ingest/v1.md",
+    "gateway-api/v1.md",
+    "gateway-api/v2.md",
+    "gateway-evidence-carriage/v1.md",
+    "tier-c-approval/v1.md",
+    "runtime-health/v3.md",
+    "operator-socket/v1.md",
+    "events/v1.md",
+    "events/v2.md",
+    "offline-tokens/v1.md",
+    "offline-tokens/v2.md",
+    "runtime-config/v2.md",
+)
+# The in-force safety boundary for an unconfirmed provisioning grant, stated
+# identically wherever the grant's gate is described.
+GRANT_BOUNDARY = (
+    "A capability that depends on an unconfirmed grant is refused before a Tier C proposal is created.",
+    "Such a capability MUST NOT be admitted into an in-force commissioned safety binding, zone, or safety profile.",
+    ("Once a safety binding, zone, or profile is in force, evidence confirmation is never consulted to evaluate or "
+     "execute its Tier C or Tier D actions, and evidence unavailability never marks that protection unavailable."),
+)
+# Evidence, confirmation, registration or grant state marking protection unavailable, in either order.
+PROTECTION_UNAVAILABLE = (
+    r"(?i)\b(?:evidence|confirm\w*|registration|epoch|grant)\b[^.]*\bprotection\b[^.]*\bunavailable\b|"
+    r"\bprotection\b[^.]*\bunavailable\b[^.]*\b(?:evidence|confirm\w*|registration|epoch|grant)\b"
+)
+# Sentences that would reverse a rule by adding to the text rather than editing
+# a clause, which the clause list alone cannot see. Every sentence a pattern
+# matches must be one of its allowlisted sentences; each entry carries a sample
+# contradiction the mutation run appends and requires refused.
+CONTRADICTIONS = (
+    ("tier-c-approval/v1.md", r"\brestart\b.*\b(?:MAY|may|can|will|shall|should)\b.*\b(?:dispatch|execut|replay|actuat)",
+     (), "On restart, an approval whose proposal has not expired MAY be dispatched again."),
+    ("evidence-exchange/v2.md", r"\bcheckpoints?\b.*\b(?:MAY|may|can)\b.*\b(?:pass|overtake|after|ahead|before)\b",
+     (), "A checkpoint retried three times MAY be handed off after a later checkpoint."),
+    ("evidence-transport/v2.md", r"queue_full.*\b(?:unauthenticated|unconfigured)\b|\b(?:unauthenticated|unconfigured)\b.*queue_full",
+     (), "An unauthenticated `queue_full` is also a handoff."),
+    ("gateway-evidence-carriage/v1.md", r"queue_full.*\b(?:unauthenticated|unconfigured)\b.*\bhandoff|\bunauthenticated\b.*queue_full.*\bsignal",
+     (), "An unauthenticated `queue_full` also signals the courier worker."),
+    ("evidence-transport/v2.md", r"\b507\b[^;]*\bbefore\b[^;]*\bdisposition|\b(?:MAY|may)\b[^;]*\b507\b|\b507\b[^;]*\b(?:MAY|may)\b",
+     (), "An authority MAY nevertheless answer `507 retention_capacity_exhausted` before any identity disposition."),
+    ("evidence-exchange/v2.md",
+     r"(?i)\benvelopes?\b.*\b(?:still|continue[sd]?)\b.*\b(?:identity|epoch)|\b(?:identity|epoch)[- ]scoped\b.*\benvelopes?\b.*\b(?:handed off|continue)",
+     (), "Envelopes are still handed off under an identity-scoped disposition."),
+    ("runtime-health/v3.md", r"(?i)\babsen(?:ce|t)\b.*not_stopped|not_stopped.*\babsen(?:ce|t)\b",
+     ("Absence means unknown and MUST NOT be interpreted as `not_stopped`.",),
+     "A gateway consumer MAY treat absence as `not_stopped`."),
+    ("evidence-commissioning-ingest/v1.md",
+     r"\bissuing key\b.*\b(?:always|implicitly|automatically)\b|\bissuing key\b(?: itself)? is permitted(?! only)",
+     (), "The issuing key itself is always permitted."),
+    ("evidence-transport/v2.md",
+     r"\bstop\b.*\b(?:clears?|cleared|expires?|lapses?|lifts?)\b|\b(?:clears?|expires?|lapses?|lifts?)\b.*\bstop\b",
+     ("The gateway does not originate, widen or clear the stop.",),
+     "The gateway clears a stop after 24 hours."),
+    ("gateway-evidence-carriage/v1.md", r"\bbypass",
+     ("It MUST NOT create a queue row, retire the offered artifact, bypass backoff, or imply custody.",),
+     "A `queue_full` signal bypasses backoff."),
+    ("events/v2.md", r"`approval_admitted=true`",
+     ("`approval_admitted=true`: an operator affirmative reply durably admitted as an approval.",
+      ("An approval that was admitted and then recorded `approval_expired_undispatched` or "
+       "`approval_aborted_undispatched` keeps `approval_admitted=true`; its `approved_action_outcome` is "
+       "`not_dispatched`, and `safe_default_outcome` reports only whether that safe default ran."),
+      ("An approval recorded `dispatch_outcome_unknown` or `dispatch_not_proven` keeps `approval_admitted=true`, "
+       "and its `approved_action_outcome` is `unknown`: no record reports that the approved action ran or did "
+       "not until a reconciliation records `reconciled_executed` or `reconciled_not_executed`, which is appended "
+       "and never rewrites the uncertain record."),
+      ("Proposed, awaiting ratification: an approval recorded `dispatch_refused_contention` keeps "
+       "`approval_admitted=true`; its `approved_action_outcome` is `not_dispatched`, because the dispatcher refused "
+       "the approved act before actuation, and `safe_default_outcome` reports the non-actuating safe default the "
+       "runtime then applies.")),
+     "`approval_admitted=true` is also recorded for a reply whose commit failed."),
+    ("events/v2.md", r"`approval_admitted=false`.*\b(?:rejection|rejected|refused|said no)\b",
+     ("Consumers MUST NOT infer an operator rejection from `approval_admitted=false`.",),
+     "`approval_admitted=false` records that the operator rejected the proposal."),
+    ("evidence-exchange/v2.md",
+     (r"(?i)\bstop(?: record)?s?\b[^.]*\b(?:lift(?:s|ed)?|clear(?:s|ed)?|delet(?:e|es|ed)|revok(?:e|es|ed)|"
+      r"expir(?:e|es|ed)|laps(?:e|es|ed)|reset)\b|\b(?:lift(?:s|ed)?|revok(?:e|es|ed))\b[^.]*\bstop\b"),
+     ("This revision defines no operation that deletes, clears, supersedes or weakens a stop record.",
+      "A later disposition cannot lift one.",
+      "`superseded` means only that the newly received disposition has no new effect; it never revokes an earlier stop."),
+     "An authority MAY lift an identity stop by issuing a later disposition."),
+    ("tier-c-approval/v1.md", r"(?i)\babsen\w+ of (?:the |that |a )?(?:durable )?(?:dispatch-start marker|marker|`dispatch_started`)",
+     ("After restart, absence of that marker does not prove that dispatch did not begin.",
+      ("Only where the runtime possesses affirmative durable proof that dispatch was never invoked, it durably "
+       "records `approval_aborted_undispatched` with reason `runtime_restart`, performs the proposal's non-actuating "
+       "safe default, alerts the operator, and requires a fresh proposal derived from current observations if the "
+       "condition persists; absence of `dispatch_started` is not such proof.")),
+     "Absence of `dispatch_started` after restart proves that dispatch never began."),
+    ("tier-c-approval/v1.md",
+     r"(?i)\b(?:model inference|gateway response|uncommissioned sensor|absence of an alarm)\b.*\b(?:may|can)\b.*\breconcil",
+     (), "A gateway response MAY reconcile a `dispatch_not_proven` record."),
+    ("tier-c-approval/v1.md",
+     (r"(?i)\bwall[- ]?clock\b.*\b(?:govern|decide|extend|restore|shorten)|"
+      r"expires_at_ms.*\b(?:restor|reconstruct|re-?establish|resum|regain)|"
+      r"\b(?:restor|reconstruct|re-?establish|resum|regain)\w*\b.*expires_at_ms"),
+     ("Wall-clock movement MUST NOT shorten or extend execution authority.",),
+     "After restart the runtime restores the proposal's deadline from `expires_at_ms`."),
+    ("offline-tokens/v2.md", r"(?i)\bwildcard\b.*\bauthori[sz]",
+     ("A wildcard action scope does not authorize Tier C.",),
+     "A wildcard action scope authorizes Tier C while a proposal is open."),
+    ("offline-tokens/v2.md", r"(?i)\bexpir\w*\b.*\b(?:extends?|revives?|creates?)\b",
+     (), "A token's expiry extends the proposal's authority."),
+    ("runtime-config/v2.md", r"approval_timeout_seconds.*\b(?:MAY|may)\b.*\b(?:exceed|extend|beyond)",
+     (), "`approval_timeout_seconds` MAY exceed the release maximum for a remote site."),
+    *((name, PROTECTION_UNAVAILABLE, (GRANT_BOUNDARY[2],),
+       "Where a zone's actuator depends on a capability awaiting evidence confirmation, the runtime reports that "
+       "zone's protection unavailable.") for name in FILES),
+)
+GATE = re.compile(
+    r"\b(gat(?:e|es|ed|ing)|delay(?:s|ed|ing)?|block(?:s|ed|ing)?|suppress(?:es|ed|ing)?|"
+    r"marks? (?:it |them )?unavailable|deferred until|defers?|waits? (?:for|on)|waiting (?:for|on)|"
+    r"postpone[sd]?|postpones|holds?(?=[^.]*\buntil\b))\b",
+    re.IGNORECASE,
+)
+ACTION = re.compile(r"Tier C|Tier D|approved action|safety action|runtime action", re.IGNORECASE)
+NO_GATING = (
+    "MUST NOT gate, delay, suppress, or mark unavailable an approved Tier C action, any Tier D execution, "
+    "or an in-force commissioned safety binding, zone, or safety profile."
+)
+
+# (file, section start, section end, clause). Each clause is required inside its
+# section, and together they are the only sentences the scan admits.
+CLAUSES = (
+    ("evidence-transport/v2.md", "### Refusal policy", "The reasons mean",
+     "So no delivery outcome may discard evidence, and no delivery state may delay or gate a runtime action."),
+    ("evidence-exchange/v2.md", "**`pending_authorisation` is a durable working state", "**Resolution at the authority.**",
+     "Evidence state MUST NOT block, delay, suppress, or mark unavailable an approved Tier C action or any Tier D execution."),
+    ("evidence-exchange/v2.md", "**`pending_authorisation` is a durable working state", "**Resolution at the authority.**",
+     "never lets the pending state block, delay or gate a local Tier D safety action."),
+    ("evidence-exchange/v2.md", "**Effects at the runtime.**", "## Three state models",
+     ("No disposition, and no state it produces, gates, delays, suppresses, or marks unavailable an approved Tier C "
+      "action, any Tier D execution, or an in-force commissioned safety binding, zone, or safety profile.")),
+    ("evidence-exchange/v2.md", "## Fail-closed and fail-open", "## Registry ownership",
+     "**Recording what happened fails open.** An unreachable authority MUST NOT block, delay or gate a Tier C/D action."),
+    ("evidence-exchange/v2.md", "## Invariants", "## Chain row format", "Evidence never gates a safety action."),
+    ("evidence-exchange/v2.md", "## Invariants", "## Chain row format",
+     ("A disposition never confirms an epoch, records delivery, or changes action authority, and no disposition "
+      "state gates a safety action.")),
+    ("gateway-api/v2.md", "## Tier 3 Reasoning Response Payload", "### Reasoning Auth Envelope",
+     "Tier C remains approval-gated and Tier D remains rule-only."),
+    ("tier-c-approval/v1.md", "## Reconciliation", "## Safe Defaults",
+     ("An unresolved `dispatch_outcome_unknown` or `dispatch_not_proven` blocks only a later Tier C proposal "
+      "commanding the same physical outcome on the same commissioned zone.")),
+    ("tier-c-approval/v1.md", "## Reconciliation", "## Safe Defaults",
+     "It does not block another outcome, another zone, Tier A/B, or any Tier D evaluation or execution."),
+    ("tier-c-approval/v1.md", "## Dispatch", "## Restart",
+     ("Once the approval commit succeeds, dispatch MUST proceed without waiting for evidence signing, evidence "
+      "delivery, action-log persistence, Tier C decision export, gateway availability or any further state-store "
+      "write.")),
+    ("operator-socket/v1.md", "## Tier C Reconciliation", "## Vectors",
+     ("Once recorded, the uncertain dispatch no longer blocks a later Tier C proposal commanding the same "
+      "physical outcome on the same commissioned zone.")),
+    ("evidence-exchange/v2.md", "**`pending_authorisation` is a durable working state", "**Resolution at the authority.**",
+     ("An operator reply becomes an approved Tier C decision only through the durable admission in "
+      "[tier-c-approval/v1.md](../tier-c-approval/v1.md), and once admitted its dispatch waits on no evidence "
+      "state; no evidence status reopens, replaces, or loses it;")),
+    ("runtime-health/v3.md", "| `registration_confirmation_overdue` |", "| `registration_offer` |", "It " + NO_GATING),
+    ("runtime-health/v3.md", "| `delivery_stop_status` |", "| `action_records` |", "It " + NO_GATING),
+    ("runtime-health/v3.md", "are reported together.", "Gateway site-health projection may include",
+     "They MUST NOT gate, delay or suppress an approved Tier C action or any Tier D execution."),
+    ("evidence-exchange/v2.md", "### Checkpoint", "#### Identity lifetime and replacement",
+     ("This ordering applies only among checkpoints and MUST NOT delay Tier C or Tier D execution, local "
+      "evidence sealing, or envelope handoff.")),
+    ("runtime-health/v3.md", "| `posture_problems` |", "\n",
+     ("Evidence is never a startup gate — a runtime reports these rather than refusing to run, because Tier D is "
+      "never gated on evidence availability.")),
+    ("tier-c-approval/v1.md", "## Reconciliation", "## Safe Defaults",
+     "The block does not affect another outcome, another zone, Tier A/B, or any Tier D evaluation or execution."),
+)
+GRANT_SECTIONS = (
+    ("evidence-exchange/v2.md", "**`pending_authorisation` is a durable working state", "**Resolution at the authority.**"),
+    ("runtime-health/v3.md", "| `registration_confirmation_overdue` |", "| `registration_offer` |"),
+)
+# Clauses that do not pair a gating verb with an action, so the scan cannot see
+# them, and that a reversing edit has passed every other checker without.
+REQUIRED_ONLY = tuple((name, start, end, clause) for name, start, end in GRANT_SECTIONS for clause in GRANT_BOUNDARY) + (
+    ("tier-c-approval/v1.md", "## Dispatch", "## Restart",
+     "Reaching the ceiling MUST NOT delay dispatch, discard the approval, or cause replay."),
+    ("evidence-exchange/v2.md", "### Evidence disposition", "The values are closed",
+     "it never records delivery, never confirms an epoch, and never changes action authority."),
+    ("evidence-exchange/v2.md", "**Registration status at the runtime**", "**Evidence findings**",
+     "it never confirms the epoch and never changes action authority."),
+    ("operator-socket/v1.md", "## Commissioning Reference Delivery", "## Tier C Reconciliation",
+     "it never lifts an `epoch` or `identity` disposition."),
+    ("gateway-evidence-carriage/v1.md", "### Outbound acknowledgement", "Persistent MQTT sessions are required",
+     "It MUST NOT create a queue row, retire the offered artifact, bypass backoff, or imply custody."),
+    ("gateway-evidence-carriage/v1.md", "### Outbound acknowledgement", "Persistent MQTT sessions are required",
+     "The runtime retries an artifact refused `queue_full` with its existing bounded back-off."),
+    ("evidence-transport/v2.md", "A **handoff** is", "A timer is",
+     ("A `queue_full` handoff admits no bytes, transfers no custody, and changes no queue ordering; it only makes "
+      "an existing eligible head entry for that device runnable once.")),
+    ("evidence-transport/v2.md", "An **authenticated", "A timer is",
+     "A carriage on any other topic, or whose `device_id` values disagree, is no admission and signals nothing."),
+    ("evidence-transport/v2.md", "### Retention bounds", "### Refusal policy",
+     ("`507 retention_capacity_exhausted` is permitted only for an identity already subject to a durably issued "
+      "identity-scoped disposition.")),
+    ("evidence-transport/v2.md", "**Stopped scopes.**", "```json",
+     "The gateway does not originate, widen or clear the stop."),
+    ("evidence-exchange/v2.md", "**Effects at the runtime.**", "## Three state models",
+     ("Under an epoch- or identity-scoped disposition, the runtime continues sealing Tier C and Tier D evidence "
+      "locally but MUST NOT newly hand off an artifact within the stopped scope.")),
+    ("evidence-exchange/v2.md", "### Checkpoint", "#### Identity lifetime and replacement",
+     "Retry eligibility does not permit a later checkpoint to pass an earlier unacknowledged checkpoint."),
+    ("evidence-exchange/v2.md", "### Checkpoint", "#### Identity lifetime and replacement",
+     ("A checkpoint stops being a predecessor only after the runtime durably records a verified `queued` "
+      "acknowledgement, a covering verified stop disposition, or a verified terminal gateway-admission refusal "
+      "`malformed` or `binding_mismatch`, or after it durably moves the checkpoint's stored copy into damaged or "
+      "foreign-identity custody as below.")),
+    ("runtime-health/v3.md", "| `delivery_stop_status` |", "| `action_records` |",
+     "Absence means unknown and MUST NOT be interpreted as `not_stopped`."),
+    ("evidence-commissioning-ingest/v1.md", "**Who may cancel.**", "**Applying a cancellation.**",
+     "The issuing key itself is permitted only when its entry lists it."),
+    ("events/v2.md", "### Tier C Semantics", "runs after a NO as after a timeout.",
+     "A reply whose admission commit did not succeed is not an approval,"),
+    ("events/v2.md", "### Tier C Semantics", "runs after a NO as after a timeout.",
+     "Consumers MUST NOT infer an operator rejection from `approval_admitted=false`."),
+    ("offline-tokens/v2.md", "## Tier C Binding", "## Verification Rules",
+     "A token MUST NOT be consumed by a reply that did not become a durable approval."),
+    ("offline-tokens/v2.md", "`offline-tokens/v1` remains the implemented legacy format", "## Token Encoding",
+     ("A runtime conforming to this revision MUST NOT accept a v1 token as approval for any Tier C action. This "
+      "includes host-state Tier C actions that remain on the existing approval workflow.")),
+    ("operator-socket/v1.md", "## Tier C Reconciliation", "## Vectors",
+     "Reconciliation only appends: it never rewrites evidence, replays the action or reaches Tier D."),
+    ("tier-c-approval/v1.md", "## Safe Defaults", "## Decision States",
+     "Neither state authorizes the proposed physical action."),
+    ("tier-c-approval/v1.md", "## Restart", "## Reconciliation",
+     "If that process terminates before dispatch begins, restart MUST NOT execute or replay the approved action."),
+    ("tier-c-approval/v1.md", "## Restart", "## Reconciliation",
+     "Once dispatch has begun, absence of a durable outcome MUST NOT cause automatic replay."),
+    ("tier-c-approval/v1.md", "## Safe Defaults", "## Decision States",
+     ("It MUST NOT invoke any executor, command or transport capable of changing relay, contactor, valve, "
+      "protected-circuit, supply-transfer or other physical state.")),
+    ("tier-c-approval/v1.md", "## Safe Defaults", "## Decision States",
+     "The runtime MUST additionally refuse any safe default whose action-registry entry is marked `physical`."),
+    ("tier-c-approval/v1.md", "## Exports", "## Vectors",
+     ("Gateway API v1 retains its shipped request, response and export semantics; it MUST NOT emit an events/v2 "
+      "approval record on a surface that declares events/v1.")),
+    ("tier-c-approval/v1.md", "## The Proposal", "## Admission",
+     "No reply can approve it and no physical action executes."),
+    ("tier-c-approval/v1.md", "## The Proposal", "## Admission", "Tier D remains unaffected."),
+    ("tier-c-approval/v1.md", "## Safe Defaults", "## Decision States", "No safe-default intent may actuate."),
+    ("gateway-evidence-carriage/v1.md", "**Return order is per device.**", "### Envelope",
+     "An unacknowledged or refused artifact for one device MUST NOT delay publication to another device."),
+    ("gateway-evidence-carriage/v1.md", "**Return order is per device.**", "### Envelope",
+     "It does not enter that device's lane and cannot block another device."),
+    ("evidence-exchange/v2.md", "**Emission.**", "**Verification at the runtime.**",
+     ("For an epoch without that declaration, a lower checkpoint is refused artifact-scoped and MUST NOT produce "
+      "`identity_replacement_required`.")),
+    ("evidence-transport/v2.md", "**Carriage capability.**", "## Device authorisation and enumeration resistance",
+     ("Deploying every gateway before the authority is the recommended order, and is not the correctness "
+      "boundary: the credential's registered capability is.")),
+    ("operator-socket/v1.md", "## Commissioning Reference Delivery", "## Tier C Reconciliation",
+     "The bridge opens and writes neither runtime store,"),
+)
+
+
+class CheckError(Exception):
+    pass
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace("**", "")).strip()
+
+
+def sentences(text: str) -> list[str]:
+    """Every sentence, splitting table cells, list items and prose alike."""
+    out: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", text):
+        for item in re.split(r"\n(?=\s*(?:[-*] |\d+\. |\|))", paragraph):
+            for cell in re.split(r"(?<!\\)\|", item):
+                prose = _norm(re.sub(r"^\s*(?:[-*] |\d+\. )", "", cell))
+                out.extend(s for s in re.split(r"(?<=[.;!?])\s+(?=[A-Z`(\[])", prose) if s)
+    return out
+
+
+def matches(texts: dict[str, str]) -> list[tuple[str, str]]:
+    return [(name, s) for name, text in texts.items() for s in sentences(text) if GATE.search(s) and ACTION.search(s)]
+
+
+def _section(text: str, start: str, end: str) -> str:
+    a = text.find(start)
+    b = text.find(end, a + len(start)) if a >= 0 else -1
+    if a < 0 or b < 0:
+        raise CheckError(f"no section starting {start[:50]!r}")
+    return text[a:b]
+
+
+def check(texts: dict[str, str], allowed: set[str] | None = None) -> None:
+    for name, start, end, clause in (*CLAUSES, *REQUIRED_ONLY):
+        if _norm(clause) not in _norm(_section(texts[name], start, end)):
+            raise CheckError(f"{name}: the clause {clause[:70]!r} is not in its section {start[:40]!r}")
+    if allowed is None:
+        allowed = {s for c in CLAUSES for s in sentences(c[3])}
+    for name, sentence in matches(texts):
+        if sentence not in allowed:
+            raise CheckError(
+                f"{name}: {sentence[:120]!r} pairs a gating verb with an action and is not a reviewed clause. "
+                "Evidence never gates Tier C or Tier D; if this sentence is a negation, add it to CLAUSES with its "
+                "section. This scan reads one sentence at a time and cannot see a rule split across sentences."
+            )
+    for name, pattern, permitted, _ in CONTRADICTIONS:
+        for sentence in sentences(texts[name]):
+            if re.search(pattern, sentence) and sentence not in {_norm(p) for p in permitted}:
+                raise CheckError(
+                    f"{name}: {sentence[:120]!r} contradicts a rule this guard holds, or states it in a form no "
+                    "reviewer has allowlisted. The guard is a pattern over single sentences and sees only the "
+                    "phrasings it names."
+                )
+
+
+def reverse(clause: str) -> str:
+    edited = clause
+    for old, new in (("MUST NOT ", "MAY "), ("never ", ""), ("No disposition", "Any disposition"),
+                     ("no delivery state may", "a delivery state may"), ("no disposition state", "disposition state"),
+                     ("is refused before", "is refused after"), ("without waiting for", "after waiting for"),
+                     ("non-actuating", "actuating"), ("with its existing bounded back-off", "without back-off"),
+                     ("admits no bytes", "admits the bytes"), ("is no admission and signals nothing", "is an admission"),
+                     ("is permitted only for", "is permitted for"), ("does not originate", "may originate"),
+                     ("does not permit", "permits"), ("stops being a predecessor", "remains a predecessor"),
+                     ("opens and writes neither", "opens and writes each"),
+                     ("is permitted only when its entry lists it", "is always permitted"),
+                     ("is not an approval", "is an approval"),
+                     ("waits on no evidence state", "waits on evidence state"),
+                     ("blocks only a later Tier C proposal", "blocks every later Tier C proposal"),
+                     ("It does not block another outcome", "It blocks another outcome"),
+                     ("no longer blocks a later Tier C proposal", "still blocks a later Tier C proposal"),
+                     ("Neither state authorizes", "Either state authorizes"),
+                     ("MUST additionally refuse", "MAY admit"),
+                     ("The block does not affect", "The block affects"),
+                     ("is never consulted", "is consulted"), ("never marks", "marks"),
+                     ("No reply can approve it and no physical action executes",
+                      "A reply can approve it and the physical action executes"),
+                     ("remains unaffected", "is held with it"), ("No safe-default intent may", "A safe-default intent may"),
+                     ("does not enter that device's lane and cannot block", "enters that device's lane and can block"),
+                     ("and is not the correctness boundary", "and is the correctness boundary")):
+        edited = edited.replace(old, new, 1)
+    if edited == clause:
+        edited = clause.replace("remains approval-gated", "is not approval-gated", 1)
+    return edited
+
+
+def mutants(texts: dict[str, str]):
+    for name, start, end, clause in (*CLAUSES, *REQUIRED_ONLY):
+        pattern = r"\s+".join(re.escape(w) for w in clause.split())
+        deleted, count = re.subn(pattern, "", texts[name], count=1)
+        yield f"delete {clause[:50]!r}", {**texts, name: deleted}, None, count
+        edited, count = re.subn(pattern, reverse(clause).replace("\\", "\\\\"), texts[name], count=1)
+        yield f"reverse {clause[:50]!r}", {**texts, name: edited}, None, count
+        # Re-pin: the scan's allowlist regenerated from the reversed text, as a
+        # mechanical `--print-units` refresh would; the required clause must still fail it.
+        edited_texts = {**texts, name: edited}
+        yield (f"re-pin reversed {clause[:40]!r}", edited_texts,
+               {s for _, s in matches(edited_texts)}, count)
+    for name, _, _, sample in CONTRADICTIONS:
+        yield f"append to {name}: {sample[:50]!r}", {**texts, name: texts[name] + f"\n\n{sample}\n"}, None, 1
+    for name in FILES:
+        yield (f"append to {name}", {**texts, name: texts[name] + "\n\nEvidence state may delay an approved Tier C action.\n"},
+               None, 1)
+        yield (f"append a gate to {name}", {**texts, name: texts[name] + "\n\nA disposition gates Tier D execution.\n"},
+               None, 1)
+
+
+def main() -> int:
+    texts = {name: (ROOT / name).read_text(encoding="utf-8") for name in FILES}
+    if "--print-units" in sys.argv[1:]:
+        for name, sentence in matches(texts):
+            print(f"{name}: {sentence}")
+        return 0
+    try:
+        check(texts)
+    except CheckError as error:
+        print(f"check-evidence-patf-clauses: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, edited, allowed, count in mutants(texts):
+            total += 1
+            if count != 1:
+                survived.append(f"{label}: the mutation matches nothing")
+                continue
+            try:
+                check(edited, allowed)
+            except CheckError:
+                continue
+            survived.append(label)
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"patf mutations: {total} refused")
+    print(f"patf clauses: {len(CLAUSES) + len(REQUIRED_ONLY)} clauses hold across {len(FILES)} contracts")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

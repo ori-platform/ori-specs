@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check the commissioning-resolution corpus against evidence-exchange/v1.
+"""Check the commissioning-resolution corpus against evidence-exchange/v2.
 
-`evidence-exchange/vectors/receiver-state/commissioning-resolution.json` holds
+`evidence-exchange/vectors/receiver-state/commissioning-resolution-v2.json` holds
 the cases that no single wire artifact can express: what the evidence
 authority does with an anchor registration depends on the commissioning
 authorisations it already holds, which reach it through the commissioning path
@@ -17,9 +17,15 @@ and never from the device. This script holds the corpus to the contract:
   the contract and compared with the literal, including whether a confirmation
   is issued, whether anything is quarantined, and whether a gap is recorded;
 - every row of the resolution table has a case, and the transport refusal of a
-  device-side authorisation has one.
+  device-side authorisation has one;
+- every pending-registration cancellation is verified under the published
+  cancellation key and applied as the contract states — removal from the
+  pending bound, retention, tombstone, and refusal of a held authorisation or
+  of another device or epoch — and every decision's emitted dispositions and
+  confirmation delivery are recomputed from the emission mapping.
 
     python3 scripts/check-evidence-commissioning-vectors
+    python3 scripts/check-evidence-commissioning-vectors --mutations
 
 Requires the `cryptography` package for Ed25519 verification; the check refuses
 to run without it rather than skipping the signatures. Exits non-zero on the
@@ -32,12 +38,16 @@ import base64
 import hashlib
 import json
 import pathlib
+import re
 import sys
 from typing import Any
 
 try:
     from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
 except ImportError:  # pragma: no cover - the gate must not pass silently
     print(
         "check-evidence-commissioning-vectors: the cryptography package is required",
@@ -51,12 +61,25 @@ CORPUS = (
     / "evidence-exchange"
     / "vectors"
     / "receiver-state"
-    / "commissioning-resolution.json"
+    / "commissioning-resolution-v2.json"
 )
-TRANSPORT = ROOT / "evidence-transport" / "vectors" / "ingest-auth.json"
+TRANSPORT = ROOT / "evidence-transport" / "vectors" / "ingest-auth-v2.json"
 
 REGISTRATION_DOMAIN = b"ori.evidence_anchor_registration.v1\0"
 AUTHORISATION_DOMAIN = b"ori.evidence_commissioning_authorization.v1\0"
+CANCELLATION_DOMAIN = b"ori.evidence_commissioning_cancellation.v1\0"
+CANCELLATION_FIELDS = {
+    "v",
+    "device_id",
+    "anchor_epoch_id",
+    "commissioning_digest",
+    "expected_authorisation_key_id",
+    "cancellation_id",
+    "reason",
+    "issued_at_ms",
+    "key_id",
+    "signature",
+}
 REGISTRATION_FIELDS = {
     "v",
     "device_id",
@@ -107,13 +130,66 @@ REQUIRED_OUTCOMES = {
         and c["expected"] == "accept"
         and c["epoch_confirmation_issued"]
     ),
-    "wrong digest for held device and epoch": lambda c: (
-        c["reject_reason"] == "commissioning_digest_mismatch"
-        and kind(c["artifact"]) == "registration"
+    "unresolved reference retained although a sibling authorisation is held": lambda c: (
+        kind(c["artifact"]) == "registration"
+        and c["expected"] == "accept"
+        and not c["epoch_confirmation_issued"]
         and any(
-            a["pubkey_hex"] == c["artifact"]["pubkey_hex"]
+            a["device_id"] == c["artifact"]["device_id"]
+            and a["anchor_epoch_id"] == c["artifact"]["anchor_epoch_id"]
             for a in c["receiver_state"]["held_authorisations"]
         )
+    ),
+    "named authorisation promotes its registration while a sibling is held": lambda c: (
+        c["source"] == "commissioning_path"
+        and c["epoch_confirmation_issued"]
+        and c["receiver_state"]["held_authorisations"]
+    ),
+    "an agreeing registration naming a revoked authorisation is refused": lambda c: (
+        c["reject_reason"] == "commissioning_digest_mismatch"
+        and c["receiver_state"]["revoked_authorisations"]
+    ),
+    "a re-signed registration with the same binding is idempotent": lambda c: (
+        c["expected"] == "accept"
+        and kind(c["artifact"]) == "registration"
+        and any(r["commissioning_digest"] == c["artifact"]["commissioning_digest"]
+                for r in c["receiver_state"]["retained_registrations"])
+    ),
+    "a different binding under a pending digest conflicts": lambda c: (
+        c["reject_reason"] == "pending_registration_conflict"
+    ),
+    "an applied registration retried after revocation returns its confirmation": lambda c: (
+        c["expected"] == "accept"
+        and c["epoch_confirmation_issued"]
+        and c["receiver_state"]["applied_registrations"]
+        and c["receiver_state"]["revoked_authorisations"]
+    ),
+    "a re-offer of a promoted registration returns its confirmation": lambda c: (
+        c["expected"] == "accept"
+        and c["epoch_confirmation_issued"]
+        and c["receiver_state"]["applied_registrations"]
+        and c["receiver_state"]["held_authorisations"]
+        and not c["receiver_state"]["revoked_authorisations"]
+    ),
+    "a pending conflict applies once the first registration is refused": lambda c: (
+        c["expected"] == "accept"
+        and kind(c["artifact"]) == "registration"
+        and c["epoch_confirmation_issued"]
+        and c["receiver_state"]["refused_registrations"]
+    ),
+    "a pending conflict is refused once the first registration applied": lambda c: (
+        c["reject_reason"] == "commissioning_digest_mismatch"
+        and c["receiver_state"]["applied_registrations"]
+    ),
+    "a disagreeing named authorisation refuses the retained registration": lambda c: (
+        c["source"] == "commissioning_path"
+        and c["authority_state_after"]["refused_registrations"]
+    ),
+    "refused registration stays refused after its authorisation is revoked": lambda c: (
+        c["reject_reason"] == "commissioning_digest_mismatch"
+        and c["receiver_state"]["refused_registrations"]
+        and c["receiver_state"]["revoked_authorisations"]
+        and not c["receiver_state"]["held_authorisations"]
     ),
     "resolved authorisation names another device, key or epoch": lambda c: (
         c["reject_reason"] == "commissioning_digest_mismatch"
@@ -128,11 +204,371 @@ REQUIRED_OUTCOMES = {
         and kind(c["artifact"]) == "authorisation"
         and c["reject_reason"] == "malformed"
     ),
+    "a cancellation removes the exact pending registration and releases its place": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "accept"
+        and len(c["authority_state_after"]["retained_registrations"])
+        < len(c["receiver_state"]["retained_registrations"])
+    ),
+    "a cancellation before registration terminates the later registration": lambda c: (
+        kind(c["artifact"]) == "registration"
+        and c["reject_reason"] == "commissioning_digest_mismatch"
+        and c["receiver_state"]["cancellations"]
+        and not c["receiver_state"]["refused_registrations"]
+    ),
+    "the cancelled authorisation arriving later does not revive it": lambda c: (
+        kind(c["artifact"]) == "authorisation"
+        and c["source"] == "commissioning_path"
+        and c["reject_reason"] == "cancelled"
+    ),
+    "an authorisation naming another issuer than the tombstone is refused terminally": lambda c: (
+        kind(c["artifact"]) == "authorisation"
+        and c["source"] == "commissioning_path"
+        and c["reject_reason"] == "cancellation_issuer_mismatch"
+        and not c["receiver_state"]["retained_registrations"]
+    ),
+    "a repeated issuer mismatch stays terminal while a sibling stays pending": lambda c: (
+        kind(c["artifact"]) == "authorisation"
+        and c["reject_reason"] == "cancellation_issuer_mismatch"
+        and c["receiver_state"]["retained_registrations"]
+        and c["authority_state_after"]["retained_registrations"]
+    ),
+    "a fresh authorisation under a new digest proceeds after an issuer mismatch": lambda c: (
+        kind(c["artifact"]) == "authorisation"
+        and c["expected"] == "accept"
+        and c["epoch_confirmation_issued"]
+        and any(x["expected_authorisation_key_id"] != c["artifact"]["key_id"]
+                for x in c["receiver_state"]["cancellations"])
+    ),
+    "a cancellation naming another expected issuer than the tombstone is refused": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["reject_reason"] == "cancellation_mismatch"
+        and c["receiver_state"]["cancellations"]
+    ),
+    "a cancellation leaves another digest pending": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "accept"
+        and c["authority_state_after"]["retained_registrations"]
+    ),
+    "a cancellation naming another device or epoch changes nothing": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "reject"
+        and c["receiver_state"]["retained_registrations"]
+    ),
+    "a cancellation of a held authorisation is refused": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "reject"
+        and c["receiver_state"]["held_authorisations"]
+    ),
+    "a repeated cancellation is idempotent": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "accept"
+        and any(digest(x) == digest(c["artifact"]) for x in c["receiver_state"]["cancellations"])
+    ),
+    "a distinct cancellation of a tombstoned digest changes nothing": lambda c: (
+        kind(c["artifact"]) == "cancellation"
+        and c["expected"] == "accept"
+        and c["receiver_state"]["cancellations"]
+        and not any(digest(x) == digest(c["artifact"]) for x in c["receiver_state"]["cancellations"])
+    ),
+    "a fresh reference registers after a cancellation": lambda c: (
+        kind(c["artifact"]) == "registration"
+        and c["expected"] == "accept"
+        and c["receiver_state"]["cancellations"]
+    ),
+    "a pending conflict resolves once its digest is cancelled": lambda c: (
+        kind(c["artifact"]) == "registration"
+        and c["reject_reason"] == "commissioning_digest_mismatch"
+        and c["receiver_state"]["cancellations"]
+        and any(
+            r["commissioning_digest"] == c["artifact"]["commissioning_digest"] and not binds(r, c["artifact"])
+            for r in c["receiver_state"]["refused_registrations"]
+        )
+    ),
 }
 
 
 class Failure(Exception):
     pass
+
+
+# The contract text that states the resolution rule is pinned, in order: the
+# verification paragraph, the resolution section through the idempotency key,
+# the whole adversarial table, and the ingest contract's promotion and
+# revocation paragraphs. A ratified change applied to one of them and not the
+# others then fails here instead of passing unread. A pin forces a touch, not
+# agreement, so the outcomes below are read from the pinned text itself.
+CONTRACT = ROOT / "evidence-exchange" / "v2.md"
+INGEST = ROOT / "evidence-commissioning-ingest" / "v1.md"
+PINNED = ROOT / "scripts" / "evidence-exchange-resolution-pinned-units.json"
+TEXT_BLOCKS = (
+    (CONTRACT, "The authority MUST verify the authorisation before applying a registration.", "The fuller commissioning"),
+    (CONTRACT, "**Resolution at the authority.**", "### Delivery envelope"),
+    (CONTRACT, "Normative. Every row is a required test vector.", "### Test vectors"),
+    (INGEST, "| Condition | HTTP | `reason` |", "`revoked` and `cancelled` are decided by digest"),
+    (INGEST, "**Promotion.**", "## Response"),
+)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _texts(text: str) -> dict:
+    return {CONTRACT: text, INGEST: INGEST.read_text(encoding="utf-8")}
+
+
+def resolution_units(text: str, ingest: str | None = None) -> list[str]:
+    sources = _texts(text)
+    if ingest is not None:
+        sources[INGEST] = ingest
+    units: list[str] = []
+    for source, start_marker, end_marker in TEXT_BLOCKS:
+        body = sources[source]
+        start = body.find(start_marker)
+        end = body.find(end_marker, start)
+        if start < 0 or end < start:
+            fail(f"{source.name} lacks the block starting {start_marker[:40]!r}")
+        units.extend(_block_units(body[start:end]))
+    return units
+
+
+def _block_units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith("|"):
+            units.extend(
+                _norm(line)
+                for line in lines
+                if line.strip() and not re.fullmatch(r"\|[\s:|-]+\|", line.strip())
+            )
+        else:
+            prose = _norm(paragraph)
+            units.extend(u for u in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if u)
+    return units
+
+
+# Each branch of `resolve` names the pinned text it implements. The table rows
+# give their outcome in their own Outcome cell; the prose rules must be present
+# word for word, so rewording one is a change to this checker, not a re-pin.
+TABLE_ROWS = {
+    "applies": "| Resolves to an unrevoked authorisation naming the same",
+    "pending": "| Resolves to nothing,",
+    "disagrees": "but its `device_id`, `pubkey_hex` or `anchor_epoch_id` disagrees |",
+    "revoked": "but that authorisation is revoked, and the registration has not already applied |",
+    "device_presents": "| The device presents the authorisation object itself |",
+    "cancelled": "| Names a commissioning digest a cancellation has tombstoned |",
+}
+# The ingest refusal table rows a cancellation, or an authorisation arriving
+# after one, is refused under; each gives its reason in its own cell.
+INGEST_ROWS = {
+    "authorisation_cancelled": "| An authorisation with this digest is tombstoned by a cancellation |",
+    "authorisation_held": "| A cancellation names a digest whose authorisation the authority holds, revoked or not |",
+    "cancellation_mismatch": (
+        "| A cancellation names a digest under which a registration is pending for another device or epoch, "
+        "or a tombstone is held for another device, epoch or expected authorisation key |"
+    ),
+    "authorisation_inconsistent": (
+        "| An authorisation arrives under a tombstoned digest naming a key other than the tombstone's "
+        "expected key |"
+    ),
+}
+# The emission mapping rows for registration outcomes, each giving the scope
+# and disposition in its own cells.
+EMISSION_ROWS = {
+    "refused": "| Registration refused `commissioning_digest_mismatch`, on arrival or on the commissioning path |",
+    "pending": "| Registration retained pending |",
+}
+PROSE_RULES = {
+    "retained_response": (
+        "Byte-identical registration bytes that have already applied are answered with their retained "
+        "response, including the original epoch confirmation, before any resolution,"
+    ),
+    "terminal": "A `commissioning_digest_mismatch` is terminal for the exact canonical registration bytes.",
+    "pending_idempotent": (
+        "anchor_epoch_id)` binding is accepted idempotently. The authority retains the first canonical "
+        "registration bytes and does not update them."
+    ),
+    "arrival_terminal": (
+        "the authority atomically removes the registration from pending retention and records "
+        "`commissioning_digest_mismatch` as its terminal refusal."
+    ),
+    "cancellation": (
+        "Applying it atomically removes the registration retained pending under that digest from "
+        "the pending bound, retains its exact bytes as a terminal refusal, commits an "
+        "`artifact_terminal` disposition for it to the device's return set, and installs a durable "
+        "tombstone for the digest."
+    ),
+    "arrival_disposition": (
+        "It retains the exact registration bytes as a terminal refusal and commits an "
+        "`artifact_terminal` disposition for them to the device's return set."
+    ),
+}
+PENDING_CONFLICT = re.compile(r"naming that digest with any different binding is refused `(\d+) (\w+)`")
+# Rules no branch of `resolve` computes, which the corpus therefore cannot
+# contradict. They are held word for word: rewording one is a change to this
+# checker, never only a re-pin.
+REQUIRED_SENTENCES = {
+    "named authorisation decides": "An authorisation other than the one named never determines the outcome.",
+    "pending does not override existing anchor": (
+        "This pending-binding rule does not override the existing-anchor rule:"
+    ),
+    "pending conflict is transient": (
+        "The refusal lasts only while the first registration is pending: once it applies, "
+        "or reaches a terminal refusal, the same refused bytes are resolved afresh when resubmitted."
+    ),
+    "revocation keeps confirmations": (
+        "so a later revocation of the authorisation they named neither withdraws that "
+        "confirmation nor changes those bytes."
+    ),
+    "revocation keeps anchors": "and it never deactivates an anchor.",
+    "adversarial mismatch is final": (
+        "| Registration not already applied whose named authorisation is held and names a "
+        "different device, key or epoch, or is revoked | Reject `commissioning_digest_mismatch`; "
+        "final for those bytes; no gap |"
+    ),
+    "ingest revocation finds nothing pending": (
+        "No pending registration is expected under a held authorisation; an implementation "
+        "finding one MUST fail the transaction as inconsistent state: it revokes nothing,"
+    ),
+    "pending bound never evicts": (
+        "a new registration at the bound is refused `429 pending_registration_limit` with "
+        "`Retry-After`, audited, and never evicts a retained one."
+    ),
+    "ingest arrival refuses disagreeing": (
+        "A retained registration that the arriving authorisation does not bind is removed from "
+        "retention in that transaction, with `commissioning_digest_mismatch` recorded as its "
+        "terminal refusal."
+    ),
+    "promotion delivers through the return set": (
+        "This path commits a confirmation or disposition to the device's return set in "
+        "`evidence-transport/v2`, which carries it on the device's next authenticated response "
+        "there, and a byte-identical registration re-offer receives the same artifact;"
+    ),
+    "tombstone never removed": "A tombstone is never removed.",
+    "cancelled authorisation never revives": (
+        "and a later arrival of the cancelled authorisation is refused on the commissioning path and never "
+        "revives it."
+    ),
+    "cancellation id bound": (
+        "a cancellation with the same `key_id` and `cancellation_id` but any other bytes is refused "
+        "`409 cancellation_id_reused`, decided before the cancellation is applied, and changes nothing."
+    ),
+    "cancellation leaves others": (
+        "Registrations under other digests, and every other device and epoch, are unaffected, and a "
+        "fresh reference proceeds as any registration does."
+    ),
+    "cancellation idempotent": (
+        "A cancellation is idempotent: a byte-identical resubmission is `accepted` with the same "
+        "outcome, and a distinct cancellation of a digest already tombstoned for the same device, epoch and "
+        "expected authorisation key is `accepted`, audited, and changes nothing."
+    ),
+    "tombstone key": (
+        "The resulting tombstone binds `(commissioning_digest, device_id, anchor_epoch_id, "
+        "expected_authorisation_key_id)`."
+    ),
+}
+
+
+def _transport_policy() -> dict:
+    """The refusal policy, read from evidence-transport/v2 by its own checker."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+
+    path = ROOT / "scripts" / "check-evidence-transport-refusal-policy-vectors"
+    loader = SourceFileLoader("transport_policy", str(path))
+    spec = importlib.util.spec_from_loader("transport_policy", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    try:
+        return module.load_policy(module.CONTRACT.read_text(encoding="utf-8"))
+    except module.CheckError as error:
+        fail(f"evidence-transport/v2 does not hold to its own checker: {error}")
+        raise AssertionError("unreachable") from error
+
+
+def contract_rules(text: str, ingest: str | None = None) -> dict:
+    """Read each outcome `resolve` applies from the pinned contract text."""
+    prose = _norm(text)
+    rules: dict[str, Any] = {}
+    for key, marker in TABLE_ROWS.items():
+        rows = [line for line in text.splitlines() if marker in line]
+        if len(rows) != 1:
+            fail(f"the resolution table no longer carries exactly one row for {key}")
+        cell = _norm(rows[0].rstrip().rstrip("|").rsplit("|", 1)[1])
+        reject = re.match(r"Reject `(\w+)`", cell)
+        if cell.startswith("Apply") and "issue the epoch confirmation" in cell:
+            rules[key] = ("accept", None, True)
+        elif cell.startswith("Retain the registration pending; `accepted` with no confirmation"):
+            rules[key] = ("accept", None, False)
+        elif reject:
+            rules[key] = ("reject", reject.group(1), False)
+        elif cell.startswith("Refused at transport as an artifact the courier does not carry"):
+            rules[key] = ("reject", "malformed", False)
+        else:
+            fail(f"the {key} row states an outcome this checker cannot read: {cell[:60]!r}")
+    for key, sentence in PROSE_RULES.items():
+        rules[key] = _norm(sentence) in prose
+    ingest_text = ingest if ingest is not None else INGEST.read_text(encoding="utf-8")
+    for key, marker in INGEST_ROWS.items():
+        rows = [line for line in ingest_text.splitlines() if _norm(line).startswith(_norm(marker))]
+        if len(rows) != 1:
+            fail(f"the ingest refusal table no longer carries exactly one row for {key}")
+        cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+        reason = re.fullmatch(r"`(\w+)`", cells[-1])
+        if len(cells) != 3 or not cells[1].isdigit() or reason is None:
+            fail(f"the ingest {key} row is not condition | status | `reason`")
+        rules[key] = (int(cells[1]), reason.group(1))
+    for key, marker in EMISSION_ROWS.items():
+        rows = [line for line in text.splitlines() if line.startswith(marker)]
+        if len(rows) != 1:
+            fail(f"the emission mapping no longer carries exactly one row for {key}")
+        cells = [c.strip() for c in rows[0].strip().strip("|").split("|")]
+        named = [re.fullmatch(r"`(\w+)`", c) for c in cells[1:]]
+        if len(cells) != 3 or not all(named):
+            fail(f"the emission {key} row is not trigger | `scope` | `disposition`")
+        rules[f"emit_{key}"] = tuple(m.group(1) for m in named)
+    conflict = PENDING_CONFLICT.search(prose)
+    rules["pending_conflict"] = conflict.group(2) if conflict else None
+    # One unit per line, so no sentence can be completed by its neighbour.
+    pinned = "\n".join(resolution_units(text, ingest))
+    for key, sentence in REQUIRED_SENTENCES.items():
+        if _norm(sentence) not in pinned:
+            fail(
+                f"the contract no longer states the {key!r} rule word for word; changing it "
+                "changes this checker, never only the pin"
+            )
+    if conflict is not None:
+        statuses = [
+            status
+            for status, reasons in _transport_policy()["table"].items()
+            if conflict.group(2) in reasons
+        ]
+        if statuses != [int(conflict.group(1))]:
+            fail(
+                f"evidence-exchange refuses a pending conflict {conflict.group(1)} "
+                f"{conflict.group(2)}; evidence-transport carries that reason at {statuses}"
+            )
+    return rules
+
+
+def check_contract_text(text: str, ingest: str | None = None) -> None:
+    units = resolution_units(text, ingest)
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    if units != pinned:
+        added = [u for u in units if u not in pinned]
+        removed = [u for u in pinned if u not in units]
+        fail(
+            "the resolution text differs from the pinned units, in content or order. Re-pinning "
+            "is a semantic change: update scripts/evidence-exchange-resolution-pinned-units.json "
+            "only together with this corpus and, where an outcome changed, this checker\n"
+            + "".join(f"  + {u}\n" for u in added)
+            + "".join(f"  - {u}\n" for u in removed)
+        )
 
 
 def fail(message: str) -> None:
@@ -155,8 +591,10 @@ def kind(artifact: dict) -> str:
         return "registration"
     if keys == AUTHORISATION_FIELDS:
         return "authorisation"
+    if keys == CANCELLATION_FIELDS:
+        return "cancellation"
     fail(
-        f"artifact with keys {sorted(keys)} is neither a registration nor an authorisation"
+        f"artifact with keys {sorted(keys)} is neither a registration, an authorisation nor a cancellation"
     )
     return ""
 
@@ -175,84 +613,209 @@ def verify(artifact: dict, domain: bytes, public_hex: str, where: str) -> None:
         fail(f"{where}: signature does not verify ({exc.__class__.__name__})")
 
 
-def resolve(
-    case: dict, device_public_hex: str, commissioning_public_hex: str
-) -> tuple[str, str | None, dict, bool]:
-    """Recompute (expected, reject_reason, authority_state_after, confirmation_issued)."""
+def verify_registration(registration: dict, where: str) -> None:
+    """Derive key_id and anchor_epoch_id, then verify under the registration's own key.
+
+    The resolution order recomputes both identifiers and checks the signature
+    before resolving the reference, so a registration whose claimed identifiers
+    do not derive, or that is signed by any key but its own, never reaches
+    resolution; a vector relying on one describes an unreachable outcome.
+    """
+    pubkey_hex = registration["pubkey_hex"]
+    if not re.fullmatch(r"[0-9a-f]{64}", pubkey_hex):
+        fail(f"{where}: pubkey_hex is not 64 lowercase hex")
+    public_key_b64 = base64.b64encode(bytes.fromhex(pubkey_hex)).decode()
+    device_id = registration["device_id"]
+    key_id = "sha256:" + hashlib.sha256(
+        canonical({"device_id": device_id, "public_key_b64": public_key_b64, "v": 1})
+    ).hexdigest()
+    capability_hash = "sha256:" + hashlib.sha256(
+        canonical(registration["capability_profile"])
+    ).hexdigest()
+    epoch = "sha256:" + hashlib.sha256(
+        canonical(
+            {
+                "capability_hash": capability_hash,
+                "device_id": device_id,
+                "posture": registration["posture"],
+                "public_key_b64": public_key_b64,
+                "v": 1,
+            }
+        )
+    ).hexdigest()
+    if registration["key_id"] != key_id:
+        fail(f"{where}: key_id does not derive from device_id and pubkey_hex")
+    if registration["anchor_epoch_id"] != epoch:
+        fail(f"{where}: anchor_epoch_id does not derive from the registration")
+    verify(registration, REGISTRATION_DOMAIN, pubkey_hex, where)
+
+
+def resolve(case: dict, keys: dict, rules: dict) -> tuple:
+    """Recompute (expected, reject_reason, authority_state_after, confirmation_issued,
+    confirmation_delivery, dispositions) from the contract's rules."""
     state = case["receiver_state"]
     held = list(state["held_authorisations"])
+    revoked = list(state["revoked_authorisations"])
     retained = list(state["retained_registrations"])
+    refused = [digest(r) for r in state["refused_registrations"]]
+    applied = list(state["applied_registrations"])
+    cancellations = list(state["cancellations"])
+    tombstones = {c["commissioning_digest"]: c for c in cancellations}
     artifact = case["artifact"]
     what = kind(artifact)
-    if case["source"] == "courier" and what == "authorisation":
-        return (
-            "reject",
-            "malformed",
-            {
-                "retained_registrations": [r["commissioning_digest"] for r in retained],
-                "confirmed_epochs": [],
-            },
-            False,
-        )
-    if what == "authorisation":
-        verify(artifact, AUTHORISATION_DOMAIN, commissioning_public_hex, case["name"])
-        held.append(artifact)
-        matching = [
-            r
-            for r in retained
-            if r["commissioning_digest"] == digest(artifact) and binds(artifact, r)
-        ]
-        remaining = [r["commissioning_digest"] for r in retained if r not in matching]
+
+    def after(retained_now, confirmed, refused_now, tombstoned=None):
+        return {
+            "retained_registrations": [r["commissioning_digest"] for r in retained_now],
+            "confirmed_epochs": confirmed,
+            "refused_registrations": refused_now,
+            "tombstoned_digests": sorted(tombstoned if tombstoned is not None else tombstones),
+        }
+
+    def outcome(key: str) -> tuple[str, str | None, bool]:
+        return rules[key]
+
+    def require(key: str) -> None:
+        if not rules[key]:
+            fail(f"{case['name']}: the contract no longer states the {key} rule this case relies on")
+
+    def disposition(registration: dict, key: str, delivery: str) -> dict:
+        scope, value = rules[f"emit_{key}"]
+        return {"triggering_digest": digest(registration), "scope": scope, "disposition": value, "delivery": delivery}
+
+    unchanged = after(retained, [], refused)
+    if case["source"] == "courier" and what in ("authorisation", "cancellation"):
+        expected, reason, _ = outcome("device_presents")
+        return expected, reason, unchanged, False, None, []
+    if what == "cancellation":
+        verify(artifact, CANCELLATION_DOMAIN, keys["cancellation"], case["name"])
+        require("cancellation")
+        named_digest = artifact["commissioning_digest"]
+        if any(digest(a) == named_digest for a in held + revoked):
+            _, reason = rules["authorisation_held"]
+            return "reject", reason, unchanged, False, None, []
+        bound = (artifact["device_id"], artifact["anchor_epoch_id"])
+        pending = [r for r in retained if r["commissioning_digest"] == named_digest]
+        earlier = tombstones.get(named_digest)
+        key = (*bound, artifact["expected_authorisation_key_id"])
+        if any((r["device_id"], r["anchor_epoch_id"]) != bound for r in pending) or (
+            earlier is not None
+            and (earlier["device_id"], earlier["anchor_epoch_id"], earlier["expected_authorisation_key_id"]) != key
+        ):
+            _, reason = rules["cancellation_mismatch"]
+            return "reject", reason, unchanged, False, None, []
+        require("arrival_disposition")
+        remaining = [r for r in retained if r not in pending]
         return (
             "accept",
             None,
-            {
-                "retained_registrations": remaining,
-                "confirmed_epochs": [r["anchor_epoch_id"] for r in matching],
-            },
-            bool(matching),
+            after(remaining, [], refused + [digest(r) for r in pending], set(tombstones) | {named_digest}),
+            False,
+            None,
+            [disposition(r, "refused", "return_set") for r in pending],
         )
-    verify(artifact, REGISTRATION_DOMAIN, device_public_hex, case["name"])
-    resolved = [a for a in held if digest(a) == artifact["commissioning_digest"]]
+    if what == "authorisation":
+        verify(artifact, AUTHORISATION_DOMAIN, keys["commissioning"], case["name"])
+        if digest(artifact) in tombstones:
+            # The tombstone confers authority only over the key it names.
+            same_issuer = tombstones[digest(artifact)]["expected_authorisation_key_id"] == artifact["key_id"]
+            _, reason = rules["authorisation_cancelled" if same_issuer else "authorisation_inconsistent"]
+            return "reject", reason, unchanged, False, None, []
+        named = [r for r in retained if r["commissioning_digest"] == digest(artifact)]
+        promoted = [r for r in named if binds(artifact, r)]
+        disagreeing = [r for r in named if not binds(artifact, r)]
+        if disagreeing:
+            require("arrival_terminal")
+            require("arrival_disposition")
+        remaining = [r for r in retained if r not in named]
+        return (
+            "accept",
+            None,
+            after(
+                remaining,
+                [r["anchor_epoch_id"] for r in promoted],
+                refused + [digest(r) for r in disagreeing],
+            ),
+            bool(promoted),
+            "return_set" if promoted else None,
+            [disposition(r, "refused", "return_set") for r in disagreeing],
+        )
+    verify_registration(artifact, case["name"])
+    if any(digest(r) == digest(artifact) for r in applied):
+        # Answered from its retained response, before any resolution.
+        require("retained_response")
+        return "accept", None, unchanged, True, "response", []
+
+    def refuse(key: str):
+        expected, reason, _ = outcome(key)
+        now = refused + ([digest(artifact)] if rules["terminal"] and digest(artifact) not in refused else [])
+        return expected, reason, after(retained, [], now), False, None, [disposition(artifact, "refused", "response")]
+
+    if digest(artifact) in refused:
+        require("terminal")
+        return refuse("disagrees")
+    named_digest = artifact["commissioning_digest"]
+    if any(digest(a) == named_digest for a in revoked):
+        return refuse("revoked")
+    if named_digest in tombstones:
+        return refuse("cancelled")
+    resolved = [a for a in held if digest(a) == named_digest]
     if resolved:
         if all(binds(a, artifact) for a in resolved):
+            expected, reason, confirm = outcome("applies")
             return (
-                "accept",
-                None,
-                {
-                    "retained_registrations": [],
-                    "confirmed_epochs": [artifact["anchor_epoch_id"]],
-                },
-                True,
+                expected, reason, after([], [artifact["anchor_epoch_id"]] if confirm else [], refused),
+                confirm, "response" if confirm else None, [],
             )
-        return (
-            "reject",
-            "commissioning_digest_mismatch",
-            {"retained_registrations": [], "confirmed_epochs": []},
-            False,
-        )
-    same_epoch = [
-        a
-        for a in held
-        if a["device_id"] == artifact["device_id"]
-        and a["anchor_epoch_id"] == artifact["anchor_epoch_id"]
-    ]
-    if same_epoch:
-        return (
-            "reject",
-            "commissioning_digest_mismatch",
-            {"retained_registrations": [], "confirmed_epochs": []},
-            False,
-        )
+        return refuse("disagrees")
+    pending = [r for r in retained if r["commissioning_digest"] == named_digest]
+    if pending:
+        if all(binds(r, artifact) for r in pending):
+            require("pending_idempotent")
+            # The first bytes stay retained; the disposition names them, not these.
+            return "accept", None, unchanged, False, None, [disposition(pending[0], "pending", "response")]
+        if rules["pending_conflict"] is None:
+            fail(f"{case['name']}: the contract no longer states the pending-conflict refusal")
+        return "reject", rules["pending_conflict"], unchanged, False, None, []
+    expected, reason, confirm = outcome("pending")
     return (
-        "accept",
-        None,
-        {
-            "retained_registrations": [artifact["commissioning_digest"]],
-            "confirmed_epochs": [],
-        },
-        False,
+        expected, reason, after(retained + [artifact], [], refused), confirm, None,
+        [disposition(artifact, "pending", "response")],
     )
+
+
+def check_reachable(case: dict) -> None:
+    """Refuse a receiver state no sequence of arrivals can produce.
+
+    Revocation marks an authorisation and never forgets it, and an arriving
+    authorisation resolves every registration pending under it, so: a pending
+    registration names no held or revoked authorisation; an applied one names a
+    held or revoked authorisation that binds it; and a refused registration
+    resubmitted names one held or revoked, or a tombstoned digest. A
+    cancellation is refused for a held authorisation and removes what is
+    pending, so no tombstone names a held or revoked authorisation and nothing
+    stays pending under a tombstone.
+    """
+    state = case["receiver_state"]
+    known = {digest(a): a for a in state["held_authorisations"] + state["revoked_authorisations"]}
+    tombstoned = {c["commissioning_digest"] for c in state["cancellations"]}
+    name = case["name"]
+    if tombstoned & set(known):
+        fail(f"{name}: a tombstone names an authorisation the state holds")
+    for retained in state["retained_registrations"]:
+        if retained["commissioning_digest"] in known:
+            fail(f"{name}: a registration is retained pending under an authorisation already held or revoked")
+        if retained["commissioning_digest"] in tombstoned:
+            fail(f"{name}: a registration is retained pending under a tombstoned digest")
+    for applied in state["applied_registrations"]:
+        named = known.get(applied["commissioning_digest"])
+        if named is None or not binds(named, applied):
+            fail(f"{name}: an applied registration names no held or revoked authorisation binding it")
+    for refused in state["refused_registrations"]:
+        if kind(refused) != "registration":
+            fail(f"{name}: a refused registration is not a registration")
+        if refused["commissioning_digest"] not in known and refused["commissioning_digest"] not in tombstoned:
+            fail(f"{name}: a refused registration names an authorisation the state never held or cancelled")
 
 
 def binds(authorisation: dict, registration: dict) -> bool:
@@ -262,79 +825,337 @@ def binds(authorisation: dict, registration: dict) -> bool:
     )
 
 
+def check_corpus(corpus: dict, rules: dict | None = None) -> None:
+    if rules is None:
+        rules = contract_rules(CONTRACT.read_text(encoding="utf-8"))
+    if (
+        corpus.get("artifact") != "commissioning_resolution_state"
+        or corpus.get("resolution_order") != RESOLUTION_ORDER
+    ):
+        fail("corpus header or resolution_order does not match the contract")
+    commissioning_public_hex = corpus["commissioning_key_public_hex"]
+    keys = {"commissioning": commissioning_public_hex, "cancellation": corpus["cancellation_key_public_hex"]}
+    names: set[str] = set()
+    keys_seen: set[frozenset] = set()
+    for case in corpus["cases"]:
+        name = case["name"]
+        if name in names:
+            fail(f"duplicate case name {name}")
+        names.add(name)
+        keys_seen.add(frozenset(case))
+        body = {k: v for k, v in case["artifact"].items() if k != "signature"}
+        if canonical(body).hex() != case["canonical_hex"]:
+            fail(f"{name}: canonical_hex does not reproduce")
+        for held in case["receiver_state"]["held_authorisations"]:
+            if kind(held) != "authorisation":
+                fail(f"{name}: a held authorisation is not an authorisation")
+            verify(
+                held,
+                AUTHORISATION_DOMAIN,
+                commissioning_public_hex,
+                f"{name} held authorisation",
+            )
+        for revoked in case["receiver_state"]["revoked_authorisations"]:
+            verify(revoked, AUTHORISATION_DOMAIN, commissioning_public_hex, f"{name} revoked authorisation")
+        for refused in case["receiver_state"]["refused_registrations"]:
+            verify_registration(refused, f"{name} refused registration")
+        for applied in case["receiver_state"]["applied_registrations"]:
+            if kind(applied) != "registration":
+                fail(f"{name}: an applied registration is not a registration")
+            verify_registration(applied, f"{name} applied registration")
+        for retained in case["receiver_state"]["retained_registrations"]:
+            if kind(retained) != "registration":
+                fail(f"{name}: a retained registration is not a registration")
+            verify_registration(retained, f"{name} retained registration")
+        for cancellation in case["receiver_state"]["cancellations"]:
+            if kind(cancellation) != "cancellation":
+                fail(f"{name}: a held cancellation is not a cancellation")
+            verify(cancellation, CANCELLATION_DOMAIN, keys["cancellation"], f"{name} held cancellation")
+        check_reachable(case)
+        computed = resolve(case, keys, rules)
+        literal = (
+            case["expected"],
+            case["reject_reason"],
+            case["authority_state_after"],
+            case["epoch_confirmation_issued"],
+            case["confirmation_delivery"],
+            case["dispositions"],
+        )
+        if literal != computed:
+            fail(f"{name}: expected {literal} but the contract gives {computed}")
+        reason = computed[1]
+        if case["quarantined"] or case["gap_recorded"]:
+            fail(f"{name}: no resolution outcome quarantines or records a gap")
+        expected_auth = "not_reached" if reason == "malformed" else "valid"
+        if case["authenticator"] != expected_auth:
+            fail(f"{name}: authenticator must be {expected_auth}")
+    if len(keys_seen) != 1:
+        fail("every case must carry the same keys")
+    for label, predicate in REQUIRED_OUTCOMES.items():
+        if not any(predicate(c) for c in corpus["cases"]):
+            fail(f"corpus does not cover: {label}")
+
+
 def main() -> int:
-    try:
+    text = CONTRACT.read_text(encoding="utf-8")
+    if "--print-units" in sys.argv[1:]:
+        print(json.dumps(resolution_units(text), indent=2, ensure_ascii=False))
+        return 0
+    if "--mutations" in sys.argv[1:]:
+        survived = []
+        units = resolution_units(text)
+        ingest = INGEST.read_text(encoding="utf-8")
+        sources = {CONTRACT: text, INGEST: ingest}
+        for source, start_marker, end_marker in TEXT_BLOCKS:
+            body = sources[source]
+            start = body.find(start_marker)
+            end = body.find(end_marker, start)
+            block = body[start:end]
+            for paragraph_unit in _block_units(block):
+                pattern = r"\s+".join(re.escape(w) for w in paragraph_unit.split())
+                edited_block, count = re.subn(pattern, "", block, count=1)
+                if count != 1:
+                    survived.append(f"unit not removable from its block: {paragraph_unit}")
+                    continue
+                edited = dict(sources)
+                edited[source] = body[:start] + edited_block + body[end:]
+                try:
+                    check_contract_text(edited[CONTRACT], edited[INGEST])
+                except Failure:
+                    continue
+                survived.append(paragraph_unit)
         with CORPUS.open(encoding="utf-8") as handle:
             corpus = json.load(handle)
-        if (
-            corpus.get("artifact") != "commissioning_resolution_state"
-            or corpus.get("resolution_order") != RESOLUTION_ORDER
-        ):
-            fail("corpus header or resolution_order does not match the contract")
-        device_public_hex = corpus["signing_key_public_hex"]
-        commissioning_public_hex = corpus["commissioning_key_public_hex"]
-        names: set[str] = set()
-        keys_seen: set[frozenset] = set()
-        for case in corpus["cases"]:
-            name = case["name"]
-            if name in names:
-                fail(f"duplicate case name {name}")
-            names.add(name)
-            keys_seen.add(frozenset(case))
-            body = {k: v for k, v in case["artifact"].items() if k != "signature"}
-            if canonical(body).hex() != case["canonical_hex"]:
-                fail(f"{name}: canonical_hex does not reproduce")
-            for held in case["receiver_state"]["held_authorisations"]:
-                if kind(held) != "authorisation":
-                    fail(f"{name}: a held authorisation is not an authorisation")
-                verify(
-                    held,
-                    AUTHORISATION_DOMAIN,
-                    commissioning_public_hex,
-                    f"{name} held authorisation",
-                )
-            for retained in case["receiver_state"]["retained_registrations"]:
-                if kind(retained) != "registration":
-                    fail(f"{name}: a retained registration is not a registration")
-                verify(
-                    retained,
-                    REGISTRATION_DOMAIN,
-                    device_public_hex,
-                    f"{name} retained registration",
-                )
-            expected, reason, after, confirmed = resolve(
-                case, device_public_hex, commissioning_public_hex
-            )
-            literal = (
-                case["expected"],
-                case["reject_reason"],
-                case["authority_state_after"],
-                case["epoch_confirmation_issued"],
-            )
-            if literal != (expected, reason, after, confirmed):
-                fail(
-                    f"{name}: expected {literal} but the contract gives {(expected, reason, after, confirmed)}"
-                )
-            if case["quarantined"] or case["gap_recorded"]:
-                fail(f"{name}: no resolution outcome quarantines or records a gap")
-            expected_auth = "not_reached" if reason == "malformed" else "valid"
-            if case["authenticator"] != expected_auth:
-                fail(f"{name}: authenticator must be {expected_auth}")
-        if len(keys_seen) != 1:
-            fail("every case must carry the same keys")
-        for label, predicate in REQUIRED_OUTCOMES.items():
-            if not any(predicate(c) for c in corpus["cases"]):
-                fail(f"corpus does not cover: {label}")
+        # A re-pin forces a touch, not agreement: each outcome changed in the
+        # text, as if re-pinned, must be refused by the corpus it contradicts.
+        repins = (
+            ("revoked row applies", "already applied | Reject `commissioning_digest_mismatch`;",
+             "already applied | Apply, recomputing epoch and `key_id` as above; issue the epoch confirmation;"),
+            ("disagreeing row applies", "disagrees | Reject `commissioning_digest_mismatch`; no gap |",
+             "disagrees | Apply, recomputing epoch and `key_id` as above; issue the epoch confirmation |"),
+            ("disagreeing row names another reason", "disagrees | Reject `commissioning_digest_mismatch`; no gap |",
+             "disagrees | Reject `binding_mismatch`; no gap |"),
+            ("unresolved row applies", "| Retain the registration pending; `accepted` with no confirmation; no gap.",
+             "| Apply, recomputing epoch and `key_id` as above; issue the epoch confirmation; no gap."),
+            ("applied row withholds", "| Apply, recomputing epoch and `key_id` as above; issue the epoch confirmation |",
+             "| Retain the registration pending; `accepted` with no confirmation |"),
+            ("pending conflict is a plain conflict", "refused\n`409 pending_registration_conflict`", "refused\n`409 conflict`"),
+            ("retained response dropped", "have already applied are answered with their retained response",
+             "have already applied are resolved afresh"),
+            ("mismatch not terminal", "A `commissioning_digest_mismatch` is terminal for the exact canonical",
+             "A `commissioning_digest_mismatch` is advisory for the exact canonical"),
+            ("arrival not terminal", "the authority atomically removes the registration from pending retention",
+             "the authority keeps the registration in pending retention"),
+            ("tombstoned row applies", "tombstoned | Reject `commissioning_digest_mismatch`; record the terminal refusal;",
+             "tombstoned | Apply, recomputing epoch and `key_id` as above; issue the epoch confirmation;"),
+            ("pending emits no disposition", "| Registration retained pending | `artifact` | `retained_pending` |",
+             "| Registration retained pending | `artifact` | `artifact_terminal` |"),
+            ("refusal emits another scope",
+             "on arrival or on the commissioning path | `artifact` | `artifact_terminal` |",
+             "on arrival or on the commissioning path | `identity` | `identity_replacement_required` |"),
+        )
+        for key, sentence in REQUIRED_SENTENCES.items():
+            pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+            reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+            edited, count = re.subn(pattern, reworded, text, count=1)
+            edited_ingest = ingest
+            if count == 0:
+                edited_ingest, count = re.subn(pattern, reworded, ingest, count=1)
+            if count != 1:
+                survived.append(f"re-pin mutant for {key!r} matches nothing")
+                continue
+            try:
+                check_corpus(corpus, contract_rules(edited, edited_ingest))
+            except Failure:
+                continue
+            survived.append(f"re-pin: {key} reworded")
+        for label, old, new in repins:
+            pattern = r"\s+".join(re.escape(w) for w in old.split())
+            edited, count = re.subn(pattern, new.replace("\\", "\\\\"), text)
+            if count != 1:
+                survived.append(f"re-pin mutant {label!r} matches {count} places")
+                continue
+            try:
+                check_corpus(corpus, contract_rules(edited))
+            except Failure:
+                continue
+            survived.append(f"re-pin: {label}")
+        ingest_repins = (
+            ("held authorisation cancelled", "revoked or not | 409 | `authorisation_held` |",
+             "revoked or not | 409 | `revoked` |"),
+            ("mismatch not refused", "expected authorisation key | 422 | `cancellation_mismatch` |",
+             "expected authorisation key | 422 | `unknown_authorisation` |"),
+            ("inconsistent issuer revives", "than the tombstone's expected key | 409 | `cancellation_issuer_mismatch` |",
+             "than the tombstone's expected key | 409 | `cancelled` |"),
+            ("inconsistent issuer loops on 503", "than the tombstone's expected key | 409 | `cancellation_issuer_mismatch` |",
+             "than the tombstone's expected key | 503 | `unavailable` |"),
+            ("cancelled authorisation revives", "tombstoned by a cancellation | 409 | `cancelled` |",
+             "tombstoned by a cancellation | 409 | `revoked` |"),
+        )
+        for label, old, new in ingest_repins:
+            edited_ingest = ingest.replace(old, new)
+            if edited_ingest == ingest:
+                survived.append(f"ingest re-pin mutant {label!r} matches nothing")
+                continue
+            try:
+                check_corpus(corpus, contract_rules(text, edited_ingest))
+            except Failure:
+                continue
+            survived.append(f"ingest re-pin: {label}")
+        # Each case's emitted dispositions and confirmation delivery, corrupted.
+        emission_mutants = 0
+        for i, case in enumerate(corpus["cases"]):
+            mutants = []
+            for j, _ in enumerate(case["dispositions"]):
+                mutants.append(("disposition dropped", lambda c, j=j: c["dispositions"].pop(j)))
+                mutants.append(("delivery swapped", lambda c, j=j: c["dispositions"][j].update(
+                    delivery="return_set" if c["dispositions"][j]["delivery"] == "response" else "response")))
+                mutants.append(("scope widened", lambda c, j=j: c["dispositions"][j].update(scope="identity")))
+            if not case["dispositions"]:
+                mutants.append(("disposition invented", lambda c: c["dispositions"].append({
+                    "triggering_digest": digest(c["artifact"]), "scope": "artifact",
+                    "disposition": "artifact_terminal", "delivery": "response"})))
+            if case["confirmation_delivery"] is not None:
+                mutants.append(("confirmation delivery swapped", lambda c: c.update(
+                    confirmation_delivery="return_set" if c["confirmation_delivery"] == "response" else "response")))
+            for label, edit in mutants:
+                emission_mutants += 1
+                bad = json.loads(json.dumps(corpus))
+                edit(bad["cases"][i])
+                try:
+                    check_corpus(bad)
+                except Failure:
+                    continue
+                survived.append(f"{label} in {case['name']}")
+        if survived:
+            for unit in survived:
+                print(f"mutant survived: {unit[:80]!r}", file=sys.stderr)
+            return 1
+        flips = 0
+        for i, case in enumerate(corpus["cases"]):
+            bad = json.loads(json.dumps(corpus))
+            bad["cases"][i]["expected"] = "reject" if case["expected"] == "accept" else "accept"
+            flips += 1
+            try:
+                check_corpus(bad)
+            except Failure:
+                continue
+            survived.append(f"verdict of {case['name']}")
+        # Each mutant is re-signed and re-encoded so exactly one property fails:
+        # an identifier that does not derive, or a signature by a key other
+        # than the registration's own.
+        device_key = Ed25519PrivateKey.from_private_bytes(
+            bytes.fromhex(corpus["signing_key_seed_hex"])
+        )
+        other_hex = Ed25519PrivateKey.from_private_bytes(b"\x07" * 32).public_key().public_bytes_raw().hex()
+
+        def resign(target: dict) -> None:
+            body = {k: v for k, v in target.items() if k != "signature"}
+            signature = device_key.sign(REGISTRATION_DOMAIN + canonical(body))
+            target["signature"] = "ed25519:" + base64.b64encode(signature).decode()
+
+        def rederive(target: dict) -> None:
+            b64 = base64.b64encode(bytes.fromhex(target["pubkey_hex"])).decode()
+            target["key_id"] = "sha256:" + hashlib.sha256(canonical(
+                {"device_id": target["device_id"], "public_key_b64": b64, "v": 1}
+            )).hexdigest()
+            capability = "sha256:" + hashlib.sha256(canonical(target["capability_profile"])).hexdigest()
+            target["anchor_epoch_id"] = "sha256:" + hashlib.sha256(canonical({
+                "capability_hash": capability, "device_id": target["device_id"],
+                "posture": target["posture"], "public_key_b64": b64, "v": 1,
+            })).hexdigest()
+
+        def flip(value: str) -> str:
+            return value[:-1] + ("1" if value[-1] == "0" else "0")
+
+        edits = {
+            "key_id": lambda t: t.update(key_id=flip(t["key_id"])),
+            "anchor_epoch_id": lambda t: t.update(anchor_epoch_id=flip(t["anchor_epoch_id"])),
+            "foreign signer": lambda t: (t.update(pubkey_hex=other_hex), rederive(t)),
+        }
+        for i, case in enumerate(corpus["cases"]):
+            spots = [("artifact", None)] if kind(case["artifact"]) == "registration" else []
+            spots += [("retained", j) for j in range(len(case["receiver_state"]["retained_registrations"]))]
+            for where, j in spots:
+                for label, edit in edits.items():
+                    bad = json.loads(json.dumps(corpus))
+                    bad_case = bad["cases"][i]
+                    target = bad_case["artifact"] if j is None else bad_case["receiver_state"]["retained_registrations"][j]
+                    edit(target)
+                    resign(target)
+                    if j is None:
+                        body = {k: v for k, v in target.items() if k != "signature"}
+                        bad_case["canonical_hex"] = canonical(body).hex()
+                    flips += 1
+                    try:
+                        check_corpus(bad)
+                    except Failure as error:
+                        wanted = "signature does not verify" if label == "foreign signer" else f"{label} does not derive"
+                        if wanted in str(error):
+                            continue
+                        survived.append(f"{label} in {case['name']} {where} refused for another reason: {error}")
+                        continue
+                    survived.append(f"{label} in {case['name']} {where}")
+        # Unreachable receiver states, each refused for being unreachable.
+        for i, case in enumerate(corpus["cases"]):
+            state = case["receiver_state"]
+            edits = []
+            if state["revoked_authorisations"] or state["held_authorisations"]:
+                edits.append(("forget every authorisation", lambda s: s.update(
+                    held_authorisations=[], revoked_authorisations=[])))
+            if case["artifact"].get("capability_profile") and any(
+                digest(a) == case["artifact"]["commissioning_digest"] for a in state["held_authorisations"]
+            ):
+                edits.append(("retain the arriving registration under a held authorisation", lambda s, a=case["artifact"]: s.update(
+                    retained_registrations=[r for r in s["retained_registrations"]] + [a])))
+            if case["artifact"].get("capability_profile") and any(
+                c["commissioning_digest"] == case["artifact"]["commissioning_digest"] for c in state["cancellations"]
+            ):
+                edits.append(("retain the arriving registration under a tombstone", lambda s, a=case["artifact"]: s.update(
+                    retained_registrations=[r for r in s["retained_registrations"]] + [a])))
+            for label, edit in edits:
+                bad = json.loads(json.dumps(corpus))
+                edit(bad["cases"][i]["receiver_state"])
+                flips += 1
+                try:
+                    check_corpus(bad)
+                except Failure:
+                    continue
+                survived.append(f"unreachable state survived: {label} in {case['name']}")
+        for label, covers in REQUIRED_OUTCOMES.items():
+            bad = json.loads(json.dumps(corpus))
+            bad["cases"] = [c for c in corpus["cases"] if not covers(c)]
+            flips += 1
+            try:
+                check_corpus(bad)
+            except Failure:
+                continue
+            survived.append(f"without {label}")
+        if survived:
+            for unit in survived:
+                print(f"mutant survived: {unit[:60]!r}", file=sys.stderr)
+            return 1
+        print(
+            f"resolution mutations: {len(units)} text, "
+            f"{len(repins) + len(REQUIRED_SENTENCES) + len(ingest_repins)} re-pin "
+            f"and {flips + emission_mutants} corpus mutants refused"
+        )
+    try:
+        check_contract_text(text)
+        with CORPUS.open(encoding="utf-8") as handle:
+            corpus = json.load(handle)
+        check_corpus(corpus)
         with TRANSPORT.open(encoding="utf-8") as handle:
             transport = json.load(handle)
-        if not any(
-            c["name"] == "device_side_commissioning_authorization"
-            and c["expected"] == "refused_malformed_before_verifier"
-            for c in transport["negative_cases"]
-        ):
-            fail(
-                "ingest-auth.json lacks the device-side commissioning_authorization refusal"
-            )
+        for required in ("device_side_commissioning_authorization", "unknown_artifact_type"):
+            if not any(
+                c["name"] == required
+                and c["expected"] == "refused_malformed_before_verifier"
+                and c.get("status") == 400
+                and c.get("reason") == "malformed"
+                for c in transport["negative_cases"]
+            ):
+                fail(f"ingest-auth.json lacks the {required} refusal before any verifier")
     except Failure as failure:
         print(f"check-evidence-commissioning-vectors: {failure}", file=sys.stderr)
         return 1
