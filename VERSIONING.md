@@ -349,7 +349,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | capability-grant-issuance | v1 | `draft` | `amendable` | — |
 | cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
 | cli-commands | v2 | `draft` | `amendable` | — |
-| commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
+| commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit complete |
+| commissioned-safety-binding | v2 | `draft` | `frozen` | shipment, runtime `332754b`, 2026-09-23; audit pending |
 | device-configuration | v1 | `draft` | `amendable` | — |
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
