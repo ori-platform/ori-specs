@@ -47,6 +47,20 @@ MODEL_SENTENCES = {
         "1 to 128 Unicode scalar values, none of them a control character (general "
         "category `Cc`), a character with the Unicode `White_Space` property, `/`, `+`, or `#`."
     ),
+    "opt_in": (
+        "The rules below apply exactly when at least one configured device declares `gateway-evidence-carriage/v1` "
+        "in `device_carriage`, and a configuration that breaks one is refused at load, before any lane opens:"
+    ),
+    "legacy": "`enabled: true` on its own activates none of the rules below.",
+    "legacy_keys": (
+        "the directories are absolute and distinct, the bounds and the interval are positive, and each environment "
+        "variable name is a name, containing no whitespace or `=`."
+    ),
+    "domain_scope": "A device on `gateway-api/v1` carriage is held only to the `gateway.device_ids` rule above;",
+    "restore": (
+        "Removing every declaration restores the courier's own validation; the gateway migrates and deletes nothing "
+        "it retains when a declaration is added or removed."
+    ),
     "carriage": (
         "`device_carriage` declares each device's inbound evidence-carriage contract as exactly `gateway-api/v1` or "
         "`gateway-evidence-carriage/v1`. Absence defaults to `gateway-api/v1`. Every key MUST be one of "
@@ -62,10 +76,14 @@ MODEL_SENTENCES = {
 }
 RULES = ("directories", "bounds", "probe", "backoff", "share", "env", "device_id", "carriage", "stopped")
 CARRIAGE = ("gateway-api/v1", "gateway-evidence-carriage/v1")
-MODEL_MUTANTS = {"carriage_default_v1": False, "carriage_unknown_device_ok": False, "stopped_device_unbounded": False}
+MODEL_MUTANTS = {"carriage_default_v1": False, "carriage_unknown_device_ok": False, "stopped_device_unbounded": False,
+                 "opt_in_ignored": False, "domain_on_legacy": False}
+LEGACY_DEVICE_FORBIDDEN = "/+#|"
+OPT_IN = "gateway-evidence-carriage/v1"
+OPT_IN_RULES = ("probe", "backoff", "share", "stopped")
 ENV_KEYS = ("endpoint_env", "client_id_env", "secret_env")
 DEVICE = re.compile(r"[^\s/+#\x00-\x1f\x7f-\x9f]{1,128}")
-ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ENV_NAME = re.compile(r"[^\s=]+")
 
 
 class CheckError(Exception):
@@ -153,10 +171,11 @@ def effective(defaults: dict, evidence: dict, devices: list | None = None) -> di
 
 
 def validate(defaults: dict, devices: list, evidence: dict) -> dict | None:
+    """The courier's own rules whenever it is enabled; the opt-in rules only when a device declares the carriage."""
     if not evidence.get("enabled", False):
         return None
     for device in devices:
-        if not isinstance(device, str) or not DEVICE.fullmatch(device):
+        if not isinstance(device, str) or not device or any(ch in device for ch in LEGACY_DEVICE_FORBIDDEN):
             raise Refused("device_id")
     out, back = evidence.get("queue_directory", ""), evidence.get("return_queue_directory", "")
     if not (out.startswith("/") and back.startswith("/")) or out.rstrip("/") == back.rstrip("/"):
@@ -165,6 +184,23 @@ def validate(defaults: dict, devices: list, evidence: dict) -> dict | None:
     for key in ("max_items", "max_bytes", "retry_interval_s"):
         if type(values[key]) is not int or values[key] <= 0:
             raise Refused("bounds")
+    for key in ENV_KEYS:
+        if not ENV_NAME.fullmatch(evidence.get(key, "")):
+            raise Refused("env")
+    carriage = evidence.get("device_carriage", {})
+    if not isinstance(carriage, dict) or any(v not in CARRIAGE for v in carriage.values()) or (
+            set(carriage) - set(devices) and not MODEL_MUTANTS["carriage_unknown_device_ok"]):
+        raise Refused("carriage")
+    if MODEL_MUTANTS["carriage_unknown_device_ok"]:
+        values["device_carriage"] = {**values["device_carriage"], **carriage}
+    opted = [d for d in devices if values["device_carriage"].get(d) == OPT_IN]
+    if MODEL_MUTANTS["opt_in_ignored"]:
+        opted = list(devices)
+    if not opted:
+        return values
+    for device in (devices if MODEL_MUTANTS["domain_on_legacy"] else opted):
+        if not DEVICE.fullmatch(device):
+            raise Refused("device_id")
     if not 300 <= values["store_probe_interval_s"] <= 900:
         raise Refused("probe")
     if not values["backoff_max_s"] >= values["backoff_base_s"] >= values["retry_interval_s"]:
@@ -176,21 +212,12 @@ def validate(defaults: dict, devices: list, evidence: dict) -> dict | None:
         # Between two bare artifacts and four, whether two encoded records fit
         # depends on record framing the contract leaves to the implementation.
         raise CheckError("a case sits in the framing-dependent band of the share rule; move it")
-    for key in ENV_KEYS:
-        if not ENV_NAME.fullmatch(evidence.get(key, "")):
-            raise Refused("env")
-    carriage = evidence.get("device_carriage", {})
-    if not isinstance(carriage, dict) or any(v not in CARRIAGE for v in carriage.values()) or (
-            set(carriage) - set(devices) and not MODEL_MUTANTS["carriage_unknown_device_ok"]):
-        raise Refused("carriage")
     for total, device in (("stopped_max_items", "stopped_device_max_items"),
                           ("stopped_max_bytes", "stopped_device_max_bytes")):
         if type(values[total]) is not int or values[total] <= 0 or type(values[device]) is not int or values[device] <= 0:
             raise Refused("stopped")
         if values[device] > values[total] and not MODEL_MUTANTS["stopped_device_unbounded"]:
             raise Refused("stopped")
-    if MODEL_MUTANTS["carriage_unknown_device_ok"]:
-        values["device_carriage"] = {**values["device_carriage"], **carriage}
     return values
 
 
@@ -221,6 +248,35 @@ def check(document: dict, defaults: dict) -> None:
     if not any(c["valid"] and c["effective"] and "gateway-evidence-carriage/v1" in c["effective"]["device_carriage"].values()
                and "gateway-api/v1" in c["effective"]["device_carriage"].values() for c in document["cases"]):
         raise CheckError("no case shows a mixed site, one device declared and another defaulted to gateway-api/v1")
+    # The opt-in conditions: a legacy site keeps what the shipped loader accepts, and every opt-in refusal
+    # disappears with the declaration.
+    def legacy(c: dict) -> bool:
+        return c["valid"] and c["effective"] and OPT_IN not in c["effective"]["device_carriage"].values()
+    if not any(legacy(c) and c["effective"]["backoff_max_s"] < c["effective"]["backoff_base_s"] for c in document["cases"]):
+        raise CheckError("no case shows a legacy site accepted with a back-off bound below its base")
+    if not any(legacy(c) and c["effective"]["max_items"] < 2 * len(c["device_ids"]) for c in document["cases"]):
+        raise CheckError("no case shows a legacy site accepted with a queue too small for the registration reserve")
+    if not any(c["valid"] and c["effective"] and any(v == OPT_IN for v in c["effective"]["device_carriage"].values())
+               and any(v != OPT_IN and not DEVICE.fullmatch(d) for d, v in c["effective"]["device_carriage"].items())
+               for c in document["cases"]):
+        raise CheckError("no case shows a legacy device outside the routing domain accepted beside an opted-in device")
+    empties = [c for c in document["cases"] if c["valid"] and c["evidence"].get("device_carriage") == {}]
+    if not any(any(o["valid"] and "device_carriage" not in o["evidence"] and o["effective"] == e["effective"]
+                   and o["device_ids"] == e["device_ids"] for o in document["cases"]) for e in empties):
+        raise CheckError("no case shows an empty device_carriage map accepted as the absent map")
+    for c in document["cases"]:
+        if not c["valid"] and c.get("rule") in OPT_IN_RULES + ("device_id",) and "device_carriage" in c["evidence"]:
+            twin = {k: v for k, v in c["evidence"].items() if k != "device_carriage"}
+            try:
+                if validate(defaults, c["device_ids"], twin) is None:
+                    raise CheckError(f"{c['name']}: the twin without its declaration is not an enabled courier")
+            except Refused as refusal:
+                if refusal.rule in OPT_IN_RULES or (refusal.rule == "device_id" and all(
+                        not any(ch in d for ch in LEGACY_DEVICE_FORBIDDEN) for d in c["device_ids"])):
+                    raise CheckError(f"{c['name']}: still refused for {refusal.rule} without any declaration; the opt-in "
+                                     "rules must fall away with it")
+    if not any(not c["valid"] and c.get("rule") == "device_id" and "device_carriage" in c["evidence"] for c in document["cases"]):
+        raise CheckError("no case shows the routing domain refusing an opted-in device")
 
 
 def main() -> int:
