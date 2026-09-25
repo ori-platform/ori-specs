@@ -101,29 +101,14 @@ accurate description of what a repo implements.
   which target it was built for. The reinstall works and says nothing. Tracked
   in `ori-runtime` #361.
 
-## runtime-mobile/v2 design targets
+## runtime-mobile/v2 implementation targets
 
-- **No conformance corpus exists**
-  ([runtime-mobile/v2.md](../runtime-mobile/v2.md)): the contract defines a
-  signed publication and verification grammar for Android payloads and is not
-  implementable from prose alone. No vectors accompany it, so nothing drives
-  the producing signer in `ori-runtime` and the consuming verifier in the
-  Android application against the same bytes, and neither may claim
-  conformance.
-
-  The corpus must cover at minimum one accepted payload per target, a duplicate
-  key, an unknown field, a missing field, each field malformed in turn, a
-  signature made under the release-bundle domain, a `runtime_release_bundle`
-  key entry carrying the same public key, a `revoked` key, a `verify_only` key
-  verifying an existing payload, a digest mismatch, a size mismatch, a wrong
-  `runtime_version`, an `artifact` disagreeing with the derived name, a
-  downloaded basename disagreeing with it, an `artifact` carrying a path
-  separator or a `..` component, each ABI substituted into each other slot
-  including the width-only cases, and a payload absent.
-
-  Until then no release publishes a signed payload, and the Android consumer
-  obtains one by building it from the runtime source tree. Tracked in
-  `ori-runtime` #536.
+- **No Android consumer verifies a payload**
+  ([runtime-mobile/v2.md](../runtime-mobile/v2.md)): the conformance corpus,
+  [payload-vectors-v2.json](../runtime-mobile/payload-vectors-v2.json), drives
+  the runtime's producing signer and its reference verifier, and runtime
+  v2.5.0-rc.10 published signed payloads. No Android application verifies a
+  payload against the same bytes.
 
 ## evidence/v1 design targets
 
@@ -146,8 +131,9 @@ accurate description of what a repo implements.
   unconditionally; `ori-cli` has no `evidence commission` command
   (`ori-cli#34`); the gateway courier refuses `commissioning_authorization` at
   ingress. The authority-side ingest of a signed authorisation is now
-  [evidence-commissioning-ingest/v1.md](../evidence-commissioning-ingest/v1.md),
-  a design target with no implementation.
+  [evidence-commissioning-ingest/v1.md](../evidence-commissioning-ingest/v1.md);
+  the authority holds a library function that verifies a signed
+  authorisation, with no ingest endpoint and no revocation path.
 - **Evidence export ingestion** ([evidence-exchange/v1.md](../evidence-exchange/v1.md)):
   chain rows are marked `exported` locally but no authenticated receiver
   exists. The exchange contract specifies all seven artifacts. The runtime now
@@ -300,12 +286,12 @@ accurate description of what a repo implements.
 
 ## safety-profile/v1 implementation targets
 
-- **No consumer** ([safety-profile/v1.md](../safety-profile/v1.md)): the
-  contract is a pre-ratification design target with a profile set and a
-  corpus. `ori-runtime` #324 is the intended consumer — safety registry,
-  typed evaluators, activation from accepted zones, durable trip state — and
-  nothing implements any of it. Every Tier D trip point on a device today is
-  still an untyped number in a first-party `skill.yaml`.
+- **The consumer is dormant** ([safety-profile/v1.md](../safety-profile/v1.md)):
+  runtime v2.5.0-rc.8 ships the release-owned safety registry, typed
+  evaluators, activation from accepted zones and durable trip state, and every
+  profile it ships is a `candidate`, so the registry activates nothing. Every
+  Tier D trip point on a device today is still an untyped number in a
+  first-party `skill.yaml`.
 
 - **Every shipped profile is a `candidate`, and a candidate activates nothing**
   ([safety-profile/v1.md](../safety-profile/v1.md)): the three profiles carry
@@ -333,13 +319,12 @@ accurate description of what a repo implements.
 
 ## commissioned-safety-binding/v1 implementation targets
 
-- **Producer core only, no consumer**
+- **No released producer**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):
-  the contract is a pre-ratification design target. `ori-cli` builds and signs
-  a binding and reproduces the corpus in Go; the capture, physical proof and
-  delivery ceremony in `ori-cli` #34 remain open, and `ori-runtime` #324 is
-  the intended consumer. Until both exist, no device can activate an actuating
-  safety profile under this contract's rules.
+  the runtime consumer shipped in v2.5.0-rc.8 and verifies, retains and
+  reports a binding. `ori-cli` produces, verifies, captures and signs bindings
+  on its default branch and has no release. No device can activate an
+  actuating safety profile, because every shipped profile is a `candidate`.
 
 - **The unsafe NC rule survives in governing documents**
   ([commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md)):

@@ -1,0 +1,2235 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check contract status records against the contracts and the tables that summarise them.
+
+`status/<contract>/<version>.json` is the single source of truth for a contract
+version's maturity, adoption, compatibility and proof (VERSIONING.md, "Status
+records"). This checker holds everything else to it:
+
+- every `<contract>/v<N>.md` has exactly one record and every record names one;
+- every value is from the closed vocabularies, and the freeze rule's
+  consequences hold (a claimed implementation on a default branch, or a
+  shipped one, forces `frozen`; `frozen` names its event and carries a
+  baseline audit; `ratified` names a record);
+- each contract's `Status:` paragraph is the one rendered from its record, and
+  no other status wording in that block, in a README row or in a VERSIONING row
+  contradicts the record;
+- a frozen version whose baseline audit is pending takes no normative edit: its
+  text, less its `Status:` paragraph, matches the digest the audit pins, and a
+  pending audit with no tracking issue is reported as a gap;
+- a frozen version whose baseline audit is complete differs from its freeze
+  revision only by hunks the audit classifies as erratum or additive, and its
+  contract and vector hashes match the freeze revision (needs full history).
+
+Run from anywhere:
+
+    python3 scripts/check-contract-status              # check
+    python3 scripts/check-contract-status --mutations  # prove each check fires
+    python3 scripts/check-contract-status --write-status-lines
+    python3 scripts/check-contract-status --write-rows
+    python3 scripts/check-contract-status --print-rows
+    python3 scripts/check-contract-status --digest <contract>/<version>
+    python3 scripts/check-contract-status --draft-audit <contract>/<version>
+
+Stdlib only, so it runs as a `language: system` hook.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import difflib
+import hashlib
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from collections.abc import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+MATURITY = ("draft", "ratified")
+COMPATIBILITY = ("amendable", "frozen")
+LIFECYCLES = ("unimplemented", "implemented-unreleased", "shipped")
+IMPLEMENTED = ("implemented-unreleased", "shipped")
+CONFORMANCE = ("unassessed", "conforming", "partial", "non-conforming")
+# Words that qualify a claim out of condition 4, and the verbs a claim needs for condition 2.
+CLAIM_QUALIFIERS = re.compile(r"\b(planned|partial(ly)?|experimental|test-only|illustrative|non-conforming)\b", re.I)
+CLAIM_VERB = re.compile(r"\b(implement(s|ed)?|conform(s|ed)?|conformance)\b", re.I)
+CLAIMS = ("claimed", "none")
+ROLES = ("producer", "consumer", "gateway", "authority", "verifier", "issuer", "cli", "firmware", "runtime")
+REPOSITORIES = ("runtime", "gateway", "evidence-authority", "cli", "edge-firmware", "sdk-python", "skills-hub")
+FREEZE_EVENTS = ("claiming-merge", "shipment", "conservative-baseline")
+BRANCH_PROTECTION = ("protected", "unprotected")
+STRUCTURAL = {"bad-value", "ratified-without-record", "ratified-record-missing", "frozen-without-frozen-by",
+              "audit-missing", "frozen-by-unmatched"}
+PROOF_FIELDS = ("end_to_end", "hil", "production")
+PROOF_STATES = ("none", "partial", "established")
+
+TOP_KEYS = {"contract", "version", "maturity", "ratified_by", "adoption", "compatibility", "frozen_by",
+            "proof", "baseline_audit", "companion_files", "notes"}
+ENTRY_KEYS = {"role", "repository", "lifecycle", "conformance", "claim", "implementation", "current", "assessment",
+              "notes"}
+CLAIM_KEYS = {"status", "commit", "claim_citation"}
+PATH_KEYS = {"path_base", "component", "path"}
+LINE_CITATION_KEYS = {"line", "text"}
+SPAN_CITATION_KEYS = {"heading_line", "heading_text", "item_lines", "item_text"}
+IMPLEMENTATION_KEYS = {"commit", "release", "paths", "path_base", "component", "vendored_revision"}
+PATH_BASES = ("repository-root", "component-root")
+COMPONENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+CURRENT_KEYS = {"commit", "vendored_revision"}
+ASSESSMENT_KEYS = {"snapshot", "commit", "assessed_at", "method", "divergences", "missing_requirements"}
+SNAPSHOTS = ("implementation", "current")
+FROZEN_KEYS = {"event", "repository", "commit", "date", "release", "contract_revision", "pinned_revision",
+               "branch_protection", "conservative", "reason"}
+AUDIT_STATES = ("pending", "complete")
+AUDIT_KEYS = {"status", "freeze_revision", "changes_since_freeze", "issue", "pinned_sha256", "pinned_files",
+              "contract_sha256",
+              "vectors", "role_commits", "hunks"}
+HUNK_CLASSES = ("erratum", "additive", "semantic")
+HUNK_KEYS = {"hunk_sha256", "commit", "classification", "summary", "destination", "optional",
+             "unknown_field_compatible"}
+ISSUE = re.compile(r"^https://github\.com/ori-platform/ori-specs/issues/[1-9][0-9]*$")
+DECISIONS_DIR = "decisions/"
+# Vector files in a directory that holds more than one version are attributed here; a file whose name carries a
+# version token (for example -v2.json) is attributed by that token. None marks a review artifact of no version.
+VECTOR_OWNER = {"evidence/vectors/": "v2", "runtime-config/vectors/": "v2", "runtime-config/inventory/": None,
+                "skills-package/vectors/": "v3"}
+
+HEX = re.compile(r"^[0-9a-f]{7,40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+VERSION_FILE = re.compile(r"^v[1-9][0-9]*\.md$")
+NOT_CONTRACT_DIRS = {"status", "scripts", "gaps", "agent-skills", ".github", ".git"}
+
+EVENT_TEXT = {
+    "claiming-merge": "a conformance-claiming merge",
+    "shipment": "shipment",
+    "conservative-baseline": "a conservative baseline determination",
+}
+PROOF_TEXT = {"end_to_end": "end-to-end", "hil": "HIL", "production": "production"}
+
+LIMITS = (
+    "Limits: this check reads text, not intent. It cannot tell whether a recorded conformance claim is true, "
+    "whether a change classified additive is really optional, or whether an implementation it has no record of "
+    "exists; it pins a version's own vN.md and every file attributed to it, vectors and companion documents alike. "
+    "Its "
+    "wording guard is a heuristic over the status block and the summary rows: it matches listed phrasings only, "
+    "so a spelling variant (\"design-target\", \"not-yet shipped\", a phrase split across lines) or a synonym "
+    "passes it, and it reads no other prose. Its privacy check is structural only (relative paths, no '..', no "
+    "absolute or local paths, a logical component name), matches the listed forms only and is not complete: it does "
+    "not detect private names, and file:///, https://, $HOME/ and %2e%2e/ paths, and any path in a free-text field "
+    "such as notes or assessment.method, pass it. The issue-reference check likewise matches listed forms only and "
+    "is not complete: a reference in backticks or emphasis, :#N, pull/N and pull-request URLs pass it. Against the "
+    "merge base "
+    "it protects frozen records, pending and complete audits, claims, assessments and shipped releases, but it "
+    "cannot compare a record that is new in the change, and it reads no sibling repository unless run with "
+    "--verify-siblings, which CI cannot do."
+)
+# An issue reference: a tracker URL, or a repository or bare issue number.
+ISSUE_REFERENCE = re.compile(r"issues/[0-9]+|[A-Za-z0-9_.-]#[0-9]+\b|(?:^|[\s(\[])#[0-9]+\b")
+
+
+# Records to compare against in place of the merge base; the mutation harness sets it, nothing else does.
+BASE_OVERRIDE: dict[tuple[str, str], dict] | None = None
+LIFECYCLE_RANK = {"unimplemented": 0, "implemented-unreleased": 1, "shipped": 2}
+HISTORY_LIMIT = ("A record that is new in the change has no merge-base version, so this comparison cannot reach it; "
+                 "only records already on the default branch are protected this way.")
+
+UNREADABLE: set[tuple[str, str]] = set()  # records present on disk that did not parse, from the last load
+
+
+class Finding:
+    def __init__(self, code: str, where: str, message: str) -> None:
+        self.code, self.where, self.message = code, where, message
+
+    def __str__(self) -> str:
+        return f"[{self.code}] {self.where}: {self.message}"
+
+
+# --- discovery -----------------------------------------------------------------------------------
+
+def contract_dirs(root: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(p for p in root.iterdir() if p.is_dir() and p.name not in NOT_CONTRACT_DIRS
+                  and not p.name.startswith("."))
+
+
+def contract_versions(root: pathlib.Path) -> list[tuple[str, str]]:
+    found = []
+    for d in contract_dirs(root):
+        for f in sorted(d.iterdir()):
+            if f.is_file() and VERSION_FILE.match(f.name):
+                found.append((d.name, f.stem))
+    return found
+
+
+def nested_versions(root: pathlib.Path) -> list[str]:
+    """Version documents below a contract directory's top level, which the status model cannot name."""
+    return sorted(f.relative_to(root).as_posix() for d in contract_dirs(root) for f in d.rglob("v*.md")
+                  if f.parent != d and VERSION_FILE.match(f.name))
+
+
+def is_version_document(contract: str, rel: str) -> bool:
+    return rel.startswith(f"{contract}/") and "/" not in rel[len(contract) + 1:] and bool(
+        VERSION_FILE.match(rel.rsplit("/", 1)[-1]))
+
+
+def version_of_file(contract: str, rel: str, versions: list[str], companions: dict[str, str] | None = None) -> str | None:
+    """The version a file in a contract directory belongs to, None for a declared review artifact.
+
+    A file named with one version belongs to it. A companion document listed in a record's companion_files belongs
+    to that record's version. A file under a directory in VECTOR_OWNER belongs to its owner. Any other non-Markdown
+    file belongs to the only version of a single-version directory. Any other Markdown file is unattributed: a
+    companion document next to its version is ambiguous until a record names it.
+    """
+    name = rel.rsplit("/", 1)[-1]
+    tokens = [v for v in versions if re.search(rf"(?<![0-9a-z]){v}(?![0-9])", name)]
+    if len(tokens) == 1:
+        return tokens[0]
+    if companions and rel in companions:
+        return companions[rel]
+    for prefix, owner in VECTOR_OWNER.items():
+        if rel.startswith(prefix):
+            return owner
+    if rel.endswith(".md"):
+        return "unattributed"
+    return versions[0] if len(versions) == 1 else "unattributed"
+
+
+def companion_map(root: pathlib.Path) -> dict[str, str]:
+    """{path: version} from every readable record's companion_files."""
+    out: dict[str, str] = {}
+    for path in sorted((root / "status").glob("*/v*.json")):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, OSError):
+            continue
+        files = rec.get("companion_files") if isinstance(rec, dict) else None
+        if isinstance(files, list):
+            for rel in files:
+                if isinstance(rel, str):
+                    out.setdefault(rel, path.stem)
+    return out
+
+
+def version_files(root: pathlib.Path, contract: str, version: str, versions: list[str]) -> dict[str, str]:
+    """{path: sha256} for the vectors and companion documents of one contract version as they stand in the tree."""
+    out = {}
+    companions = companion_map(root)
+    d = root / contract
+    for f in sorted(d.rglob("*")):
+        if f.is_file():
+            rel = f.relative_to(root).as_posix()
+            if not is_version_document(contract, rel) and version_of_file(contract, rel, versions, companions) == version:
+                out[rel] = hashlib.sha256(f.read_bytes()).hexdigest()
+    return out
+
+
+def _no_duplicates(pairs: list) -> dict:
+    keys = [k for k, _ in pairs]
+    dup = sorted({k for k in keys if keys.count(k) > 1})
+    if dup:
+        raise ValueError(f"duplicate keys {dup}")
+    return dict(pairs)
+
+
+def load_records(root: pathlib.Path, findings: list[Finding]) -> dict[tuple[str, str], dict]:
+    records: dict[tuple[str, str], dict] = {}
+    unreadable: set[tuple[str, str]] = set()
+    status = root / "status"
+    if not status.is_dir():
+        return records
+    for path in sorted(status.rglob("*")):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(root).as_posix()
+        m = re.match(r"^status/([a-z0-9-]+)/(v[1-9][0-9]*)\.json$", rel)
+        if not m:
+            findings.append(Finding("record-path", rel, "a status record must be status/<contract>/v<N>.json"))
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicates)
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
+            findings.append(Finding("record-unreadable", rel, f"not valid JSON: {exc}"))
+            unreadable.add((m.group(1), m.group(2)))
+            continue
+        if not isinstance(data, dict):
+            findings.append(Finding("record-unreadable", rel, "a record is a JSON object"))
+            unreadable.add((m.group(1), m.group(2)))
+            continue
+        if data.get("contract") != m.group(1) or data.get("version") != m.group(2):
+            findings.append(Finding("record-path", rel, "contract and version must match the record's path"))
+        records[(m.group(1), m.group(2))] = data
+    UNREADABLE.clear()
+    UNREADABLE.update(unreadable)
+    return records
+
+
+# --- rendering ----------------------------------------------------------------------------------
+
+def short(commit: str) -> str:
+    return commit[:7]
+
+
+def who(entry: dict) -> str:
+    role, repo = entry["role"], entry["repository"]
+    return role if role == repo else f"{role} ({repo})"
+
+
+def render_adoption(rec: dict) -> str:
+    parts = []
+    for e in rec["adoption"]:
+        text = f"{who(e)} `{e['lifecycle']}`"
+        if e["lifecycle"] == "shipped":
+            text += f" in {e['implementation']['release']}"
+        if e["claim"]["status"] == "claimed":
+            text += ", claimed"
+        text += f", `{e['conformance']}`"
+        details = []
+        cur = e.get("assessment") or {}
+        if cur.get("divergences"):
+            n = len(cur["divergences"])
+            details.append(f"{n} divergence{'s' if n > 1 else ''}")
+        if cur.get("missing_requirements"):
+            n = len(cur["missing_requirements"])
+            details.append(f"{n} missing requirement{'s' if n > 1 else ''}")
+        if cur.get("snapshot") in SNAPSHOTS and cur.get("commit"):
+            text += f" at assessed {cur['snapshot']} snapshot `{short(str(cur['commit']))}`"
+        if details:
+            text += f" ({', '.join(details)})"
+        current = e.get("current") or {}
+        if cur and cur.get("snapshot") != "current" and current.get("commit"):
+            text += f"; current `{short(str(current['commit']))}` unassessed"
+        parts.append(text)
+    return ", ".join(parts) if parts else "none recorded"
+
+
+def render_freeze(rec: dict) -> str:
+    if rec["compatibility"] == "amendable":
+        return "`amendable`"
+    fb = rec["frozen_by"]
+    where = f"{fb['repository']} `{short(fb['commit'])}`, {fb['date']}"
+    if fb.get("release"):
+        where += f"; release {fb['release']}"
+    return f"`frozen` by {EVENT_TEXT[fb['event']]} ({where}), baseline audit `{rec['baseline_audit']['status']}`"
+
+
+def render_maturity(rec: dict, relative_to: str) -> str:
+    if rec["maturity"] == "ratified":
+        return f"`ratified` ([decision]({relative_to}{rec['ratified_by']}))"
+    return "`draft`"
+
+
+def render_status(rec: dict) -> str:
+    c, v = rec["contract"], rec["version"]
+    proof = ", ".join(f"{PROOF_TEXT[k]} `{rec['proof'][k]['state']}`" for k in PROOF_FIELDS)
+    return (f"Status: maturity {render_maturity(rec, '../')}; compatibility {render_freeze(rec)}; "
+            f"adoption: {render_adoption(rec)}; proof: {proof}. "
+            f"Record: [status/{c}/{v}.json](../status/{c}/{v}.json).")
+
+
+def render_readme_cells(rec: dict) -> list[str]:
+    compat = "`amendable`" if rec["compatibility"] == "amendable" else (
+        f"`frozen` ({rec['frozen_by']['date']}), audit `{rec['baseline_audit']['status']}`")
+    return [render_maturity(rec, ""), render_adoption(rec), compat]
+
+
+def render_versioning_cells(rec: dict) -> list[str]:
+    if rec["compatibility"] == "amendable":
+        by = "—"
+    else:
+        fb = rec["frozen_by"]
+        by = (f"{fb['event']}, {fb['repository']} `{short(fb['commit'])}`, {fb['date']}; "
+              f"audit {rec['baseline_audit']['status']}")
+    return [render_maturity(rec, ""), f"`{rec['compatibility']}`", by]
+
+
+def read_text(path: pathlib.Path) -> str:
+    """Read a repository text file; undecodable bytes become U+FFFD and so fail every comparison."""
+    return path.read_bytes().decode("utf-8", errors="replace")
+
+
+def norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+# --- contract text ------------------------------------------------------------------------------
+
+def status_block(lines: list[str]) -> tuple[int, int, int, int] | None:
+    """Return (block_start, block_end, para_start, para_end) for the leading status blockquote."""
+    for i, line in enumerate(lines):
+        if line.startswith("## "):
+            return None
+        if re.match(r"^> ?Status:", line):
+            bs = i
+            while bs > 0 and lines[bs - 1].startswith(">"):
+                bs -= 1
+            be = i
+            while be + 1 < len(lines) and lines[be + 1].startswith(">"):
+                be += 1
+            pe = i
+            while pe + 1 <= be and lines[pe + 1].strip() not in (">", ""):
+                pe += 1
+            return bs, be, i, pe
+    return None
+
+
+def paragraph_text(lines: list[str]) -> str:
+    return norm(" ".join(re.sub(r"^> ?", "", ln) for ln in lines))
+
+
+def normative_digest(text: str) -> str:
+    lines = text.split("\n")
+    sb = status_block(lines)
+    if sb:
+        lines = lines[: sb[2]] + lines[sb[3] + 1:]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def wrap_status(text: str) -> list[str]:
+    return ["> " + ln for ln in textwrap.wrap(text, width=76, break_long_words=False, break_on_hyphens=False)]
+
+
+# --- wording ------------------------------------------------------------------------------------
+
+NEGATION = re.compile(r"\b(not|no|never|nothing|none|neither|nor|partially|without)\b", re.I)
+
+
+def negated(text: str, start: int) -> bool:
+    return bool(NEGATION.search(text[max(0, start - 30):start]))
+
+
+def wording(rec: dict, text: str, where: str, findings: list[Finding]) -> None:
+    states = {e["lifecycle"] for e in rec["adoption"]}
+    if re.search(r"\b(no|not|never|nothing)\b[^.;|]{0,40}\bshipped\b|\bunshipped\b", text, re.I) and "shipped" in states:
+        findings.append(Finding("wording-no-shipped", where,
+                                "says nothing has shipped while the record has a shipped adoption entry"))
+    if re.search(r"\bno (conforming )?implementations?\b|\bnot (yet )?implemented\b|\bno part of this contract is "
+                 r"implemented\b|\bnothing implements\b", text, re.I) and states - {"unimplemented"}:
+        findings.append(Finding("wording-no-implementation", where,
+                                "says there is no implementation while the record has an adoption entry"))
+    if not states & set(IMPLEMENTED):
+        for m in re.finditer(r"(?<![\w-])implemented(?![\w-])", text, re.I):
+            if not negated(text, m.start()):
+                findings.append(Finding("wording-partial-as-implemented", where,
+                                        "says implemented while every adoption entry is partial or unimplemented"))
+                break
+    if "shipped" in states and re.search(r"\bdesign target\b", text, re.I):
+        findings.append(Finding("wording-design-target", where,
+                                "calls a version with a shipped implementation a design target"))
+    if re.search(r"\bpre-ratification\b", text, re.I) and rec["maturity"] == "ratified":
+        findings.append(Finding("wording-pre-ratification", where, "says pre-ratification for a ratified version"))
+    if rec["compatibility"] == "frozen" and re.search(r"\bamendable in place\b|\bpre-ratification exception\b",
+                                                      text, re.I):
+        findings.append(Finding("wording-amendable-while-frozen", where,
+                                "says the version is amendable in place while the record freezes it"))
+    for field, pat in (("end_to_end", r"end[- ]to[- ]end"), ("hil", r"HIL|hardware[- ]in[- ]the[- ]loop"),
+                       ("production", r"production|commercially")):
+        for m in re.finditer(rf"(?:\b(?:{pat})[- ](?:proven|verified|validated|tested)\b|\bproven (?:{pat})\b)",
+                             text, re.I):
+            if not negated(text, m.start()) and rec["proof"][field]["state"] == "none":
+                findings.append(Finding("wording-proof-implied", where,
+                                        f"claims {PROOF_TEXT[field]} proof the record's proof field does not hold"))
+                break
+
+
+# --- record checks ------------------------------------------------------------------------------
+
+def evidence_of(entry: object) -> dict:
+    """The implementation snapshot of an entry, or an empty mapping."""
+    ev = entry.get("implementation") if isinstance(entry, dict) else None
+    return ev if isinstance(ev, dict) else {}
+
+
+def current_of(entry: object) -> dict:
+    cur = entry.get("current") if isinstance(entry, dict) else None
+    return cur if isinstance(cur, dict) else {}
+
+
+def check_path_base(w: str, holder: dict, paths: list, bad: Callable[[str, str], None]) -> None:
+    """A path is relative to its declared base; a component is a logical name, never a path.
+
+    This is structural privacy only, over the listed forms: it refuses absolute and local paths, `..`, and a
+    component shaped like a path. It is not complete (file:///, https://, $HOME/ and %2e%2e/ forms pass), and it
+    does not detect private repository names; that needs a trusted scan outside this repository.
+    """
+    base = holder.get("path_base", "repository-root")
+    if base not in PATH_BASES:
+        bad("bad-value", f"{w}.path_base must be one of {PATH_BASES}")
+    comp = holder.get("component")
+    if base == "component-root" and comp is None:
+        bad("citation-component-missing", f"{w} is component-root, so it names its component")
+    if base == "repository-root" and comp is not None:
+        bad("bad-value", f"{w} is repository-root and carries no component")
+    if comp is not None and (not isinstance(comp, str) or not COMPONENT.match(comp)):
+        bad("citation-component-invalid",
+            f"{w}.component must be a stable logical identifier such as library-crate, not a path. This check is "
+            "structural only and does not detect private names")
+    for path in paths:
+        if not isinstance(path, str) or not path.strip() or path.startswith(("/", "\\", "~")) or re.match(
+                r"^[A-Za-z]:", path) or ".." in re.split(r"[\\/]", path):
+            bad("citation-path-invalid", f"{w} path {path!r} must be relative to its base, without '..'")
+
+
+def text_list(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(d, str) and d.strip() for d in value)
+
+
+def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: dict, findings: list[Finding]) -> bool:
+    where = f"status/{key[0]}/{key[1]}.json"
+    ok = True
+
+    def bad(code: str, msg: str) -> None:
+        # Only a record the renderer cannot read is withheld from the later checks; a rule violation is
+        # reported and the record is still held to its summaries, so one finding never masks another.
+        nonlocal ok
+        if code in STRUCTURAL:
+            ok = False
+        findings.append(Finding(code, where, msg))
+
+    extra = set(rec) - TOP_KEYS
+    if extra:
+        bad("bad-value", f"unknown fields {sorted(extra)}")
+    if rec.get("maturity") not in MATURITY:
+        bad("bad-value", f"maturity must be one of {MATURITY}")
+    if rec.get("compatibility") not in COMPATIBILITY:
+        bad("bad-value", f"compatibility must be one of {COMPATIBILITY}")
+    if rec.get("maturity") == "ratified":
+        ref = rec.get("ratified_by")
+        if not isinstance(ref, str) or not ref:
+            bad("ratified-without-record", "`ratified` requires `ratified_by` naming the decision record")
+        elif "\x00" in ref or not ref.startswith(DECISIONS_DIR) or ".." in ref.split("/"):
+            bad("ratified-record-missing", f"`ratified_by` names a decision record under {DECISIONS_DIR}")
+        else:
+            path, _, anchor = ref.partition("#")
+            target = (root / path).resolve()
+            if not target.is_relative_to(root.resolve()) or target.suffix != ".md" or not target.is_file():
+                bad("ratified-record-missing", f"`ratified_by` names {path}, which is not a Markdown file in this repository")
+            elif anchor and anchor not in {slug(h) for h in re.findall(r"^#+ (.+)$", read_text(target), re.M)}:
+                bad("ratified-record-missing", f"`ratified_by` names #{anchor}, which {path} has no heading for")
+    elif "ratified_by" in rec:
+        bad("bad-value", "`ratified_by` belongs only to a ratified version")
+
+    comp = rec.get("companion_files")
+    if comp is not None:
+        c = str(rec.get("contract"))
+        if not isinstance(comp, list) or not comp or not all(
+                isinstance(x, str) and x.startswith(f"{c}/") and x.endswith(".md") and ".." not in x.split("/")
+                and not is_version_document(c, x) and (root / x).is_file() for x in comp):
+            bad("bad-value", "companion_files lists existing Markdown files in this contract's directory, other "
+                             "than its version documents")
+        else:
+            for x in comp:
+                owners = [k for k, r in records.items() if isinstance(r, dict) and isinstance(
+                    r.get("companion_files"), list) and x in r["companion_files"]]
+                if len(owners) > 1:
+                    bad("bad-value", f"{x} is listed as a companion by more than one version")
+    adoption = rec.get("adoption")
+    if not isinstance(adoption, list):
+        bad("bad-value", "adoption must be a list")
+        adoption = []
+    for i, e in enumerate(adoption):
+        w = f"adoption[{i}]"
+        if not isinstance(e, dict):
+            bad("bad-value", f"{w} must be an object")
+            continue
+        required = {"role", "repository", "lifecycle", "conformance", "claim", "implementation"}
+        if set(e) - ENTRY_KEYS or not required <= set(e):
+            bad("bad-value", f"{w} needs {sorted(required)} and may add only {sorted(ENTRY_KEYS - required)}")
+            continue
+        if e["role"] not in ROLES:
+            bad("bad-value", f"{w}.role must be one of {ROLES}")
+        if e["repository"] not in REPOSITORIES:
+            bad("bad-value", f"{w}.repository must be one of {REPOSITORIES}")
+        if e["lifecycle"] not in LIFECYCLES:
+            bad("bad-value", f"{w}.lifecycle must be one of {LIFECYCLES}")
+        if e["conformance"] not in CONFORMANCE:
+            bad("bad-value", f"{w}.conformance must be one of {CONFORMANCE}")
+        cl, ev, cur = e["claim"], e["implementation"], e.get("current")
+        if not isinstance(cl, dict) or set(cl) - CLAIM_KEYS or cl.get("status") not in CLAIMS:
+            bad("bad-value", f"{w}.claim is {{status, commit, citation}} with status one of {CLAIMS}; a contract "
+                             "naming its source of truth is not a claim")
+            continue
+        if not isinstance(ev, dict) or set(ev) - IMPLEMENTATION_KEYS:
+            bad("bad-value", f"{w}.implementation may hold only {sorted(IMPLEMENTATION_KEYS)}")
+            continue
+        if cur is not None and (not isinstance(cur, dict) or set(cur) - CURRENT_KEYS):
+            bad("bad-value", f"{w}.current may hold only {sorted(CURRENT_KEYS)}")
+            continue
+        cur = cur or {}
+        asm = e.get("assessment")
+        if asm is not None and (not isinstance(asm, dict) or set(asm) - ASSESSMENT_KEYS):
+            bad("bad-value", f"{w}.assessment may hold only {sorted(ASSESSMENT_KEYS)}")
+            continue
+        asm = asm or {}
+        life, conf, claim = e["lifecycle"], e["conformance"], cl["status"]
+        dv, mr = asm.get("divergences"), asm.get("missing_requirements")
+        for name, val in (("divergences", dv), ("missing_requirements", mr)):
+            if val is not None and not text_list(val):
+                bad("bad-value", f"{w}.assessment.{name} is a non-empty list of text when present")
+        for name, snap in (("implementation", ev), ("current", cur)):
+            vr = snap.get("vendored_revision")
+            if vr is not None and not (isinstance(vr, str) and HEX.match(vr)):
+                bad("bad-value", f"{w}.{name}.vendored_revision must be the ori-specs commit its manifest pins at "
+                                 f"{name}.commit")
+            if snap and "commit" in snap and not HEX.match(str(snap["commit"])):
+                bad("bad-value", f"{w}.{name}.commit must be a commit")
+        if "paths" in ev or "path_base" in ev or "component" in ev:
+            check_path_base(f"{w}.implementation", ev, ev.get("paths") if isinstance(ev.get("paths"), list) else [None],
+                            bad)
+        if cur and "commit" not in cur:
+            bad("bad-value", f"{w}.current names current_implementation_commit as current.commit")
+        if life != "unimplemented" and not (isinstance(ev.get("commit"), str) and HEX.match(ev["commit"])):
+            bad("bad-value", f"{w}.implementation.commit must name the commit of the live implementation")
+        if life == "shipped" and not (isinstance(ev.get("release"), str) and ev["release"]):
+            bad("shipped-without-release", f"{w} is shipped, so implementation.release must name the release")
+        if life != "shipped" and ev.get("release"):
+            bad("bad-value", f"{w} is not shipped but names release {ev['release']}")
+        if life == "unimplemented" and claim == "claimed":
+            bad("unimplemented-claimed", f"{w} is unimplemented and cannot carry a conformance claim")
+        if life == "unimplemented" and conf != "unassessed":
+            bad("unimplemented-assessed", f"{w} is unimplemented, so its conformance cannot be assessed")
+        if conf == "conforming" and dv:
+            bad("conforming-with-divergences", f"{w} is conforming, so it records no divergence")
+        if conf == "partial" and claim == "claimed":
+            bad("partial-with-full-claim",
+                f"{w} is partial but carries an unqualified conformance claim; an implementation that claims "
+                "more than it does is non-conforming")
+        if conf == "partial" and dv:
+            bad("bad-value", f"{w} is partial and records divergences; an implementation that is both incomplete "
+                             "and contradictory is non-conforming")
+        if conf == "partial" and not mr:
+            bad("partial-without-missing", f"{w} is partial, so assessment.missing_requirements names what is missing")
+        if conf == "non-conforming" and not dv:
+            bad("non-conforming-without-divergence", f"{w} is non-conforming, so assessment.divergences names each one")
+        if conf in ("unassessed", "conforming") and mr:
+            bad("bad-value", f"{w} is {conf} and cannot record missing requirements")
+        if conf == "unassessed" and dv:
+            bad("bad-value", f"{w} records divergences, which is an assessment; set its conformance")
+        if conf != "unassessed":
+            snap = {"implementation": ev, "current": cur}.get(str(asm.get("snapshot")))
+            if not (str(asm.get("method", "")).strip() and DATE.match(str(asm.get("assessed_at", ""))) and snap
+                    and asm.get("commit") and asm.get("commit") == snap.get("commit")):
+                bad("conformance-without-assessment",
+                    f"{w} is {conf}, which needs a behavioural assessment record naming the implementation or "
+                    "current snapshot it assessed (assessment.snapshot and the same commit), its method and "
+                    "assessed_at. A claim or a vendored revision is not one, and an assessment never attaches to "
+                    "the claim commit")
+        if conf == "unassessed" and e.get("assessment") is not None:
+            bad("bad-value", f"{w} records an assessment but leaves conformance unassessed")
+        if claim == "claimed":
+            if not HEX.match(str(cl.get("commit", ""))) or not isinstance(cl.get("claim_citation"), dict):
+                bad("claim-without-citation",
+                    f"{w} is claimed, so claim.commit and claim.claim_citation name where the qualifying claim is")
+            else:
+                check_citation(rec, w, cl["claim_citation"], bad)
+        elif set(cl) != {"status"}:
+            bad("bad-value", f"{w}.claim carries a commit or citation but its status is none")
+        if life == "shipped" and rec.get("compatibility") != "frozen":
+            bad("shipment-forces-freeze",
+                f"{w} is shipped, and shipment freezes the version whether the implementation claimed conformance, "
+                "was unassessed or was found non-conforming: set compatibility to frozen")
+        elif life == "implemented-unreleased" and claim == "claimed" and rec.get("compatibility") != "frozen":
+            bad("claim-forces-freeze",
+                f"{w} carries a qualifying conformance claim on a default branch, which freezes the version whether "
+                "or not the branch is protected or the conformance is assessed: set compatibility to frozen")
+
+    if rec.get("compatibility") == "frozen":
+        fb = rec.get("frozen_by")
+        if not isinstance(fb, dict) or fb.get("event") not in FREEZE_EVENTS:
+            bad("frozen-without-frozen-by", f"`frozen` requires frozen_by with an event from {FREEZE_EVENTS}")
+        else:
+            if set(fb) - FROZEN_KEYS:
+                bad("bad-value", f"frozen_by has unknown fields {sorted(set(fb) - FROZEN_KEYS)}")
+            if not (isinstance(fb.get("date"), str) and DATE.match(fb["date"])):
+                bad("bad-value", "frozen_by.date must be YYYY-MM-DD")
+            if fb.get("conservative") is not (fb["event"] == "conservative-baseline"):
+                bad("bad-value", "frozen_by.conservative is true exactly when the event is conservative-baseline")
+            if fb.get("branch_protection") not in BRANCH_PROTECTION:
+                bad("bad-value", f"frozen_by.branch_protection records provenance as one of {BRANCH_PROTECTION}; "
+                                 "it is never a condition of the freeze")
+            if not HEX.match(str(fb.get("contract_revision", ""))):
+                bad("bad-value", "frozen_by.contract_revision must name the last ori-specs commit that changed the "
+                                 "contract before the event")
+            if fb.get("pinned_revision") is not None and not HEX.match(str(fb["pinned_revision"])):
+                bad("bad-value", "frozen_by.pinned_revision is the ori-specs commit the freezing artifact pins")
+            if fb["event"] == "conservative-baseline" and not str(fb.get("reason", "")).strip():
+                bad("conservative-without-reason",
+                    "a conservative-baseline determination records the code revision, the contract revision and "
+                    "a stated reason")
+            if fb.get("repository") not in REPOSITORIES or not HEX.match(str(fb.get("commit", ""))):
+                bad("frozen-by-unmatched", "frozen_by must name the repository and commit of the event")
+            elif fb["event"] == "conservative-baseline":
+                if not any(isinstance(e, dict) and e.get("repository") == fb["repository"] for e in adoption):
+                    bad("frozen-by-unmatched", "the conservative baseline names a repository no adoption entry records")
+            else:
+                if fb["event"] == "claiming-merge":
+                    matched = any(isinstance(e, dict) and e.get("repository") == fb["repository"]
+                                  and isinstance(e.get("claim"), dict) and e["claim"].get("status") == "claimed"
+                                  and e["claim"].get("commit") == fb["commit"] for e in adoption)
+                    why = "a claiming-merge names the commit of a cited qualifying claim in the same repository"
+                else:
+                    matched = any(isinstance(e, dict) and e.get("repository") == fb["repository"]
+                                  and e.get("lifecycle") == "shipped" and fb.get("release")
+                                  and evidence_of(e).get("release") == fb["release"] for e in adoption)
+                    why = "a shipment names the release of a shipped adoption entry"
+                if not matched:
+                    bad("frozen-by-unmatched", why)
+                event_entries = [e for e in adoption if isinstance(e, dict) and e.get("repository") == fb["repository"]
+                                 and evidence_of(e).get("commit") == fb["commit"]
+                                 and evidence_of(e).get("vendored_revision")]
+                pins = {evidence_of(e)["vendored_revision"] for e in event_entries}
+                if pins and fb.get("pinned_revision") not in pins:
+                    bad("pinned-revision-mismatch",
+                        f"the freezing implementation vendors {sorted(pins)} at {fb['commit']}, so "
+                        "frozen_by.pinned_revision is that revision and the audit's freeze_revision follows it")
+        check_audit_record(rec, adoption, bad)
+    elif "baseline_audit" in rec:
+        bad("audit-requires-frozen", "a record with a baseline audit is frozen: a pending audit is never amendable, "
+                                     "and a version never unfreezes")
+    elif "frozen_by" in rec:
+        bad("bad-value", "frozen_by belongs only to a frozen version; a version never unfreezes")
+
+    proof = rec.get("proof")
+    if not isinstance(proof, dict) or set(proof) != set(PROOF_FIELDS):
+        bad("bad-value", f"proof must hold exactly {PROOF_FIELDS}")
+    else:
+        adoption_refs = {str(v) for e in adoption for snap in (evidence_of(e), current_of(e))
+                         for v in snap.values() if isinstance(v, str)}
+        for k in PROOF_FIELDS:
+            p = proof[k]
+            if not isinstance(p, dict) or p.get("state") not in PROOF_STATES or set(p) - {"state", "evidence"}:
+                bad("bad-value", f"proof.{k} must be {{state, evidence}} with state one of {PROOF_STATES}")
+                continue
+            if p["state"] != "none":
+                evid = str(p.get("evidence", "")).strip()
+                if not evid:
+                    bad("proof-without-evidence", f"proof.{k} is {p['state']} and names no evidence of its own")
+                elif evid in adoption_refs or re.fullmatch(r"v\d[\w.-]*|[0-9a-f]{7,40}", evid):
+                    bad("proof-implied-by-adoption",
+                        f"proof.{k} cites only a release or commit; implementation or shipment is not proof")
+    return ok
+
+
+def slug(heading: str) -> str:
+    """GitHub's heading anchor: lower case, punctuation other than '-' and '_' dropped, spaces to '-'."""
+    return re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", heading.strip().lower()))
+
+
+def check_citation(rec: dict, w: str, cit: dict, bad: Callable[[str, str], None]) -> None:
+    """The mechanical half of the five conditions; the rest was checked against the commit when recorded.
+
+    A citation is one declaration, `{path_base, component?, path, line, text}`, or one heading-plus-item span,
+    `{path_base, component?, path, heading_line, heading_text, item_lines: [first, last], item_text}`. Nothing
+    else stands in for the heading of a list item. The repository role is the containing entry's.
+    """
+    if cit.get("path_base") not in PATH_BASES:
+        bad("claim-without-citation", f"{w}.claim.claim_citation declares path_base, one of {PATH_BASES}")
+        return
+    check_path_base(f"{w}.claim.claim_citation", cit, [cit.get("path")], bad)
+    keys = set(cit) - PATH_KEYS
+    if "path" not in cit:
+        bad("claim-without-citation", f"{w}.claim.claim_citation names its path")
+        return
+    if keys == LINE_CITATION_KEYS:
+        ok = (isinstance(cit["line"], int) and not isinstance(cit["line"], bool)
+              and cit["line"] >= 1 and str(cit["text"]).strip())
+        text, whole = str(cit["text"]), str(cit["text"])
+    elif keys == SPAN_CITATION_KEYS:
+        lines = cit["item_lines"]
+        ok = (isinstance(cit["heading_line"], int) and not isinstance(cit["heading_line"], bool)
+              and isinstance(lines, list) and len(lines) == 2 and all(isinstance(n, int) and not isinstance(n, bool)
+                                                                      for n in lines)
+              and 1 <= cit["heading_line"] < lines[0] <= lines[1]
+              and str(cit["heading_text"]).strip() and str(cit["item_text"]).strip()
+              and str(cit["item_text"]).count("\n") == lines[1] - lines[0])
+        text, whole = str(cit["item_text"]), f"{cit['heading_text']} {cit['item_text']}"
+    else:
+        bad("claim-without-citation", f"{w}.claim.claim_citation is {{path_base, component?, path, line, text}} or "
+                                      "{path_base, component?, path, heading_line, heading_text, item_lines, "
+                                      "item_text}; free context is not accepted")
+        return
+    if not ok:
+        bad("claim-without-citation", f"{w}.claim.claim_citation has a malformed file, line, span or text")
+        return
+    target = rf"(?<![\w-]){re.escape(str(rec.get('contract')))}/{re.escape(str(rec.get('version')))}(\.md)?(?![\w])"
+    if not re.search(target, text):
+        bad("claim-citation-unqualified", f"{w}: the cited text does not name {rec.get('contract')}/"
+                                          f"{rec.get('version')} (condition 1)")
+    if not CLAIM_VERB.search(whole):
+        bad("claim-citation-unqualified", f"{w}: the cited text does not state that it implements or conforms to "
+                                          "the version (condition 2); code that builds, signs, verifies or uses an "
+                                          "object 'per' or 'defined by' a contract is provenance")
+    if CLAIM_QUALIFIERS.search(whole):
+        bad("claim-citation-unqualified", f"{w}: the cited claim is qualified as planned, partial, experimental, "
+                                          "test-only, illustrative or non-conforming (condition 4)")
+
+
+def check_audit_record(rec: dict, adoption: list, bad: Callable[[str, str], None]) -> None:
+    ba = rec.get("baseline_audit")
+    if not isinstance(ba, dict) or ba.get("status") not in AUDIT_STATES:
+        bad("audit-missing", f"a frozen version carries baseline_audit with status one of {AUDIT_STATES}")
+        return
+    if set(ba) - AUDIT_KEYS:
+        bad("bad-value", f"baseline_audit has unknown fields {sorted(set(ba) - AUDIT_KEYS)}")
+    fb = rec.get("frozen_by") if isinstance(rec.get("frozen_by"), dict) else {}
+    if not HEX.match(str(ba.get("freeze_revision", ""))) or ba.get("freeze_revision") != (
+            fb.get("pinned_revision") or fb.get("contract_revision")):
+        bad("bad-value", "baseline_audit.freeze_revision is frozen_by.pinned_revision where the freezing artifact "
+                         "pins one, and frozen_by.contract_revision otherwise")
+    ch = ba.get("changes_since_freeze")
+    if not isinstance(ch, list) or not all(isinstance(c, str) and HEX.match(c) for c in ch):
+        bad("bad-value", "baseline_audit.changes_since_freeze is a list of ori-specs commits")
+    if ba.get("issue") is not None and not (isinstance(ba["issue"], str) and ISSUE.match(ba["issue"])):
+        bad("bad-value", "baseline_audit.issue is null or the tracking issue's URL")
+    if ba["status"] == "pending":
+        if not SHA256.match(str(ba.get("pinned_sha256", ""))):
+            bad("audit-missing", "a pending audit pins the normative text as it stands: add "
+                                 "baseline_audit.pinned_sha256 (--digest prints it)")
+        pf = ba.get("pinned_files")
+        if not isinstance(pf, dict) or not all(isinstance(k, str) and SHA256.match(str(v)) for k, v in pf.items()):
+            bad("audit-missing", "a pending audit pins the version's non-Markdown files as {path: sha256} in "
+                                 "baseline_audit.pinned_files (--digest prints them)")
+        return
+    if not SHA256.match(str(ba.get("contract_sha256", ""))):
+        bad("bad-value", "a complete audit records contract_sha256, the frozen contract's hash at freeze_revision")
+    vec = ba.get("vectors")
+    prefix = f"{rec.get('contract')}/"
+    if not isinstance(vec, dict) or not all(
+            isinstance(k, str) and k.startswith(prefix) and ".." not in k.split("/") and SHA256.match(str(v))
+            for k, v in vec.items()):
+        bad("bad-value", f"a complete audit records vectors as {{path: sha256}} at freeze_revision, each path "
+                         f"inside {prefix}")
+    rc = ba.get("role_commits")
+    if not isinstance(rc, list) or not all(isinstance(r, dict) and set(r) == {"role", "repository", "commit"}
+                                           and HEX.match(str(r.get("commit", ""))) for r in rc):
+        bad("bad-value", "a complete audit records role_commits as [{role, repository, commit}]")
+    else:
+        have = {(r["role"], r["repository"]) for r in rc}
+        for e in adoption:
+            if isinstance(e, dict) and e.get("lifecycle") != "unimplemented" and (e.get("role"), e.get("repository")) not in have:
+                bad("audit-roles-incomplete",
+                    f"a complete audit records the repository commit of every role; {e.get('role')} "
+                    f"({e.get('repository')}) has none")
+    hunks = ba.get("hunks")
+    if not isinstance(hunks, list):
+        bad("bad-value", "a complete audit classifies every later hunk in baseline_audit.hunks")
+        return
+    for i, h in enumerate(hunks):
+        w = f"baseline_audit.hunks[{i}]"
+        if not isinstance(h, dict) or set(h) - HUNK_KEYS or not SHA256.match(str(h.get("hunk_sha256", ""))):
+            bad("bad-value", f"{w} needs hunk_sha256 and a classification, and no other fields than {sorted(HUNK_KEYS)}")
+            continue
+        if h.get("classification") not in HUNK_CLASSES:
+            bad("bad-value", f"{w}.classification must be one of {HUNK_CLASSES}")
+        if h.get("classification") == "semantic" and not re.fullmatch(r"[a-z0-9-]+/v[1-9][0-9]*",
+                                                                     str(h.get("destination", ""))):
+            bad("bad-value", f"{w} is semantic, so it names the destination version that now owns it")
+        if h.get("classification") == "additive" and not (h.get("optional") is True
+                                                          and h.get("unknown_field_compatible") is True):
+            bad("additive-not-optional", f"{w}: an additive change to a frozen version must be optional and safe "
+                                         "for a consumer that ignores unknown fields")
+
+
+def git_blob(rev: str, path: str) -> bytes | None:
+    """Read a file at an ori-specs revision from this checkout's history, or None where history is absent."""
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "show", f"{rev}:{path}"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def normative_lines(text: str) -> list[str]:
+    lines = text.split("\n")
+    sb = status_block(lines)
+    return lines[: sb[2]] + lines[sb[3] + 1:] if sb else lines
+
+
+def net_hunks(baseline: str, current: str) -> list[tuple[str, str]]:
+    """(sha256, first changed line) for each difference between two texts, Status: paragraphs excluded."""
+    a, b = normative_lines(baseline), normative_lines(current)
+    out = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        body = "\n".join(["-" + ln for ln in a[i1:i2]] + ["+" + ln for ln in b[j1:j2]])
+        out.append((hashlib.sha256(body.encode("utf-8")).hexdigest(), (a[i1:i2] + b[j1:j2] + [""])[0][:80]))
+    return out
+
+
+def versions_in(root: pathlib.Path, contract: str) -> list[str]:
+    return sorted((f.stem for f in (root / contract).iterdir() if f.is_file() and VERSION_FILE.match(f.name)),
+                  key=lambda v: int(v[1:]))
+
+
+def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: list[Finding]) -> None:
+    where = f"{key[0]}/{key[1]}.md"
+    ba = rec["baseline_audit"]
+    current = read_text(root / where)
+    if ba["status"] == "pending":
+        if ba.get("issue") is None:
+            findings.append(Finding("gap-audit-without-issue", where,
+                                    "the baseline audit is pending and names no tracking issue; a pending audit "
+                                    "is a gap until an issue tracks it"))
+        actual = normative_digest(current)
+        if actual != ba["pinned_sha256"]:
+            findings.append(Finding(
+                "frozen-audit-pending", where,
+                f"the normative text of this frozen version changed (sha256 {actual}, pinned "
+                f"{ba['pinned_sha256']}) while its baseline audit is pending. No normative edit is admitted until "
+                "the audit is complete; the Status: paragraph and the status record stay editable. Only the "
+                "Status: paragraph is excluded from the digest."))
+        now = version_files(root, key[0], key[1], versions_in(root, key[0]))
+        for path in sorted(set(now) | set(ba["pinned_files"])):
+            if now.get(path) != ba["pinned_files"].get(path):
+                findings.append(Finding(
+                    "frozen-audit-pending", path,
+                    "a file of this frozen version was added, removed or changed while its baseline audit is "
+                    "pending; vector bytes stay with the version they exercised"))
+        return
+    base = git_blob(ba["freeze_revision"], where)
+    if base is None:
+        findings.append(Finding("baseline-unverifiable", where,
+                                f"the complete audit's baseline {ba['freeze_revision']}:{where} is not in this "
+                                "checkout's history; the check needs full history (fetch-depth 0)"))
+        return
+    if hashlib.sha256(base).hexdigest() != ba["contract_sha256"]:
+        findings.append(Finding("baseline-hash-mismatch", where,
+                                "contract_sha256 is not the hash of the contract at freeze_revision"))
+    attributed = set(version_files(root, key[0], key[1], versions_in(root, key[0])))
+    for path in sorted(attributed ^ set(ba["vectors"])):
+        findings.append(Finding("vector-drift", path,
+                                "the files attributed to this version differ from the complete audit's recorded set; "
+                                "a vector or companion document was added, removed or re-attributed"))
+    for path, digest in sorted(ba["vectors"].items()):
+        old = git_blob(ba["freeze_revision"], path)
+        if old is None or hashlib.sha256(old).hexdigest() != digest:
+            findings.append(Finding("baseline-hash-mismatch", path,
+                                    f"the recorded vector hash is not the file's hash at {ba['freeze_revision']}"))
+        now = root / path
+        if not now.is_file() or hashlib.sha256(now.read_bytes()).hexdigest() != digest:
+            findings.append(Finding("vector-drift", path,
+                                    "a frozen vector file differs from the recorded baseline; vector bytes stay "
+                                    "with the version they exercised"))
+    recorded = {h["hunk_sha256"]: h for h in ba["hunks"]}
+    for digest, first in net_hunks(base.decode("utf-8", errors="replace"), current):
+        h = recorded.get(digest)
+        if h is None:
+            findings.append(Finding(
+                "baseline-drift", where,
+                f"a change from the freeze revision is not classified in the audit (hunk {digest[:12]}, near "
+                f"{first!r}). Drift is measured from the recorded baseline, not from main; only a recorded "
+                "erratum or additive hunk may remain, and the check cannot tell whether its classification is true."))
+        elif h["classification"] == "semantic":
+            findings.append(Finding("semantic-hunk-in-frozen", where,
+                                    f"hunk {digest[:12]} is classified semantic, so it belongs to "
+                                    f"{h.get('destination')} and may not remain in this frozen version"))
+    for h in ba["hunks"]:
+        if h["classification"] == "semantic" and not (root / f"{h.get('destination')}.md").is_file():
+            findings.append(Finding("semantic-destination-missing", where,
+                                    f"semantic hunk {h['hunk_sha256'][:12]} names {h.get('destination')}, which "
+                                    "does not exist"))
+
+
+def draft_audit(root: pathlib.Path, key: tuple[str, str], rec: dict) -> dict:
+    """A complete-audit skeleton for a reviewer to classify: hashes at the freeze revision and every net hunk."""
+    where = f"{key[0]}/{key[1]}.md"
+    rev = rec["baseline_audit"]["freeze_revision"]
+    base = git_blob(rev, where)
+    if base is None:
+        raise SystemExit(f"{rev}:{where} is not in this checkout's history")
+    listing = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only", rev, f"{key[0]}/"],
+                             capture_output=True, text=True).stdout.split()
+    vectors = {}
+    versions = versions_in(root, key[0])
+    companions = companion_map(root)
+    for path in listing:
+        if not is_version_document(key[0], path) and version_of_file(key[0], path, versions, companions) == key[1]:
+            blob = git_blob(rev, path)
+            if blob is not None:
+                vectors[path] = hashlib.sha256(blob).hexdigest()
+    return {
+        **rec["baseline_audit"], "status": "complete",
+        "contract_sha256": hashlib.sha256(base).hexdigest(), "vectors": vectors,
+        "role_commits": [{"role": e["role"], "repository": e["repository"], "commit": e["implementation"]["commit"]}
+                         for e in rec["adoption"] if e["lifecycle"] != "unimplemented"],
+        "hunks": [{"hunk_sha256": d, "classification": None, "summary": first}
+                  for d, first in net_hunks(base.decode("utf-8", errors="replace"), read_text(root / where))],
+    }
+
+
+# --- tables -------------------------------------------------------------------------------------
+
+def table_rows(text: str, heading: str) -> list[list[str]]:
+    section = re.search(rf"^## {re.escape(heading)}\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+    rows = []
+    if not section:
+        return rows
+    for line in section.group(1).split("\n"):
+        if line.startswith("|") and not re.match(r"^\|\s*:?-", line):
+            rows.append([c.strip() for c in line.strip().strip("|").split("|")])
+    return rows[1:]  # drop the header
+
+
+def check_issue_references(root: pathlib.Path, records: dict, findings: list[Finding]) -> None:
+    """baseline_audit.issue is the only issue reference a generated or status file may carry."""
+    def walk(value: object, path: str) -> list[str]:
+        if isinstance(value, dict):
+            return [x for k, v in value.items() if path + k != "baseline_audit.issue"
+                    for x in walk(v, f"{path}{k}.")]
+        if isinstance(value, list):
+            return [x for v in value for x in walk(v, path)]
+        return [path.rstrip(".")] if isinstance(value, str) and ISSUE_REFERENCE.search(value) else []
+    for key, rec in sorted(records.items()):
+        for field in walk(rec, ""):
+            findings.append(Finding("issue-reference", f"status/{key[0]}/{key[1]}.json",
+                                    f"{field} carries an issue reference; baseline_audit.issue is the only one allowed"))
+    for name in ("README.md", "VERSIONING.md", "CONTRIBUTING.md"):
+        if (root / name).is_file() and ISSUE_REFERENCE.search(read_text(root / name)):
+            findings.append(Finding("issue-reference", name, "carries an issue reference; prose stays issue-free"))
+
+
+def base_records(root: pathlib.Path) -> dict[tuple[str, str], dict] | None:
+    """The status records at the merge base with the default branch, or None where history is unavailable."""
+    if BASE_OVERRIDE is not None:
+        return BASE_OVERRIDE
+    try:
+        mb = subprocess.run(["git", "-C", str(root), "merge-base", "HEAD", "origin/main"], capture_output=True,
+                            text=True, timeout=30)
+        if mb.returncode != 0:
+            return None
+        base = mb.stdout.strip()
+        listing = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "--name-only", base, "status/"],
+                                 capture_output=True, text=True, timeout=30).stdout.split()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = {}
+    for rel in listing:
+        m = re.match(r"^status/([a-z0-9-]+)/(v[1-9][0-9]*)\.json$", rel)
+        blob = subprocess.run(["git", "-C", str(root), "show", f"{base}:{rel}"], capture_output=True, timeout=30)
+        if m and blob.returncode == 0:
+            try:
+                out[(m.group(1), m.group(2))] = json.loads(blob.stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                continue
+    return out
+
+
+def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) -> None:
+    """Refuse what no single record can show: an unfreeze, a re-pin, and an implementation going backwards."""
+    base = base_records(root)
+    if base is None:
+        findings.append(Finding("history-unavailable", "status/",
+                                "cannot read the status records at the merge base with origin/main, so an unfreeze "
+                                "or a re-pin could not be refused; run with the default branch fetched"))
+        return
+    for key, old in sorted(base.items()):
+        where = f"status/{key[0]}/{key[1]}.json"
+        new = records.get(key)
+        if old.get("compatibility") == "frozen":
+            if not isinstance(new, dict):
+                if key not in UNREADABLE:
+                    findings.append(Finding("unfreeze-refused", where, "a frozen record was deleted; a version never "
+                                                                       f"unfreezes. {HISTORY_LIMIT}"))
+                continue
+            if new.get("compatibility") != "frozen":
+                findings.append(Finding("unfreeze-refused", where, "a frozen record became amendable; a version never "
+                                                                   f"unfreezes. {HISTORY_LIMIT}"))
+            oa, na = old.get("baseline_audit") or {}, new.get("baseline_audit") or {}
+            if oa.get("status") == "pending":
+                fields = [("frozen_by", old.get("frozen_by"), new.get("frozen_by")),
+                          ("freeze_revision", oa.get("freeze_revision"), na.get("freeze_revision"))]
+                if na.get("status") != "complete":
+                    fields += [("pinned_sha256", oa.get("pinned_sha256"), na.get("pinned_sha256")),
+                               ("pinned_files", oa.get("pinned_files"), na.get("pinned_files"))]
+                for name, a, b in fields:
+                    if a != b:
+                        findings.append(Finding("frozen-pin-changed", where,
+                                                f"{name} changed while the baseline audit is pending; a re-pin would "
+                                                f"admit the edit the pin refuses. {HISTORY_LIMIT}"))
+            elif oa.get("status") == "complete":
+                if na.get("status") != "complete":
+                    findings.append(Finding("audit-regressed", where,
+                                            "a complete baseline audit returned to pending, which would let a re-pin "
+                                            f"admit an edit the audit refuses. {HISTORY_LIMIT}"))
+                for name, a, b in (("frozen_by", old.get("frozen_by"), new.get("frozen_by")),
+                                   ("freeze_revision", oa.get("freeze_revision"), na.get("freeze_revision")),
+                                   ("contract_sha256", oa.get("contract_sha256"), na.get("contract_sha256")),
+                                   ("vectors", oa.get("vectors"), na.get("vectors"))):
+                    if a != b:
+                        findings.append(Finding("audit-regressed", where,
+                                                f"{name} of a complete baseline audit changed; the recorded baseline is "
+                                                f"fixed once the audit completes. {HISTORY_LIMIT}"))
+                old_hunks, new_hunks = oa.get("hunks") or [], na.get("hunks")
+                if not isinstance(new_hunks, list) or new_hunks[:len(old_hunks)] != old_hunks:
+                    findings.append(Finding("audit-regressed", where,
+                                            "a complete baseline audit's recorded hunks were changed or removed; hunks "
+                                            f"may only be appended. {HISTORY_LIMIT}"))
+        if not isinstance(new, dict):
+            continue
+        new_entries = {(e.get("role"), e.get("repository")): e for e in new.get("adoption") or [] if isinstance(e, dict)}
+        for e in old.get("adoption") or []:
+            if not isinstance(e, dict):
+                continue
+            claimed = isinstance(e.get("claim"), dict) and e["claim"].get("status") == "claimed"
+            ne = new_entries.get((e.get("role"), e.get("repository")))
+            who = f"the {e.get('role')} ({e.get('repository')}) entry"
+            if isinstance(ne, dict):
+                old_asm = e.get("assessment") if isinstance(e.get("assessment"), dict) else {}
+                new_asm = ne.get("assessment") if isinstance(ne.get("assessment"), dict) else {}
+                if claimed and not (isinstance(ne.get("claim"), dict) and ne["claim"].get("status") == "claimed"):
+                    findings.append(Finding("adoption-regressed", where,
+                                            f"{who}'s claim went from claimed to none; a mistaken claim still froze the "
+                                            f"version and stays recorded. {HISTORY_LIMIT}"))
+                if e.get("conformance") not in (None, "unassessed") and ne.get("conformance") == "unassessed":
+                    findings.append(Finding("adoption-regressed", where,
+                                            f"{who}'s assessed conformance was downgraded to unassessed. "
+                                            f"{HISTORY_LIMIT}"))
+                lost = [d for d in old_asm.get("divergences") or [] if d not in (new_asm.get("divergences") or [])]
+                if lost:
+                    findings.append(Finding("adoption-regressed", where,
+                                            f"{who}'s recorded divergences were erased ({len(lost)}). {HISTORY_LIMIT}"))
+                old_rel = (e.get("implementation") or {}).get("release") if e.get("lifecycle") == "shipped" else None
+                new_rel = (ne.get("implementation") or {}).get("release") if isinstance(ne.get("implementation"),
+                                                                                         dict) else None
+                if old_rel and ne.get("lifecycle") == "shipped" and new_rel != old_rel:
+                    findings.append(Finding("adoption-regressed", where,
+                                            f"{who}'s shipped release was rewritten from {old_rel} to {new_rel}. "
+                                            f"{HISTORY_LIMIT}"))
+            if e.get("lifecycle") != "shipped" and not claimed:
+                continue
+            if ne is None:
+                findings.append(Finding("adoption-regressed", where,
+                                        f"{who}, shipped or claimed, was removed. {HISTORY_LIMIT}"))
+            elif LIFECYCLE_RANK.get(ne.get("lifecycle"), -1) < LIFECYCLE_RANK.get(e.get("lifecycle"), -1):
+                findings.append(Finding("adoption-regressed", where,
+                                        f"the {e.get('role')} ({e.get('repository')}) lifecycle moved from "
+                                        f"{e.get('lifecycle')} to {ne.get('lifecycle')}. {HISTORY_LIMIT}"))
+
+
+def check_tables(root: pathlib.Path, records: dict, all_records: dict, findings: list[Finding]) -> None:
+    readme = read_text(root / "README.md")
+    seen = set()
+    for row in table_rows(readme, "Contracts"):
+        m = re.search(r"\]\(([a-z0-9-]+)/(v[1-9][0-9]*)\.md\)", row[1] if len(row) > 1 else "")
+        if not m:
+            findings.append(Finding("readme-row-mismatch", "README.md",
+                                    f"row {row[0]!r} links no <contract>/v<N>.md; companion documents go below the table"))
+            continue
+        key = (m.group(1), m.group(2))
+        seen.add(key)
+        rec = records.get(key)
+        if not rec:
+            continue
+        if [norm(c) for c in row[2:]] != [norm(c) for c in render_readme_cells(rec)]:
+            findings.append(Finding("readme-row-mismatch", f"README.md {key[0]}/{key[1]}",
+                                    f"row does not match its record; expected {' | '.join(render_readme_cells(rec))}"))
+        wording(rec, " | ".join(row), f"README.md {key[0]}/{key[1]}", findings)
+    for key in sorted(set(records) - seen):
+        findings.append(Finding("readme-row-missing", "README.md", f"no row for {key[0]}/{key[1]}"))
+
+    versioning = read_text(root / "VERSIONING.md")
+    seen = set()
+    for row in table_rows(versioning, "Current Baseline"):
+        if len(row) < 2:
+            continue
+        key = (row[0].strip("` "), row[1].strip("` "))
+        seen.add(key)
+        rec = records.get(key)
+        if not rec:
+            if key not in all_records and key not in UNREADABLE:
+                findings.append(Finding("versioning-row-mismatch", "VERSIONING.md", f"row {key} has no record"))
+            continue
+        if [norm(c) for c in row[2:]] != [norm(c) for c in render_versioning_cells(rec)]:
+            findings.append(Finding("versioning-row-mismatch", f"VERSIONING.md {key[0]}/{key[1]}",
+                                    f"row does not match its record; expected "
+                                    f"{' | '.join(render_versioning_cells(rec))}"))
+        wording(rec, " | ".join(row), f"VERSIONING.md {key[0]}/{key[1]}", findings)
+    for key in sorted(set(records) - seen):
+        findings.append(Finding("versioning-row-missing", "VERSIONING.md", f"no row for {key[0]}/{key[1]}"))
+
+
+# --- driver -------------------------------------------------------------------------------------
+
+def check(root: pathlib.Path) -> list[Finding]:
+    findings: list[Finding] = []
+    records = load_records(root, findings)
+    versions = contract_versions(root)
+    for key in versions:
+        if key not in records and key not in UNREADABLE:
+            findings.append(Finding("record-missing", f"{key[0]}/{key[1]}.md",
+                                    f"no status record; add status/{key[0]}/{key[1]}.json"))
+    for key in sorted(set(records) - set(versions)):
+        findings.append(Finding("record-orphan", f"status/{key[0]}/{key[1]}.json",
+                                "names a contract version with no <contract>/<version>.md"))
+    for rel in nested_versions(root):
+        findings.append(Finding("nested-version", rel, "a version document sits below its contract directory; "
+                                                       "versions are <contract>/v<N>.md"))
+    companions = companion_map(root)
+    for d in contract_dirs(root):
+        vs = versions_in(root, d.name)
+        frozen_dir = any(isinstance(records.get((d.name, v)), dict) and records[(d.name, v)].get("compatibility") == "frozen"
+                         for v in vs)
+        for f in sorted(d.rglob("*")):
+            rel = f.relative_to(root).as_posix()
+            if not f.is_file() or not vs or is_version_document(d.name, rel) or \
+                    version_of_file(d.name, rel, vs, companions) != "unattributed":
+                continue
+            if f.suffix != ".md":
+                findings.append(Finding("vector-unattributed", rel,
+                                        "a non-Markdown file in a multi-version directory belongs to no version; "
+                                        "name it with its version or add its directory to VECTOR_OWNER"))
+            elif frozen_dir:
+                findings.append(Finding("companion-unattributed", rel,
+                                        "a companion document in a frozen contract's directory belongs to no "
+                                        "version; list it in that version's companion_files so its audit pins it"))
+    valid = {k: r for k, r in records.items() if k in versions and check_record(root, k, r, records, findings)}
+    for key, rec in valid.items():
+        path = root / f"{key[0]}/{key[1]}.md"
+        lines = read_text(path).split("\n")
+        sb = status_block(lines)
+        where = f"{key[0]}/{key[1]}.md"
+        if not sb:
+            findings.append(Finding("status-line-missing", where, "no leading '> Status:' blockquote"))
+        else:
+            if paragraph_text(lines[sb[2]:sb[3] + 1]) != norm(render_status(rec)):
+                findings.append(Finding("status-line-mismatch", where,
+                                        "the Status: paragraph is not the one rendered from the record "
+                                        "(--write-status-lines rewrites it)"))
+            wording(rec, paragraph_text(lines[sb[0]:sb[1] + 1]), f"{where} status block", findings)
+        if rec["compatibility"] == "frozen":
+            check_audit(root, key, rec, findings)
+    check_issue_references(root, records, findings)
+    missing = [n for n in ("README.md", "VERSIONING.md") if not (root / n).is_file()]
+    for name in missing:
+        findings.append(Finding("summary-missing", name, "the summary table this check validates is missing"))
+    if not missing:
+        check_tables(root, valid, records, findings)
+    check_history(root, records, findings)
+    return findings
+
+
+# --- sibling repositories (opt-in; CI has none of them checked out) ------------------------------
+
+SIBLING_DEFAULTS = {"runtime": ("ori-runtime", "ori"), "gateway": ("ori-gateway",), "cli": ("ori-cli",),
+                    "edge-firmware": ("ori-edge-firmware",), "sdk-python": ("ori-sdk-python",),
+                    "skills-hub": ("ori-skills-hub",)}
+
+
+def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=60)
+
+
+def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, versions: list[str]) -> set[str]:
+    """ori-specs revisions pinned, at `commit`, by vector manifests covering this contract version."""
+    pins = set()
+    listing = _git(repo, "ls-tree", "-r", "--name-only", commit).stdout.decode("utf-8", "replace").split()
+    for path in listing:
+        if not path.endswith("MANIFEST.json"):
+            continue
+        try:
+            m = json.loads(_git(repo, "show", f"{commit}:{path}").stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(m, dict) or not isinstance(m.get("source_commit"), str):
+            continue
+        base = str(m.get("source_path", "")).strip("/")
+        files = m.get("files") if isinstance(m.get("files"), dict) else {}
+        for name in files:
+            rel = name if name.startswith(f"{contract}/") else f"{base}/{name}" if base and base != "." else name
+            if rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version:
+                pins.add(m["source_commit"][:7])
+                break
+    return pins
+
+
+def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str, str],
+                    components: dict[tuple[str, str], str]) -> list[Finding]:
+    """Check each recorded snapshot against the sibling repositories: every value must exist at its own commit."""
+    findings: list[Finding] = []
+    repos: dict[str, pathlib.Path] = {}
+    for role, names in SIBLING_DEFAULTS.items():
+        for name in names:
+            if (directory / name / ".git").exists():
+                repos[role] = directory / name
+                break
+    for role, path in extra.items():
+        repos[role] = pathlib.Path(path)
+    records = load_records(root, findings)
+    for (c, v), rec in sorted(records.items()):
+        versions = versions_in(root, c)
+        for i, e in enumerate(rec.get("adoption") or []):
+            where = f"status/{c}/{v}.json adoption[{i}] {e.get('role')} ({e.get('repository')})"
+            repo = repos.get(e.get("repository"))
+            if repo is None:
+                findings.append(Finding("sibling-unavailable", where, "no checkout given for this repository"))
+                continue
+            default = next((r for r in ("origin/main", "main") if _git(repo, "rev-parse", "--verify", r).returncode == 0),
+                           "HEAD")
+
+            def on_default(commit: str, label: str) -> bool:
+                if _git(repo, "cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
+                    findings.append(Finding("sibling-missing", where, f"{label} {commit} does not exist"))
+                    return False
+                if _git(repo, "merge-base", "--is-ancestor", commit, default).returncode != 0:
+                    findings.append(Finding("sibling-missing", where, f"{label} {commit} is not on {default}"))
+                return True
+
+            def prefix(holder: dict) -> str | None:
+                if holder.get("path_base") == "component-root":
+                    sub = components.get((e.get("repository"), holder.get("component")))
+                    if sub is None:
+                        findings.append(Finding("sibling-unavailable", where,
+                                                f"no --component mapping for {holder.get('component')}"))
+                    return None if sub is None else sub.rstrip("/") + "/"
+                return ""
+
+            impl = e.get("implementation") or {}
+            if impl.get("commit") and on_default(impl["commit"], "implementation.commit"):
+                pre = prefix(impl)
+                for path in impl.get("paths") or []:
+                    if pre is not None and _git(repo, "cat-file", "-e", f"{impl['commit']}:{pre}{path.rstrip('/')}").returncode:
+                        findings.append(Finding("sibling-missing", where,
+                                                f"implementation path {path} does not exist at {impl['commit']}"))
+                pins = manifest_pins(repo, impl["commit"], c, v, versions)
+                if impl.get("vendored_revision") not in (pins or {None}):
+                    findings.append(Finding("sibling-vendored", where,
+                                            f"implementation.vendored_revision is {impl.get('vendored_revision')}, the "
+                                            f"manifest at {impl['commit']} pins {sorted(pins) or 'nothing'}"))
+                if impl.get("release") and _git(repo, "merge-base", "--is-ancestor", impl["commit"],
+                                                 impl["release"]).returncode != 0:
+                    findings.append(Finding("sibling-missing", where,
+                                            f"release {impl['release']} does not contain {impl['commit']}"))
+            cur = e.get("current") or {}
+            if cur.get("commit") and on_default(cur["commit"], "current.commit"):
+                pins = manifest_pins(repo, cur["commit"], c, v, versions)
+                if cur.get("vendored_revision") not in (pins or {None}):
+                    findings.append(Finding("sibling-vendored", where,
+                                            f"current.vendored_revision is {cur.get('vendored_revision')}, the "
+                                            f"manifest at {cur['commit']} pins {sorted(pins) or 'nothing'}"))
+            cl = e.get("claim") or {}
+            cit = cl.get("claim_citation")
+            if cl.get("status") == "claimed" and isinstance(cit, dict) and on_default(str(cl.get("commit")), "claim.commit"):
+                pre = prefix(cit)
+                blob = _git(repo, "show", f"{cl['commit']}:{pre or ''}{cit.get('path')}")
+                lines = blob.stdout.decode("utf-8", "replace").split("\n") if blob.returncode == 0 else []
+                spans = ([(cit["line"], cit["text"])] if "line" in cit else
+                         [(cit["heading_line"], cit["heading_text"]), (cit["item_lines"][0], cit["item_text"])])
+                for start, text in spans:
+                    got = "\n".join(lines[start - 1:start - 1 + str(text).count("\n") + 1])
+                    if str(text) not in got:
+                        findings.append(Finding("sibling-citation", where,
+                                                f"the cited text is not at {cit.get('path')}:{start} in {cl['commit']}"))
+    return findings
+
+
+def write_status_lines(root: pathlib.Path) -> None:
+    findings: list[Finding] = []
+    for key, rec in load_records(root, findings).items():
+        path = root / f"{key[0]}/{key[1]}.md"
+        lines = path.read_text(encoding="utf-8").split("\n")
+        sb = status_block(lines)
+        if sb:
+            lines[sb[2]:sb[3] + 1] = wrap_status(render_status(rec))
+            path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_rows(root: pathlib.Path) -> None:
+    """Rewrite the README and VERSIONING table cells each record renders, leaving every other line alone."""
+    findings: list[Finding] = []
+    records = load_records(root, findings)
+    for name, pattern, cells in (("README.md", r"^\| (.+?) \| \[([a-z0-9-]+)/(v[1-9][0-9]*)\.md\]\(", "readme"),
+                                 ("VERSIONING.md", r"^\| ()([a-z0-9-]+) \| (v[1-9][0-9]*) \|", "versioning")):
+        path = root / name
+        lines = path.read_text(encoding="utf-8").split("\n")
+        for i, line in enumerate(lines):
+            m = re.match(pattern, line)
+            rec = records.get((m.group(2), m.group(3))) if m else None
+            if not rec:
+                continue
+            c, v = m.group(2), m.group(3)
+            if cells == "readme":
+                lines[i] = f"| {m.group(1)} | [{c}/{v}.md]({c}/{v}.md) | " + " | ".join(render_readme_cells(rec)) + " |"
+            else:
+                lines[i] = f"| {c} | {v} | " + " | ".join(render_versioning_cells(rec)) + " |"
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def print_rows(root: pathlib.Path) -> None:
+    findings: list[Finding] = []
+    for key, rec in sorted(load_records(root, findings).items()):
+        print(f"| {key[0]} | {key[1]} | " + " | ".join(render_versioning_cells(rec)) + " |")
+    print()
+    for key, rec in sorted(load_records(root, findings).items()):
+        print(f"| {key[0]} {key[1]} | [{key[0]}/{key[1]}.md]({key[0]}/{key[1]}.md) | "
+              + " | ".join(render_readme_cells(rec)) + " |")
+
+
+# --- mutations ----------------------------------------------------------------------------------
+
+def _edit_json(root: pathlib.Path, rel: str, fn: Callable[[dict], None]) -> None:
+    p = root / rel
+    data = json.loads(p.read_text(encoding="utf-8"))
+    fn(data)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _insert_status_paragraph(root: pathlib.Path, rel: str, sentence: str) -> None:
+    p = root / rel
+    lines = p.read_text(encoding="utf-8").split("\n")
+    sb = status_block(lines)
+    assert sb
+    lines[sb[3] + 1:sb[3] + 1] = [">", f"> {sentence}"]
+    p.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _first(records: dict, pred: Callable[[dict], bool]) -> str:
+    for (c, v), r in sorted(records.items()):
+        if pred(r):
+            return f"{c}/{v}"
+    raise SystemExit("mutation precondition: no record fits")
+
+
+def mutations() -> int:
+    findings: list[Finding] = []
+    records = load_records(ROOT, findings)
+    unshipped = _first(records, lambda r: r["compatibility"] == "amendable" and not r["adoption"])
+    base = copy.deepcopy(records)
+    shipped_frozen = _first(records, lambda r: r["compatibility"] == "frozen" and any(
+        e["lifecycle"] == "shipped" for e in r["adoption"]))
+    vector_frozen = "evidence-exchange/v1" if ("evidence-exchange", "v1") in records else _first(
+        records, lambda r: r.get("baseline_audit", {}).get("pinned_files"))
+    pinned_frozen = _first(records, lambda r: r.get("frozen_by", {}).get("pinned_revision"))
+    impl_only = _first(records, lambda r: r["compatibility"] == "amendable" and r["adoption"]
+                       and all(e["lifecycle"] == "implemented-unreleased" for e in r["adoption"]))
+    claimed_freeze = _first(records, lambda r: r.get("frozen_by", {}).get("event") == "claiming-merge")
+
+    def claim(key: str, sentence: str | None = None, **citation: object) -> dict:
+        cit = citation or {"path_base": "repository-root", "path": "README.md", "line": 1,
+                           "text": sentence or f"This repository implements {key}."}
+        return {"status": "claimed", "commit": "0" * 12, "claim_citation": cit}
+
+    def entry_update(rel: str, assessment: dict | None = None, **kw: object) -> Callable[[pathlib.Path], None]:
+        def edit(r: dict) -> None:
+            e = r["adoption"][0]
+            e.update(kw)
+            if assessment is not None:
+                e["assessment"] = {"snapshot": "implementation", "commit": e["implementation"].get("commit"),
+                                   **assessment}
+        return lambda root: _edit_json(root, f"status/{rel}.json", edit)
+
+    assessed = {"method": "compared with the contract", "assessed_at": "2026-09-25"}
+    frozen = _first(records, lambda r: r["compatibility"] == "frozen" and r["maturity"] == "draft")
+    conservative = _first(records, lambda r: r.get("frozen_by", {}).get("event") == "conservative-baseline")
+    protected = _first(records, lambda r: r.get("frozen_by", {}).get("branch_protection") == "protected")
+
+    def shipped_entry(r: dict) -> None:
+        r["adoption"].append({"role": "producer", "repository": "runtime", "lifecycle": "shipped",
+                              "conformance": "unassessed", "claim": {"status": "none"},
+                              "implementation": {"commit": "0" * 12, "release": "v0.0.0"}})
+
+    def append_normative(root: pathlib.Path, rel: str, sentence: str) -> str:
+        p = root / f"{rel}.md"
+        text = p.read_text(encoding="utf-8")
+        p.write_text(text.rstrip("\n") + f"\n\n{sentence}\n", encoding="utf-8")
+        return normative_digest(p.read_text(encoding="utf-8"))
+
+    def readme_edit(root: pathlib.Path) -> None:
+        p = root / "README.md"
+        text = p.read_text(encoding="utf-8")
+        target = f"]({frozen}.md) |"
+        i = text.index(target)
+        end = text.index("\n", i)
+        p.write_text(text[:i] + text[i:end].replace("`frozen`", "`amendable`") + text[end:], encoding="utf-8")
+
+    audited = "evidence-exchange/v1" if ("evidence-exchange", "v1") in records else frozen
+
+    def complete_audit(root: pathlib.Path, adjust: Callable[[dict], None] | None = None, rel: str = "") -> None:
+        """Complete the audit of one frozen record: every net hunk admitted, vectors restored to the baseline."""
+        rel = rel or audited
+        key = tuple(rel.split("/"))
+        rec = json.loads((root / f"status/{rel}.json").read_text(encoding="utf-8"))
+        audit = draft_audit(root, key, rec)  # type: ignore[arg-type]
+        for h in audit["hunks"]:
+            h.update(classification="additive", optional=True, unknown_field_compatible=True)
+        for path in audit["vectors"]:
+            blob = git_blob(audit["freeze_revision"], path)
+            assert blob is not None
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_bytes(blob)
+        c, v = key
+        # The reconstructed version holds exactly its baseline files: later additions leave the tree.
+        later = set(version_files(root, c, v, versions_in(root, c))) - set(audit["vectors"])
+        for path in later:
+            (root / path).unlink()
+        if adjust:
+            adjust(audit)
+
+        def store(r: dict) -> None:
+            r["baseline_audit"] = audit
+            if r.get("companion_files"):
+                kept = [x for x in r["companion_files"] if x not in later]
+                if kept:
+                    r["companion_files"] = kept
+                else:
+                    r.pop("companion_files")
+        _edit_json(root, f"status/{rel}.json", store)
+        write_status_lines(root)
+        write_rows(root)
+
+    def complete_on_main(root: pathlib.Path) -> None:
+        """Complete the audit and put that record on this case's merge base, as if the audit had merged."""
+        complete_audit(root)
+        assert BASE_OVERRIDE is not None
+        BASE_OVERRIDE[tuple(audited.split("/"))] = json.loads(  # type: ignore[index]
+            (root / f"status/{audited}.json").read_text(encoding="utf-8"))
+
+    def attack_a(root: pathlib.Path) -> None:
+        """Edit a completed version, re-pin every revision to a later one, and clear the hunks."""
+        complete_on_main(root)
+        append_normative(root, audited, "A consumer MUST also refuse an empty body.")
+        head = git_blob("HEAD", f"{audited}.md")
+        def edit(r: dict) -> None:
+            later = r["baseline_audit"]["changes_since_freeze"][-1]
+            r["frozen_by"].update(contract_revision=later, pinned_revision=later)
+            r["baseline_audit"].update(freeze_revision=later, hunks=[],
+                                       contract_sha256=hashlib.sha256(head or b"").hexdigest())
+        _edit_json(root, f"status/{audited}.json", edit)
+
+    def attack_b(root: pathlib.Path) -> None:
+        """Edit a completed version, flip its audit back to pending, and re-pin."""
+        complete_on_main(root)
+        digest = append_normative(root, audited, "A consumer MUST also refuse an empty body.")
+        c, v = audited.split("/")
+        _edit_json(root, f"status/{audited}.json", lambda r: r.update(baseline_audit={
+            "status": "pending", "freeze_revision": r["baseline_audit"]["freeze_revision"],
+            "changes_since_freeze": r["baseline_audit"]["changes_since_freeze"], "issue": r["baseline_audit"]["issue"],
+            "pinned_sha256": digest, "pinned_files": version_files(root, c, v, versions_in(root, c))}))
+
+    def after_completion(fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        def mutate(root: pathlib.Path) -> None:
+            complete_on_main(root)
+            _edit_json(root, f"status/{audited}.json", lambda r: fn(r["baseline_audit"]))
+        return mutate
+
+    def entry_where(pred: Callable[[dict], bool]) -> tuple[str, int]:
+        for (c, v), r in sorted(records.items()):
+            for i, e in enumerate(r["adoption"]):
+                if pred(e):
+                    return f"{c}/{v}", i
+        raise SystemExit("mutation precondition: no entry fits")
+
+    def entry_edit(pred: Callable[[dict], bool], fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        rel, i = entry_where(pred)
+        return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(r["adoption"][i]))
+
+    companion_rel = _first(records, lambda r: r["compatibility"] == "frozen" and r.get("companion_files"))
+    companion_docs = records[tuple(companion_rel.split("/"))]["companion_files"]  # type: ignore[index]
+    companion_doc = companion_docs[0]
+    # A companion present at the freeze revision, for the cases that complete the audit first.
+    frozen_docs = [x for x in companion_docs if git_blob(
+        records[tuple(companion_rel.split("/"))]["baseline_audit"]["freeze_revision"], x) is not None]  # type: ignore[index]
+    completed_doc = frozen_docs[0] if frozen_docs else companion_doc
+    companion_dir = companion_rel.split("/")[0]
+
+    def companion_edit(root: pathlib.Path, doc: str = "") -> None:
+        doc = doc or companion_doc
+        (root / doc).write_text((root / doc).read_text() + "\nA profile MUST also be signed.\n")
+
+    def companion_add(root: pathlib.Path) -> None:
+        (root / companion_dir / "extra.md").write_text("# Extra\n\nA consumer MUST refuse this.\n")
+        _edit_json(root, f"status/{companion_rel}.json",
+                   lambda r: r["companion_files"].append(f"{companion_dir}/extra.md"))
+
+    def companion_add_unlisted(root: pathlib.Path) -> None:
+        (root / companion_dir / "extra.md").write_text("# Extra\n\nA consumer MUST refuse this.\n")
+
+    def companion_delete(root: pathlib.Path, doc: str = "") -> None:
+        doc = doc or companion_doc
+        (root / doc).unlink()
+        companion_reattribute(root, doc)
+
+    def companion_reattribute(root: pathlib.Path, doc: str = "") -> None:
+        doc = doc or companion_doc
+        def edit(r: dict) -> None:
+            kept = [x for x in r.get("companion_files", []) if x != doc]
+            if kept:
+                r["companion_files"] = kept
+            else:
+                r.pop("companion_files", None)
+        _edit_json(root, f"status/{companion_rel}.json", edit)
+
+    def completed_then(fn: Callable[..., None]) -> Callable[[pathlib.Path], None]:
+        def mutate(root: pathlib.Path) -> None:
+            complete_audit(root, rel=companion_rel)
+            if fn is companion_add:
+                fn(root)
+            else:
+                fn(root, completed_doc)
+        return mutate
+
+    def drop_snapshot(root: pathlib.Path) -> None:
+        rel = next(f"{c}/{v}" for (c, v), r in sorted(records.items())
+                   if any(e.get("assessment") for e in r["adoption"]))
+        p = root / f"{rel}.md"
+        text = p.read_text(encoding="utf-8")
+        start = text.index(" at\n> assessed") if " at\n> assessed" in text else text.index(" at assessed")
+        end = text.index("`", text.index("snapshot", start) + len("snapshot ") + 1) + 1
+        p.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    def first_hunk(update: dict) -> Callable[[dict], None]:
+        return lambda a: a["hunks"][0].update(update)
+
+    def rec_edit(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        return lambda root: _edit_json(root, f"status/{rel}.json", fn)
+
+    def e0(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(r["adoption"][0]))
+
+    def decision(root: pathlib.Path) -> None:
+        (root / "decisions").mkdir(exist_ok=True)
+        (root / "decisions" / "x.md").write_text("# Decision\n", encoding="utf-8")
+
+    def table_lines(root: pathlib.Path, name: str) -> list[str]:
+        return (root / name).read_text(encoding="utf-8").split("\n")
+
+    def table_insert(root: pathlib.Path, name: str, anchor: str, row: str) -> None:
+        lines = table_lines(root, name)
+        i = next(i for i, ln in enumerate(lines) if anchor in ln)
+        (root / name).write_text("\n".join(lines[:i] + [row] + lines[i:]), encoding="utf-8")
+
+    def table_drop(root: pathlib.Path, name: str, anchor: str) -> None:
+        (root / name).write_text("\n".join(ln for ln in table_lines(root, name) if anchor not in ln), encoding="utf-8")
+
+    def table_replace(root: pathlib.Path, name: str, anchor: str, old: str, new: str) -> None:
+        lines = [ln.replace(old, new) if anchor in ln else ln for ln in table_lines(root, name)]
+        (root / name).write_text("\n".join(lines), encoding="utf-8")
+
+    def forget(rel: str) -> None:
+        """Drop one record from this case's merge base, as if it were new in the change."""
+        assert BASE_OVERRIDE is not None
+        BASE_OVERRIDE.pop(tuple(rel.split("/")), None)  # type: ignore[arg-type]
+
+    def unfreeze(root: pathlib.Path) -> None:
+        """The reviewer's first bypass: drop the freeze and everything that forces it."""
+        def edit(r: dict) -> None:
+            r["compatibility"] = "amendable"
+            r.pop("frozen_by", None)
+            r.pop("baseline_audit", None)
+            r["adoption"] = [e for e in r["adoption"] if e["lifecycle"] != "shipped"
+                             and e["claim"]["status"] != "claimed"]
+        _edit_json(root, f"status/{shipped_frozen}.json", edit)
+        write_status_lines(root)
+        write_rows(root)
+
+    def repin(root: pathlib.Path) -> None:
+        """The reviewer's second bypass: edit frozen text and move the pin to match."""
+        digest = append_normative(root, frozen, "A consumer MUST also refuse an empty body.")
+        _edit_json(root, f"status/{frozen}.json", lambda r: r["baseline_audit"].update(pinned_sha256=digest))
+
+    def delete_version(root: pathlib.Path) -> None:
+        """The reviewer's third bypass: delete the frozen version with its record, so nothing is missing."""
+        c, v = frozen.split("/")
+        (root / f"status/{frozen}.json").unlink()
+        (root / f"{frozen}.md").unlink()
+        for name in ("README.md", "VERSIONING.md"):
+            text = (root / name).read_text(encoding="utf-8").split("\n")
+            keep = [ln for ln in text if f"]({frozen}.md)" not in ln and not ln.startswith(f"| {c} | {v} |")]
+            (root / name).write_text("\n".join(keep), encoding="utf-8")
+
+    def regress(root: pathlib.Path) -> None:
+        def edit(r: dict) -> None:
+            e = next(e for e in r["adoption"] if e["lifecycle"] == "shipped")
+            e["lifecycle"] = "implemented-unreleased"
+            e["implementation"]["release"] = None
+        _edit_json(root, f"status/{shipped_frozen}.json", edit)
+
+    def drop_shipped(root: pathlib.Path) -> None:
+        _edit_json(root, f"status/{shipped_frozen}.json", lambda r: r.update(adoption=[
+            e for e in r["adoption"] if e["lifecycle"] != "shipped"] or r["adoption"][:0]))
+
+    def new_record(root: pathlib.Path) -> str:
+        """A record absent from the merge base cannot be compared, and is not refused for it."""
+        forget(frozen)
+        return ""
+
+    def edit_vector(root: pathlib.Path) -> None:
+        rec = records[tuple(vector_frozen.split("/"))]  # type: ignore[index]
+        path = sorted(rec["baseline_audit"]["pinned_files"])[0]
+        (root / path).write_bytes((root / path).read_bytes() + b"\n")
+
+    def add_vector(root: pathlib.Path) -> None:
+        c, v = vector_frozen.split("/")
+        (root / c / f"extra-vectors-{v}.json").write_text("{}\n", encoding="utf-8")
+
+    def drop_issue(root: pathlib.Path) -> None:
+        _edit_json(root, f"status/{frozen}.json", lambda r: r["baseline_audit"].update(issue=None))
+
+    def edit_status_only(root: pathlib.Path) -> None:
+        _edit_json(root, f"status/{frozen}.json",
+                   lambda r: r["proof"].update(hil={"state": "partial", "evidence": "a bench record"}))
+        write_status_lines(root)
+
+    def vector_edit(root: pathlib.Path) -> None:
+        complete_audit(root)
+        rec = json.loads((root / f"status/{audited}.json").read_text(encoding="utf-8"))
+        path = sorted(rec["baseline_audit"]["vectors"])[0]
+        (root / path).write_bytes((root / path).read_bytes() + b"\n")
+
+    cases: list[tuple[str, str | None, Callable[[pathlib.Path], None]]] = [
+        ("an unmutated copy passes", None, lambda root: None),
+        ("a 'no shipped' line under a record with nothing shipped passes", None,
+         lambda root: _insert_status_paragraph(root, f"{unshipped}.md", "No shipped consumer claims conformance.")),
+        ("a record flipped to shipped under a 'no shipped' line", "wording-no-shipped",
+         lambda root: (_insert_status_paragraph(root, f"{unshipped}.md", "No shipped consumer claims conformance."),
+                       _edit_json(root, f"status/{unshipped}.json", shipped_entry))),
+        ("ratified without ratified_by", "ratified-without-record",
+         lambda root: _edit_json(root, f"status/{unshipped}.json", lambda r: r.update(maturity="ratified"))),
+        ("ratified_by naming a file that does not exist", "ratified-record-missing",
+         lambda root: _edit_json(root, f"status/{unshipped}.json",
+                                 lambda r: r.update(maturity="ratified", ratified_by="decisions/none.md"))),
+        ("a missing record", "record-missing", lambda root: (root / f"status/{frozen}.json").unlink()),
+        ("a record naming no contract version", "record-orphan",
+         lambda root: shutil.copy(root / f"status/{frozen}.json", root / "status" / frozen.split("/")[0] / "v99.json")),
+        ("a version with no implementation summarised as implemented", "wording-partial-as-implemented",
+         lambda root: _insert_status_paragraph(root, f"{unshipped}.md", "Implemented by the evidence authority.")),
+        ("a partial implementation carrying an unqualified full claim", "partial-with-full-claim",
+         entry_update(impl_only, {**assessed, "missing_requirements": ["the endpoint"]}, conformance="partial",
+                      claim=claim(impl_only))),
+        ("a claimed implementation left amendable", "claim-forces-freeze",
+         entry_update(impl_only, claim=claim(impl_only))),
+        ("an unimplemented entry carrying a claim", "unimplemented-claimed",
+         entry_update(impl_only, lifecycle="unimplemented", claim=claim(impl_only))),
+        ("an unimplemented entry with an assessed conformance", "unimplemented-assessed",
+         entry_update(impl_only, {**assessed, "divergences": ["x"]}, lifecycle="unimplemented",
+                      conformance="non-conforming")),
+        ("a conforming entry that records a divergence", "conforming-with-divergences",
+         entry_update(impl_only, {**assessed, "divergences": ["x"]}, conformance="conforming")),
+        ("a non-conforming entry with no divergence", "non-conforming-without-divergence",
+         entry_update(impl_only, assessed, conformance="non-conforming")),
+        ("a partial entry naming no missing requirement", "partial-without-missing",
+         entry_update(impl_only, assessed, conformance="partial")),
+        ("an assessed conformance with no recorded assessment", "conformance-without-assessment",
+         entry_update(impl_only, conformance="conforming")),
+        ("an assessment with no date", "conformance-without-assessment",
+         entry_update(impl_only, {"method": "compared"}, conformance="conforming")),
+        ("a shipped entry with no release identifier", "shipped-without-release",
+         entry_update(impl_only, lifecycle="shipped")),
+        ("a claim with no citation", "claim-without-citation",
+         entry_update(impl_only, claim={"status": "claimed", "commit": "0" * 12})),
+        ("a citation that only says 'per' the contract", "claim-citation-unqualified",
+         entry_update(impl_only, claim=claim(impl_only, f"The delivery ledger, per `{impl_only}`."))),
+        ("a citation qualified as partial", "claim-citation-unqualified",
+         entry_update(impl_only, claim=claim(impl_only, f"Implements part of {impl_only}; partial."))),
+        ("a heading-less 'defined by' list item", "claim-citation-unqualified",
+         entry_update(impl_only, claim=claim(impl_only, f"- the HTTPS channel defined by `{impl_only}`"))),
+        ("a citation carrying free-text context", "claim-without-citation",
+         entry_update(impl_only, claim=claim(impl_only, path_base="repository-root", path="README.md", line=1,
+                                             text=f"- defined by `{impl_only}`",
+                                             context="Implemented in this repository:"))),
+        ("an absolute citation path", "citation-path-invalid",
+         entry_update(impl_only, claim=claim(impl_only, path_base="repository-root", path="/src/exchange.rs", line=1,
+                                             text=f"Implements {impl_only}."))),
+        ("a citation path climbing out of its base", "citation-path-invalid",
+         entry_update(impl_only, claim=claim(impl_only, path_base="component-root", component="library-crate",
+                                             path="../src/exchange.rs", line=1, text=f"Implements {impl_only}."))),
+        ("a component-root citation with no component", "citation-component-missing",
+         entry_update(impl_only, claim=claim(impl_only, path_base="component-root", path="src/exchange.rs", line=1,
+                                             text=f"Implements {impl_only}."))),
+        ("a component that is a path", "citation-component-invalid",
+         entry_update(impl_only, claim=claim(impl_only, path_base="component-root", component="crates/lib",
+                                             path="src/exchange.rs", line=1, text=f"Implements {impl_only}."))),
+        ("a component that is a local directory name", "citation-component-invalid",
+         entry_update(impl_only, claim=claim(impl_only, path_base="component-root", component="Home_Dir.Checkout",
+                                             path="src/exchange.rs", line=1, text=f"Implements {impl_only}."))),
+        ("a heading-plus-item span is a valid citation, so the claim freezes", "claim-forces-freeze",
+         entry_update(impl_only, claim=claim(impl_only, path_base="repository-root", path="README.md", heading_line=2,
+                                             heading_text="Implemented in this repository:", item_lines=[5, 5],
+                                             item_text=f"- the channel defined by `{impl_only}`"))),
+        ("a claiming merge that names no cited claim", "frozen-by-unmatched",
+         lambda root: _edit_json(root, f"status/{claimed_freeze}.json",
+                                 lambda r: r["frozen_by"].update(commit="0" * 12))),
+        ("a shipped implementation left amendable", "shipment-forces-freeze",
+         lambda root: _edit_json(root, f"status/{unshipped}.json", shipped_entry)),
+        ("a contract naming its source of truth recorded as a claim", "bad-value",
+         entry_update(impl_only, claim={"status": "documented"})),
+        ("a conservative baseline with no stated reason", "conservative-without-reason",
+         lambda root: _edit_json(root, f"status/{conservative}.json", lambda r: r["frozen_by"].pop("reason"))),
+        ("an unprotected default branch still freezes", None,
+         lambda root: (forget(protected),
+                       _edit_json(root, f"status/{protected}.json",
+                                  lambda r: r["frozen_by"].update(branch_protection="unprotected")))[-1]),
+        ("frozen without frozen_by", "frozen-without-frozen-by",
+         lambda root: _edit_json(root, f"status/{frozen}.json", lambda r: r.pop("frozen_by"))),
+        ("proof inferred from a release", "proof-implied-by-adoption",
+         lambda root: _edit_json(root, f"status/{frozen}.json",
+                                 lambda r: r["proof"].update(production={"state": "established", "evidence": "v2.4.0"}))),
+        ("proof claimed in wording the record does not hold", "wording-proof-implied",
+         lambda root: _insert_status_paragraph(root, f"{unshipped}.md", "The exchange is proven end to end.")),
+        ("an unknown lifecycle", "bad-value", entry_update(impl_only, lifecycle="implemented")),
+        ("a normative edit to a frozen version whose audit is pending", "frozen-audit-pending",
+         lambda root: append_normative(root, frozen, "A consumer MUST also refuse an empty body.")),
+        ("a status edit to a frozen version whose audit is pending passes", None, edit_status_only),
+        ("a pending audit with no tracking issue is a gap", "gap-audit-without-issue", drop_issue),
+        ("a tracking issue in another repository", "bad-value",
+         lambda root: _edit_json(root, f"status/{frozen}.json", lambda r: r["baseline_audit"].update(
+             issue="https://github.com/example/example/issues/1"))),
+        ("a frozen record made amendable, with its forcing entries removed", "unfreeze-refused", unfreeze),
+        ("frozen text edited and its pin moved to match", "frozen-pin-changed", repin),
+        ("a frozen version deleted together with its record", "unfreeze-refused", delete_version),
+        ("a freeze event rewritten while its audit is pending", "frozen-pin-changed",
+         lambda root: _edit_json(root, f"status/{frozen}.json", lambda r: r["frozen_by"].update(date="2026-01-01"))),
+        ("a shipped entry moved back to implemented-unreleased", "adoption-regressed", regress),
+        ("a shipped entry removed", "adoption-regressed", drop_shipped),
+        ("history unavailable is refused, not skipped", "history-unavailable", lambda root: "no-history"),
+        ("a record new in the change is not compared", None, new_record),
+        ("a frozen version's vector file edited", "frozen-audit-pending", edit_vector),
+        ("pending: a frozen companion document edited", "frozen-audit-pending", companion_edit),
+        ("pending: a companion document added to a frozen version", "frozen-audit-pending", companion_add),
+        ("pending: a frozen companion document deleted", "frozen-audit-pending", companion_delete),
+        ("pending: a frozen companion document re-attributed", "frozen-audit-pending", companion_reattribute),
+        ("an unattributed companion document in a frozen directory", "companion-unattributed",
+         companion_add_unlisted),
+        ("a companion listed by two versions", "bad-value:more than one version",
+         lambda root: ((root / "skills-package" / "extra.md").write_text("# Extra\n"),
+                       *[_edit_json(root, f"status/skills-package/{v}.json",
+                                    lambda r: r.update(companion_files=["skills-package/extra.md"]))
+                         for v in ("v1", "v2")])),
+        ("companion_files naming a missing file", "bad-value:companion_files lists",
+         rec_edit(companion_rel, lambda r: r["companion_files"].append(f"{companion_dir}/missing.md"))),
+        ("complete: a frozen companion document edited", "vector-drift:differs from the recorded",
+         completed_then(companion_edit)),
+        ("complete: a companion document added", "vector-drift:attributed to this version differ",
+         completed_then(companion_add)),
+        ("complete: a frozen companion document deleted", "vector-drift:attributed to this version differ",
+         completed_then(companion_delete)),
+        ("complete: a frozen companion document re-attributed", "vector-drift:attributed to this version differ",
+         completed_then(companion_reattribute)),
+        ("a status line that drops the assessed snapshot", "status-line-mismatch", drop_snapshot),
+        ("attack A: a completed audit edited, re-pinned to a later revision, hunks cleared",
+         "audit-regressed:freeze_revision", attack_a),
+        ("attack A also clears the recorded hunks", "audit-regressed:only be appended", attack_a),
+        ("attack B: a completed audit edited, flipped back to pending, re-pinned", "audit-regressed:returned to pending",
+         attack_b),
+        ("a completed audit's contract hash rewritten", "audit-regressed:contract_sha256",
+         after_completion(lambda a: a.update(contract_sha256="0" * 64))),
+        ("a completed audit's vector hashes rewritten", "audit-regressed:vectors",
+         after_completion(lambda a: a.update(vectors={}))),
+        ("a completed audit's recorded hunk reclassified", "audit-regressed:only be appended",
+         after_completion(lambda a: a["hunks"][0].update(summary="rewritten"))),
+        ("a hunk appended to a completed audit passes", None,
+         after_completion(lambda a: a["hunks"].append({"hunk_sha256": "0" * 64, "classification": "erratum",
+                                                        "summary": "appended"}))),
+        ("a claim changed from claimed to none", "adoption-regressed:claimed to none",
+         entry_edit(lambda e: e["claim"]["status"] == "claimed" and e["lifecycle"] == "shipped",
+                    lambda e: e.update(claim={"status": "none"}))),
+        ("an assessed conformance downgraded to unassessed", "adoption-regressed:downgraded",
+         entry_edit(lambda e: e["conformance"] == "non-conforming",
+                    lambda e: (e.update(conformance="unassessed"), e.pop("assessment")))),
+        ("a recorded divergence erased", "adoption-regressed:divergences were erased",
+         entry_edit(lambda e: e["conformance"] == "non-conforming",
+                    lambda e: e["assessment"].update(divergences=["a different divergence"]))),
+        ("a shipped release rewritten", "adoption-regressed:release was rewritten",
+         entry_edit(lambda e: e["lifecycle"] == "shipped", lambda e: e["implementation"].update(release="v9.9.9"))),
+        ("a vector file added to a frozen version", "frozen-audit-pending", add_vector),
+        ("a pinned revision that is not the freezing implementation's vendored revision", "pinned-revision-mismatch",
+         lambda root: _edit_json(root, f"status/{pinned_frozen}.json",
+                                 lambda r: r["frozen_by"].update(pinned_revision="0" * 7))),
+        ("a missing README.md", "summary-missing", lambda root: (root / "README.md").unlink()),
+        ("a missing VERSIONING.md", "summary-missing", lambda root: (root / "VERSIONING.md").unlink()),
+        ("a NUL in ratified_by", "ratified-record-missing",
+         lambda root: _edit_json(root, f"status/{unshipped}.json",
+                                 lambda r: r.update(maturity="ratified", ratified_by="decisions/x\u0000.md"))),
+        ("ratified_by outside the decision records", "ratified-record-missing",
+         lambda root: _edit_json(root, f"status/{unshipped}.json",
+                                 lambda r: r.update(maturity="ratified", ratified_by="README.md"))),
+        ("a record with a duplicate key", "record-unreadable",
+         lambda root: (root / f"status/{unshipped}.json").write_text(
+             (root / f"status/{unshipped}.json").read_text().replace('{', '{"maturity": "draft", ', 1))),
+        ("a two-digit version with no record", "record-missing",
+         lambda root: shutil.copy(root / f"{unshipped}.md", root / unshipped.split("/")[0] / "v10.md")),
+        ("a nested version document", "nested-version",
+         lambda root: ((root / unshipped.split("/")[0] / "sub").mkdir(),
+                       shutil.copy(root / f"{unshipped}.md", root / unshipped.split("/")[0] / "sub" / "v1.md"))),
+        ("a file in a multi-version directory that belongs to no version", "vector-unattributed",
+         lambda root: ((root / "runtime-config" / "extra").mkdir(),
+                       (root / "runtime-config" / "extra" / "notes.json").write_text("{}\n"))),
+        ("a pending audit shown as amendable", "audit-requires-frozen",
+         lambda root: _edit_json(root, f"status/{frozen}.json", lambda r: r.update(compatibility="amendable"))),
+        ("a complete audit admitting every later hunk passes", None, complete_audit),
+        ("a complete audit with a later edit it does not classify", "baseline-drift",
+         lambda root: (complete_audit(root), append_normative(root, audited, "A consumer MUST also refuse this."))),
+        ("a complete audit missing one net hunk", "baseline-drift",
+         lambda root: complete_audit(root, lambda a: a["hunks"].pop(0))),
+        ("a semantic hunk left in the frozen version", "semantic-hunk-in-frozen",
+         lambda root: complete_audit(root, first_hunk({"classification": "semantic", "destination": "evidence/v2"}))),
+        ("a semantic hunk with no destination", "bad-value",
+         lambda root: complete_audit(root, first_hunk({"classification": "semantic"}))),
+        ("a semantic hunk moved to a version that does not exist", "semantic-destination-missing",
+         lambda root: complete_audit(root, first_hunk({"classification": "semantic", "destination": "evidence/v9"}))),
+        ("an additive hunk that is not optional", "additive-not-optional",
+         lambda root: complete_audit(root, first_hunk({"optional": False}))),
+        ("a baseline hash that is not the freeze revision's", "baseline-hash-mismatch",
+         lambda root: complete_audit(root, lambda a: a.update(contract_sha256="0" * 64))),
+        ("a frozen vector file changed after a complete audit", "vector-drift", vector_edit),
+        ("a complete audit missing a role's repository commit", "audit-roles-incomplete",
+         lambda root: complete_audit(root, lambda a: a["role_commits"].pop())),
+        ("a Status: paragraph that disagrees with its record", "status-line-mismatch",
+         lambda root: _edit_json(root, f"status/{frozen}.json",
+                                 lambda r: r["proof"].update(hil={"state": "partial", "evidence": "a bench record"}))),
+        ("a README row disagreeing with its record", "readme-row-mismatch", readme_edit),
+        ("a stray file under status/", "record-path:must be status/",
+         lambda root: (root / "status" / unshipped.split("/")[0] / "notes.txt").write_text("x\n")),
+        ("a record that is not an object", "record-unreadable:JSON object",
+         lambda root: (root / f"status/{unshipped}.json").write_text("[]\n")),
+        ("a record whose contract disagrees with its path", "record-path:must match",
+         rec_edit(unshipped, lambda r: r.update(contract="elsewhere"))),
+        ("'no implementation' wording on an implemented version", "wording-no-implementation",
+         lambda root: _insert_status_paragraph(root, f"{shipped_frozen}.md", "No implementation exists.")),
+        ("design-target wording on a shipped version", "wording-design-target",
+         lambda root: _insert_status_paragraph(root, f"{shipped_frozen}.md", "This is a design target.")),
+        ("pre-ratification wording on a ratified version", "wording-pre-ratification",
+         lambda root: (decision(root), _edit_json(root, f"status/{unshipped}.json", lambda r: r.update(
+             maturity="ratified", ratified_by="decisions/x.md")),
+             _insert_status_paragraph(root, f"{unshipped}.md", "It is pre-ratification."))[-1]),
+        ("amendable wording on a frozen version", "wording-amendable-while-frozen",
+         lambda root: _insert_status_paragraph(root, f"{frozen}.md", "It is amendable in place.")),
+        ("an implementation path base outside the vocabulary", "bad-value:path_base must be one of",
+         e0(impl_only, lambda e: e["implementation"].update(path_base="elsewhere", paths=["a.py"]))),
+        ("a repository-root implementation naming a component", "bad-value:carries no component",
+         e0(impl_only, lambda e: e["implementation"].update(path_base="repository-root", component="library-crate"))),
+        ("an unknown record field", "bad-value:unknown fields", rec_edit(unshipped, lambda r: r.update(extra=1))),
+        ("a maturity outside the vocabulary", "bad-value:maturity must be",
+         rec_edit(unshipped, lambda r: r.update(maturity="final"))),
+        ("a compatibility outside the vocabulary", "bad-value:compatibility must be",
+         rec_edit(unshipped, lambda r: r.update(compatibility="open"))),
+        ("ratified_by naming an anchor its record lacks", "ratified-record-missing:has no heading for",
+         lambda root: (decision(root), _edit_json(root, f"status/{unshipped}.json", lambda r: r.update(
+             maturity="ratified", ratified_by="decisions/x.md#nope")))[-1]),
+        ("ratified_by on a draft", "bad-value:belongs only to a ratified",
+         rec_edit(unshipped, lambda r: r.update(ratified_by="decisions/x.md"))),
+        ("adoption that is not a list", "bad-value:adoption must be a list",
+         rec_edit(unshipped, lambda r: r.update(adoption={}))),
+        ("an adoption entry that is not an object", "bad-value:must be an object",
+         rec_edit(unshipped, lambda r: r.update(adoption=[1]))),
+        ("an adoption entry missing a field", "bad-value:needs", e0(impl_only, lambda e: e.pop("lifecycle"))),
+        ("a role outside the vocabulary", "bad-value:.role must be", e0(impl_only, lambda e: e.update(role="x"))),
+        ("a repository outside the vocabulary", "bad-value:.repository must be",
+         e0(impl_only, lambda e: e.update(repository="x"))),
+        ("a conformance outside the vocabulary", "bad-value:.conformance must be",
+         e0(impl_only, lambda e: e.update(conformance="fine"))),
+        ("an unknown implementation field", "bad-value:implementation may hold only",
+         e0(impl_only, lambda e: e["implementation"].update(extra=1))),
+        ("an unknown current field", "bad-value:current may hold only",
+         e0(impl_only, lambda e: e["current"].update(extra=1))),
+        ("an unknown assessment field", "bad-value:assessment may hold only",
+         e0(impl_only, lambda e: e.update(assessment={"extra": 1}))),
+        ("divergences that are not a list of text", "bad-value:non-empty list of text",
+         entry_update(impl_only, {**assessed, "divergences": "x"}, conformance="non-conforming")),
+        ("a vendored revision that is not a commit", "bad-value:vendored_revision must be",
+         e0(impl_only, lambda e: e["implementation"].update(vendored_revision="zzz"))),
+        ("a snapshot commit that is not a commit", "bad-value:commit must be a commit",
+         e0(impl_only, lambda e: e["current"].update(commit="zz"))),
+        ("a current snapshot without its commit", "bad-value:current_implementation_commit",
+         e0(impl_only, lambda e: e.update(current={"vendored_revision": "0c34880"}))),
+        ("an implemented entry without its implementation commit", "bad-value:commit of the live",
+         e0(impl_only, lambda e: e["implementation"].pop("commit"))),
+        ("an unreleased entry naming a release", "bad-value:is not shipped but names release",
+         e0(impl_only, lambda e: e["implementation"].update(release="v1.0.0"))),
+        ("a partial entry recording divergences", "bad-value:partial and records divergences",
+         entry_update(impl_only, {**assessed, "divergences": ["x"], "missing_requirements": ["y"]},
+                      conformance="partial")),
+        ("a conforming entry recording missing requirements", "bad-value:cannot record missing requirements",
+         entry_update(impl_only, {**assessed, "missing_requirements": ["y"]}, conformance="conforming")),
+        ("an unassessed entry carrying an assessment", "bad-value:leaves conformance unassessed",
+         entry_update(impl_only, assessed)),
+        ("an unassessed entry recording divergences", "bad-value:which is an assessment",
+         entry_update(impl_only, {**assessed, "divergences": ["x"]})),
+        ("a claim of status none carrying a commit", "bad-value:status is none",
+         e0(impl_only, lambda e: e.update(claim={"status": "none", "commit": "0" * 12}))),
+        ("an unknown frozen_by field", "bad-value:frozen_by has unknown fields",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(extra=1))),
+        ("a freeze date that is not a date", "bad-value:date must be",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(date="May"))),
+        ("conservative set on a non-conservative event", "bad-value:conservative is true exactly",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(conservative=True))),
+        ("branch protection outside the vocabulary", "bad-value:branch_protection records",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(branch_protection="maybe"))),
+        ("a contract revision that is not a commit", "bad-value:contract_revision must name",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(contract_revision="zz"))),
+        ("a pinned revision that is not a commit", "bad-value:pinned_revision is the ori-specs commit",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(pinned_revision="zz"))),
+        ("a freeze event naming no repository", "frozen-by-unmatched:must name the repository",
+         rec_edit(frozen, lambda r: r["frozen_by"].update(repository="nowhere"))),
+        ("a conservative baseline in a repository with no entry", "frozen-by-unmatched:no adoption entry records",
+         rec_edit(conservative, lambda r: r["frozen_by"].update(repository="cli"))),
+        ("frozen_by on an amendable record", "bad-value:frozen_by belongs only",
+         rec_edit(unshipped, lambda r: r.update(frozen_by={}))),
+        ("proof missing a field", "bad-value:proof must hold exactly", rec_edit(unshipped, lambda r: r["proof"].pop("hil"))),
+        ("a proof state outside the vocabulary", "bad-value:with state one of",
+         rec_edit(unshipped, lambda r: r["proof"].update(hil={"state": "sure"}))),
+        ("a proof state with no evidence", "proof-without-evidence",
+         rec_edit(unshipped, lambda r: r["proof"].update(hil={"state": "partial"}))),
+        ("a citation with no path base", "claim-without-citation:declares path_base",
+         entry_update(impl_only, claim={"status": "claimed", "commit": "0" * 12, "claim_citation": {
+             "path": "README.md", "line": 1, "text": f"Implements {impl_only}."}})),
+        ("a citation with no path", "claim-without-citation:names its path",
+         entry_update(impl_only, claim={"status": "claimed", "commit": "0" * 12, "claim_citation": {
+             "path_base": "repository-root", "line": 1, "text": f"Implements {impl_only}."}})),
+        ("a citation with a malformed line", "claim-without-citation:malformed",
+         entry_update(impl_only, claim=claim(impl_only, path_base="repository-root", path="a.py", line=0,
+                                             text=f"Implements {impl_only}."))),
+        ("a citation naming another contract", "claim-citation-unqualified:does not name",
+         entry_update(impl_only, claim=claim(impl_only, "This repository implements events/v1."))),
+        ("a baseline audit that is not an object", "audit-missing:carries baseline_audit",
+         rec_edit(frozen, lambda r: r.update(baseline_audit=[]))),
+        ("an unknown baseline audit field", "bad-value:baseline_audit has unknown fields",
+         rec_edit(frozen, lambda r: r["baseline_audit"].update(extra=1))),
+        ("a freeze revision that is not the event's", "bad-value:freeze_revision is frozen_by",
+         rec_edit(frozen, lambda r: r["baseline_audit"].update(freeze_revision="0000000"))),
+        ("changes since the freeze that are not commits", "bad-value:changes_since_freeze is a list",
+         rec_edit(frozen, lambda r: r["baseline_audit"].update(changes_since_freeze="x"))),
+        ("a pending audit without its text digest", "audit-missing:pinned_sha256",
+         rec_edit(frozen, lambda r: r["baseline_audit"].pop("pinned_sha256"))),
+        ("a pending audit without its file pins", "audit-missing:pinned_files",
+         rec_edit(frozen, lambda r: r["baseline_audit"].pop("pinned_files"))),
+        ("a complete audit without the contract hash", "bad-value:contract_sha256",
+         lambda root: complete_audit(root, lambda a: a.pop("contract_sha256"))),
+        ("a complete audit with malformed vectors", "bad-value:vectors as",
+         lambda root: complete_audit(root, lambda a: a.update(vectors=[]))),
+        ("a complete audit with malformed role commits", "bad-value:role_commits as",
+         lambda root: complete_audit(root, lambda a: a.update(role_commits="x"))),
+        ("a complete audit whose hunks are not a list", "bad-value:classifies every later hunk",
+         lambda root: complete_audit(root, lambda a: a.update(hunks="x"))),
+        ("a complete audit with a malformed hunk", "bad-value:needs hunk_sha256",
+         lambda root: complete_audit(root, lambda a: a["hunks"].__setitem__(0, {"x": 1}))),
+        ("a hunk classified outside the vocabulary", "bad-value:classification must be one of",
+         lambda root: complete_audit(root, first_hunk({"classification": "cosmetic"}))),
+        ("a complete audit whose baseline is not in history", "baseline-unverifiable",
+         lambda root: (complete_audit(root, lambda a: a.update(freeze_revision="0000000")),
+                       _edit_json(root, f"status/{audited}.json", lambda r: (
+                           r["frozen_by"].update(contract_revision="0000000"),
+                           r["frozen_by"].pop("pinned_revision", None))))),
+        ("a recorded vector hash that is not the freeze revision's", "baseline-hash-mismatch:vector hash",
+         lambda root: complete_audit(root, lambda a: a["vectors"].update(
+             {sorted(a["vectors"])[0]: "0" * 64}))),
+        ("a README row that links no version document", "readme-row-mismatch:links no",
+         lambda root: table_insert(root, "README.md", f"]({unshipped}.md) |",
+                                   "| Stray | [gaps](gaps/open.md) | a | b | c |")),
+        ("a README row removed", "readme-row-missing", lambda root: table_drop(root, "README.md", f"]({unshipped}.md) |")),
+        ("a VERSIONING row with no record", "versioning-row-mismatch:has no record",
+         lambda root: table_insert(root, "VERSIONING.md", f"| {unshipped.replace('/', ' | ')} |",
+                                   "| nothing | v1 | a | b | c |")),
+        ("a VERSIONING row disagreeing with its record", "versioning-row-mismatch:does not match",
+         lambda root: table_replace(root, "VERSIONING.md", f"| {unshipped.replace('/', ' | ')} |", "`amendable`",
+                                    "`frozen`")),
+        ("a VERSIONING row removed", "versioning-row-missing",
+         lambda root: table_drop(root, "VERSIONING.md", f"| {unshipped.replace('/', ' | ')} |")),
+        ("a contract without its Status paragraph", "status-line-missing",
+         lambda root: (root / f"{unshipped}.md").write_text(
+             (root / f"{unshipped}.md").read_text().replace("> Status:", "> State:", 1))),
+        ("an issue reference in a record", "issue-reference:status/",
+         rec_edit(unshipped, lambda r: r.update(notes="See ori-runtime#1."))),
+        ("an issue reference in README.md", "issue-reference:README.md",
+         lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
+    ]
+    failed = 0
+    # Codes a case must not produce: a valid span citation is accepted, not refused.
+    forbidden = {"a heading-plus-item span is a valid citation, so the claim freezes":
+                 {"claim-without-citation", "claim-citation-unqualified"}}
+    for name, code, mutate in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / "specs"
+            shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            for rel in sorted((root / "status").rglob("*.json")):
+                data = json.loads(rel.read_text(encoding="utf-8"))
+                if isinstance(data.get("baseline_audit"), dict) and data["baseline_audit"].get("issue") is None:
+                    _edit_json(root, rel.relative_to(root).as_posix(), lambda r: r["baseline_audit"].update(
+                        issue="https://github.com/ori-platform/ori-specs/issues/1"))
+            global BASE_OVERRIDE
+            # Every case compares against the records as they stand, as if they were already on main.
+            BASE_OVERRIDE = copy.deepcopy(base)
+            if mutate(root) == "no-history":
+                BASE_OVERRIDE = None
+            got = check(root)
+            BASE_OVERRIDE = None
+            codes = {f.code for f in got}
+            if code is None:
+                good = not got
+                detail = "" if good else "; ".join(str(f) for f in got[:3])
+            else:
+                want, _, fragment = code.partition(":")
+                good = any(f.code == want and fragment in f.message + f.where for f in got) \
+                    and not codes & forbidden.get(name, set())
+                detail = "" if good else f"got {sorted(codes) or 'no finding'}"
+            print(f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") +
+                  (f" ({detail})" if detail else ""))
+            failed += not good
+    total, bad_sibling = sibling_mutations(impl_only)
+    failed += bad_sibling
+    total += len(cases)
+    print(f"{total - failed}/{total} mutations behaved as named")
+    return 1 if failed else 0
+
+
+def sibling_mutations(rel: str) -> tuple[int, int]:
+    """Drive --verify-siblings against a synthetic sibling repository built in a scratch directory."""
+    c, v = rel.split("/")
+    sentence = f"This repository implements {rel}."
+
+    def git(repo: pathlib.Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                               "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def build(tmp: pathlib.Path) -> tuple[pathlib.Path, str, str]:
+        repo = tmp / "siblings" / "ori-gateway"
+        repo.mkdir(parents=True)
+        git(repo, "init", "-q", "-b", "main")
+        (repo / "old.txt").write_text("x\n")
+        git(repo, "add", "old.txt")
+        git(repo, "commit", "-q", "-m", "initial")
+        git(repo, "tag", "v0")
+        (repo / "impl.go").write_text(f"// {sentence}\n")
+        (repo / "MANIFEST.json").write_text(json.dumps({"source_commit": "a" * 40, "files": {
+            f"{c}/vectors/x.json": "0" * 64}}))
+        git(repo, "add", "impl.go", "MANIFEST.json")
+        git(repo, "commit", "-q", "-m", "implement")
+        a = git(repo, "rev-parse", "--short=12", "HEAD")
+        git(repo, "checkout", "-q", "-b", "side")
+        (repo / "side.txt").write_text("x\n")
+        git(repo, "add", "side.txt")
+        git(repo, "commit", "-q", "-m", "side")
+        b = git(repo, "rev-parse", "--short=12", "HEAD")
+        git(repo, "checkout", "-q", "main")
+        return tmp / "siblings", a, b
+
+    def entry(a: str) -> dict:
+        return {"role": "gateway", "repository": "gateway", "lifecycle": "implemented-unreleased",
+                "conformance": "unassessed",
+                "claim": {"status": "claimed", "commit": a, "claim_citation": {
+                    "path_base": "repository-root", "path": "impl.go", "line": 1, "text": sentence}},
+                "implementation": {"commit": a, "release": None, "paths": ["impl.go"], "vendored_revision": "aaaaaaa"},
+                "current": {"commit": a, "vendored_revision": "aaaaaaa"}}
+
+    cases: list[tuple[str, str | None, Callable[[dict, str, str], None]]] = [
+        ("sibling: a snapshot that matches its repository passes", None, lambda e, a, b: None),
+        ("sibling: a repository with no checkout", "sibling-unavailable:no checkout",
+         lambda e, a, b: e.update(repository="skills-hub")),
+        ("sibling: an implementation commit that does not exist", "sibling-missing:does not exist",
+         lambda e, a, b: e["implementation"].update(commit="0" * 12)),
+        ("sibling: an implementation commit off the default branch", "sibling-missing:is not on",
+         lambda e, a, b: e["implementation"].update(commit=b)),
+        ("sibling: a component with no mapping", "sibling-unavailable:no --component",
+         lambda e, a, b: e["implementation"].update(path_base="component-root", component="library-crate")),
+        ("sibling: a path absent at its commit", "sibling-missing:does not exist at",
+         lambda e, a, b: e["implementation"].update(paths=["missing.go"])),
+        ("sibling: an implementation pin the manifest does not carry", "sibling-vendored:implementation",
+         lambda e, a, b: e["implementation"].update(vendored_revision="bbbbbbb")),
+        ("sibling: a release that does not contain the implementation", "sibling-missing:does not contain",
+         lambda e, a, b: (e.update(lifecycle="shipped"), e["implementation"].update(release="v0"))),
+        ("sibling: a current pin the manifest does not carry", "sibling-vendored:current",
+         lambda e, a, b: e["current"].update(vendored_revision="bbbbbbb")),
+        ("sibling: a citation whose text is not at its line", "sibling-citation",
+         lambda e, a, b: e["claim"]["claim_citation"].update(text=f"Nothing here implements {rel}.")),
+    ]
+    failed = 0
+    for name, code, mutate in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = pathlib.Path(tmp)
+            siblings, a, b = build(tmpdir)
+            root = tmpdir / "specs"
+            shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            for other in (root / "status").rglob("*.json"):
+                if other.relative_to(root).as_posix() != f"status/{rel}.json":
+                    other.unlink()
+            e = entry(a)
+            mutate(e, a, b)
+            _edit_json(root, f"status/{rel}.json", lambda r: r.update(adoption=[e]))
+            got = verify_siblings(root, siblings, {}, {})
+            if code is None:
+                good = not got
+            else:
+                want, _, fragment = code.partition(":")
+                good = any(f.code == want and fragment in f.message for f in got)
+            detail = "" if good else f" (got {[str(f)[:120] for f in got] or 'no finding'})"
+            print(f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") + detail)
+            failed += not good
+    return len(cases), failed
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--mutations", action="store_true", help="prove each check fires on a scratch copy")
+    ap.add_argument("--write-status-lines", action="store_true", help="rewrite each Status: paragraph from its record")
+    ap.add_argument("--print-rows", action="store_true", help="print the VERSIONING and README rows the records render")
+    ap.add_argument("--digest", metavar="CONTRACT/VERSION", help="print the normative digest a pending audit pins")
+    ap.add_argument("--write-rows", action="store_true", help="rewrite the README and VERSIONING rows from the records")
+    ap.add_argument("--verify-siblings", metavar="DIR",
+                    help="check every snapshot against sibling checkouts under DIR; CI cannot run this")
+    ap.add_argument("--sibling", action="append", default=[], metavar="ROLE=PATH",
+                    help="a checkout for a repository role that has no default directory name")
+    ap.add_argument("--component", action="append", default=[], metavar="ROLE:COMPONENT=SUBDIR",
+                    help="where a component-root component lives inside its repository")
+    ap.add_argument("--draft-audit", metavar="CONTRACT/VERSION",
+                    help="print a complete-audit skeleton, hashes and net hunks, for a reviewer to classify")
+    args = ap.parse_args()
+    if args.mutations:
+        return mutations()
+    if args.write_status_lines or args.write_rows:
+        if args.write_status_lines:
+            write_status_lines(ROOT)
+        if args.write_rows:
+            write_rows(ROOT)
+        return 0
+    if args.draft_audit:
+        key = tuple(args.draft_audit.split("/"))
+        rec = load_records(ROOT, [])[key]  # type: ignore[index]
+        print(json.dumps(draft_audit(ROOT, key, rec), indent=2))  # type: ignore[arg-type]
+        return 0
+    if args.print_rows:
+        print_rows(ROOT)
+        return 0
+    if args.digest:
+        c, v = args.digest.split("/")
+        print(json.dumps({"pinned_sha256": normative_digest((ROOT / f"{args.digest}.md").read_text(encoding="utf-8")),
+                          "pinned_files": version_files(ROOT, c, v, versions_in(ROOT, c))}, indent=2))
+        return 0
+    if args.verify_siblings:
+        extra = dict(x.split("=", 1) for x in args.sibling)
+        comps = {}
+        for x in args.component:
+            lhs, sub = x.split("=", 1)
+            role, comp = lhs.split(":", 1)
+            comps[(role, comp)] = sub
+        found = verify_siblings(ROOT, pathlib.Path(args.verify_siblings), extra, comps)
+        for f in found:
+            print(f, file=sys.stderr)
+        print(f"sibling verification: {len(found)} finding(s)")
+        return 1 if found else 0
+    findings = check(ROOT)
+    gaps = [f for f in findings if f.code.startswith("gap-")]
+    errors = [f for f in findings if not f.code.startswith("gap-")]
+    for f in errors:
+        print(f, file=sys.stderr)
+    if gaps:
+        print(f"\nGaps ({len(gaps)}), which fail the check until closed:", file=sys.stderr)
+        for f in gaps:
+            print(f"  {f}", file=sys.stderr)
+    if findings:
+        print(f"\n{len(errors)} finding(s), {len(gaps)} gap(s). {LIMITS}", file=sys.stderr)
+        return 1
+    print(f"contract status: {len(contract_versions(ROOT))} contract versions agree with their records. Privacy is "
+          "checked structurally, over listed forms only; private names are not detected, and the path and "
+          "issue-reference checks are not complete.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

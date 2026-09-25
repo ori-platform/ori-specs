@@ -1,12 +1,12 @@
 # Hazard Session Procedure
 
-> Status: Design target, pre-ratification. Companion to
+> Status: Companion to
 > [procedure.md](procedure.md), which covers the mechanism sessions a bench can
 > run; this document covers the sessions that deliberately produce an
 > over-condition. No hazard session has been run, and none may be until this
 > document has been reviewed and accepted by a competent person for the
-> specific installation it will be run on. Amendable in place under the
-> [pre-ratification exception](../VERSIONING.md#pre-ratification-exception).
+> specific installation it will be run on. It has no status record of its own; see
+> [companion documents](../VERSIONING.md#companion-documents).
 
 A mechanism session establishes that a reading reaches a commanded outcome. It
 cannot establish that the trip point protects anything, because nothing was at
