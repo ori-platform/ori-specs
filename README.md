@@ -14,7 +14,9 @@ below are checked against those records.
 | --- | --- | --- | --- | --- |
 | Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | `draft` | none recorded | `amendable` |
 | Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | `draft` | none recorded | `amendable` |
-| CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | `draft` | runtime `shipped` in v0.9.0-beta.1, `partial` at assessed implementation snapshot `eee40d3` (7 missing requirements); current `d2aba48` unassessed, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `pending` |
+| CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | `draft` | runtime `shipped` in v0.9.0-beta.1, `partial` at assessed implementation snapshot `eee40d3` (7 missing requirements); current `d2aba48` unassessed, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `complete` |
+| CLI commands | [cli-commands/v2.md](cli-commands/v2.md) | `draft` | none recorded | `amendable` |
+| Operator Socket | [operator-socket/v1.md](operator-socket/v1.md) | `draft` | none recorded | `amendable` |
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | `draft` | producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed`, consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `pending` |
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | `draft` | none recorded | `amendable` |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |

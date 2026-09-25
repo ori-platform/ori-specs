@@ -343,7 +343,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | --- | --- | --- | --- | --- |
 | capability-grant | v1 | `draft` | `amendable` | — |
 | capability-grant-issuance | v1 | `draft` | `amendable` | — |
-| cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
+| cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
+| cli-commands | v2 | `draft` | `amendable` | — |
 | commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
 | device-configuration | v1 | `draft` | `amendable` | — |
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
@@ -365,6 +366,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit pending |
 | gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
+| operator-socket | v1 | `draft` | `amendable` | — |
 | runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-config | v2 | `draft` | `amendable` | — |
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
