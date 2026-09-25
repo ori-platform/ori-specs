@@ -353,7 +353,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
-| evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit pending |
+| evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
+| evidence-exchange | v2 | `draft` | `amendable` | — |
 | evidence-transport | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
 | evidence-transport | v2 | `draft` | `amendable` | — |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
