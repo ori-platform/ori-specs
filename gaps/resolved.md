@@ -73,8 +73,7 @@ Tier D never reaches the enricher by construction. See `ori-runtime/DECISIONS.md
 Resolved (2026-06-09): `gateway-config/v1.md` documents all `gateway.yaml` keys,
 types, defaults, and validation rules for all five top-level sections: `gateway`,
 `provider`, `reporting`, `sim`, `fleet`. Separation between `provider` (Tier 3
-reasoning) and `reporting.provider` (advisory/product) is made explicit. Tracked
-by `ori-platform/ori-specs#5`.
+reasoning) and `reporting.provider` (advisory/product) is made explicit.
 
 ## G-15 — Tier C enrichment MQTT transport wiring
 
@@ -133,7 +132,9 @@ the runtime emits it for new Tier C/D attestations when its loaded artifact
 supports it, falling back to `MAINTENANCE_PERFORMED` on older or unparseable
 artifact versions. Verifiers must accept both forms; the per-device emission
 vocabulary is visible as `action_event_type` in runtime health and the
-heartbeat evidence block. See `evidence/v1.md`.
+heartbeat evidence block. See `evidence/v1.md`. Superseded: the runtime now
+emits `SAFETY_ACTION_EXECUTED` natively; the fallback applies only to rows from
+the retired producer.
 
 ## G-24 — Public evidence protocol version projection
 
@@ -141,7 +142,7 @@ Resolved (2026-07-23): runtime health reports the public evidence contract
 version `evidence.v1` while evidence signing is available and `''` otherwise.
 The loaded artifact's declared protocol identifier remains internal to startup
 validation and is not exposed through the public health contract. Implemented
-by `ori-runtime` #253.
+in `ori-runtime`. Superseded by evidence/v2: health reports `ori.evidence.v2`.
 
 ## G-25 — `evidence.artifact_version` reported to operators
 
@@ -154,4 +155,33 @@ runtime-health`, which no typed removal reaches. Released runtimes at `2.4.x`
 and earlier still send the field and are accepted rather than rejected.
 `ori-gateway` never consumed it.
 
-Tracked in `ori-runtime` #327 and `ori-cli` #35.
+Tracked in `ori-runtime` and `ori-cli`.
+
+## G-26 — `storage_degraded` producer adoption
+
+Implemented: firmware emits `storage_degraded` from a latch held outside the
+failed store (`ori-edge-firmware`), and the runtime verifies it against a
+shared vector. Hardware-in-the-loop proof pending. See
+`firmware-telemetry/v1.md`.
+
+## G-27 — The unsafe NC rule in governing documents
+
+Resolved: the operator-facing wiring instructions in `ori-runtime`
+(`CLAUDE.md`, `docs/RASPBERRY_PI_SUPPORT.md`) now say never to select NC or NO
+by convention, matching the "contact type is not an input" rule in
+`commissioned-safety-binding/v1.md`.
+
+## G-28 — Example cutoff beyond the sensor's full scale
+
+Withdrawn: the premise was a `5.0×` capacity multiplier. The electrical
+overcurrent profile in `safety-profile/v1.md` uses `2.0×`.
+
+## G-29 — Non-Python enforcement of the binding grammar
+
+Resolved: the Go verifier in `ori-cli` enforces the closed grammar of
+`commissioned-safety-binding/v1.md` against the corpus.
+
+## G-30 — Cross-language independence of the binding corpus
+
+Resolved: `ori-cli` reproduces the `commissioned-safety-binding/v1.md` corpus
+in Go as producer and verifier, sharing no code with the Python generator.
