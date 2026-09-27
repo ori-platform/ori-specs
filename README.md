@@ -16,7 +16,7 @@ below are checked against those records.
 | Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | `draft` | none recorded | `amendable` |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | `draft` | runtime `shipped` in v0.9.0-beta.1, `partial` at assessed implementation snapshot `eee40d3` (7 missing requirements); current `d2aba48` unassessed, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `complete` |
 | CLI commands | [cli-commands/v2.md](cli-commands/v2.md) | `draft` | none recorded | `amendable` |
-| Operator Socket | [operator-socket/v1.md](operator-socket/v1.md) | `draft` | none recorded | `amendable` |
+| Operator Socket | [operator-socket/v1.md](operator-socket/v1.md) | `draft` | runtime `implemented-unreleased`, `partial` at assessed implementation snapshot `0f867e1` (2 missing requirements), cli (runtime) `implemented-unreleased`, `partial` at assessed implementation snapshot `0f867e1` (1 missing requirement) | `amendable` |
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | `draft` | producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed`, consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `complete` |
 | Commissioned safety binding | [commissioned-safety-binding/v2.md](commissioned-safety-binding/v2.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.11, `unassessed`, producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed` | `frozen` (2026-09-23), audit `pending` |
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | `draft` | none recorded | `amendable` |
@@ -43,7 +43,7 @@ below are checked against those records.
 | Gateway Evidence Carriage | [gateway-evidence-carriage/v1.md](gateway-evidence-carriage/v1.md) | `draft` | none recorded | `amendable` |
 | Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `pending` |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
-| Offline Tier C tokens | [offline-tokens/v2.md](offline-tokens/v2.md) | `draft` | none recorded | `amendable` |
+| Offline Tier C tokens | [offline-tokens/v2.md](offline-tokens/v2.md) | `draft` | verifier (runtime) `implemented-unreleased`, claimed, `unassessed` | `frozen` (2026-09-26), audit `complete` |
 | Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
 | Runtime config surface (closed) | [runtime-config/v2.md](runtime-config/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime configuration orchestration | [runtime-config-orchestration/v1.md](runtime-config-orchestration/v1.md) | `draft` | none recorded | `amendable` |
@@ -52,7 +52,7 @@ below are checked against those records.
 | Runtime evidence anchor | [runtime-evidence-anchor/v2.md](runtime-evidence-anchor/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime health socket RPC (previous) | [runtime-health/v1.md](runtime-health/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `pending` |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, `non-conforming` at assessed current snapshot `d2aba48` (2 divergences), cli `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `complete` |
-| Runtime health socket RPC | [runtime-health/v3.md](runtime-health/v3.md) | `draft` | none recorded | `amendable` |
+| Runtime health socket RPC | [runtime-health/v3.md](runtime-health/v3.md) | `draft` | producer (runtime) `implemented-unreleased`, `unassessed` | `amendable` |
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | `draft` | producer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `pending` |
 | Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.10, claimed, `unassessed`, verifier (runtime) `shipped` in v2.5.0-rc.10, claimed, `unassessed` | `frozen` (2026-09-16), audit `pending` |
 | Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | `draft` | producer (runtime) `shipped` in v2.3.0, `unassessed`, consumer (runtime) `shipped` in v2.3.0, `unassessed` | `frozen` (2026-08-13), audit `pending` |
@@ -69,7 +69,7 @@ below are checked against those records.
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | `draft` | consumer (runtime) `shipped` in v2.4.0-rc.3, `unassessed` | `frozen` (2026-08-17), audit `pending` |
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | verifier (evidence-authority) `implemented-unreleased`, `unassessed` | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
-| Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | none recorded | `amendable` |
+| Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `implemented-unreleased`, `unassessed` | `amendable` |
 
 Companion documents carry no record of their own; see
 [VERSIONING.md](VERSIONING.md#companion-documents):
