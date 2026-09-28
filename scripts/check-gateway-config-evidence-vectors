@@ -73,17 +73,39 @@ MODEL_SENTENCES = {
     "stopped_device": "Positive, and at most `stopped_max_items`.",
     "stopped_device_bytes": "Positive, and at most `stopped_max_bytes`.",
     "stopped_start": "A bound is therefore never a reason to refuse to start.",
+    "ca_file": (
+        "A non-empty `authority_ca_file` is an absolute, clean path: it begins with a single `/`, and has no `.` or "
+        "`..` component, no repeated or trailing `/`, and no leading or trailing whitespace."
+    ),
 }
-RULES = ("directories", "bounds", "probe", "backoff", "share", "env", "device_id", "carriage", "stopped")
+RULES = ("directories", "ca_file", "bounds", "probe", "backoff", "share", "env", "device_id", "carriage", "stopped")
 CARRIAGE = ("gateway-api/v1", "gateway-evidence-carriage/v1")
 MODEL_MUTANTS = {"carriage_default_v1": False, "carriage_unknown_device_ok": False, "stopped_device_unbounded": False,
-                 "opt_in_ignored": False, "domain_on_legacy": False}
+                 "opt_in_ignored": False, "domain_on_legacy": False, "ca_file_unclean_ok": False}
 LEGACY_DEVICE_FORBIDDEN = "/+#|"
 OPT_IN = "gateway-evidence-carriage/v1"
 OPT_IN_RULES = ("probe", "backoff", "share", "stopped")
 ENV_KEYS = ("endpoint_env", "client_id_env", "secret_env")
 DEVICE = re.compile(r"[^\s/+#\x00-\x1f\x7f-\x9f]{1,128}")
 ENV_NAME = re.compile(r"[^\s=]+")
+
+
+def clean_absolute(path: str) -> bool:
+    """Whether path is absolute and already in its cleaned form, as the gateway's loader cleans it."""
+    if not path.startswith("/") or path.strip() != path:
+        return False
+    if MODEL_MUTANTS["ca_file_unclean_ok"]:
+        return True
+    parts: list[str] = []
+    for component in path.split("/"):
+        if component in ("", "."):
+            continue
+        if component == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(component)
+    return path == "/" + "/".join(parts)
 
 
 class CheckError(Exception):
@@ -120,7 +142,7 @@ def load_contract(text: str) -> dict:
             defaults[cells[0].strip("`")] = cells[2]
     wanted = {"max_items", "max_bytes", "retry_interval_s", "store_probe_interval_s",
               "backoff_base_s", "backoff_max_s", "device_carriage", "stopped_max_items", "stopped_max_bytes",
-              "stopped_device_max_items", "stopped_device_max_bytes"}
+              "stopped_device_max_items", "stopped_device_max_bytes", "authority_ca_file"}
     if not wanted <= set(defaults):
         raise CheckError(f"the evidence table lacks {sorted(wanted - set(defaults))}")
     try:
@@ -135,6 +157,8 @@ def load_contract(text: str) -> dict:
     if bound is None:
         raise CheckError("the backoff_max_s default is not the model's")
     numbers["backoff_max_floor"] = int(bound.group(1))
+    if defaults["authority_ca_file"] != '`""`':
+        raise CheckError("the authority_ca_file default is not the model's")
     if defaults["device_carriage"] != "`{}`":
         raise CheckError("the device_carriage default is not the model's")
     for key, total in (("stopped_device_max_items", "stopped_max_items"), ("stopped_device_max_bytes", "stopped_max_bytes")):
@@ -167,6 +191,7 @@ def effective(defaults: dict, evidence: dict, devices: list | None = None) -> di
         "backoff_base_s": base,
         "backoff_max_s": evidence.get("backoff_max_s", max(defaults["backoff_max_floor"], base)),
         "store_probe_interval_s": evidence.get("store_probe_interval_s", defaults["store_probe_interval_s"]),
+        "authority_ca_file": evidence.get("authority_ca_file", ""),
     }
 
 
@@ -180,6 +205,9 @@ def validate(defaults: dict, devices: list, evidence: dict) -> dict | None:
     out, back = evidence.get("queue_directory", ""), evidence.get("return_queue_directory", "")
     if not (out.startswith("/") and back.startswith("/")) or out.rstrip("/") == back.rstrip("/"):
         raise Refused("directories")
+    ca_file = evidence.get("authority_ca_file", "")
+    if ca_file != "" and (type(ca_file) is not str or not clean_absolute(ca_file)):
+        raise Refused("ca_file")
     values = effective(defaults, evidence, devices)
     for key in ("max_items", "max_bytes", "retry_interval_s"):
         if type(values[key]) is not int or values[key] <= 0:
@@ -327,6 +355,7 @@ def main() -> int:
                          ("| `map` | `{}` |", "| `map` | `{\"*\": \"gateway-evidence-carriage/v1\"}` |"),
                          ("`stopped_max_items` divided equally across", "`max_items` divided equally across"),
                          ("| `5`     |", "| `10`    |"), ("| `900`   |", "| `600`   |"),
+                         ("| `\"\"`    |", "| `\"/etc/ssl/cert.pem\"` |"),
                          ("`300`, or `backoff_base_s` if longer", "`600`, or `backoff_base_s` if longer")):
             total += 1
             start = text.find(START)
