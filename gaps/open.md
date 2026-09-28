@@ -105,8 +105,9 @@ accurate description of what a repo implements.
 
 - **Anchor registry** ([evidence-exchange/v2.md](../evidence-exchange/v2.md)):
   the authority retains registrations and resolves them against held
-  authorisations on main; the runtime produces no registration on main (it
-  reports `pending_authorisation`), and no registration has crossed end to
+  authorisations on main; the runtime seals and re-offers a registration once
+  a commissioning reference is recorded for its current epoch, and reports
+  `pending_authorisation` until one is; no registration has crossed end to
   end.
 - **Commissioning reference ingress and authorisation path**
   ([evidence-exchange/v2.md](../evidence-exchange/v2.md)): the contract now
@@ -115,11 +116,16 @@ accurate description of what a repo implements.
   delivered by the local bridge command in
   [operator-socket/v1.md](../operator-socket/v1.md). The evidence authority resolves
   a registration against held authorisations and refuses a courier-submitted
-  authorisation at the transport. The device side is open:
-  `ori-runtime` still models a `CommissioningAuthorisationSource` that would
-  hand the registrar the full object, and reports `pending_authorisation`
-  unconditionally; `ori-cli` has no `evidence commission` command
- ; the gateway courier refuses `commissioning_authorization` at
+  authorisation at the transport. The device side is half built. The
+  `ori-runtime` bridge implements `evidence commission` by the mechanism that
+  predates the operator socket: it reads the current epoch from the health
+  socket and records the reference in the runtime's state store itself, and
+  the runtime reads the recorded reference and seals its registration from
+  it. The socket-served command that operator-socket/v1 specifies, in which
+  the bridge submits the reference to the running runtime and writes no
+  store, is open: the runtime's operator socket refuses the
+  `evidence_commission` operation, and `ori-cli` has no `evidence commission`
+  command. The gateway courier refuses `commissioning_authorization` at
   ingress. The authority-side ingest of a signed authorisation is now
   [evidence-commissioning-ingest/v1.md](../evidence-commissioning-ingest/v1.md);
   the authority holds a library function that verifies a signed

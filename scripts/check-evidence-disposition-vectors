@@ -248,7 +248,8 @@ HEALTH_SENTENCES = {
         "An acknowledgement for a handoff initiated after durable stop application is refused as inconsistent "
         "state and does not reduce local counts."
     ),
-    # replay(): a retired identity's stopped-local artifacts are kept and queryable, and counted only under it.
+    # replay(): a retired identity's stopped-local artifacts never count toward the replacement identity's fields.
+    # No health version defines a surface that reports them, so the corpus asserts no value for them.
     "retired_kept": (
         "Identity replacement retains the retired identity's stop and evidence records under that retired "
         "identity. They remain queryable in its retirement/archive record but do not contribute to the "
@@ -655,16 +656,6 @@ def replay(contract: dict, document: dict, wire: dict, sequence: dict) -> None:
             "oldest_stopped_local_since_ms": None if not local else (None if None in since else min(since)),
         }
 
-    def retired_local() -> dict:
-        """Each retired identity's stopped-local artifacts, queryable under that identity only."""
-        out: dict = {}
-        for d, e in sealed.items():
-            if e["device"] != state["device"] and d not in custodied and in_stopped_scope(e["epoch"], e["device"]):
-                entry = out.setdefault(e["device"], {"count": 0, "bytes": 0})
-                entry["count"] += 1
-                entry["bytes"] = None if entry["bytes"] is None or e["bytes"] is None else entry["bytes"] + e["bytes"]
-        return out
-
     def handed_before_stop(entry: dict) -> bool:
         """Whether the runtime can prove this artifact's handoff began before every stop now covering it."""
         if not entry["handed"]:
@@ -796,13 +787,7 @@ def replay(contract: dict, document: dict, wire: dict, sequence: dict) -> None:
             if MODEL_MUTANTS["configuration_clears_stops"]:
                 stops.clear()
         elif event == "identity_replacement":
-            # A new identity starts afresh; the retired identity's stop records and sealed artifacts are kept.
-            if MODEL_MUTANTS["replacement_drops_retired"]:
-                retired = state["device"]
-                for key in [k for k in stops if k[0] == retired]:
-                    del stops[key]
-                for d in [d for d, e in sealed.items() if e["device"] == retired]:
-                    del sealed[d]
+            # A new identity starts afresh; nothing the replacement reports reads the retired identity's records.
             state["device"] = step["device"]
             epochs.clear()
             state["current"], state["last"] = step["epoch"], None
@@ -820,9 +805,6 @@ def replay(contract: dict, document: dict, wire: dict, sequence: dict) -> None:
             observed["envelopes"] = not in_stopped_scope(current)
             observed["records_locally"] = True
             observed.update(local_counts())
-            observed["retired_identity_stopped"] = sorted(
-                {k[0] for k in stops if k[1] == "identity" and k[0] != state["device"]})
-            observed["retired_stopped_local"] = retired_local()
         if "reoffers_epoch" in step["expect"]:
             observed["reoffers_epoch"] = {e: reoffers(e) for e in step["expect"]["reoffers_epoch"]}
         for key, value in step["expect"].items():
@@ -839,7 +821,6 @@ MODEL_MUTANTS = {
     "new_epoch_clears_stops": False,
     "reference_lifts_epoch_stop": False,
     "later_disposition_lifts": False,
-    "replacement_drops_retired": False,
     "count_current_epoch_only": False,
     "count_retired_identity": False,
     "ack_of_unhanded_off_moves": False,
@@ -914,6 +895,11 @@ REQUIRED_SEQUENCES = (
 
 
 def check(contract: dict, document: dict) -> None:
+    # The health fields the sequences expect are those of the runtime-health version this model reads.
+    cited = set(re.findall(r"runtime-health/v\d+", document["note"]))
+    if cited != {f"runtime-health/{HEALTH.stem}"}:
+        raise CheckError(
+            f"the corpus note cites {sorted(cited)} for its health fields; they are runtime-health/{HEALTH.stem}")
     wire = check_wire(contract, document)
     check_mapping(contract, document)
     check_schedule(contract, document)
@@ -927,6 +913,9 @@ def check(contract: dict, document: dict) -> None:
 
 
 def corpus_mutants(document: dict):
+    bad = copy.deepcopy(document)
+    bad["note"] = bad["note"].replace(f"runtime-health/{HEALTH.stem}", "runtime-health/v2", 1)
+    yield "note cites another health version", bad
     for i, case in enumerate(document["wire_cases"]):
         bad = copy.deepcopy(document)
         bad["wire_cases"][i]["expected"] = "accept" if case["expected"] == "reject" else "reject"
@@ -987,8 +976,6 @@ def corpus_mutants(document: dict):
                     target[key] = not value
                 elif isinstance(value, int):
                     target[key] = value + 1
-                elif isinstance(value, list):
-                    target[key] = value[:-1] if value else ["energy-monitor-ikeja-01"]
                 elif isinstance(value, dict) and key == "reoffers_epoch":
                     target[key] = {e: not v for e, v in value.items()}
                 elif value is None:
