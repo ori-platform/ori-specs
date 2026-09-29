@@ -113,6 +113,9 @@ proposed v2 vocabulary did not enter v1. It does not prove wire compatibility
 or consumer behavior; before events/v2 ratification or implementation, a data
 vector and independent v1/v2 consumer checks are mandatory.
 
+Each corpus's `contract` member must name exactly the contract versions it
+exercises, several where it is replayed through more than one contract.
+
     python3 scripts/check-tier-c-approval-vectors
     python3 scripts/check-tier-c-approval-vectors --mutations
 
@@ -2061,7 +2064,44 @@ def snapshot_verdict(contract: dict, case: dict) -> tuple[str, str | None]:
     return "valid", "sha256:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+# Every contract version each corpus exercises, and no other: its `contract` member names exactly these. A corpus
+# replayed through another contract's admission exercises both, and names both.
+DECLARED_CONTRACTS = {
+    "admission": frozenset({"tier-c-approval/v1", "runtime-config/v2"}),
+    "tokens": frozenset({"offline-tokens/v2", "tier-c-approval/v1"}),
+    "reconcile": frozenset({"operator-socket/v1", "tier-c-approval/v1"}),
+    "signing": frozenset({"offline-tokens/v2"}),
+}
+CONTRACT_VERSION = re.compile(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*/v[1-9][0-9]*\b")
+
+
+def check_declarations(documents: dict) -> None:
+    for which, expected in DECLARED_CONTRACTS.items():
+        named = set(CONTRACT_VERSION.findall(str(documents[which].get("contract", ""))))
+        if named != expected:
+            raise CheckError(f"{which}: the corpus's contract member names {sorted(named)}; it exercises "
+                             f"{sorted(expected)}")
+
+
+def declaration_mutants(documents: dict):
+    """Each exercised version swapped for a sibling, a contract it does not exercise added, and none declared."""
+    for which, expected in DECLARED_CONTRACTS.items():
+        for token in sorted(expected):
+            name, version = token.rsplit("/v", 1)
+            other = f"{name}/v{int(version) - 1 or int(version) + 1}"
+            bad = copy.deepcopy(documents)
+            bad[which]["contract"] = bad[which]["contract"].replace(token, other)
+            yield f"{which}: declares {other} for {token}", bad
+        bad = copy.deepcopy(documents)
+        bad[which]["contract"] += ", with gateway-api/v1"
+        yield f"{which}: declares a contract it does not exercise", bad
+        bad = copy.deepcopy(documents)
+        del bad[which]["contract"]
+        yield f"{which}: declares no contract", bad
+
+
 def check(contract: dict, documents: dict) -> None:
+    check_declarations(documents)
     check_signing(contract, documents["signing"])
     reached: set[str] = set()
     coverage: set = set()
@@ -2638,7 +2678,8 @@ def main() -> int:
         return 1
     if "--mutations" in sys.argv[1:]:
         survived, total = [], 0
-        for label, bad in (*corpus_mutants(documents), *signing_mutants(documents, contract["domain"])):
+        for label, bad in (*declaration_mutants(documents), *corpus_mutants(documents),
+                           *signing_mutants(documents, contract["domain"])):
             total += 1
             try:
                 check(contract, bad)

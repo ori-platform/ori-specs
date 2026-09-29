@@ -20,7 +20,10 @@ records"). This checker holds everything else to it:
   pending audit with no tracking issue is reported as a gap;
 - a frozen version whose baseline audit is complete differs from its freeze
   revision only by hunks the audit classifies as erratum or additive, and its
-  contract and vector hashes match the freeze revision (needs full history).
+  contract and vector hashes match the freeze revision (needs full history);
+- a corpus whose `contract` member names contract versions names its own
+  contract at the version it is attributed to, and every version it names
+  exists.
 
 Run from anywhere:
 
@@ -142,6 +145,22 @@ LIMITS = (
 )
 # An issue reference: a tracker URL, or a repository or bare issue number.
 ISSUE_REFERENCE = re.compile(r"issues/[0-9]+|[A-Za-z0-9_.-]#[0-9]+\b|(?:^|[\s(\[])#[0-9]+\b")
+
+
+# A contract version named in a corpus's `contract` member.
+CONTRACT_TOKEN = re.compile(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+)*)/(v[1-9][0-9]*)\b")
+# Corpora whose declaration names another version of their own contract, each held to the exact value recorded here
+# so that no other declaration passes under it. commissioned-safety-binding/v2 is frozen with its baseline audit
+# pending, which pins these bytes and owns what the corpus declares.
+DECLARATION_EXEMPT = {
+    "commissioned-safety-binding/binding-vectors-v2.json": "ori-specs/commissioned-safety-binding/v1.md",
+}
+DECLARATION_LIMIT = (
+    "Limit: this reads only a corpus's `contract` member. It requires the corpus's own contract at the version the "
+    "corpus is attributed to, and that every other contract version it names exists; it cannot tell whether a "
+    "cross-contract version that exists is the one exercised. The checker that reads the corpus holds it to its "
+    "exact declared set."
+)
 
 
 # Records to compare against in place of the merge base; the mutation harness sets it, nothing else does.
@@ -1249,6 +1268,42 @@ def check_tables(root: pathlib.Path, records: dict, all_records: dict, findings:
 
 # --- driver -------------------------------------------------------------------------------------
 
+def check_corpus_declarations(root: pathlib.Path, findings: list[Finding]) -> None:
+    """Refuse a corpus that declares a version of its own contract other than the one it is attributed to."""
+    companions = companion_map(root)
+    for d in contract_dirs(root):
+        vs = versions_in(root, d.name)
+        for f in sorted(d.rglob("*.json")):
+            rel = f.relative_to(root).as_posix()
+            version = version_of_file(d.name, rel, vs, companions) if vs else None
+            if version in (None, "unattributed"):
+                continue
+            try:
+                document = json.loads(f.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, OSError):
+                continue
+            declared = document.get("contract") if isinstance(document, dict) else None
+            if not isinstance(declared, str):
+                continue
+            if rel in DECLARATION_EXEMPT:
+                if declared != DECLARATION_EXEMPT[rel]:
+                    findings.append(Finding("corpus-declaration", rel,
+                                            f"the exemption holds this corpus to {DECLARATION_EXEMPT[rel]!r}, and "
+                                            f"it now declares {declared!r}. {DECLARATION_LIMIT}"))
+                continue
+            named = CONTRACT_TOKEN.findall(declared)
+            own = sorted({v for c, v in named if c == d.name})
+            if own != [version]:
+                findings.append(Finding("corpus-declaration", rel,
+                                        f"attributed to {d.name}/{version}, but its contract member names "
+                                        f"{d.name} at {own or 'no version'}. {DECLARATION_LIMIT}"))
+            for c, v in named:
+                if not (root / c / f"{v}.md").is_file():
+                    findings.append(Finding("corpus-declaration", rel,
+                                            f"its contract member names {c}/{v}, which does not exist. "
+                                            f"{DECLARATION_LIMIT}"))
+
+
 def check(root: pathlib.Path) -> list[Finding]:
     findings: list[Finding] = []
     records = load_records(root, findings)
@@ -1297,6 +1352,7 @@ def check(root: pathlib.Path) -> list[Finding]:
             wording(rec, paragraph_text(lines[sb[0]:sb[1] + 1]), f"{where} status block", findings)
         if rec["compatibility"] == "frozen":
             check_audit(root, key, rec, findings)
+    check_corpus_declarations(root, findings)
     check_issue_references(root, records, findings)
     missing = [n for n in ("README.md", "VERSIONING.md") if not (root / n).is_file()]
     for name in missing:
@@ -1823,6 +1879,13 @@ def mutations() -> int:
         path = sorted(rec["baseline_audit"]["vectors"])[0]
         (root / path).write_bytes((root / path).read_bytes() + b"\n")
 
+    def redeclare(root: pathlib.Path, rel: str, old: str, new: str) -> None:
+        path = root / rel
+        text = path.read_text(encoding="utf-8")
+        if text.count(old) != 1:
+            raise SystemExit(f"mutation target {rel} does not name {old} exactly once")
+        path.write_text(text.replace(old, new), encoding="utf-8")
+
     cases: list[tuple[str, str | None, Callable[[pathlib.Path], None]]] = [
         ("an unmutated copy passes", None, lambda root: None),
         ("a 'no shipped' line under a record with nothing shipped passes", None,
@@ -2194,6 +2257,18 @@ def mutations() -> int:
              (root / f"{unshipped}.md").read_text().replace("> Status:", "> State:", 1))),
         ("an issue reference in a record", "issue-reference:status/",
          rec_edit(unshipped, lambda r: r.update(notes="See ori-runtime#1."))),
+        ("a corpus declaring an earlier version of its own contract", "corpus-declaration:refusal-policy-v2.json",
+         lambda root: redeclare(root, "evidence-transport/vectors/refusal-policy-v2.json",
+                                "evidence-transport/v2", "evidence-transport/v1")),
+        ("a corpus naming another contract in place of its own", "corpus-declaration:tier-c-reconcile.json",
+         lambda root: redeclare(root, "operator-socket/vectors/tier-c-reconcile.json",
+                                "operator-socket/v1", "cli-commands/v1")),
+        ("a corpus naming a contract version that does not exist", "corpus-declaration:does not exist",
+         lambda root: redeclare(root, "evidence-transport/vectors/handoff-order-v2.json",
+                                "evidence-exchange/v2", "evidence-exchange/v9")),
+        ("an exempt corpus declaring anything but its recorded value", "corpus-declaration:the exemption holds",
+         lambda root: redeclare(root, "commissioned-safety-binding/binding-vectors-v2.json",
+                                "commissioned-safety-binding/v1", "commissioned-safety-binding/v2")),
         ("an issue reference in README.md", "issue-reference:README.md",
          lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
     ]
