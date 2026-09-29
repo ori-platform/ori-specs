@@ -992,10 +992,103 @@ def versions_in(root: pathlib.Path, contract: str) -> list[str]:
                   key=lambda v: int(v[1:]))
 
 
+def _git_out(repo: pathlib.Path, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def generated_status_only(repo: pathlib.Path, commit: str, contract: str, version: str, touched: list[str]) -> bool:
+    """Whether a commit's change to a version's files is only its Status paragraph, rendered from its own record.
+
+    Narrow by construction: the commit touches the version's files in `<contract>/<version>.md` alone, it changes
+    the version's own status record, the contract text less its Status paragraph is byte-identical before and
+    after, and the paragraph it writes is the one rendered from that record as the commit leaves it. A commit that
+    also changes one normative word, a vector or any other file of the version, or whose paragraph is not rendered
+    from this version's record at that commit, is not generated-status-only.
+    """
+    doc, rec_path = f"{contract}/{version}.md", f"status/{contract}/{version}.json"
+    if touched != [doc]:
+        return False
+    names = _git_out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", commit)
+    if names is None or rec_path not in names.split("\n"):
+        return False
+    before, after = _git_out(repo, "show", f"{commit}^:{doc}"), _git_out(repo, "show", f"{commit}:{doc}")
+    record = _git_out(repo, "show", f"{commit}:{rec_path}")
+    if before is None or after is None or record is None:
+        return False
+    if normative_digest(before) != normative_digest(after):
+        return False
+    try:
+        rendered = norm(render_status(json.loads(record)))
+    except (ValueError, KeyError, TypeError, RecursionError):
+        return False
+    lines = after.split("\n")
+    sb = status_block(lines)
+    return bool(sb) and paragraph_text(lines[sb[2]:sb[3] + 1]) == rendered
+
+
+_EXPECTED_CHANGES: dict[tuple, list[str] | None] = {}  # one answer per version and baseline for the process
+
+
+def expected_changes(repo: pathlib.Path, root: pathlib.Path, contract: str, version: str,
+                     freeze: str) -> list[str] | None:
+    """The full hashes of the commits after freeze, in HEAD's history, that a version's changes_since_freeze lists.
+
+    A commit is listed when it changes the version's contract text or a file attributed to the version, unless
+    its only change is the generated Status paragraph (generated_status_only). None when history is unreadable.
+    """
+    key = (str(repo), contract, version, freeze)
+    if key in _EXPECTED_CHANGES:
+        return _EXPECTED_CHANGES[key]
+    log = _git_out(repo, "log", "--format=%H", "--reverse", f"{freeze}..HEAD", "--", f"{contract}/")
+    result: list[str] | None = None
+    if log is not None:
+        versions, companions, result = versions_in(root, contract), companion_map(root), []
+        for commit in log.split():
+            names = _git_out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit) or ""
+            touched = sorted(n for n in names.split("\n") if n == f"{contract}/{version}.md" or (
+                n.startswith(f"{contract}/") and not is_version_document(contract, n)
+                and version_of_file(contract, n, versions, companions) == version))
+            if touched and not generated_status_only(repo, commit, contract, version, touched):
+                result.append(commit)
+    _EXPECTED_CHANGES[key] = result
+    return result
+
+
+def check_changes_since_freeze(root: pathlib.Path, key: tuple[str, str], ba: dict, findings: list[Finding]) -> None:
+    where = f"status/{key[0]}/{key[1]}.json"
+    expected = expected_changes(ROOT, root, key[0], key[1], str(ba.get("freeze_revision")))
+    if expected is None:
+        findings.append(Finding("baseline-unverifiable", where,
+                                "changes_since_freeze could not be derived from this checkout's history; the check "
+                                "needs full history (fetch-depth 0)"))
+        return
+    recorded = {}
+    for c in ba.get("changes_since_freeze") or []:
+        full = (_git_out(ROOT, "rev-parse", "--verify", "--quiet", f"{c}^{{commit}}") or "").strip()
+        recorded[full or c] = c
+    for commit in expected:
+        if commit not in recorded:
+            findings.append(Finding("changes-since-freeze", where,
+                                    f"{commit[:7]} changes this version after its freeze and is not in "
+                                    "changes_since_freeze; only a commit whose sole change is the Status paragraph "
+                                    "rendered from this record is left out"))
+    for full, short in recorded.items():
+        if full not in expected:
+            findings.append(Finding("changes-since-freeze", where,
+                                    f"changes_since_freeze lists {short}, which changes nothing of this version "
+                                    "after its freeze but its generated Status paragraph, or is not in HEAD's "
+                                    "history after the freeze revision"))
+
+
 def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: list[Finding]) -> None:
     where = f"{key[0]}/{key[1]}.md"
     ba = rec["baseline_audit"]
     current = read_text(root / where)
+    check_changes_since_freeze(root, key, ba, findings)
     if ba["status"] == "pending":
         if ba.get("issue") is None:
             findings.append(Finding("gap-audit-without-issue", where,
@@ -2499,6 +2592,11 @@ def mutations() -> int:
          erratum_edit(lambda e: e.update(commit="06ba18e"))),
         ("an erratum naming a commit that left the file unchanged", "vector-erratum-invalid:does not change",
          erratum_edit(lambda e: e.update(commit="a43f95b"))),
+        ("a generated-status-only commit listed in changes_since_freeze", "changes-since-freeze:lists c0b68f6",
+         lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"]["changes_since_freeze"].append(
+             "c0b68f6"))),
+        ("a commit that changed the version left out of changes_since_freeze", "changes-since-freeze:4c9760c",
+         lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"].update(changes_since_freeze=[]))),
         ("an erratum whose commit is outside HEAD's history", "vector-erratum-invalid:not in HEAD's history",
          unreachable("4c9760c")),
         ("a hunk whose commit is outside HEAD's history", "hunk-commit-unreachable:a000026",
@@ -2553,8 +2651,79 @@ def mutations() -> int:
     total, bad_sibling = sibling_mutations(impl_only)
     failed += bad_sibling
     total += len(cases)
+    more, bad_changes = changes_mutations()
+    total += more
+    failed += bad_changes
     print(f"{total - failed}/{total} mutations behaved as named")
     return 1 if failed else 0
+
+
+def changes_mutations() -> tuple[int, int]:
+    """Build a history in a scratch repository and require each commit to be listed or left out as the rule says."""
+
+    def git(repo: pathlib.Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                               "-c", "commit.gpgsign=false", *args], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    rec = {"contract": "demo", "version": "v1", "maturity": "draft", "adoption": [], "compatibility": "amendable",
+           "proof": {"end_to_end": {"state": "none"}, "hil": {"state": "none"}, "production": {"state": "none"}}}
+    body = "\n# Demo v1\n\nThe demo contract says one thing.\n"
+
+    def write(repo: pathlib.Path, record: dict, text: str = body, other: bool = False,
+              vector: str | None = None, own: bool = True) -> None:
+        paragraph = "\n".join(wrap_status(render_status(record)))
+        (repo / "demo" / "v1.md").write_text(paragraph + "\n" + text)
+        if own:
+            (repo / "status" / "demo" / "v1.json").write_text(json.dumps(record) + "\n")
+        if other:
+            (repo / "status" / "other" / "v1.json").write_text(json.dumps({**record, "notes": "x"}) + "\n")
+        if vector is not None:
+            (repo / "demo" / "vectors" / "cases.json").write_text(vector)
+
+    def commit(repo: pathlib.Path, message: str) -> str:
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", message)
+        return git(repo, "rev-parse", "HEAD")
+
+    def state(n: str) -> dict:
+        return {**rec, "proof": {**rec["proof"], "hil": {"state": n}}}
+
+    cases = []
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp)
+        git(repo, "init", "-q", "-b", "main")
+        for d in ("demo/vectors", "status/demo", "status/other"):
+            (repo / d).mkdir(parents=True)
+        write(repo, rec, vector="{}\n")
+        write(repo, rec, other=True)
+        freeze = commit(repo, "freeze")
+        write(repo, state("partial"))
+        cases.append(("the Status paragraph re-rendered from its own changed record", commit(repo, "a"), False))
+        write(repo, state("none"), body.replace("one thing", "one other thing"))
+        cases.append(("a re-rendered Status paragraph and one normative word", commit(repo, "b"), True))
+        text = body.replace("one thing", "one other thing")
+        write(repo, state("none"), text, vector="[]\n")  # b left the record at none; only a vector changes here
+        cases.append(("a vector alone", commit(repo, "v"), True))
+        (repo / "status" / "demo" / "v1.json").write_text(json.dumps(state("partial")) + "\n")
+        commit(repo, "the record changes and the paragraph is left stale")
+        write(repo, state("partial"), text, other=True, own=False)
+        cases.append(("a Status paragraph caught up with a record another commit changed, while another record "
+                      "changes", commit(repo, "c"), True))
+        (repo / "status" / "demo" / "v1.json").write_text(json.dumps(state("established")) + "\n")
+        (repo / "demo" / "v1.md").write_text("\n".join(wrap_status(render_status(state("none")))) + "\n" + text)
+        cases.append(("a Status paragraph not rendered from the record the commit leaves", commit(repo, "r"), True))
+        write(repo, state("partial"), text, vector="{}\n")
+        cases.append(("a re-rendered Status paragraph and a vector", commit(repo, "d"), True))
+        write(repo, state("none"), text)
+        cases.append(("the Status paragraph re-rendered again from its own record", commit(repo, "e"), False))
+        expected = expected_changes(repo, repo, "demo", "v1", freeze) or []
+        failed = 0
+        for name, sha, listed in cases:
+            good = (sha in expected) == listed
+            print(f"{'ok  ' if good else 'FAIL'} changes_since_freeze: {name} -> {'listed' if listed else 'left out'}")
+            failed += not good
+    return len(cases), failed
 
 
 def sibling_mutations(rel: str) -> tuple[int, int]:
