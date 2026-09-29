@@ -1071,6 +1071,11 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
             findings.append(Finding("vector-drift", path,
                                     "a frozen vector file differs from the recorded baseline; vector bytes stay "
                                     f"with the version they exercised. {VECTOR_ERRATUM_LIMIT}"))
+    for h in ba["hunks"]:
+        if isinstance(h, dict) and h.get("commit") and is_ancestor(str(h["commit"])) is not True:
+            findings.append(Finding("hunk-commit-unreachable", where,
+                                    f"hunk {str(h.get('hunk_sha256'))[:12]} names commit {h['commit']}, which is not in "
+                                    "HEAD's history; a squash or a rewrite leaves the record pointing at nothing"))
     recorded = {h["hunk_sha256"]: h for h in ba["hunks"]}
     for digest, first in net_hunks(base.decode("utf-8", errors="replace"), current):
         h = recorded.get(digest)
@@ -1091,6 +1096,37 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     "does not exist"))
 
 
+def _refuse_duplicates(pairs: list) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"a member is named twice: {sorted({k for k in keys if keys.count(k) > 1})}")
+    return dict(pairs)
+
+
+def strict_json(data: bytes) -> object:
+    """Parse a vector file refusing a member named twice at any depth; a later duplicate would otherwise win."""
+    return json.loads(data.decode("utf-8"), object_pairs_hook=_refuse_duplicates)
+
+
+# Commits treated as absent from HEAD's history; the mutation harness sets it, nothing else does.
+NOT_ANCESTORS: set[str] = set()
+_ANCESTRY: dict[str, bool | None] = {}  # one answer per commit for the life of the process
+
+
+def is_ancestor(commit: str) -> bool | None:
+    """Whether commit is in HEAD's history: True, False, or None when git cannot say."""
+    if commit in NOT_ANCESTORS:
+        return False
+    if commit not in _ANCESTRY:
+        try:
+            r = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", commit, "HEAD"],
+                               capture_output=True, timeout=30)
+            _ANCESTRY[commit] = {0: True, 1: False}.get(r.returncode)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return _ANCESTRY[commit]
+
+
 def _metadata_changes(old: bytes | None, new: bytes | None) -> set[str] | None:
     """The top-level members that differ between two vector files, or None when anything else differs.
 
@@ -1099,9 +1135,9 @@ def _metadata_changes(old: bytes | None, new: bytes | None) -> set[str] | None:
     distinction between true, 1 and 1.0.
     """
     try:
-        a = json.loads(old.decode("utf-8")) if old is not None else None
-        b = json.loads(new.decode("utf-8")) if new is not None else None
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        a = strict_json(old) if old is not None else None
+        b = strict_json(new) if new is not None else None
+    except (UnicodeDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(a, dict) or not isinstance(b, dict) or list(a) != list(b):
         return None
@@ -1124,6 +1160,13 @@ def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, di
             findings.append(Finding("vector-erratum-invalid", path,
                                     f"the erratum at {commit} starts from {str(e.get('from_sha256'))[:12]}, not from "
                                     f"the file's recorded bytes {expected[:12]}. {VECTOR_ERRATUM_LIMIT}"))
+        ancestor = is_ancestor(commit)
+        if ancestor is not True:
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the erratum's commit {commit} is not in HEAD's history"
+                                    + (" (git could not say)" if ancestor is None else "")
+                                    + "; a squash or a rewrite leaves the record pointing at nothing. "
+                                    + VECTOR_ERRATUM_LIMIT))
         before, after = git_blob(f"{commit}^", path), git_blob(commit, path)
         if (before is None or after is None) and git_blob(commit, "VERSIONING.md") is not None:
             findings.append(Finding("vector-erratum-invalid", path,
@@ -1146,6 +1189,13 @@ def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, di
                                     f"{VECTOR_ERRATUM_LIMIT}"))
         declared |= set(e.get("members") or [])
         expected = str(e.get("to_sha256"))
+    try:
+        if now is not None:
+            strict_json(now)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        findings.append(Finding("vector-erratum-invalid", path,
+                                f"the file does not parse strictly ({exc}), so no structural comparison can hold. "
+                                f"{VECTOR_ERRATUM_LIMIT}"))
     net = _metadata_changes(baseline, now)
     if net is None or not net <= declared:
         findings.append(Finding("vector-erratum-invalid", path,
@@ -1393,8 +1443,11 @@ def check_corpus_declarations(root: pathlib.Path, findings: list[Finding]) -> No
             if version in (None, "unattributed"):
                 continue
             try:
-                document = json.loads(f.read_text(encoding="utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, OSError):
+                document = strict_json(f.read_bytes())
+            except (UnicodeDecodeError, ValueError, RecursionError, OSError) as exc:
+                findings.append(Finding("corpus-declaration", rel,
+                                        f"the corpus does not parse strictly ({exc}); a member named twice would let "
+                                        f"a later copy stand in for the one a reader sees. {DECLARATION_LIMIT}"))
                 continue
             declared = document.get("contract") if isinstance(document, dict) else None
             if not isinstance(declared, str):
@@ -2023,6 +2076,23 @@ def mutations() -> int:
         keys[2], keys[3] = keys[3], keys[2]
         return {k: data[k] for k in keys}
 
+    def unreachable(commit: str) -> Callable[[pathlib.Path], None]:
+        """Treat commit as outside HEAD's history, as a squash or a rewrite would leave it."""
+        return lambda root: NOT_ANCESTORS.add(commit)
+
+    def duplicate_member(rel: str, member: str, value: str) -> Callable[[pathlib.Path], None]:
+        """Name a top-level member twice, the first copy altered, so a last-wins parse sees only the original."""
+        def edit(root: pathlib.Path) -> None:
+            path = root / rel
+            lines = path.read_text(encoding="utf-8").split("\n")
+            at = [i for i, line in enumerate(lines) if re.match(rf'^ {{1,2}}"{member}": ', line)]
+            if len(at) != 1:
+                raise SystemExit(f"mutation target {rel} has no single top-level {member}")
+            indent = lines[at[0]][:len(lines[at[0]]) - len(lines[at[0]].lstrip())]
+            lines.insert(at[0], f'{indent}"{member}": {value},')
+            path.write_text("\n".join(lines), encoding="utf-8")
+        return edit
+
     cases: list[tuple[str, str | None, Callable[[pathlib.Path], None]]] = [
         ("an unmutated copy passes", None, lambda root: None),
         ("a 'no shipped' line under a record with nothing shipped passes", None,
@@ -2429,6 +2499,15 @@ def mutations() -> int:
          erratum_edit(lambda e: e.update(commit="06ba18e"))),
         ("an erratum naming a commit that left the file unchanged", "vector-erratum-invalid:does not change",
          erratum_edit(lambda e: e.update(commit="a43f95b"))),
+        ("an erratum whose commit is outside HEAD's history", "vector-erratum-invalid:not in HEAD's history",
+         unreachable("4c9760c")),
+        ("a hunk whose commit is outside HEAD's history", "hunk-commit-unreachable:a000026",
+         unreachable("a000026")),
+        ("a frozen vector naming cases twice, the first copy altered", "vector-erratum-invalid:parse strictly",
+         duplicate_member(anchor_vec, "cases", "[]")),
+        ("a corpus naming its contract member twice", "corpus-declaration:parse strictly",
+         duplicate_member("evidence-transport/vectors/refusal-policy-v2.json", "contract",
+                          '"evidence-transport/v1 refusal policy"')),
         ("a frozen vector's erratum removed", "vector-drift:vector bytes stay",
          lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"].pop("vector_errata"))),
         ("a recorded vector erratum rewritten", "audit-regressed:vector errata",
@@ -2458,6 +2537,7 @@ def mutations() -> int:
                 BASE_OVERRIDE = None
             got = check(root)
             BASE_OVERRIDE = None
+            NOT_ANCESTORS.clear()
             codes = {f.code for f in got}
             if code is None:
                 good = not got

@@ -244,8 +244,9 @@ A frozen version admits exactly two kinds of change in place:
   an implementation conform retroactively. Any observable or normative
   correction requires a successor version.
 
-A frozen vector file admits one erratum and no other change: a **metadata
-erratum**, which corrects only the descriptive top-level members `vector_set`,
+A frozen vector file admits one kind of change, and only in place: the
+**metadata erratum**, one or more of which may be recorded in sequence, each
+correcting only the descriptive top-level members `vector_set`,
 `contract` and `canonicalisation`, each a string before and after, while every
 other member, case, input, expected result, signature and ordering stays
 structurally identical. It is recorded in the audit's `vector_errata` with the
@@ -319,7 +320,9 @@ current text with the baseline. Every difference must be a recorded
 files must still match their recorded hashes, or be reached from them by recorded
 metadata errata: each erratum's commit must change the file from its
 `from_sha256` to its `to_sha256` and only in its declared members, the chain
-must end at the file's current bytes, and the file must differ from its freeze
+must end at the file's current bytes, every erratum and hunk commit must be in
+the checked-out history (a squash or rewrite that drops one is refused), every
+file compared must parse with no member named twice, and the file must differ from its freeze
 revision in nothing but declared descriptive members, compared as parsed JSON
 with member order, list order and value types kept. An appended file must be absent at
 `freeze_revision`, match its recorded hash, and quote a clause that exists where
