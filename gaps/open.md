@@ -116,16 +116,13 @@ accurate description of what a repo implements.
   delivered by the local bridge command in
   [operator-socket/v1.md](../operator-socket/v1.md). The evidence authority resolves
   a registration against held authorisations and refuses a courier-submitted
-  authorisation at the transport. The device side is half built. The
-  `ori-runtime` bridge implements `evidence commission` by the mechanism that
-  predates the operator socket: it reads the current epoch from the health
-  socket and records the reference in the runtime's state store itself, and
-  the runtime reads the recorded reference and seals its registration from
-  it. The socket-served command that operator-socket/v1 specifies, in which
-  the bridge submits the reference to the running runtime and writes no
-  store, is open: the runtime's operator socket refuses the
-  `evidence_commission` operation, and `ori-cli` has no `evidence commission`
-  command. The gateway courier refuses `commissioning_authorization` at
+  authorisation at the transport. The device side is built in `ori-runtime`
+  and unreleased: its bridge's `evidence commission` submits the reference to
+  the running runtime over the operator socket and opens no store, and the
+  runtime records it against its own device and current epoch and seals its
+  registration from it. The installer does not yet write `operator-uid`, so an
+  installed runtime admits root alone, and `ori-cli` has no
+  `evidence commission` command. The gateway courier refuses `commissioning_authorization` at
   ingress. The authority-side ingest of a signed authorisation is now
   [evidence-commissioning-ingest/v1.md](../evidence-commissioning-ingest/v1.md);
   the authority holds a library function that verifies a signed
@@ -187,18 +184,20 @@ accurate description of what a repo implements.
   terminal uncertainty record reserved at admission and the pending-outcome
   ceiling, the same-outcome block evaluated at proposal creation and again at
   reply admission (`proposal_blocked_uncertain_outcome`), and reconciliation
-  are specified with a corpus and a model checker; the runtime implementation
-  is in progress and not on main, and `action_records` in `runtime-health/v3`
-  is not yet reported. The authenticated local operator reconciliation is
+  are specified with a corpus and a model checker; the runtime implements them
+  on main, unreleased, and reports `action_records` in `runtime-health/v3`.
+  The authenticated local operator reconciliation is
   closed at contract level: `evidence reconcile-tier-c` in
   [operator-socket/v1.md](../operator-socket/v1.md) is submitted to the running
   runtime over its local operator socket and authorized from kernel-provided
   peer credentials, with a closed reason and refusal set,
   root-or-installed-operator admission and an `identical_repeat` audit record,
-  with a corpus and a model checker, and neither the runtime nor the CLI
-  implements it. The runtime binds no operator socket for it yet, and the
-  access-control entry that lets the installed operator connect without a group
-  is contract text only. The kernel's peer credentials carry the effective user
+  with a corpus and a model checker. The runtime serves it over its operator
+  socket and its bridge submits it, on main and unreleased, granting the
+  installed operator connect by access-control entries; it answers an identical
+  request after a commissioned-feedback reconciliation in a shape only
+  [operator-socket/v2.md](../operator-socket/v2.md) defines, and `ori-cli` does
+  not implement it. The kernel's peer credentials carry the effective user
   ID; the audit login user ID is read for the peer process pinned by
   `SO_PEERPIDFD`, which needs Linux 6.5 or later, and no implementation has
   shown it yet. The installer does not
@@ -209,7 +208,8 @@ accurate description of what a repo implements.
   write the store, and the installed operator reconciles without store
   permissions. The commissioned-feedback
   mapping that proves an outcome is still undefined, so that form of
-  reconciliation has no contract shape. No consumer enforces the release
+  reconciliation has no contract shape beyond the answer operator-socket/v2
+  fixes for an identical operator request. No consumer enforces the release
   maximum on `approval_timeout_seconds` from
   [runtime-config/v2.md](../runtime-config/v2.md).
 - **Evidence-carriage consumers cite gateway-api/v1**
@@ -444,7 +444,8 @@ accurate description of what a repo implements.
   kernel-provided credentials as the runtime service identity for the install
   scope, an explicit `--socket` included, and reports an unverified peer
   `runtime_unavailable`; a request naming `operation` twice is refused
-  `invalid_arguments`. No bridge implements either.
+  `invalid_arguments`. The runtime's bridge and socket implement both, on main
+  and unreleased; `ori-cli` implements neither.
 - **events/v1 `approved` semantics** (`ori-runtime`;
   [events/v1.md](../events/v1.md)): events/v1 is unchanged, and `approved=true`
   means the operator supplied an affirmative token; it does not mean admitted
@@ -460,11 +461,9 @@ accurate description of what a repo implements.
   scope (`/run/ori/` for a system install, `/run/user/<uid>/ori/` for a user
   scope) and which needs a search-permission access-control entry on the
   runtime directory as well as the connect entry on the socket; the unit
-  creates that directory with mode `0700` under `UMask=0077`. The in-progress
-  bridge `evidence commission`, on no main branch, reads and writes the state
-  stores directly, needing
-  store write permission and able to leave WAL files owned by its caller; it
-  must move to the socket and write no store. The audit login user ID is read
+  creates that directory with mode `0700` under `UMask=0077`. The runtime's
+  bridge submits both commands over the socket and opens no store, on main and
+  unreleased; `ori-cli` implements neither. The audit login user ID is read
   for a peer pinned by `SO_PEERPIDFD` and recorded `null` otherwise, and the
   recorded entry point is `local_operator_socket`. An installed runtime serves
   its health socket at `<install root>/data/health.sock`.
