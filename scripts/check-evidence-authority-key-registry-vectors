@@ -12,11 +12,14 @@ registry* section, never from the corpus:
 - registries: every rule is re-evaluated, an accepted registry breaks none, and
   a refused one breaks exactly the one rule it names, so no case is refused by
   accident;
-- public keys: the refused encodings are exactly the set the contract defines.
-  The eight points of small order are computed here from the RFC 8032,
-  section 5.1 curve arithmetic, not read from the contract or the corpus, and
-  the contract's table must name exactly their y-coordinates; every encoding
-  with y >= p is enumerated. Every accepted key decodes to a curve point;
+- public keys: every key is decoded here under RFC 8032, section 5.1.3, and
+  its verdict and the clause that refuses it are recomputed. The eight points
+  of small order are computed from the curve arithmetic, not read from the
+  contract or the corpus, and the contract's table must name exactly their
+  y-coordinates. Every non-canonical, small-order and invalid sign encoding
+  must be present, with off-curve encodings under both sign bits, and the
+  valid encodings nearest each refused boundary must be accepted, so an
+  over-broad refusal fails as surely as a missing one;
 - selections: each `(purpose, key_id)` is resolved against the registry it
   names, by purpose and without trial verification.
 
@@ -71,7 +74,7 @@ KEY_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 PUBLIC_KEY = re.compile(r"^[0-9a-f]{64}$")
 DOCUMENT_MEMBERS = {"schema", "keys"}
 KEY_MEMBERS = {"key_id", "public_key_hex", "purpose", "status"}
-RULES = ("members", "schema", "empty", "key_id_encoding", "public_key_encoding", "key_id_mismatch", "weak_key",
+RULES = ("members", "schema", "empty", "key_id_encoding", "public_key_encoding", "key_id_mismatch", "refused_key",
          "purpose", "status", "duplicate", "cross_purpose", "active_count")
 SELECTION_REFUSALS = ("unknown_key", "wrong_purpose", "retired_key")
 
@@ -94,19 +97,27 @@ SENTENCES = {
         "`wrong_purpose`, and one held `revoked` is `retired_key`; an `active` or a `verify_only` key verifies."
     ),
     "trial": "Selection is by `(purpose, key_id)`, never by trial verification.",
-    "sign_bit": "clear bit 255, which carries the sign of x, and call the result y;",
-    "weak": (
-        "The key is refused when y ≥ p, a non-canonical encoding, or when y is the y-coordinate of one of the "
-        "eight points of small order, those whose order divides 8, whatever bit 255 holds:"
+    "decode": (
+        "`public_key_hex` MUST decode as a canonical compressed Ed25519 point under RFC 8032, section 5.1.3, and "
+        "that point MUST NOT be of small order."
     ),
-    "count": "That refuses 48 encodings:",
-    "only": "No other key is refused by this rule.",
+    "sign": "bit 255 is the sign of x, and clearing it gives y;",
+    "clauses": "The key is refused when any of these holds, and accepted otherwise:",
+    "non_canonical": "y ≥ p: a non-canonical encoding, whatever bit 255 holds;",
+    "off_curve": (
+        "(y² − 1) / (d·y² + 1) has no square root modulo p: y is the coordinate of no curve point, whatever bit "
+        "255 holds;"
+    ),
+    "invalid_sign": "the recovered x is 0 and bit 255 is set:",
+    "small_order": "the point decoded is one of the eight points of small order, those whose order divides 8,",
+    "whole": "so a registry holding one refused key is refused whole;",
 }
 
 # Model defects the corpus must catch; each is switched on alone under --mutations.
 MODEL_MUTANTS = {name: False for name in (
     "skip_members", "skip_schema", "skip_empty", "skip_key_id_encoding", "skip_public_key_encoding",
-    "skip_key_id_mismatch", "skip_small_order", "skip_non_canonical", "sign_bit_is_y", "skip_purpose",
+    "skip_key_id_mismatch", "skip_small_order", "skip_non_canonical", "skip_off_curve", "skip_invalid_sign",
+    "sign_bit_is_y", "refuse_near_p", "refuse_near_small_order", "refuse_next_to_off_curve", "skip_purpose",
     "skip_status", "skip_duplicate", "skip_cross_purpose", "allow_no_active", "allow_two_active",
     "trial_selection", "revoked_verifies", "uppercase_hex_accepted",
 )}
@@ -197,21 +208,55 @@ def small_order_ys() -> set[int]:
 SMALL_ORDER_Y = small_order_ys()
 
 
-def weak(encoding: bytes) -> bool:
+CLAUSES = ("non_canonical", "off_curve", "invalid_sign", "small_order")
+
+
+def _square_root_ratio(u: int, v: int) -> int | None:
+    """RFC 8032, section 5.1.3, step 2: x with v * x^2 = u, or None when u / v is not a square."""
+    x = u * pow(v, 3, P) * pow(u * pow(v, 7, P), (P - 5) // 8, P) % P
+    if (v * x * x - u) % P == 0:
+        return x
+    if (v * x * x + u) % P == 0:
+        return x * SQRT_M1 % P
+    return None
+
+
+def refusal(encoding: bytes) -> str | None:
+    """The clause that refuses a 32-byte public key, decoding it under RFC 8032, or None when it is accepted."""
     value = int.from_bytes(encoding, "little")
+    sign = value >> 255
     y = value if MODEL_MUTANTS["sign_bit_is_y"] else value & Y_MASK
-    if y >= P and not MODEL_MUTANTS["skip_non_canonical"]:
-        return True
-    return y in SMALL_ORDER_Y and not MODEL_MUTANTS["skip_small_order"]
+    if y >= P:
+        if not MODEL_MUTANTS["skip_non_canonical"]:
+            return "non_canonical"
+        y %= P
+    if MODEL_MUTANTS["refuse_near_p"] and y >= P - 64:
+        return "non_canonical"
+    if MODEL_MUTANTS["refuse_near_small_order"] and any(0 < abs(y - s) <= 2 for s in SMALL_ORDER_Y):
+        return "small_order"
+    x = _square_root_ratio((y * y - 1) % P, (D * y * y + 1) % P)
+    if MODEL_MUTANTS["refuse_next_to_off_curve"] and x is not None and any(
+            _square_root_ratio((z * z - 1) % P, (D * z * z + 1) % P) is None for z in (y - 1, y + 1)):
+        return "off_curve"
+    if x is None:
+        return None if MODEL_MUTANTS["skip_off_curve"] else "off_curve"
+    if x == 0 and sign == 1:
+        return None if MODEL_MUTANTS["skip_invalid_sign"] else "invalid_sign"
+    if x & 1 != sign:
+        x = P - x
+    if _same(_mul(8, (x, y, 1, x * y % P)), IDENTITY) and not MODEL_MUTANTS["skip_small_order"]:
+        return "small_order"
+    return None
 
 
-def refused_encodings() -> set[str]:
-    """Every encoding the contract refuses: y >= p, or a small-order y, with bit 255 either way."""
-    out = set()
-    for y in list(range(P, 2**255)) + sorted(SMALL_ORDER_Y):
-        for sign in (0, 1):
-            out.add((y | (sign << 255)).to_bytes(32, "little").hex())
-    return out
+def valid_ys_beside(y: int, step: int) -> int | None:
+    """The nearest y beyond y, in the direction of step, that decodes to a point of order greater than 8."""
+    z = y + step
+    while 0 <= z < P:
+        if refusal(z.to_bytes(32, "little")) is None:
+            return z
+        z += step
+    return None
 
 
 # --- the contract ---------------------------------------------------------------------------------------------------
@@ -252,10 +297,6 @@ def load_contract(text: str) -> dict:
     if table_ys != SMALL_ORDER_Y:
         raise CheckError(f"the small-order table names {len(table_ys)} y-coordinates that differ from the "
                          f"{len(SMALL_ORDER_Y)} the RFC 8032 arithmetic gives")
-    count = re.search(r"That refuses (\d+) encodings: the (\d+) with y ≥ p, and the (\d+) whose y", flat)
-    expected = (len(refused_encodings()), 2 * (2**255 - P), 2 * len(SMALL_ORDER_Y))
-    if not count or tuple(int(g) for g in count.groups()) != expected:
-        raise CheckError(f"the contract's encoding count is not {expected[0]}, {expected[1]} and {expected[2]}")
     return {
         "schema": schema.group(1),
         "purposes": set(re.findall(r"`([a-z_]+)`", purposes.group(1))),
@@ -305,8 +346,8 @@ def violations(contract: dict, document: object) -> set[str]:
             if id_ok and key["key_id"].lower() != derive_key_id(key["public_key_hex"].lower()) \
                     and not MODEL_MUTANTS["skip_key_id_mismatch"]:
                 found.add("key_id_mismatch")
-            if weak(bytes.fromhex(key["public_key_hex"])):
-                found.add("weak_key")
+            if refusal(bytes.fromhex(key["public_key_hex"])) is not None:
+                found.add("refused_key")
         purpose_ok = key["purpose"] in contract["purposes"] or MODEL_MUTANTS["skip_purpose"]
         status_ok = key["status"] in contract["statuses"] or MODEL_MUTANTS["skip_status"]
         if not purpose_ok:
@@ -363,11 +404,72 @@ def check_test_keys(document: dict) -> None:
             raise CheckError(f"{entry['name']}: the public key is not the seed's")
 
 
+def check_public_keys(entries: list, test_keys: set[str]) -> None:
+    """Each key's verdict and clause, decoded here; the fixed encodings all present; valid neighbours accepted."""
+    declared = {}
+    for entry in entries:
+        key = entry["public_key_hex"]
+        if key in declared:
+            raise CheckError(f"public key {key[:16]}... appears twice")
+        if not PUBLIC_KEY.fullmatch(key):
+            raise CheckError(f"public key {key[:16]}... is not 64 lowercase hexadecimal digits")
+        got = refusal(bytes.fromhex(key))
+        want = entry["clause"] if entry["expected"] == "refused" else None
+        if entry["expected"] not in ("refused", "accepted") or (entry["expected"] == "accepted") != (want is None):
+            raise CheckError(f"public key {key[:16]}... declares {entry['expected']} with clause {entry.get('clause')}")
+        if got != want:
+            raise CheckError(f"public key {key[:16]}... is declared {entry['expected']} ({want}); decoding gives "
+                             f"{'accepted' if got is None else 'refused (' + got + ')'}")
+        declared[key] = (int.from_bytes(bytes.fromhex(key), "little"), got)
+    by_clause: dict[str | None, set[int]] = {}
+    for value, clause in declared.values():
+        by_clause.setdefault(clause, set()).add(value)
+    fixed = {
+        "non_canonical": {y | (s << 255) for y in range(P, 2**255) for s in (0, 1)},
+        "small_order": {int.from_bytes(k, "little") for k in _small_order_encodings()},
+        "invalid_sign": {1 | (1 << 255), (P - 1) | (1 << 255)},
+    }
+    for clause, values in fixed.items():
+        if by_clause.get(clause, set()) != values:
+            raise CheckError(f"the corpus's {clause} encodings are not exactly the {len(values)} the contract fixes")
+    off = by_clause.get("off_curve", set())
+    off_ys = {v & Y_MASK for v in off}
+    if len(off_ys) < 8 or any({y, y | (1 << 255)} - off for y in off_ys):
+        raise CheckError("the corpus needs at least eight off-curve y values, each with both sign bits")
+    accepted = by_clause.get(None, set())
+    if not test_keys <= {v.to_bytes(32, "little").hex() for v in accepted}:
+        raise CheckError("a published test key is not among the accepted public keys")
+    if not any(v >> 255 for v in accepted):
+        raise CheckError("no accepted public key has bit 255 set")
+    accepted_ys = {v & Y_MASK for v in accepted}
+    wanted = {valid_ys_beside(P, -1)} | {valid_ys_beside(s, step) for s in SMALL_ORDER_Y for step in (-1, 1)}
+    wanted.discard(None)
+    missing = {y | (s << 255) for y in wanted if y is not None for s in (0, 1)} - accepted
+    if missing:
+        raise CheckError(f"{len(missing)} encodings of the valid y nearest a refused boundary (below p, and on each "
+                         "side of each small-order y), with each sign bit, are not accepted in the corpus")
+    if not any(y - 1 in off_ys or y + 1 in off_ys for y in accepted_ys):
+        raise CheckError("no accepted encoding sits next to an off-curve y")
+
+
+def _small_order_encodings() -> list[bytes]:
+    """The canonical encodings of the eight small-order points: each y with each x sign that decodes."""
+    out = []
+    for y in SMALL_ORDER_Y:
+        for sign in (0, 1):
+            encoding = (y | (sign << 255)).to_bytes(32, "little")
+            point = decode(encoding)
+            if point is not None and _same(_mul(8, point), IDENTITY):
+                out.append(encoding)
+    if len(out) != 8:
+        raise CheckError(f"the small-order points have {len(out)} canonical encodings, not 8")
+    return out
+
+
 def check(contract: dict, document: dict) -> None:
     check_declaration(document)
     check_test_keys(document)
     test_keys = {k["public_key_hex"] for k in document["test_keys"]}
-    refused = refused_encodings()
     registries = {}
     for case in document["registries"]:
         if case["name"] in registries:
@@ -386,22 +488,7 @@ def check(contract: dict, document: dict) -> None:
                                  f"and breaks {sorted(got) or 'nothing'}")
         else:
             raise CheckError(f"registry {case['name']!r} declares {case['expected']}, not an outcome")
-    declared_keys = {k["public_key_hex"]: k["expected"] for k in document["public_keys"]}
-    if len(declared_keys) != len(document["public_keys"]):
-        raise CheckError("a public key appears twice")
-    for key, expected in declared_keys.items():
-        got = "refused" if PUBLIC_KEY.fullmatch(key) and weak(bytes.fromhex(key)) else "accepted"
-        if got != expected:
-            raise CheckError(f"public key {key[:16]}... is declared {expected}; the contract gives {got}")
-        if expected == "accepted" and (key not in test_keys or decode(bytes.fromhex(key)) is None):
-            raise CheckError(f"accepted public key {key[:16]}... is not a published test key on the curve")
-    if {k for k, e in declared_keys.items() if e == "refused"} != refused:
-        raise CheckError(f"the corpus refuses {sum(e == 'refused' for e in declared_keys.values())} encodings; the "
-                         f"contract refuses exactly {len(refused)}")
-    if {k for k, e in declared_keys.items() if e == "accepted"} != test_keys:
-        raise CheckError("the accepted public keys are not exactly the published test keys")
-    if not any(e == "accepted" and int(k[-2:], 16) & 0x80 for k, e in declared_keys.items()):
-        raise CheckError("no accepted public key has bit 255 set")
+    check_public_keys(document["public_keys"], test_keys)
     for case in document["selections"]:
         registry = registries.get(case["registry"])
         if registry is None or registry["expected"] != {"accepted": True}:
@@ -455,7 +542,14 @@ def corpus_mutants(document: dict):
     for i, entry in enumerate(document["public_keys"]):
         bad = copy.deepcopy(document)
         bad["public_keys"][i]["expected"] = "accepted" if entry["expected"] == "refused" else "refused"
+        bad["public_keys"][i]["clause"] = None if entry["expected"] == "refused" else "off_curve"
         yield f"public key {i} verdict flipped", bad
+        if entry["clause"] is not None:
+            for clause in CLAUSES:
+                if clause != entry["clause"]:
+                    bad = copy.deepcopy(document)
+                    bad["public_keys"][i]["clause"] = clause
+                    yield f"public key {i} refused under {clause}", bad
         bad = copy.deepcopy(document)
         del bad["public_keys"][i]
         yield f"without public key {i}", bad
@@ -483,7 +577,6 @@ def text_mutants(text: str):
          "One of `evidence_authority_receipt`, `evidence_authority_epoch`."),
         ("a status renamed", "One of `active`, `verify_only`, `revoked`,", "One of `active`, `verify_only`, `retired`,"),
         ("the schema renamed", "Exactly `ori.evidence_authority_keys.v1`.", "Exactly `ori.evidence_authority_keys.v2`."),
-        ("the encoding count changed", "That refuses 48 encodings: the 38", "That refuses 46 encodings: the 36"),
     ):
         yield label, text.replace(old, new, 1), text.count(old)
 
