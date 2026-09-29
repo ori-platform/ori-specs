@@ -244,6 +244,16 @@ A frozen version admits exactly two kinds of change in place:
   an implementation conform retroactively. Any observable or normative
   correction requires a successor version.
 
+A frozen vector file admits one erratum and no other change: a **metadata
+erratum**, which corrects only the descriptive top-level members `vector_set`,
+`contract` and `canonicalisation`, each a string before and after, while every
+other member, case, input, expected result, signature and ordering stays
+structurally identical. It is recorded in the audit's `vector_errata` with the
+old and new hashes, the introducing commit, the members it changed, a
+justification and the repositories that must re-vendor the corrected bytes. This
+is not general permission to alter a frozen vector: a change to any other
+member, or to a case, a result or their order, needs a successor version.
+
 Consumers ignore unknown fields unless the contract explicitly forbids them.
 Where a contract forbids unknown fields, adding one is a breaking change for
 that contract.
@@ -274,6 +284,7 @@ pending audit is never shown as `amendable`.
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
+| `vector_errata` | When `complete`, optional: each metadata erratum to a file in `vectors`, in order, with `path`, `classification` (only `erratum` is admitted), `from_sha256` (the recorded bytes, or the previous erratum's result), `to_sha256`, the introducing `commit`, the changed `members` (each one of `vector_set`, `contract`, `canonicalisation`), a `justification` of why no conforming producer output or accepted input changes, and `revendor`, the repositories that must re-vendor the corrected bytes. |
 | `appended_files` | When `complete`, optional: each file added to the version after its freeze, with `path`, its `sha256`, `classification` (only `additive` is admitted), a `justification` of why no conforming consumer's accepted input changes, the `clause` it exercises quoted exactly, and `clause_basis`: `freeze_revision`, the clause is in the contract at `freeze_revision`, or `additive_hunk`, it is in the recorded additive hunk named by `hunk_sha256`. A new negative vector for a frozen version cites a `freeze_revision` clause and introduces no new reason, precedence, vocabulary, canonicalisation or strictness. |
 
 While an audit is **pending**, the version takes no normative edit.
@@ -291,7 +302,7 @@ the default branch, and refuses:
   `pinned_sha256` or `pinned_files`;
 - once the audit is complete, a return to `pending`, a change to
   `frozen_by`, `freeze_revision`, `contract_sha256` or `vectors`, or any change
-  to a recorded hunk (hunks may only be appended);
+  to a recorded hunk or vector erratum (both may only be appended);
 - a shipped or claimed adoption entry removed or moved to an earlier
   lifecycle, a claim changed from `claimed` to `none`, an assessed conformance
   downgraded to `unassessed`, a recorded divergence erased, and a shipped
@@ -305,7 +316,12 @@ history, confirms the recorded contract and vector hashes, and compares the
 current text with the baseline. Every difference must be a recorded
 `erratum` or `additive` hunk; an unrecorded difference is drift, a recorded
 `semantic` hunk must not remain, and its destination must exist. Frozen vector
-files must still match their recorded hashes. An appended file must be absent at
+files must still match their recorded hashes, or be reached from them by recorded
+metadata errata: each erratum's commit must change the file from its
+`from_sha256` to its `to_sha256` and only in its declared members, the chain
+must end at the file's current bytes, and the file must differ from its freeze
+revision in nothing but declared descriptive members, compared as parsed JSON
+with member order, list order and value types kept. An appended file must be absent at
 `freeze_revision`, match its recorded hash, and quote a clause that exists where
 its basis says; the check cannot tell whether the file is really additive, and
 review does. `--draft-audit
@@ -382,7 +398,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
 | runtime-config-signing | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-evidence-anchor | v1 | `draft` | `frozen` | claiming-merge, runtime `b5ab285`, 2026-08-23; audit complete |
-| runtime-evidence-anchor | v2 | `draft` | `amendable` | — |
+| runtime-evidence-anchor | v2 | `draft` | `frozen` | claiming-merge, runtime `01d614a`, 2026-09-26; audit complete |
 | runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
 | runtime-health | v3 | `draft` | `amendable` | — |
