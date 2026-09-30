@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Replay the evidence-exchange/v2 authority-signed artifact vectors against a conforming registry.
+
+Each file signed under an authority key purpose publishes the registry its cases are selected
+against: `authority_key_registry` in the receipt and confirmation files, the `registry` member of
+the disposition file. The registry must be refused by no rule of the contract's *The authority key
+registry* section, as `check-evidence-authority-key-registry-vectors` models it, so every `key_id`
+is the one derived from its key and every key derives from a seed the file publishes. Every case is
+then replayed by `(key_purpose, key_id)` selection, without trial verification:
+
+- an accepted case is selected and verifies under the selected key;
+- a rejected case whose authenticator is valid verifies under a key the registry holds, the
+  selected one when the rejection is semantic, one held for another purpose when purpose
+  separation is the rule under test;
+- a disposition refused `unknown_key`, `wrong_purpose` or `retired_key` is refused that by selection,
+  and every other disposition is selected.
+
+Every `evidence-exchange/vectors/` file of version 2 that names an authority key purpose must be
+replayed here.
+
+    python3 scripts/check-evidence-authority-artifact-vectors
+    python3 scripts/check-evidence-authority-artifact-vectors --mutations
+
+`--mutations` corrupts each file in the ways a regeneration can: a made-up or underived `key_id`,
+a status or key outside the registry's vocabulary, a stale signature or canonical form, and a
+rejection re-signed under the selected key; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import sys
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print("check-evidence-authority-artifact-vectors: the cryptography package is required", file=sys.stderr)
+    sys.exit(1)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "evidence-exchange" / "vectors"
+CONTRACT = ROOT / "evidence-exchange" / "v2.md"
+AUTHORITY_PURPOSES = ("evidence_authority_receipt", "evidence_authority_epoch", "evidence_authority_disposition")
+CASE_FILES = ("delivery-receipt-v2.json", "epoch-confirmation-v2.json")
+DISPOSITION_FILE = "evidence-disposition-v2.json"
+SELECTION_REFUSALS = ("unknown_key", "wrong_purpose", "retired_key")
+
+_loader = importlib.machinery.SourceFileLoader(
+    "registry_model", str(ROOT / "scripts" / "check-evidence-authority-key-registry-vectors"))
+_spec = importlib.util.spec_from_loader("registry_model", _loader)
+assert _spec is not None
+registry_model = importlib.util.module_from_spec(_spec)
+_loader.exec_module(registry_model)
+
+
+class CheckError(Exception):
+    pass
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def public_of(seed_hex: str) -> str:
+    return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex)).public_key().public_bytes_raw().hex()
+
+
+def verifies(public_key_hex: str, domain: bytes, artifact: dict) -> bool:
+    body = {k: v for k, v in artifact.items() if k != "signature"}
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex)).verify(
+            base64.b64decode(str(artifact["signature"]).removeprefix("ed25519:"), validate=True),
+            domain + canonical(body))
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def conforming(contract: dict, name: str, registry: dict, seeds: set[str]) -> None:
+    broken = registry_model.violations(contract, registry)
+    if broken:
+        raise CheckError(f"{name}: a conforming runtime refuses its registry: {sorted(broken)}")
+    published = {public_of(s) for s in seeds}
+    for key in registry["keys"]:
+        if key["public_key_hex"] not in published:
+            raise CheckError(f"{name}: registry key {key['key_id']} derives from no seed the file publishes")
+
+
+def check_case_file(contract: dict, name: str, doc: dict) -> int:
+    if doc.get("contract") != "evidence-exchange/v2":
+        raise CheckError(f"{name}: its contract member must name evidence-exchange/v2")
+    purpose = doc["key_purpose"]
+    domain = doc["domain_ascii"].encode("ascii") + b"\0"
+    registry = doc["authority_key_registry"]
+    seeds = {v for k, v in doc.items() if k.endswith("_seed_hex")}
+    conforming(contract, name, registry, seeds)
+    if public_of(doc["signing_key_seed_hex"]) != doc["signing_key_public_hex"] or \
+            doc["key_id"] != registry_model.derive_key_id(doc["signing_key_public_hex"]):
+        raise CheckError(f"{name}: the published signing key, seed and key_id do not derive from one another")
+    keys = {k["key_id"]: k for k in registry["keys"]}
+    for case in doc["cases"]:
+        where, artifact = f"{name} {case['name']}", case["artifact"]
+        if canonical({k: v for k, v in artifact.items() if k != "signature"}).hex() != case["canonical_hex"]:
+            raise CheckError(f"{where}: canonical_hex does not reproduce")
+        chosen = registry_model.select(registry, purpose, artifact["key_id"])
+        if "selected" not in chosen:
+            raise CheckError(f"{where}: selection refuses its key_id {chosen['refused']}")
+        signers = [k for k in registry["keys"] if verifies(k["public_key_hex"], domain, artifact)]
+        by_selected = verifies(keys[chosen["selected"]]["public_key_hex"], domain, artifact)
+        if case["expected"] == "accept" and not by_selected:
+            raise CheckError(f"{where}: an accepted case does not verify under the key it selects")
+        if case["authenticator"] == "valid" and not signers:
+            raise CheckError(f"{where}: a valid authenticator verifies under no key the registry holds")
+        if case["expected"] == "reject" and case["authenticator"] == "valid" and not by_selected and \
+                all(k["purpose"] == purpose for k in signers):
+            raise CheckError(f"{where}: a cross-purpose rejection is signed under its own purpose")
+        if case["expected"] == "reject" and case["name"].startswith("signed_with_") and by_selected:
+            raise CheckError(f"{where}: a purpose-separation rejection verifies under the key it selects")
+    if not any(c["expected"] == "accept" and c["artifact"]["key_id"] == doc["key_id"] for c in doc["cases"]):
+        raise CheckError(f"{name}: no accepted case is signed under the published key_id")
+    return len(doc["cases"])
+
+
+def disposition_registry(doc: dict) -> dict:
+    return {"schema": "ori.evidence_authority_keys.v1",
+            "keys": [{"key_id": key_id, "public_key_hex": entry["public_key_hex"], "purpose": entry["purpose"],
+                      "status": entry["status"]} for key_id, entry in doc["registry"].items()]}
+
+
+def check_disposition(contract: dict, doc: dict) -> int:
+    registry = disposition_registry(doc)
+    conforming(contract, DISPOSITION_FILE, registry,
+               {e["seed_hex"] for e in doc["registry"].values() if isinstance(e.get("seed_hex"), str)})
+    for case in doc["wire_cases"]:
+        key_id = case["artifact"]["key_id"]
+        if not isinstance(key_id, str) or not registry_model.KEY_ID.fullmatch(key_id):
+            raise CheckError(f"{DISPOSITION_FILE} {case['name']}: key_id {key_id!r} is no derived key id")
+        chosen = registry_model.select(registry, doc["key_purpose"], key_id)
+        want = case["reject_reason"] if case["reject_reason"] in SELECTION_REFUSALS else None
+        if chosen.get("refused") != want:
+            raise CheckError(f"{DISPOSITION_FILE} {case['name']}: selection gives {chosen}, the case needs {want}")
+    return len(doc["wire_cases"])
+
+
+def check_coverage(documents: dict) -> None:
+    for path in sorted(VECTORS.rglob("*.json")):
+        rel = path.relative_to(VECTORS).as_posix()
+        if "-v2" not in path.stem or rel in documents:
+            continue
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and doc.get("key_purpose") in AUTHORITY_PURPOSES:
+            raise CheckError(f"{rel} is signed under an authority key purpose and is not replayed here")
+
+
+def check(contract: dict, documents: dict) -> int:
+    check_coverage(documents)
+    count = sum(check_case_file(contract, name, documents[name]) for name in CASE_FILES)
+    return count + check_disposition(contract, documents[DISPOSITION_FILE])
+
+
+def corpus_mutants(documents: dict):
+    def mutant(label, name, edit):
+        bad = copy.deepcopy(documents)
+        edit(bad[name])
+        return label, bad
+
+    def rename(doc: dict, old: str, new: str) -> None:
+        text = json.dumps(doc).replace(json.dumps(old), json.dumps(new))
+        doc.clear()
+        doc.update(json.loads(text))
+
+    other_id = registry_model.derive_key_id(public_of("00" * 32))
+    for name in CASE_FILES:
+        doc = documents[name]
+        own = doc["key_id"]
+        yield mutant(f"{name}: a made-up key id throughout", name, lambda d, own=own: rename(d, own, "auth-key-1"))
+        yield mutant(f"{name}: an underived key id throughout", name, lambda d, own=own: rename(d, own, other_id))
+        def made_up_case(d: dict) -> None:
+            case = d["cases"][0]
+            case["artifact"]["key_id"] = "auth-key-1"
+            case["canonical_hex"] = canonical({k: v for k, v in case["artifact"].items() if k != "signature"}).hex()
+        yield mutant(f"{name}: a case naming a made-up key id", name, made_up_case)
+        yield mutant(f"{name}: the registry drops the signing key", name,
+                     lambda d, own=own: d["authority_key_registry"].update(
+                         keys=[k for k in d["authority_key_registry"]["keys"] if k["key_id"] != own]))
+        yield mutant(f"{name}: a registry key from no published seed", name,
+                     lambda d: d["authority_key_registry"]["keys"].append(
+                         {"key_id": other_id, "public_key_hex": public_of("00" * 32),
+                          "purpose": "evidence_authority_disposition", "status": "active"}))
+        yield mutant(f"{name}: a registry status outside the vocabulary", name,
+                     lambda d: d["authority_key_registry"]["keys"][0].update(status="retired"))
+        yield mutant(f"{name}: the contract member", name, lambda d: d.update(contract="evidence-exchange/v1"))
+        yield mutant(f"{name}: the published key_id", name, lambda d: d.update(key_id=other_id))
+        for i, case in enumerate(doc["cases"]):
+            other = doc["cases"][(i + 1) % len(doc["cases"])]["artifact"]["signature"]
+            yield mutant(f"{name} {case['name']}: a stale signature", name,
+                         lambda d, i=i, other=other: d["cases"][i]["artifact"].update(signature=other))
+            yield mutant(f"{name} {case['name']}: a stale canonical form", name,
+                         lambda d, i=i: d["cases"][i].update(canonical_hex=d["cases"][i]["canonical_hex"][:-2] + "7e"))
+
+        def flatten(d: dict) -> None:
+            seed = d["signing_key_seed_hex"]
+            domain = d["domain_ascii"].encode("ascii") + b"\0"
+            for case in d["cases"]:
+                body = {k: v for k, v in case["artifact"].items() if k != "signature"}
+                case["artifact"]["signature"] = "ed25519:" + base64.b64encode(
+                    Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed)).sign(domain + canonical(body))).decode()
+        yield mutant(f"{name}: every valid authenticator re-signed under the selected key", name, flatten)
+    doc = documents[DISPOSITION_FILE]
+    for key_id, entry in doc["registry"].items():
+        yield mutant(f"disposition: {key_id[:15]} renamed to a made-up id", DISPOSITION_FILE,
+                     lambda d, k=key_id: rename(d, k, "auth-disposition-1"))
+        yield mutant(f"disposition: {key_id[:15]} renamed to an underived id", DISPOSITION_FILE,
+                     lambda d, k=key_id: rename(d, k, other_id))
+        yield mutant(f"disposition: {key_id[:15]} without its public key", DISPOSITION_FILE,
+                     lambda d, k=key_id: d["registry"][k].update(public_key_hex=None, seed_hex=None))
+        if entry["status"] == "revoked":
+            yield mutant("disposition: a revoked key as a retired tombstone", DISPOSITION_FILE,
+                         lambda d, k=key_id: d["registry"][k].update(status="retired"))
+    for i, case in enumerate(doc["wire_cases"]):
+        if case["reject_reason"] in SELECTION_REFUSALS or i == 0:
+            yield mutant(f"disposition {case['name']}: a made-up key id", DISPOSITION_FILE,
+                         lambda d, i=i: d["wire_cases"][i]["artifact"].update(key_id="auth-disposition-9"))
+    uncovered = copy.deepcopy(documents)
+    del uncovered[CASE_FILES[0]]
+    yield "a receipt file left out of the replay", uncovered
+
+
+def load() -> dict:
+    return {name: json.loads((VECTORS / name).read_text(encoding="utf-8"))
+            for name in (*CASE_FILES, DISPOSITION_FILE)}
+
+
+def main() -> int:
+    try:
+        contract = registry_model.load_contract(CONTRACT.read_text(encoding="utf-8"))
+        documents = load()
+        count = check(contract, documents)
+    except (CheckError, registry_model.CheckError, KeyError, TypeError, ValueError) as error:
+        print(f"check-evidence-authority-artifact-vectors: {error}", file=sys.stderr)
+        return 1
+    if "--mutations" in sys.argv[1:]:
+        survived, total = [], 0
+        for label, bad in corpus_mutants(documents):
+            total += 1
+            try:
+                check(contract, bad)
+            except (CheckError, KeyError, TypeError, ValueError, AttributeError):
+                continue
+            survived.append(label)
+        if survived:
+            for label in survived:
+                print(f"mutant survived: {label}", file=sys.stderr)
+            return 1
+        print(f"authority artifact mutations: {total} refused")
+    print(f"authority artifact vectors: {count} cases across {len(CASE_FILES) + 1} files replay against "
+          "conforming registries under evidence-exchange/v2")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
