@@ -15,22 +15,37 @@ under test, which reports coverage that does not exist. Every manifest is
 checked for the defects v3 refuses on its own terms, and a case that exists to
 test one of those declares it.
 
+**Tier B execution policy.** `tier-b-policy.json` is evaluated case by case
+against the three rules of v3's *Tier B execution policy*, read from the
+contract's sentences: each refused case must carry exactly the defect its
+`rule` names and name what the rule requires, each accepted case none, every
+value kind and alternative the contract lists must have a case, and no manifest
+in any other file may carry one of the three defects.
+
 Run from the repository root:
 
     python3 scripts/check-skills-package-vectors
+    python3 scripts/check-skills-package-vectors --mutations
 
 Exits non-zero on the first unmet requirement, so it is usable as a gate.
+`--mutations` corrupts the Tier B corpus and the contract sentences, switches
+on each defect a loader could have, and requires every mutant to be refused.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VECTORS = ROOT / "skills-package" / "vectors"
 CORE = ROOT / "schema-descriptor" / "v1.md"
+CONTRACT = ROOT / "skills-package" / "v3.md"
+TIER_B = "tier-b-policy.json"
+DECLARED_CONTRACT = "skills-package/v3"
 
 #: Which cases discharge each requirement of the descriptor core, in the order
 #: the core lists them. Adding a requirement to the core fails this script until
@@ -79,6 +94,342 @@ ISOLATION_EXEMPT: dict[str, str] = {
 }
 
 
+#: The Tier B execution policy's rules, and the identifiers a refusal under each
+#: must name beside the trigger or action entry carrying the defect.
+RULES: dict[str, tuple[str, ...]] = {
+    "one_policy": ("requires_approval", "post_action"),
+    "trigger_only": ("requires_approval", "actions.available"),
+    "boolean": ("requires_approval",),
+}
+
+#: The sentences of v3 the model below encodes. Rewording one fails the check
+#: until the model is reviewed against the new text.
+RULE_SENTENCES: dict[str, str] = {
+    "one_policy": "A trigger declaring both `requires_approval: true` and "
+    "`reasoning_policy: post_action` is refused, whatever its default actions.",
+    "one_policy_false": "`requires_approval: false` beside `post_action` "
+    "declares one policy and is accepted.",
+    "trigger_only": "An `actions.available` entry carrying a `requires_approval` "
+    "member is refused, whatever its value, `false` included.",
+    "boolean": "`requires_approval`, where present, is a boolean.",
+    "boolean_kinds": "Any other value is refused and never coerced: a string, "
+    '`"true"` and `"false"` included, a number, `null`, a sequence or a mapping.',
+    "absent": "An absent member means `false`.",
+    "informational_defaults": "rule 1 binds Tier B triggers, including one whose "
+    "defaults are all Tier A.",
+}
+
+#: Value kinds the boolean rule's cases must cover, as the contract lists them.
+BOOLEAN_KINDS = frozenset(
+    {"string_true", "string_false", "number_truthy", "number_falsy", "null", "sequence", "mapping"}
+)
+
+#: Alternatives the contract accepts, each of which must have an accepted case.
+ACCEPTED_SHAPES = frozenset({"approval_only", "post_action_only", "post_action_with_false"})
+
+#: Loader defects the corpus must catch; each is switched on alone under --mutations.
+MODEL_MUTANTS: dict[str, bool] = {
+    "one_policy_only_physical": False,
+    "one_policy_on_presence": False,
+    "trigger_only_true_only": False,
+    "boolean_accepts_strings": False,
+    "boolean_accepts_numbers": False,
+    "boolean_null_is_absent": False,
+    "boolean_accepts_collections": False,
+}
+
+
+def is_boolean(value: object) -> bool:
+    if MODEL_MUTANTS["boolean_accepts_strings"] and isinstance(value, str):
+        return True
+    if MODEL_MUTANTS["boolean_accepts_numbers"] and type(value) in (int, float):
+        return True
+    if MODEL_MUTANTS["boolean_null_is_absent"] and value is None:
+        return True
+    if MODEL_MUTANTS["boolean_accepts_collections"] and isinstance(value, (list, dict)):
+        return True
+    return isinstance(value, bool)
+
+
+def policy_defects(manifest: dict, registry: dict[str, str]) -> dict[str, set[str]]:
+    """Every defect a manifest carries under the Tier B rules and those beside them.
+
+    Returns each defect with the trigger or action names carrying it.
+    """
+    found: dict[str, set[str]] = {}
+
+    def add(defect: str, where: str) -> None:
+        found.setdefault(defect, set()).add(where)
+
+    tiers: dict[str, str] = {}
+    for entry in manifest["actions"]["available"]:
+        name = entry["name"]
+        tiers[name] = entry.get("tier", "")
+        if "requires_approval" in entry and not (
+            MODEL_MUTANTS["trigger_only_true_only"] and entry["requires_approval"] is not True
+        ):
+            add("trigger_only", name)
+        floor = registry.get(name)
+        if floor and tiers[name] < floor:
+            add("below_floor", name)
+    defaults = manifest["actions"]["defaults"]
+    if set(defaults) != {trigger["name"] for trigger in manifest["triggers"]}:
+        add("defaults_mismatch", "actions.defaults")
+    for name in {a for names in defaults.values() for a in names} - set(tiers):
+        add("undeclared_default", name)
+    for trigger in manifest["triggers"]:
+        name, tier = trigger["name"], trigger.get("action_tier")
+        if tier not in ("A", "B", "C"):
+            add("action_tier", name)
+        approval = False
+        if "requires_approval" in trigger:
+            value = trigger["requires_approval"]
+            if not is_boolean(value):
+                add("boolean", name)
+            else:
+                approval = value is True
+        policy = trigger.get("reasoning_policy", "")
+        if policy not in ("", "post_action"):
+            add("reasoning_policy", name)
+        post_action = policy == "post_action"
+        actions = defaults.get(name, [])
+        physical = tier == "B" and any(tiers.get(a) == "B" for a in actions)
+        if post_action and tier != "B":
+            add("post_action_not_tier_b", name)
+        if MODEL_MUTANTS["one_policy_on_presence"]:
+            approval = "requires_approval" in trigger
+        if approval and post_action and (physical or not MODEL_MUTANTS["one_policy_only_physical"]):
+            add("one_policy", name)
+        if physical and not (approval or post_action):
+            add("no_policy", name)
+        if physical and post_action and not any(tiers.get(a) == "A" for a in actions):
+            add("post_action_without_notice", name)
+    return found
+
+
+def boolean_kind(value: object) -> str:
+    if value == "true" and isinstance(value, str):
+        return "string_true"
+    if value == "false" and isinstance(value, str):
+        return "string_false"
+    if type(value) in (int, float):
+        return "number_truthy" if value else "number_falsy"
+    if value is None:
+        return "null"
+    return {list: "sequence", dict: "mapping"}.get(type(value), type(value).__name__)
+
+
+def accepted_shape(manifest: dict) -> str:
+    trigger = manifest["triggers"][0]
+    approval = trigger.get("requires_approval", None)
+    post_action = trigger.get("reasoning_policy") == "post_action"
+    if approval is True and not post_action:
+        return "approval_only"
+    if approval is None and post_action:
+        return "post_action_only"
+    if approval is False and post_action:
+        return "post_action_with_false"
+    return "other"
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def check_tier_b(documents: dict[str, dict], contract_text: str) -> list[str]:
+    """The Tier B execution-policy corpus, against the contract's three rules."""
+    failures: list[str] = []
+    text = _norm(contract_text)
+    for key, sentence in RULE_SENTENCES.items():
+        if _norm(sentence) not in text:
+            failures.append(f"v3 no longer states the {key} sentence this checker encodes")
+    try:
+        document = documents[TIER_B]
+        declared = set(re.findall(r"skills-package/v\d+", str(document.get("contract", ""))))
+        if declared != {DECLARED_CONTRACT}:
+            failures.append(f"{TIER_B} declares {sorted(declared)}; it exercises {DECLARED_CONTRACT}")
+        registry = document["action_registry"]
+        kinds: set[str] = set()
+        shapes: set[str] = set()
+        one_policy_physical: set[bool] = set()
+        trigger_only_values: set[object] = set()
+        for case in document["cases"]:
+            name, manifest = case["name"], case["manifest"]
+            if case.get("registry") != "action_registry":
+                failures.append(f"{name}: does not name the action_registry fixture")
+            found = policy_defects(manifest, registry)
+            if case["expect"] == "accepted":
+                if "rule" in case or found:
+                    failures.append(f"{name}: accepted, but carries {sorted(found)}")
+                shapes.add(accepted_shape(manifest))
+                continue
+            if case["expect"] != "refused":
+                failures.append(f"{name}: expect is {case['expect']!r}")
+                continue
+            rule = case.get("rule")
+            if rule not in RULES:
+                failures.append(f"{name}: names no rule of the Tier B execution policy")
+                continue
+            if set(found) != {rule}:
+                failures.append(f"{name}: declares {rule}, carries {sorted(found)}")
+                continue
+            if case.get("error") != "SkillValidationError":
+                failures.append(f"{name}: a Tier B policy refusal is a SkillValidationError")
+            must = set(RULES[rule]) | found[rule]
+            missing = must - set(case.get("must_name", []))
+            if missing:
+                failures.append(f"{name}: must_name omits {sorted(missing)}")
+            trigger = manifest["triggers"][0]
+            if rule == "boolean":
+                kinds.add(boolean_kind(trigger["requires_approval"]))
+            elif rule == "one_policy":
+                defaults = manifest["actions"]["defaults"][trigger["name"]]
+                tiers = {e["name"]: e.get("tier") for e in manifest["actions"]["available"]}
+                one_policy_physical.add(any(tiers.get(a) == "B" for a in defaults))
+            else:
+                for entry in manifest["actions"]["available"]:
+                    if "requires_approval" in entry:
+                        trigger_only_values.add(entry["requires_approval"])
+        if not BOOLEAN_KINDS <= kinds:
+            failures.append(f"boolean rule: no case for {sorted(BOOLEAN_KINDS - kinds)}")
+        if not ACCEPTED_SHAPES <= shapes:
+            failures.append(f"no accepted case for {sorted(ACCEPTED_SHAPES - shapes)}")
+        if one_policy_physical != {True, False}:
+            failures.append("one_policy: needs a case with a physical default and one without")
+        if not {True, False} <= trigger_only_values:
+            failures.append("trigger_only: needs a case with true and one with false")
+        for filename, other in documents.items():
+            if filename == TIER_B:
+                continue
+            for case in other["cases"]:
+                manifest = case.get("manifest")
+                if not manifest:
+                    continue
+                stray = set(policy_defects(manifest, {})) & set(RULES)
+                if stray:
+                    failures.append(f"{filename} {case['name']}: carries Tier B policy defect {sorted(stray)}")
+    except (KeyError, TypeError, IndexError, AttributeError) as error:
+        failures.append(f"{TIER_B}: malformed ({error!r})")
+    return failures
+
+
+def _repair(case: dict) -> dict:
+    manifest = copy.deepcopy(case["manifest"])
+    trigger = manifest["triggers"][0]
+    if case["rule"] == "boolean":
+        trigger["requires_approval"] = False
+    elif case["rule"] == "one_policy":
+        del trigger["requires_approval"]
+    else:
+        for entry in manifest["actions"]["available"]:
+            entry.pop("requires_approval", None)
+    return manifest
+
+
+def corpus_mutants(documents: dict[str, dict]):
+    document = documents[TIER_B]
+    registry = document["action_registry"]
+
+    def with_tier_b(bad: dict) -> dict[str, dict]:
+        return {**documents, TIER_B: bad}
+
+    for label, value in (
+        ("declares skills-package/v2", "skills-package/v2 — Tier B execution policy"),
+        ("declares v2 beside v3", document["contract"] + ", skills-package/v2"),
+        ("declares no contract", ""),
+    ):
+        bad = copy.deepcopy(document)
+        bad["contract"] = value
+        yield label, with_tier_b(bad)
+    for i, case in enumerate(document["cases"]):
+        name = case["name"]
+        bad = copy.deepcopy(document)
+        del bad["cases"][i]
+        yield f"without {name}", with_tier_b(bad)
+        bad = copy.deepcopy(document)
+        flipped = bad["cases"][i]
+        if case["expect"] == "refused":
+            flipped["expect"] = "accepted"
+            for key in ("rule", "error", "must_name"):
+                flipped.pop(key)
+            yield f"{name} expected accepted", with_tier_b(bad)
+            for rule in RULES:
+                if rule != case["rule"]:
+                    bad = copy.deepcopy(document)
+                    bad["cases"][i]["rule"] = rule
+                    yield f"{name} blamed on {rule}", with_tier_b(bad)
+            for j in range(len(case["must_name"])):
+                bad = copy.deepcopy(document)
+                del bad["cases"][i]["must_name"][j]
+                yield f"{name} must_name without {case['must_name'][j]}", with_tier_b(bad)
+            bad = copy.deepcopy(document)
+            bad["cases"][i]["error"] = "SkillSecurityError"
+            yield f"{name} as a security error", with_tier_b(bad)
+            bad = copy.deepcopy(document)
+            bad["cases"][i]["manifest"] = _repair(case)
+            yield f"{name} repaired, still expected refused", with_tier_b(bad)
+        else:
+            flipped["expect"] = "refused"
+            flipped.update(rule="boolean", error="SkillValidationError", must_name=["requires_approval"])
+            yield f"{name} expected refused", with_tier_b(bad)
+        before = policy_defects(case["manifest"], registry)
+        for label, inject in (
+            ("a false requires_approval on an action entry",
+             lambda m: m["actions"]["available"][0].__setitem__("requires_approval", False)),
+            ("a string requires_approval",
+             lambda m: m["triggers"][0].__setitem__("requires_approval", "true")),
+            ("both policies",
+             lambda m: m["triggers"][0].update(requires_approval=True, reasoning_policy="post_action")),
+        ):
+            bad = copy.deepcopy(document)
+            inject(bad["cases"][i]["manifest"])
+            if policy_defects(bad["cases"][i]["manifest"], registry) != before:
+                yield f"{name} with {label}", with_tier_b(bad)
+    for filename, other in documents.items():
+        if filename == TIER_B:
+            continue
+        for i, case in enumerate(other["cases"]):
+            if case.get("manifest"):
+                bad = copy.deepcopy(other)
+                bad["cases"][i]["manifest"]["triggers"][0]["requires_approval"] = "false"
+                yield f"{filename} {case['name']} with a string requires_approval", {**documents, filename: bad}
+                break
+
+
+def text_mutants(contract_text: str):
+    for key, sentence in RULE_SENTENCES.items():
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        reworded = sentence.rsplit(" ", 1)[0].replace("\\", "\\\\")
+        edited, count = re.subn(pattern, reworded, contract_text, count=1)
+        yield f"reword {key}", edited, count
+
+
+def run_mutations(documents: dict[str, dict], contract_text: str) -> list[str]:
+    survived: list[str] = []
+    total = 0
+    for label, bad in corpus_mutants(documents):
+        total += 1
+        if not check_tier_b(bad, contract_text):
+            survived.append(label)
+    for flag in MODEL_MUTANTS:
+        total += 1
+        MODEL_MUTANTS[flag] = True
+        try:
+            if not check_tier_b(documents, contract_text):
+                survived.append(f"model mutant {flag}")
+        finally:
+            MODEL_MUTANTS[flag] = False
+    for label, edited, count in text_mutants(contract_text):
+        total += 1
+        if count != 1:
+            survived.append(f"{label}: matches nothing")
+        elif not check_tier_b(documents, edited):
+            survived.append(label)
+    if not survived:
+        print(f"  tier B policy mutations: {total} refused")
+    return survived
+
+
 def core_requirements() -> list[str]:
     """The core's required-case bullets, read from the contract."""
     lines = CORE.read_text(encoding="utf-8").splitlines()
@@ -101,16 +452,25 @@ def core_requirements() -> list[str]:
     return bullets
 
 
-def load_cases() -> dict[str, dict]:
-    cases: dict[str, dict] = {}
+def load_documents() -> dict[str, dict]:
+    documents: dict[str, dict] = {}
     for path in sorted(VECTORS.glob("*.json")):
-        document = json.load(
-            path.open(encoding="utf-8"),
-            parse_constant=lambda name, path=path: (_ for _ in ()).throw(
-                ValueError(f"{path.name}: {name} is not JSON")
-            ),
-        )
+        with path.open(encoding="utf-8") as handle:
+            documents[path.name] = json.load(
+                handle,
+                parse_constant=lambda name, path=path: (_ for _ in ()).throw(
+                    ValueError(f"{path.name}: {name} is not JSON")
+                ),
+            )
+    return documents
+
+
+def load_cases(documents: dict[str, dict]) -> dict[str, dict]:
+    cases: dict[str, dict] = {}
+    for filename, document in documents.items():
         for case in document["cases"]:
+            if case["name"] in cases:
+                raise ValueError(f"{filename}: case {case['name']!r} is named twice")
             cases[case["name"]] = case
     return cases
 
@@ -154,10 +514,15 @@ def check_isolation(cases: dict[str, dict], failures: list[str]) -> None:
 
 
 def main() -> int:
-    cases = load_cases()
+    documents = load_documents()
+    contract_text = CONTRACT.read_text(encoding="utf-8")
+    cases = load_cases(documents)
     failures: list[str] = []
     check_core(cases, failures)
     check_isolation(cases, failures)
+    failures += check_tier_b(documents, contract_text)
+    if not failures and "--mutations" in sys.argv[1:]:
+        failures += [f"mutant survived: {label}" for label in run_mutations(documents, contract_text)]
     if failures:
         print("skills-package vector check FAILED")
         for failure in failures:
@@ -166,6 +531,8 @@ def main() -> int:
     print(f"skills-package vector check OK: {len(cases)} cases")
     print(f"  {len(core_requirements())} descriptor-core requirements mapped")
     print(f"  {len(PRIMITIVES)} primitives accepted and refused")
+    tier_b = documents[TIER_B]["cases"]
+    print(f"  {len(tier_b)} Tier B execution-policy cases hold to {DECLARED_CONTRACT}'s three rules")
     return 0
 
 
