@@ -1,10 +1,11 @@
 # `skills-package/v3` vectors
 
-Four files, split by what a failure would blame.
+Five files, split by what a failure would blame.
 
 | File | Blames |
 | --- | --- |
 | `tier-authority.json` | A package reaching for authority v3 does not grant |
+| `tier-b-policy.json` | A Tier B execution policy that is ambiguous, misplaced or not a boolean |
 | `schema-load.json` | The `config_schema` a skill author wrote |
 | `package-config.json` | The `config` beside that schema |
 | `signature.json` | A manifest altered between signing and loading |
@@ -54,7 +55,7 @@ surrounding state needs inventing.
 ## Checking it
 
 ```bash
-python3 scripts/check-skills-package-vectors
+python3 scripts/check-skills-package-vectors --mutations
 ```
 
 It runs as a pre-commit hook and as an explicit step in `validate.yml` —
@@ -68,6 +69,16 @@ defect other than the one its case names. Both halves exist because both were
 got wrong by hand first: an audit compared against a transcription whose reading
 had stopped a bullet short, and two vectors were refusable for a reason other
 than the one under test.
+
+`tier-b-policy.json` is evaluated against the three rules of v3's *Tier B
+execution policy*, whose sentences the checker reads from the contract: each
+refused case carries exactly the defect its `rule` names (`one_policy`,
+`trigger_only` or `boolean`) and names the field and its carrier, each accepted
+case carries none, every value kind and alternative the contract lists has a
+case, and no manifest in another file carries one of the three defects.
+`--mutations` corrupts the corpus and the contract sentences and switches on
+each loader defect the corpus exists to catch, and requires every mutant to be
+refused.
 
 ## The rule this corpus exists to enforce
 
