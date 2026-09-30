@@ -20,7 +20,12 @@ records"). This checker holds everything else to it:
   pending audit with no tracking issue is reported as a gap;
 - a frozen version whose baseline audit is complete differs from its freeze
   revision only by hunks the audit classifies as erratum or additive, and its
-  contract and vector hashes match the freeze revision (needs full history).
+  contract and vector hashes match the freeze revision (needs full history);
+- a frozen vector file changes only by recorded metadata errata, confirmed at
+  their introducing commits and compared as parsed JSON;
+- a corpus whose `contract` member names contract versions names its own
+  contract at the version it is attributed to, and every version it names
+  exists.
 
 Run from anywhere:
 
@@ -62,7 +67,8 @@ CONFORMANCE = ("unassessed", "conforming", "partial", "non-conforming")
 CLAIM_QUALIFIERS = re.compile(r"\b(planned|partial(ly)?|experimental|test-only|illustrative|non-conforming)\b", re.I)
 CLAIM_VERB = re.compile(r"\b(implement(s|ed)?|conform(s|ed)?|conformance)\b", re.I)
 CLAIMS = ("claimed", "none")
-ROLES = ("producer", "consumer", "gateway", "authority", "verifier", "issuer", "cli", "firmware", "runtime")
+ROLES = ("producer", "consumer", "gateway", "authority", "verifier", "issuer", "cli", "firmware", "runtime",
+         "installer")
 REPOSITORIES = ("runtime", "gateway", "evidence-authority", "cli", "edge-firmware", "sdk-python", "skills-hub")
 FREEZE_EVENTS = ("claiming-merge", "shipment", "conservative-baseline")
 BRANCH_PROTECTION = ("protected", "unprotected")
@@ -90,13 +96,23 @@ FROZEN_KEYS = {"event", "repository", "commit", "date", "release", "contract_rev
 AUDIT_STATES = ("pending", "complete")
 AUDIT_KEYS = {"status", "freeze_revision", "changes_since_freeze", "issue", "pinned_sha256", "pinned_files",
               "contract_sha256",
-              "vectors", "role_commits", "hunks", "appended_files"}
+              "vectors", "role_commits", "hunks", "appended_files", "vector_errata"}
 # A file added to a frozen version after its freeze: recorded with its hash, its additive classification, why it is
 # additive, and the normative clause it exercises, which must exist at the freeze revision or inside a recorded
 # additive hunk.
 APPENDED_KEYS = {"path", "sha256", "classification", "justification", "clause", "clause_basis", "hunk_sha256"}
 CLAUSE_BASES = ("freeze_revision", "additive_hunk")
 HUNK_CLASSES = ("erratum", "additive", "semantic")
+# A frozen vector file admits one change in place: an erratum to these descriptive top-level members, every other
+# member structurally identical. It is not permission to alter a frozen vector.
+VECTOR_METADATA_MEMBERS = ("vector_set", "contract", "canonicalisation")
+VECTOR_ERRATUM_KEYS = {"path", "classification", "from_sha256", "to_sha256", "commit", "members", "justification",
+                       "revendor"}
+VECTOR_ERRATUM_LIMIT = (
+    "A frozen vector file admits only a metadata erratum: the listed descriptive top-level members may change, and "
+    "every other member, case, input, expected result, signature and order must stay structurally identical. It is "
+    "not permission to alter a frozen vector; any other change needs a successor version."
+)
 HUNK_KEYS = {"hunk_sha256", "commit", "classification", "summary", "destination", "optional",
              "unknown_field_compatible"}
 ISSUE = re.compile(r"^https://github\.com/ori-platform/ori-specs/issues/[1-9][0-9]*$")
@@ -105,6 +121,7 @@ DECISIONS_DIR = "decisions/"
 # version token (for example -v2.json) is attributed by that token. None marks a review artifact of no version.
 VECTOR_OWNER = {"evidence/vectors/": "v2", "evidence-exchange/vectors/": "v1", "evidence-transport/vectors/": "v1",
                 "gateway-api/vectors/": "v1", "runtime-evidence-anchor/vectors/": "v1", "offline-tokens/vectors/": "v2",
+                "operator-socket/vectors/": "v1",
                 "runtime-config/vectors/": "v2", "runtime-config/inventory/": None,
                 "skills-package/vectors/": "v3"}
 
@@ -142,6 +159,22 @@ LIMITS = (
 )
 # An issue reference: a tracker URL, or a repository or bare issue number.
 ISSUE_REFERENCE = re.compile(r"issues/[0-9]+|[A-Za-z0-9_.-]#[0-9]+\b|(?:^|[\s(\[])#[0-9]+\b")
+
+
+# A contract version named in a corpus's `contract` member.
+CONTRACT_TOKEN = re.compile(r"\b([a-z][a-z0-9]*(?:-[a-z0-9]+)*)/(v[1-9][0-9]*)\b")
+# Corpora whose declaration names another version of their own contract, each held to the exact value recorded here
+# so that no other declaration passes under it. commissioned-safety-binding/v2 is frozen with its baseline audit
+# pending, which pins these bytes and owns what the corpus declares.
+DECLARATION_EXEMPT = {
+    "commissioned-safety-binding/binding-vectors-v2.json": "ori-specs/commissioned-safety-binding/v1.md",
+}
+DECLARATION_LIMIT = (
+    "Limit: this reads only a corpus's `contract` member. It requires the corpus's own contract at the version the "
+    "corpus is attributed to, and that every other contract version it names exists; it cannot tell whether a "
+    "cross-contract version that exists is the one exercised. The checker that reads the corpus holds it to its "
+    "exact declared set."
+)
 
 
 # Records to compare against in place of the merge base; the mutation harness sets it, nothing else does.
@@ -843,6 +876,31 @@ def check_audit_record(rec: dict, adoption: list, bad: Callable[[str, str], None
                                                           and h.get("unknown_field_compatible") is True):
             bad("additive-not-optional", f"{w}: an additive change to a frozen version must be optional and safe "
                                          "for a consumer that ignores unknown fields")
+    errata = ba.get("vector_errata", [])
+    if not isinstance(errata, list):
+        bad("bad-value", "baseline_audit.vector_errata is a list of metadata errata to frozen vector files")
+        errata = []
+    for i, e in enumerate(errata):
+        w = f"baseline_audit.vector_errata[{i}]"
+        if not isinstance(e, dict) or set(e) != VECTOR_ERRATUM_KEYS:
+            bad("bad-value", f"{w} carries exactly {sorted(VECTOR_ERRATUM_KEYS)}")
+            continue
+        if e["classification"] != "erratum":
+            bad("bad-value", f"{w}.classification is erratum; a frozen vector file admits no other change")
+        if not (isinstance(e["path"], str) and isinstance(vec, dict) and e["path"] in vec):
+            bad("bad-value", f"{w}.path names a vector file this audit records at its freeze revision")
+        if not (SHA256.match(str(e["from_sha256"])) and SHA256.match(str(e["to_sha256"]))
+                and e["from_sha256"] != e["to_sha256"]):
+            bad("bad-value", f"{w} records distinct from_sha256 and to_sha256")
+        if not HEX.match(str(e["commit"])):
+            bad("bad-value", f"{w}.commit is the ori-specs commit that introduced the change")
+        if not (isinstance(e["members"], list) and e["members"] and len(set(e["members"])) == len(e["members"])
+                and set(e["members"]) <= set(VECTOR_METADATA_MEMBERS)):
+            bad("bad-value", f"{w}.members lists the changed members, each one of {list(VECTOR_METADATA_MEMBERS)}")
+        if not (isinstance(e["justification"], str) and e["justification"].strip()):
+            bad("bad-value", f"{w}.justification states why no conforming consumer's accepted input changes")
+        if not (isinstance(e["revendor"], list) and e["revendor"] and all(r in REPOSITORIES for r in e["revendor"])):
+            bad("bad-value", f"{w}.revendor names each repository that must re-vendor the corrected bytes")
     apps = ba.get("appended_files", [])
     if not isinstance(apps, list):
         bad("bad-value", "baseline_audit.appended_files is a list of {path, sha256, classification, justification, "
@@ -934,10 +992,103 @@ def versions_in(root: pathlib.Path, contract: str) -> list[str]:
                   key=lambda v: int(v[1:]))
 
 
+def _git_out(repo: pathlib.Path, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def generated_status_only(repo: pathlib.Path, commit: str, contract: str, version: str, touched: list[str]) -> bool:
+    """Whether a commit's change to a version's files is only its Status paragraph, rendered from its own record.
+
+    Narrow by construction: the commit touches the version's files in `<contract>/<version>.md` alone, it changes
+    the version's own status record, the contract text less its Status paragraph is byte-identical before and
+    after, and the paragraph it writes is the one rendered from that record as the commit leaves it. A commit that
+    also changes one normative word, a vector or any other file of the version, or whose paragraph is not rendered
+    from this version's record at that commit, is not generated-status-only.
+    """
+    doc, rec_path = f"{contract}/{version}.md", f"status/{contract}/{version}.json"
+    if touched != [doc]:
+        return False
+    names = _git_out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", commit)
+    if names is None or rec_path not in names.split("\n"):
+        return False
+    before, after = _git_out(repo, "show", f"{commit}^:{doc}"), _git_out(repo, "show", f"{commit}:{doc}")
+    record = _git_out(repo, "show", f"{commit}:{rec_path}")
+    if before is None or after is None or record is None:
+        return False
+    if normative_digest(before) != normative_digest(after):
+        return False
+    try:
+        rendered = norm(render_status(json.loads(record)))
+    except (ValueError, KeyError, TypeError, RecursionError):
+        return False
+    lines = after.split("\n")
+    sb = status_block(lines)
+    return bool(sb) and paragraph_text(lines[sb[2]:sb[3] + 1]) == rendered
+
+
+_EXPECTED_CHANGES: dict[tuple, list[str] | None] = {}  # one answer per version and baseline for the process
+
+
+def expected_changes(repo: pathlib.Path, root: pathlib.Path, contract: str, version: str,
+                     freeze: str) -> list[str] | None:
+    """The full hashes of the commits after freeze, in HEAD's history, that a version's changes_since_freeze lists.
+
+    A commit is listed when it changes the version's contract text or a file attributed to the version, unless
+    its only change is the generated Status paragraph (generated_status_only). None when history is unreadable.
+    """
+    key = (str(repo), contract, version, freeze)
+    if key in _EXPECTED_CHANGES:
+        return _EXPECTED_CHANGES[key]
+    log = _git_out(repo, "log", "--format=%H", "--reverse", f"{freeze}..HEAD", "--", f"{contract}/")
+    result: list[str] | None = None
+    if log is not None:
+        versions, companions, result = versions_in(root, contract), companion_map(root), []
+        for commit in log.split():
+            names = _git_out(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", commit) or ""
+            touched = sorted(n for n in names.split("\n") if n == f"{contract}/{version}.md" or (
+                n.startswith(f"{contract}/") and not is_version_document(contract, n)
+                and version_of_file(contract, n, versions, companions) == version))
+            if touched and not generated_status_only(repo, commit, contract, version, touched):
+                result.append(commit)
+    _EXPECTED_CHANGES[key] = result
+    return result
+
+
+def check_changes_since_freeze(root: pathlib.Path, key: tuple[str, str], ba: dict, findings: list[Finding]) -> None:
+    where = f"status/{key[0]}/{key[1]}.json"
+    expected = expected_changes(ROOT, root, key[0], key[1], str(ba.get("freeze_revision")))
+    if expected is None:
+        findings.append(Finding("baseline-unverifiable", where,
+                                "changes_since_freeze could not be derived from this checkout's history; the check "
+                                "needs full history (fetch-depth 0)"))
+        return
+    recorded = {}
+    for c in ba.get("changes_since_freeze") or []:
+        full = (_git_out(ROOT, "rev-parse", "--verify", "--quiet", f"{c}^{{commit}}") or "").strip()
+        recorded[full or c] = c
+    for commit in expected:
+        if commit not in recorded:
+            findings.append(Finding("changes-since-freeze", where,
+                                    f"{commit[:7]} changes this version after its freeze and is not in "
+                                    "changes_since_freeze; only a commit whose sole change is the Status paragraph "
+                                    "rendered from this record is left out"))
+    for full, short in recorded.items():
+        if full not in expected:
+            findings.append(Finding("changes-since-freeze", where,
+                                    f"changes_since_freeze lists {short}, which changes nothing of this version "
+                                    "after its freeze but its generated Status paragraph, or is not in HEAD's "
+                                    "history after the freeze revision"))
+
+
 def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: list[Finding]) -> None:
     where = f"{key[0]}/{key[1]}.md"
     ba = rec["baseline_audit"]
     current = read_text(root / where)
+    check_changes_since_freeze(root, key, ba, findings)
     if ba["status"] == "pending":
         if ba.get("issue") is None:
             findings.append(Finding("gap-audit-without-issue", where,
@@ -1005,10 +1156,19 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
             findings.append(Finding("baseline-hash-mismatch", path,
                                     f"the recorded vector hash is not the file's hash at {ba['freeze_revision']}"))
         now = root / path
-        if not now.is_file() or hashlib.sha256(now.read_bytes()).hexdigest() != digest:
+        chain = [e for e in ba.get("vector_errata", []) if isinstance(e, dict) and e.get("path") == path]
+        now_digest = hashlib.sha256(now.read_bytes()).hexdigest() if now.is_file() else None
+        if chain:
+            check_vector_errata(path, old, now.read_bytes() if now.is_file() else None, digest, chain, findings)
+        elif now_digest != digest:
             findings.append(Finding("vector-drift", path,
                                     "a frozen vector file differs from the recorded baseline; vector bytes stay "
-                                    "with the version they exercised"))
+                                    f"with the version they exercised. {VECTOR_ERRATUM_LIMIT}"))
+    for h in ba["hunks"]:
+        if isinstance(h, dict) and h.get("commit") and is_ancestor(str(h["commit"])) is not True:
+            findings.append(Finding("hunk-commit-unreachable", where,
+                                    f"hunk {str(h.get('hunk_sha256'))[:12]} names commit {h['commit']}, which is not in "
+                                    "HEAD's history; a squash or a rewrite leaves the record pointing at nothing"))
     recorded = {h["hunk_sha256"]: h for h in ba["hunks"]}
     for digest, first in net_hunks(base.decode("utf-8", errors="replace"), current):
         h = recorded.get(digest)
@@ -1027,6 +1187,117 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
             findings.append(Finding("semantic-destination-missing", where,
                                     f"semantic hunk {h['hunk_sha256'][:12]} names {h.get('destination')}, which "
                                     "does not exist"))
+
+
+def _refuse_duplicates(pairs: list) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError(f"a member is named twice: {sorted({k for k in keys if keys.count(k) > 1})}")
+    return dict(pairs)
+
+
+def strict_json(data: bytes) -> object:
+    """Parse a vector file refusing a member named twice at any depth; a later duplicate would otherwise win."""
+    return json.loads(data.decode("utf-8"), object_pairs_hook=_refuse_duplicates)
+
+
+# Commits treated as absent from HEAD's history; the mutation harness sets it, nothing else does.
+NOT_ANCESTORS: set[str] = set()
+_ANCESTRY: dict[str, bool | None] = {}  # one answer per commit for the life of the process
+
+
+def is_ancestor(commit: str) -> bool | None:
+    """Whether commit is in HEAD's history: True, False, or None when git cannot say."""
+    if commit in NOT_ANCESTORS:
+        return False
+    if commit not in _ANCESTRY:
+        try:
+            r = subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", commit, "HEAD"],
+                               capture_output=True, timeout=30)
+            _ANCESTRY[commit] = {0: True, 1: False}.get(r.returncode)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return _ANCESTRY[commit]
+
+
+def _metadata_changes(old: bytes | None, new: bytes | None) -> set[str] | None:
+    """The top-level members that differ between two vector files, or None when anything else differs.
+
+    Structural, not textual: both must be JSON objects with the same members in the same order, and every member
+    outside VECTOR_METADATA_MEMBERS must re-encode to the same JSON, which keeps list order, key order and the
+    distinction between true, 1 and 1.0.
+    """
+    try:
+        a = strict_json(old) if old is not None else None
+        b = strict_json(new) if new is not None else None
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(a, dict) or not isinstance(b, dict) or list(a) != list(b):
+        return None
+    changed = {k for k in a if json.dumps(a[k]) != json.dumps(b[k])}
+    if changed - set(VECTOR_METADATA_MEMBERS):
+        return None
+    if any(not isinstance(a[k], str) or not isinstance(b[k], str) for k in changed):
+        return None
+    return changed
+
+
+def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, digest: str, chain: list[dict],
+                        findings: list[Finding]) -> None:
+    """A frozen vector file changed only by recorded metadata errata, each confirmed at its introducing commit."""
+    expected = digest
+    declared: set[str] = set()
+    for e in chain:
+        commit = str(e.get("commit", ""))
+        if e.get("from_sha256") != expected:
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the erratum at {commit} starts from {str(e.get('from_sha256'))[:12]}, not from "
+                                    f"the file's recorded bytes {expected[:12]}. {VECTOR_ERRATUM_LIMIT}"))
+        ancestor = is_ancestor(commit)
+        if ancestor is not True:
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the erratum's commit {commit} is not in HEAD's history"
+                                    + (" (git could not say)" if ancestor is None else "")
+                                    + "; a squash or a rewrite leaves the record pointing at nothing. "
+                                    + VECTOR_ERRATUM_LIMIT))
+        before, after = git_blob(f"{commit}^", path), git_blob(commit, path)
+        if (before is None or after is None) and git_blob(commit, "VERSIONING.md") is not None:
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the commit {commit} does not change this file: the file is absent at it or at "
+                                    f"its parent. {VECTOR_ERRATUM_LIMIT}"))
+        elif before is None or after is None:
+            findings.append(Finding("baseline-unverifiable", path,
+                                    f"the erratum's commit {commit} or its parent is not in this checkout's history; "
+                                    "the check needs full history (fetch-depth 0)"))
+        elif hashlib.sha256(before).hexdigest() != e.get("from_sha256") or \
+                hashlib.sha256(after).hexdigest() != e.get("to_sha256"):
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the commit {commit} does not change this file from {str(e.get('from_sha256'))[:12]} "
+                                    f"to {str(e.get('to_sha256'))[:12]}; an erratum records the commit that "
+                                    f"introduced it. {VECTOR_ERRATUM_LIMIT}"))
+        elif _metadata_changes(before, after) != set(e.get("members") or []):
+            findings.append(Finding("vector-erratum-invalid", path,
+                                    f"the commit {commit} changes more than, or other than, the declared members "
+                                    f"{sorted(e.get('members') or [])}, which are descriptive metadata only. "
+                                    f"{VECTOR_ERRATUM_LIMIT}"))
+        declared |= set(e.get("members") or [])
+        expected = str(e.get("to_sha256"))
+    try:
+        if now is not None:
+            strict_json(now)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        findings.append(Finding("vector-erratum-invalid", path,
+                                f"the file does not parse strictly ({exc}), so no structural comparison can hold. "
+                                f"{VECTOR_ERRATUM_LIMIT}"))
+    net = _metadata_changes(baseline, now)
+    if net is None or not net <= declared:
+        findings.append(Finding("vector-erratum-invalid", path,
+                                "the file differs from its freeze revision in more than the declared descriptive "
+                                f"metadata {sorted(declared)}. {VECTOR_ERRATUM_LIMIT}"))
+    if now is None or hashlib.sha256(now).hexdigest() != expected:
+        findings.append(Finding("vector-drift", path,
+                                f"the file's bytes are not the ones its last recorded erratum reached ({expected[:12]}); "
+                                f"every change to a frozen vector file is recorded. {VECTOR_ERRATUM_LIMIT}"))
 
 
 def draft_audit(root: pathlib.Path, key: tuple[str, str], rec: dict) -> dict:
@@ -1158,6 +1429,11 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                         findings.append(Finding("audit-regressed", where,
                                                 f"{name} of a complete baseline audit changed; the recorded baseline is "
                                                 f"fixed once the audit completes. {HISTORY_LIMIT}"))
+                old_errata, new_errata = oa.get("vector_errata") or [], na.get("vector_errata") or []
+                if not isinstance(new_errata, list) or new_errata[:len(old_errata)] != old_errata:
+                    findings.append(Finding("audit-regressed", where,
+                                            "a complete baseline audit's recorded vector errata were changed or "
+                                            f"removed; vector errata may only be appended. {HISTORY_LIMIT}"))
                 old_hunks, new_hunks = oa.get("hunks") or [], na.get("hunks")
                 if not isinstance(new_hunks, list) or new_hunks[:len(old_hunks)] != old_hunks:
                     findings.append(Finding("audit-regressed", where,
@@ -1249,6 +1525,45 @@ def check_tables(root: pathlib.Path, records: dict, all_records: dict, findings:
 
 # --- driver -------------------------------------------------------------------------------------
 
+def check_corpus_declarations(root: pathlib.Path, findings: list[Finding]) -> None:
+    """Refuse a corpus that declares a version of its own contract other than the one it is attributed to."""
+    companions = companion_map(root)
+    for d in contract_dirs(root):
+        vs = versions_in(root, d.name)
+        for f in sorted(d.rglob("*.json")):
+            rel = f.relative_to(root).as_posix()
+            version = version_of_file(d.name, rel, vs, companions) if vs else None
+            if version in (None, "unattributed"):
+                continue
+            try:
+                document = strict_json(f.read_bytes())
+            except (UnicodeDecodeError, ValueError, RecursionError, OSError) as exc:
+                findings.append(Finding("corpus-declaration", rel,
+                                        f"the corpus does not parse strictly ({exc}); a member named twice would let "
+                                        f"a later copy stand in for the one a reader sees. {DECLARATION_LIMIT}"))
+                continue
+            declared = document.get("contract") if isinstance(document, dict) else None
+            if not isinstance(declared, str):
+                continue
+            if rel in DECLARATION_EXEMPT:
+                if declared != DECLARATION_EXEMPT[rel]:
+                    findings.append(Finding("corpus-declaration", rel,
+                                            f"the exemption holds this corpus to {DECLARATION_EXEMPT[rel]!r}, and "
+                                            f"it now declares {declared!r}. {DECLARATION_LIMIT}"))
+                continue
+            named = CONTRACT_TOKEN.findall(declared)
+            own = sorted({v for c, v in named if c == d.name})
+            if own != [version]:
+                findings.append(Finding("corpus-declaration", rel,
+                                        f"attributed to {d.name}/{version}, but its contract member names "
+                                        f"{d.name} at {own or 'no version'}. {DECLARATION_LIMIT}"))
+            for c, v in named:
+                if not (root / c / f"{v}.md").is_file():
+                    findings.append(Finding("corpus-declaration", rel,
+                                            f"its contract member names {c}/{v}, which does not exist. "
+                                            f"{DECLARATION_LIMIT}"))
+
+
 def check(root: pathlib.Path) -> list[Finding]:
     findings: list[Finding] = []
     records = load_records(root, findings)
@@ -1297,6 +1612,7 @@ def check(root: pathlib.Path) -> list[Finding]:
             wording(rec, paragraph_text(lines[sb[0]:sb[1] + 1]), f"{where} status block", findings)
         if rec["compatibility"] == "frozen":
             check_audit(root, key, rec, findings)
+    check_corpus_declarations(root, findings)
     check_issue_references(root, records, findings)
     missing = [n for n in ("README.md", "VERSIONING.md") if not (root / n).is_file()]
     for name in missing:
@@ -1823,6 +2139,53 @@ def mutations() -> int:
         path = sorted(rec["baseline_audit"]["vectors"])[0]
         (root / path).write_bytes((root / path).read_bytes() + b"\n")
 
+    def redeclare(root: pathlib.Path, rel: str, old: str, new: str) -> None:
+        """Rewrite one contract version inside the corpus's top-level contract member, and nowhere else."""
+        path = root / rel
+        lines = path.read_text(encoding="utf-8").split("\n")
+        at = [i for i, line in enumerate(lines) if re.match(r'^ {1,2}"contract": ', line)]
+        if len(at) != 1 or lines[at[0]].count(old) != 1:
+            raise SystemExit(f"mutation target {rel} does not name {old} exactly once in its contract member")
+        lines[at[0]] = lines[at[0]].replace(old, new)
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+    anchor_rec, anchor_vec = "status/runtime-evidence-anchor/v2.json", "runtime-evidence-anchor/vectors/runtime-anchor-v2.json"
+
+    def vector_structure(fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        """Edit the parsed anchor corpus and write it back; the erratum record is left as it stands."""
+        def edit(root: pathlib.Path) -> None:
+            path = root / anchor_vec
+            data = json.loads(path.read_text(encoding="utf-8"))
+            result = fn(data)
+            path.write_text(json.dumps(result if isinstance(result, dict) else data, indent=2, ensure_ascii=False)
+                            + "\n", encoding="utf-8")
+        return edit
+
+    def erratum_edit(fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
+        return lambda root: _edit_json(root, anchor_rec, lambda r: fn(r["baseline_audit"]["vector_errata"][0]))
+
+    def reorder_members(data: dict) -> dict:
+        keys = list(data)
+        keys[2], keys[3] = keys[3], keys[2]
+        return {k: data[k] for k in keys}
+
+    def unreachable(commit: str) -> Callable[[pathlib.Path], None]:
+        """Treat commit as outside HEAD's history, as a squash or a rewrite would leave it."""
+        return lambda root: NOT_ANCESTORS.add(commit)
+
+    def duplicate_member(rel: str, member: str, value: str) -> Callable[[pathlib.Path], None]:
+        """Name a top-level member twice, the first copy altered, so a last-wins parse sees only the original."""
+        def edit(root: pathlib.Path) -> None:
+            path = root / rel
+            lines = path.read_text(encoding="utf-8").split("\n")
+            at = [i for i, line in enumerate(lines) if re.match(rf'^ {{1,2}}"{member}": ', line)]
+            if len(at) != 1:
+                raise SystemExit(f"mutation target {rel} has no single top-level {member}")
+            indent = lines[at[0]][:len(lines[at[0]]) - len(lines[at[0]].lstrip())]
+            lines.insert(at[0], f'{indent}"{member}": {value},')
+            path.write_text("\n".join(lines), encoding="utf-8")
+        return edit
+
     cases: list[tuple[str, str | None, Callable[[pathlib.Path], None]]] = [
         ("an unmutated copy passes", None, lambda root: None),
         ("a 'no shipped' line under a record with nothing shipped passes", None,
@@ -2194,6 +2557,61 @@ def mutations() -> int:
              (root / f"{unshipped}.md").read_text().replace("> Status:", "> State:", 1))),
         ("an issue reference in a record", "issue-reference:status/",
          rec_edit(unshipped, lambda r: r.update(notes="See ori-runtime#1."))),
+        ("a corpus declaring an earlier version of its own contract", "corpus-declaration:refusal-policy-v2.json",
+         lambda root: redeclare(root, "evidence-transport/vectors/refusal-policy-v2.json",
+                                "evidence-transport/v2", "evidence-transport/v1")),
+        ("a corpus naming another contract in place of its own", "corpus-declaration:tier-c-reconcile.json",
+         lambda root: redeclare(root, "operator-socket/vectors/tier-c-reconcile.json",
+                                "operator-socket/v1", "cli-commands/v1")),
+        ("a corpus naming a contract version that does not exist", "corpus-declaration:does not exist",
+         lambda root: redeclare(root, "evidence-transport/vectors/handoff-order-v2.json",
+                                "evidence-exchange/v2", "evidence-exchange/v9")),
+        ("an exempt corpus declaring anything but its recorded value", "corpus-declaration:the exemption holds",
+         lambda root: redeclare(root, "commissioned-safety-binding/binding-vectors-v2.json",
+                                "commissioned-safety-binding/v1", "commissioned-safety-binding/v2")),
+        ("a case result changed in a frozen vector under a metadata erratum",
+         "vector-erratum-invalid:descriptive metadata",
+         vector_structure(lambda d: d["cases"][0].update(key_id="sha256:" + "0" * 64))),
+        ("two cases swapped in a frozen vector", "vector-erratum-invalid:descriptive metadata",
+         vector_structure(lambda d: d["cases"].insert(0, d["cases"].pop(1)))),
+        ("a case input's key changed in a frozen vector", "vector-erratum-invalid:descriptive metadata",
+         vector_structure(lambda d: d["cases"][0]["inputs"].update(public_key_b64="A" * 43 + "="))),
+        ("a descriptive member outside the whitelist changed", "vector-erratum-invalid:descriptive metadata",
+         vector_structure(lambda d: d.update(purpose="rewritten"))),
+        ("a frozen vector's member order changed", "vector-erratum-invalid:descriptive metadata",
+         vector_structure(reorder_members)),
+        ("a frozen vector reformatted with no erratum recorded", "vector-drift:last recorded erratum",
+         lambda root: (root / anchor_vec).write_bytes((root / anchor_vec).read_bytes() + b"\n")),
+        ("a changed metadata member left out of the erratum", "vector-erratum-invalid:declared members",
+         erratum_edit(lambda e: e["members"].remove("canonicalisation"))),
+        ("an erratum declaring a member outside the whitelist", "bad-value:members lists",
+         erratum_edit(lambda e: e["members"].append("purpose"))),
+        ("an erratum recording a result hash its commit did not produce", "vector-erratum-invalid:does not change",
+         erratum_edit(lambda e: e.update(to_sha256="0" * 64))),
+        ("an erratum naming a commit that did not introduce it", "vector-erratum-invalid:does not change",
+         erratum_edit(lambda e: e.update(commit="06ba18e"))),
+        ("an erratum naming a commit that left the file unchanged", "vector-erratum-invalid:does not change",
+         erratum_edit(lambda e: e.update(commit="a43f95b"))),
+        ("a generated-status-only commit listed in changes_since_freeze", "changes-since-freeze:lists c0b68f6",
+         lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"]["changes_since_freeze"].append(
+             "c0b68f6"))),
+        ("a commit that changed the version left out of changes_since_freeze", "changes-since-freeze:4c9760c",
+         lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"].update(changes_since_freeze=[]))),
+        ("an erratum whose commit is outside HEAD's history", "vector-erratum-invalid:not in HEAD's history",
+         unreachable("4c9760c")),
+        ("a hunk whose commit is outside HEAD's history", "hunk-commit-unreachable:a000026",
+         unreachable("a000026")),
+        ("a frozen vector naming cases twice, the first copy altered", "vector-erratum-invalid:parse strictly",
+         duplicate_member(anchor_vec, "cases", "[]")),
+        ("a corpus naming its contract member twice", "corpus-declaration:parse strictly",
+         duplicate_member("evidence-transport/vectors/refusal-policy-v2.json", "contract",
+                          '"evidence-transport/v1 refusal policy"')),
+        ("a frozen vector's erratum removed", "vector-drift:vector bytes stay",
+         lambda root: _edit_json(root, anchor_rec, lambda r: r["baseline_audit"].pop("vector_errata"))),
+        ("a recorded vector erratum rewritten", "audit-regressed:vector errata",
+         erratum_edit(lambda e: e.update(justification="rewritten"))),
+        ("an erratum naming no repository to re-vendor", "bad-value:revendor",
+         erratum_edit(lambda e: e.update(revendor=[]))),
         ("an issue reference in README.md", "issue-reference:README.md",
          lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
     ]
@@ -2217,6 +2635,7 @@ def mutations() -> int:
                 BASE_OVERRIDE = None
             got = check(root)
             BASE_OVERRIDE = None
+            NOT_ANCESTORS.clear()
             codes = {f.code for f in got}
             if code is None:
                 good = not got
@@ -2232,8 +2651,79 @@ def mutations() -> int:
     total, bad_sibling = sibling_mutations(impl_only)
     failed += bad_sibling
     total += len(cases)
+    more, bad_changes = changes_mutations()
+    total += more
+    failed += bad_changes
     print(f"{total - failed}/{total} mutations behaved as named")
     return 1 if failed else 0
+
+
+def changes_mutations() -> tuple[int, int]:
+    """Build a history in a scratch repository and require each commit to be listed or left out as the rule says."""
+
+    def git(repo: pathlib.Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                               "-c", "commit.gpgsign=false", *args], capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    rec = {"contract": "demo", "version": "v1", "maturity": "draft", "adoption": [], "compatibility": "amendable",
+           "proof": {"end_to_end": {"state": "none"}, "hil": {"state": "none"}, "production": {"state": "none"}}}
+    body = "\n# Demo v1\n\nThe demo contract says one thing.\n"
+
+    def write(repo: pathlib.Path, record: dict, text: str = body, other: bool = False,
+              vector: str | None = None, own: bool = True) -> None:
+        paragraph = "\n".join(wrap_status(render_status(record)))
+        (repo / "demo" / "v1.md").write_text(paragraph + "\n" + text)
+        if own:
+            (repo / "status" / "demo" / "v1.json").write_text(json.dumps(record) + "\n")
+        if other:
+            (repo / "status" / "other" / "v1.json").write_text(json.dumps({**record, "notes": "x"}) + "\n")
+        if vector is not None:
+            (repo / "demo" / "vectors" / "cases.json").write_text(vector)
+
+    def commit(repo: pathlib.Path, message: str) -> str:
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", message)
+        return git(repo, "rev-parse", "HEAD")
+
+    def state(n: str) -> dict:
+        return {**rec, "proof": {**rec["proof"], "hil": {"state": n}}}
+
+    cases = []
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp)
+        git(repo, "init", "-q", "-b", "main")
+        for d in ("demo/vectors", "status/demo", "status/other"):
+            (repo / d).mkdir(parents=True)
+        write(repo, rec, vector="{}\n")
+        write(repo, rec, other=True)
+        freeze = commit(repo, "freeze")
+        write(repo, state("partial"))
+        cases.append(("the Status paragraph re-rendered from its own changed record", commit(repo, "a"), False))
+        write(repo, state("none"), body.replace("one thing", "one other thing"))
+        cases.append(("a re-rendered Status paragraph and one normative word", commit(repo, "b"), True))
+        text = body.replace("one thing", "one other thing")
+        write(repo, state("none"), text, vector="[]\n")  # b left the record at none; only a vector changes here
+        cases.append(("a vector alone", commit(repo, "v"), True))
+        (repo / "status" / "demo" / "v1.json").write_text(json.dumps(state("partial")) + "\n")
+        commit(repo, "the record changes and the paragraph is left stale")
+        write(repo, state("partial"), text, other=True, own=False)
+        cases.append(("a Status paragraph caught up with a record another commit changed, while another record "
+                      "changes", commit(repo, "c"), True))
+        (repo / "status" / "demo" / "v1.json").write_text(json.dumps(state("established")) + "\n")
+        (repo / "demo" / "v1.md").write_text("\n".join(wrap_status(render_status(state("none")))) + "\n" + text)
+        cases.append(("a Status paragraph not rendered from the record the commit leaves", commit(repo, "r"), True))
+        write(repo, state("partial"), text, vector="{}\n")
+        cases.append(("a re-rendered Status paragraph and a vector", commit(repo, "d"), True))
+        write(repo, state("none"), text)
+        cases.append(("the Status paragraph re-rendered again from its own record", commit(repo, "e"), False))
+        expected = expected_changes(repo, repo, "demo", "v1", freeze) or []
+        failed = 0
+        for name, sha, listed in cases:
+            good = (sha in expected) == listed
+            print(f"{'ok  ' if good else 'FAIL'} changes_since_freeze: {name} -> {'listed' if listed else 'left out'}")
+            failed += not good
+    return len(cases), failed
 
 
 def sibling_mutations(rel: str) -> tuple[int, int]:

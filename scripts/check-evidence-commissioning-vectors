@@ -24,6 +24,9 @@ and never from the device. This script holds the corpus to the contract:
   of another device or epoch — and every decision's emitted dispositions and
   confirmation delivery are recomputed from the emission mapping.
 
+The transport corpus's `contract` member must name exactly the contract
+version it exercises.
+
     python3 scripts/check-evidence-commissioning-vectors
     python3 scripts/check-evidence-commissioning-vectors --mutations
 
@@ -896,6 +899,46 @@ def check_corpus(corpus: dict, rules: dict | None = None) -> None:
             fail(f"corpus does not cover: {label}")
 
 
+# Every contract version the transport corpus exercises, and no other: its `contract` member names exactly these.
+DECLARED_CONTRACTS = frozenset({"evidence-transport/v2"})
+CONTRACT_VERSION = re.compile(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)*/v[1-9][0-9]*\b")
+
+
+def check_declaration(document: dict) -> None:
+    named = set(CONTRACT_VERSION.findall(str(document.get("contract", ""))))
+    if named != DECLARED_CONTRACTS:
+        raise Failure(f"the corpus's contract member names {sorted(named)}; it exercises {sorted(DECLARED_CONTRACTS)}")
+
+
+def declaration_mutants(document: dict):
+    """Each exercised version swapped for a sibling, a contract it does not exercise added, and none declared."""
+    for token in sorted(DECLARED_CONTRACTS):
+        name, version = token.rsplit("/v", 1)
+        other = f"{name}/v{int(version) - 1 or int(version) + 1}"
+        bad = json.loads(json.dumps(document))
+        bad["contract"] = bad["contract"].replace(token, other)
+        yield f"declares {other} for {token}", bad
+    bad = json.loads(json.dumps(document))
+    bad["contract"] += ", with gateway-api/v1"
+    yield "declares a contract it does not exercise", bad
+    bad = json.loads(json.dumps(document))
+    del bad["contract"]
+    yield "declares no contract", bad
+
+def check_transport(transport: dict) -> None:
+    """The transport corpus's declaration, and the refusals before any verifier it must carry."""
+    check_declaration(transport)
+    for required in ("device_side_commissioning_authorization", "unknown_artifact_type"):
+        if not any(
+            c["name"] == required
+            and c["expected"] == "refused_malformed_before_verifier"
+            and c.get("status") == 400
+            and c.get("reason") == "malformed"
+            for c in transport["negative_cases"]
+        ):
+            fail(f"ingest-auth.json lacks the {required} refusal before any verifier")
+
+
 def main() -> int:
     text = CONTRACT.read_text(encoding="utf-8")
     if "--print-units" in sys.argv[1:]:
@@ -1122,6 +1165,15 @@ def main() -> int:
                 except Failure:
                     continue
                 survived.append(f"unreachable state survived: {label} in {case['name']}")
+        with TRANSPORT.open(encoding="utf-8") as handle:
+            transport = json.load(handle)
+        for label, bad in declaration_mutants(transport):
+            flips += 1
+            try:
+                check_transport(bad)
+            except Failure:
+                continue
+            survived.append(f"transport corpus {label}")
         for label, covers in REQUIRED_OUTCOMES.items():
             bad = json.loads(json.dumps(corpus))
             bad["cases"] = [c for c in corpus["cases"] if not covers(c)]
@@ -1147,15 +1199,7 @@ def main() -> int:
         check_corpus(corpus)
         with TRANSPORT.open(encoding="utf-8") as handle:
             transport = json.load(handle)
-        for required in ("device_side_commissioning_authorization", "unknown_artifact_type"):
-            if not any(
-                c["name"] == required
-                and c["expected"] == "refused_malformed_before_verifier"
-                and c.get("status") == 400
-                and c.get("reason") == "malformed"
-                for c in transport["negative_cases"]
-            ):
-                fail(f"ingest-auth.json lacks the {required} refusal before any verifier")
+        check_transport(transport)
     except Failure as failure:
         print(f"check-evidence-commissioning-vectors: {failure}", file=sys.stderr)
         return 1
