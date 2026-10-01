@@ -78,7 +78,7 @@ PROOF_FIELDS = ("end_to_end", "hil", "production")
 PROOF_STATES = ("none", "partial", "established")
 
 TOP_KEYS = {"contract", "version", "maturity", "ratified_by", "adoption", "compatibility", "frozen_by",
-            "proof", "baseline_audit", "companion_files", "notes"}
+            "proof", "baseline_audit", "companion_files", "notes", "corrections"}
 ENTRY_KEYS = {"role", "repository", "lifecycle", "conformance", "claim", "implementation", "current", "assessment",
               "notes"}
 CLAIM_KEYS = {"status", "commit", "claim_citation"}
@@ -176,6 +176,19 @@ DECLARATION_LIMIT = (
     "exact declared set."
 )
 
+
+# A correction reclassifies a freeze, an audit or a claim the record got wrong. It names exact old and new values
+# for these fields only; it never unfreezes, erases a shipment, removes a divergence, or touches another field.
+# The decision record is fixed by its digest once cited. A correction naming frozen_by also names the ori-specs state
+# at the external event, from which the contract revision is derived rather than chosen.
+CORRECTION_KEYS = {"date", "decision", "decision_sha256", "evidence", "old", "new"}
+BASIS = "history_basis_revision"
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+CORRECTABLE = ("frozen_by", "baseline_audit.freeze_revision", "baseline_audit.changes_since_freeze",
+               "baseline_audit.pinned_sha256", "baseline_audit.pinned_files", "baseline_audit.contract_sha256",
+               "baseline_audit.vectors", "baseline_audit.role_commits", "baseline_audit.hunks")
+CORRECTABLE_CLAIM = re.compile(r"^adoption\[([a-z-]+)/([a-z-]+)\]\.claim$")
+ABSENT = object()
 
 # Records to compare against in place of the merge base; the mutation harness sets it, nothing else does.
 BASE_OVERRIDE: dict[tuple[str, str], dict] | None = None
@@ -537,6 +550,8 @@ def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: d
     extra = set(rec) - TOP_KEYS
     if extra:
         bad("bad-value", f"unknown fields {sorted(extra)}")
+    for i, c in enumerate(rec.get("corrections", [])) if isinstance(rec.get("corrections", []), list) else [(0, None)]:
+        check_correction_shape(root, f"corrections[{i}]", c, bad)
     if rec.get("maturity") not in MATURITY:
         bad("bad-value", f"maturity must be one of {MATURITY}")
     if rec.get("compatibility") not in COMPATIBILITY:
@@ -761,6 +776,160 @@ def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: d
 def slug(heading: str) -> str:
     """GitHub's heading anchor: lower case, punctuation other than '-' and '_' dropped, spaces to '-'."""
     return re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", heading.strip().lower()))
+
+
+def correctable(path: object) -> bool:
+    return isinstance(path, str) and (path in CORRECTABLE or bool(CORRECTABLE_CLAIM.match(path)))
+
+
+def check_correction_shape(root: pathlib.Path, w: str, c: object, bad: Callable[[str, str], None]) -> None:
+    """A correction is {date, decision, decision_sha256, evidence, old, new}, plus history_basis_revision when it
+    names frozen_by: the same correctable paths in old and new, and the cited decision record unchanged."""
+    if not isinstance(c, dict) or not CORRECTION_KEYS <= set(c) <= CORRECTION_KEYS | {BASIS}:
+        bad("bad-value", f"{w} is an object of exactly {sorted(CORRECTION_KEYS)}, and {BASIS} where it names "
+                         "frozen_by")
+        return
+    if not (isinstance(c["date"], str) and DATE.match(c["date"])):
+        bad("bad-value", f"{w}.date must be YYYY-MM-DD")
+    if not (isinstance(c["evidence"], str) and c["evidence"].strip()):
+        bad("bad-value", f"{w}.evidence states the rederivation the correction rests on")
+    ref = c["decision"]
+    path = ref.partition("#")[0] if isinstance(ref, str) else ""
+    target = (root / path).resolve() if path else None
+    if not path.startswith(DECISIONS_DIR) or ".." in path.split("/") or "\x00" in path or target is None or \
+            not target.is_relative_to(root.resolve()) or target.suffix != ".md" or not target.is_file():
+        bad("bad-value", f"{w}.decision names a Markdown decision record under {DECISIONS_DIR}")
+        target = None
+    digest = c["decision_sha256"]
+    if not (isinstance(digest, str) and SHA256.match(digest)):
+        bad("bad-value", f"{w}.decision_sha256 is the lowercase hex sha256 of the decision record's bytes")
+    elif target is not None and hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+        bad("correction-decision", f"{w}.decision_sha256 does not match {path}; a cited decision record is "
+                                   "immutable, and a correction is never rewritten to match a changed one")
+    old, new = c["old"], c["new"]
+    if not isinstance(old, dict) or not isinstance(new, dict) or not old or set(old) != set(new):
+        bad("bad-value", f"{w}.old and {w}.new name the same fields, and at least one")
+        return
+    if ("frozen_by" in old) != (BASIS in c):
+        bad("bad-value", f"{w} names {BASIS}, the ori-specs state at the event, exactly when it corrects frozen_by")
+    elif BASIS in c:
+        basis = c[BASIS]
+        if not (isinstance(basis, str) and HEX.match(basis)):
+            bad("bad-value", f"{w}.{BASIS} is an ori-specs commit")
+        elif target is not None and not re.search(rf"(?<![0-9a-f]){basis}(?![0-9a-f])",
+                                                  target.read_text(encoding="utf-8", errors="replace")):
+            bad("correction-decision", f"{w}.decision does not name {BASIS} {basis}; the decision record "
+                                       "justifies the basis")
+    for f in old:
+        if not correctable(f):
+            bad("bad-value", f"{w} names {f}, which no correction may change; a correction never unfreezes, "
+                             "erases a shipment, removes a divergence or alters another field")
+
+
+def field_value(rec: dict, path: str) -> object:
+    """The value a correction path names in a record, or ABSENT."""
+    m = CORRECTABLE_CLAIM.match(path)
+    if m:
+        for e in rec.get("adoption") or []:
+            if isinstance(e, dict) and (e.get("role"), e.get("repository")) == m.groups():
+                return e.get("claim", ABSENT)
+        return ABSENT
+    head, _, tail = path.partition(".")
+    value = rec.get(head, ABSENT)
+    if tail:
+        value = value.get(tail, ABSENT) if isinstance(value, dict) else ABSENT
+    return value
+
+
+def _rev_commit(rev: object) -> str | None:
+    """The full commit a revision names in this checkout's history, or None."""
+    if not isinstance(rev, str) or not HEX.match(rev):
+        return None
+    out = (_git_out(ROOT, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}") or "").strip()
+    return out if out and is_ancestor(out) else None
+
+
+def check_correction_history(key: tuple[str, str], rec: dict, basis: object, where: str,
+                             findings: list[Finding]) -> None:
+    """A replacement freeze event must be real and agree with itself: revisions in history, the freeze revision
+    the pin (or the contract revision) and in the history basis, the contract revision the last change to the
+    contract in that basis, and the event matched by an adoption entry. That the basis is the ori-specs state at
+    the event is not something this check can see; the decision record states why, and its digest fixes that."""
+    fb, ba = rec.get("frozen_by") or {}, rec.get("baseline_audit") or {}
+
+    def refuse(msg: str) -> None:
+        findings.append(Finding("correction-history", where, f"the corrected freeze event {msg}"))
+    revs = {"frozen_by.contract_revision": fb.get("contract_revision"),
+            "baseline_audit.freeze_revision": ba.get("freeze_revision"), f"correction {BASIS}": basis}
+    if fb.get("pinned_revision") is not None:
+        revs["frozen_by.pinned_revision"] = fb.get("pinned_revision")
+    full = {name: _rev_commit(rev) for name, rev in revs.items()}
+    for name, commit in full.items():
+        if commit is None:
+            refuse(f"names {name} {revs[name]!r}, which is not a commit in this repository's history")
+    if None in full.values():
+        return
+    expected = full.get("frozen_by.pinned_revision") or full["frozen_by.contract_revision"]
+    if full["baseline_audit.freeze_revision"] != expected:
+        refuse("has a freeze revision other than its pinned revision, or its contract revision where nothing pins")
+    if _git_out(ROOT, "merge-base", "--is-ancestor", full["baseline_audit.freeze_revision"],
+                full[f"correction {BASIS}"]) is None:
+        refuse(f"has history basis {basis}, which does not contain its freeze revision; the event's ori-specs "
+               "state includes the revision the event pins")
+    derived = (_git_out(ROOT, "log", "-1", "--format=%H", full[f"correction {BASIS}"], "--",
+                        f"{key[0]}/{key[1]}.md") or "").strip()
+    if derived != full["frozen_by.contract_revision"]:
+        refuse(f"names contract revision {fb.get('contract_revision')}, which is not the last commit that changed "
+               f"{key[0]}/{key[1]}.md in history basis {basis} ({short(derived) if derived else 'none'})")
+    event, entries = fb.get("event"), [e for e in rec.get("adoption") or [] if isinstance(e, dict)
+                                       and e.get("repository") == fb.get("repository")]
+    impl = [e.get("implementation") or {} for e in entries]
+    if event == "shipment" and not any(e.get("lifecycle") == "shipped" and i.get("release") == fb.get("release")
+                                       and i.get("commit") == fb.get("commit") for e, i in zip(entries, impl)):
+        refuse("is a shipment that no shipped adoption entry records at that commit and release")
+    elif event == "claiming-merge" and not any(isinstance(e.get("claim"), dict) and e["claim"].get("status") ==
+                                               "claimed" and e["claim"].get("commit") == fb.get("commit")
+                                               for e in entries):
+        refuse("is a claiming merge that no cited claim records")
+
+
+def check_corrections(root: pathlib.Path, key: tuple[str, str], old: dict, new: dict,
+                      findings: list[Finding]) -> set[str]:
+    """Hold each correction new in the change to the merge base; return the fields the new corrections name."""
+    where = f"status/{key[0]}/{key[1]}.json"
+    before, after = old.get("corrections") or [], new.get("corrections") or []
+    if not isinstance(after, list) or after[:len(before)] != before:
+        findings.append(Finding("correction-rewritten", where, "a recorded correction was changed or removed; "
+                                f"corrections may only be appended. {HISTORY_LIMIT}"))
+        return set()
+    named: set[str] = set()
+    for i, c in enumerate(after[len(before):], len(before)):
+        if not isinstance(c, dict) or not isinstance(c.get("old"), dict) or not isinstance(c.get("new"), dict):
+            continue
+        w = f"corrections[{i}]"
+        if old.get("compatibility") != "frozen" or new.get("compatibility") != "frozen":
+            findings.append(Finding("correction-refused", where, f"{w} corrects a version that is not frozen on "
+                                                                 "both sides; a correction never unfreezes"))
+            continue
+        for path in c["old"]:
+            if not correctable(path):
+                continue
+            if field_value(old, path) != c["old"][path]:
+                findings.append(Finding("correction-forged", where, f"{w}.old {path} is not the merge-base value"))
+            if field_value(new, path) != c["new"].get(path, ABSENT):
+                findings.append(Finding("correction-mismatch", where, f"{w}.new {path} is not the record's value"))
+            if path == "frozen_by" and isinstance(old.get("frozen_by"), dict) and \
+                    old["frozen_by"].get("event") == "shipment":
+                findings.append(Finding("correction-refused", where, f"{w} replaces a shipment freeze event; a "
+                                                                     "shipment is never erased"))
+            m = CORRECTABLE_CLAIM.match(path)
+            if m and (not isinstance(c["new"][path], dict) or c["new"][path] != {"status": "none"}):
+                findings.append(Finding("correction-refused", where, f"{w} may correct {path} only to "
+                                                                     '{"status": "none"}'))
+            named.add(path)
+        if "frozen_by" in c["old"]:
+            check_correction_history(key, new, c.get(BASIS), where, findings)
+    return named
 
 
 def check_citation(rec: dict, w: str, cit: dict, bad: Callable[[str, str], None]) -> None:
@@ -1395,6 +1564,7 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
     for key, old in sorted(base.items()):
         where = f"status/{key[0]}/{key[1]}.json"
         new = records.get(key)
+        named = check_corrections(root, key, old, new, findings) if isinstance(new, dict) else set()
         if old.get("compatibility") == "frozen":
             if not isinstance(new, dict):
                 if key not in UNREADABLE:
@@ -1412,7 +1582,7 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                     fields += [("pinned_sha256", oa.get("pinned_sha256"), na.get("pinned_sha256")),
                                ("pinned_files", oa.get("pinned_files"), na.get("pinned_files"))]
                 for name, a, b in fields:
-                    if a != b:
+                    if a != b and name not in named and f"baseline_audit.{name}" not in named:
                         findings.append(Finding("frozen-pin-changed", where,
                                                 f"{name} changed while the baseline audit is pending; a re-pin would "
                                                 f"admit the edit the pin refuses. {HISTORY_LIMIT}"))
@@ -1425,7 +1595,7 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                                    ("freeze_revision", oa.get("freeze_revision"), na.get("freeze_revision")),
                                    ("contract_sha256", oa.get("contract_sha256"), na.get("contract_sha256")),
                                    ("vectors", oa.get("vectors"), na.get("vectors"))):
-                    if a != b:
+                    if a != b and name not in named and f"baseline_audit.{name}" not in named:
                         findings.append(Finding("audit-regressed", where,
                                                 f"{name} of a complete baseline audit changed; the recorded baseline is "
                                                 f"fixed once the audit completes. {HISTORY_LIMIT}"))
@@ -1435,7 +1605,8 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                                             "a complete baseline audit's recorded vector errata were changed or "
                                             f"removed; vector errata may only be appended. {HISTORY_LIMIT}"))
                 old_hunks, new_hunks = oa.get("hunks") or [], na.get("hunks")
-                if not isinstance(new_hunks, list) or new_hunks[:len(old_hunks)] != old_hunks:
+                if (not isinstance(new_hunks, list) or new_hunks[:len(old_hunks)] != old_hunks) and \
+                        "baseline_audit.hunks" not in named:
                     findings.append(Finding("audit-regressed", where,
                                             "a complete baseline audit's recorded hunks were changed or removed; hunks "
                                             f"may only be appended. {HISTORY_LIMIT}"))
@@ -1451,7 +1622,8 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
             if isinstance(ne, dict):
                 old_asm = e.get("assessment") if isinstance(e.get("assessment"), dict) else {}
                 new_asm = ne.get("assessment") if isinstance(ne.get("assessment"), dict) else {}
-                if claimed and not (isinstance(ne.get("claim"), dict) and ne["claim"].get("status") == "claimed"):
+                if claimed and not (isinstance(ne.get("claim"), dict) and ne["claim"].get("status") == "claimed") \
+                        and f"adoption[{e.get('role')}/{e.get('repository')}].claim" not in named:
                     findings.append(Finding("adoption-regressed", where,
                                             f"{who}'s claim went from claimed to none; a mistaken claim still froze the "
                                             f"version and stays recorded. {HISTORY_LIMIT}"))
@@ -2614,6 +2786,173 @@ def mutations() -> int:
          erratum_edit(lambda e: e.update(revendor=[]))),
         ("an issue reference in README.md", "issue-reference:README.md",
          lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
+    ]
+    corrected = _first(records, lambda r: bool(r.get("corrections")) and r.get("compatibility") == "frozen")
+    corrected_rec = f"status/{corrected}.json"
+
+    def set_field(rec: dict, path: str, value: object) -> None:
+        m = CORRECTABLE_CLAIM.match(path)
+        if m:
+            next(e for e in rec["adoption"] if (e["role"], e["repository"]) == m.groups())["claim"] = value
+            return
+        head, _, tail = path.partition(".")
+        if tail:
+            rec[head][tail] = value
+        else:
+            rec[head] = value
+
+    def uncorrected(rec: dict) -> dict:
+        """The record as it stood before its last correction: the merge base that correction was made against."""
+        out = copy.deepcopy(rec)
+        last = out["corrections"].pop()
+        for path, value in last["old"].items():
+            set_field(out, path, copy.deepcopy(value))
+        if not out["corrections"]:
+            out.pop("corrections")
+        return out
+
+    def correcting(edit: Callable[[dict], None] | None = None, base_is_tree: bool = False) -> Callable:
+        """Compare the corrected record with its uncorrected merge base, after an edit to the tree's record."""
+        def mutate(root: pathlib.Path) -> None:
+            assert BASE_OVERRIDE is not None
+            key = tuple(corrected.split("/"))
+            if not base_is_tree:
+                BASE_OVERRIDE[key] = uncorrected(records[key])  # type: ignore[index]
+            if edit is not None:
+                _edit_json(root, corrected_rec, edit)
+                write_status_lines(root)
+                write_rows(root)
+        return mutate
+
+    def last_correction(r: dict) -> dict:
+        return r["corrections"][-1]
+
+    def forge_old(r: dict) -> None:
+        c = last_correction(r)
+        c["old"]["baseline_audit.freeze_revision"] = c["new"]["baseline_audit.freeze_revision"]
+
+    def mismatch_new(r: dict) -> None:
+        last_correction(r)["new"]["baseline_audit.contract_sha256"] = "0" * 64
+
+    def omit_protected(r: dict) -> None:
+        c = last_correction(r)
+        for side in ("old", "new"):
+            c[side].pop("baseline_audit.contract_sha256")
+
+    def unfreeze_corrected(r: dict) -> None:
+        r["compatibility"] = "amendable"
+        r.pop("frozen_by")
+        r.pop("baseline_audit")
+        r["adoption"] = [e for e in r["adoption"] if e["lifecycle"] != "shipped"]
+
+    def replace_shipment(r: dict) -> None:
+        old = copy.deepcopy(r["frozen_by"])
+        r["frozen_by"]["date"] = "2026-01-01"
+        r["corrections"].append({**copy.deepcopy(last_correction(r)), "old": {"frozen_by": old},
+                                 "new": {"frozen_by": copy.deepcopy(r["frozen_by"])}})
+
+    def drop_divergence(r: dict) -> None:
+        e = next(e for e in r["adoption"] if (e.get("assessment") or {}).get("divergences"))
+        e["assessment"]["divergences"] = e["assessment"]["divergences"][1:] or ["replaced"]
+
+    def name_assessment(r: dict) -> None:
+        e = next(e for e in r["adoption"] if (e.get("assessment") or {}).get("divergences"))
+        path = f"adoption[{e['role']}/{e['repository']}].assessment"
+        last_correction(r)["old"][path] = last_correction(r)["new"][path] = e["assessment"]
+
+    def off_history(r: dict) -> None:
+        r["frozen_by"]["contract_revision"] = "1234567"
+        last_correction(r)["new"]["frozen_by"] = copy.deepcopy(r["frozen_by"])
+
+    def unrelated_contract_revision(r: dict) -> None:
+        own = set((_git_out(ROOT, "log", "--format=%h", "--", f"{corrected}.md") or "").split())
+        other = next(h for h in (_git_out(ROOT, "log", "--format=%h", "--", "VERSIONING.md") or "").split()
+                     if h not in own)
+        r["frozen_by"]["contract_revision"] = other
+        last_correction(r)["new"]["frozen_by"] = copy.deepcopy(r["frozen_by"])
+
+    def claim_not_none(r: dict) -> None:
+        c = last_correction(r)
+        path = next(p for p in c["new"] if CORRECTABLE_CLAIM.match(p))
+        c["new"][path] = {"status": "claimed"}
+        set_field(r, path, {"status": "claimed"})
+
+    def rewrite_recorded(r: dict) -> None:
+        last_correction(r)["evidence"] = "rewritten"
+
+    def basis_edit(fn: Callable[[dict], None]) -> Callable[[dict], None]:
+        return lambda r: fn(last_correction(r))
+
+    def earlier_basis(c: dict) -> None:
+        cr = (_git_out(ROOT, "rev-parse", "--short=7", f"{c['new']['frozen_by']['contract_revision']}^") or "")
+        c[BASIS] = cr.strip()
+
+    cited = last_correction(records[tuple(corrected.split("/"))])["decision"].partition("#")[0]  # type: ignore[index]
+    basis = last_correction(records[tuple(corrected.split("/"))]).get(BASIS, "")  # type: ignore[index]
+    other_decision, other_text = "decisions/another-decision.md", f"# Another\n\nIt names {basis}.\n".encode()
+
+    def decision_bytes(edit: Callable[[pathlib.Path], None], base_is_tree: bool = False,
+                       record: Callable[[dict], None] | None = None) -> Callable[[pathlib.Path], None]:
+        def mutate(root: pathlib.Path) -> None:
+            edit(root / cited)
+            correcting(record, base_is_tree)(root)
+        return mutate
+
+    def amend(path: pathlib.Path) -> None:
+        path.write_bytes(path.read_bytes() + b"\nAmended after citation.\n")
+
+    def unnamed(path: pathlib.Path) -> bytes:
+        return path.read_bytes().replace(basis.encode(), b"the pinned revision")
+
+    def unname_basis(path: pathlib.Path) -> None:
+        path.write_bytes(unnamed(path))
+
+    def bless(r: dict) -> None:
+        last_correction(r)["decision_sha256"] = hashlib.sha256((ROOT / cited).read_bytes()
+                                                               + b"\nAmended after citation.\n").hexdigest()
+
+    cases += [
+        ("a correction made against its merge base passes", None, correcting()),
+        ("a correction whose old value is not the merge-base value", "correction-forged:freeze_revision",
+         correcting(forge_old)),
+        ("a correction whose new value is not the record's", "correction-mismatch:contract_sha256",
+         correcting(mismatch_new)),
+        ("a protected change the correction does not name", "audit-regressed:contract_sha256",
+         correcting(omit_protected)),
+        ("a corrected record made amendable", "unfreeze-refused:became amendable", correcting(unfreeze_corrected)),
+        ("a correction that replaces a shipment freeze event", "correction-refused:shipment is never erased",
+         correcting(replace_shipment, base_is_tree=True)),
+        ("a divergence deleted beside a correction", "adoption-regressed:divergences", correcting(drop_divergence)),
+        ("a correction naming an assessment", "bad-value:no correction may change", correcting(name_assessment)),
+        ("a corrected freeze event outside this repository's history", "correction-history:not a commit",
+         correcting(off_history)),
+        ("a corrected contract revision that did not change the contract", "correction-history:not the last commit",
+         correcting(unrelated_contract_revision)),
+        ("a history basis that derives another contract revision", "correction-history:not the last commit",
+         correcting(basis_edit(earlier_basis))),
+        ("a history basis that predates the freeze revision", "correction-history:does not contain",
+         correcting(basis_edit(lambda c: c.update({BASIS: c["new"]["frozen_by"]["contract_revision"]})))),
+        ("a history basis outside this repository's history", f"correction-history:{BASIS} '1234567'",
+         correcting(basis_edit(lambda c: c.update({BASIS: "1234567"})))),
+        ("a freeze-event correction with no history basis", f"bad-value:{BASIS}",
+         correcting(basis_edit(lambda c: c.pop(BASIS)))),
+        ("a cited decision record changed", "correction-decision:does not match", decision_bytes(amend)),
+        ("a recorded decision digest rewritten to bless a changed record", "correction-rewritten:appended",
+         decision_bytes(amend, base_is_tree=True, record=bless)),
+        ("a cited decision record deleted", "bad-value:decision record", decision_bytes(lambda p: p.unlink())),
+        ("a cited decision record replaced by another", "correction-decision:does not match",
+         decision_bytes(lambda p: p.write_bytes(other_text))),
+        ("a decision record that does not name the history basis", "correction-decision:does not name",
+         decision_bytes(unname_basis, record=lambda r: last_correction(r).update(
+             decision_sha256=hashlib.sha256(unnamed(ROOT / cited)).hexdigest()))),
+        ("a correction citing another decision under the same digest", "correction-decision:does not match",
+         decision_bytes(lambda p: (p.parent.parent / other_decision).write_bytes(other_text),
+                        record=lambda r: last_correction(r).update(decision=other_decision))),
+        ("a claim corrected to anything but none", "correction-refused:only to", correcting(claim_not_none)),
+        ("a recorded correction rewritten", "correction-rewritten:appended",
+         correcting(rewrite_recorded, base_is_tree=True)),
+        ("a correction citing no decision record", "bad-value:decision record",
+         correcting(lambda r: last_correction(r).update(decision="decisions/absent.md"))),
     ]
     failed = 0
     # Codes a case must not produce: a valid span citation is accepted, not refused.

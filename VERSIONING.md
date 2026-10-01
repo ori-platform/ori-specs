@@ -28,6 +28,7 @@ A record carries:
 | `baseline_audit` | Only when `frozen`, and always then: the audit of the version's text against its freeze revision. See [Baseline Audit](#baseline-audit). |
 | `proof` | `end_to_end`, `hil` and `production`, each with its own `state` of `none`, `partial` or `established`, and its own evidence. |
 | `notes` | Optional prose. |
+| `corrections` | Optional, append-only: each recorded correction of a misclassified freeze, audit or claim. See [Corrections](#corrections). |
 
 Adoption vocabularies:
 
@@ -312,6 +313,35 @@ the default branch, and refuses:
 A record that is new in the change has no merge-base version and cannot be
 compared.
 
+### Corrections
+
+A freeze event, an audit or a claim recorded on a misreading of these rules,
+such as provenance wording classified as a conformance claim, is corrected only
+by appending to the record's `corrections` an entry `{date, decision,
+decision_sha256, evidence, old, new}`. `old` and `new` name the same fields,
+with their exact values before and after, from a closed set: `frozen_by`, the
+audit's `freeze_revision`, `changes_since_freeze`, `pinned_sha256`,
+`pinned_files`, `contract_sha256`, `vectors`, `role_commits` and `hunks`, and
+an adoption entry's `claim`, which may only become `{"status": "none"}`.
+`decision` names a decision record under `decisions/`, `decision_sha256` the
+sha256 of its bytes, checked on every run, and `evidence` states the
+rederivation. A correction naming `frozen_by` also names
+`history_basis_revision`, the ori-specs commit that was the repository's state
+at the event, which the decision record names and justifies.
+
+Against the merge base, the checker requires every `old` value to be the
+merge-base value and every `new` value to be the record's, and lifts the
+refusals above for the named fields only. A replacement freeze event must name
+commits in this repository's history, its freeze revision must be its pinned
+revision (or its contract revision where nothing pins) and in the history
+basis, its contract revision must be the last commit that changed the contract
+in that basis, and an adoption entry must record the event. A correction never unfreezes, never
+replaces a shipment event, never removes a divergence, and is never changed or
+removed once recorded. The checker cannot verify a sibling repository's commit
+or release; `--verify-siblings` does. A shipment attributed to the wrong
+release or repository is not a misclassification and cannot be corrected this
+way; it needs a later, separately ratified change to this schema.
+
 When an audit is **complete**, the checker reads `freeze_revision` from
 history, confirms the recorded contract and vector hashes, and compares the
 current text with the baseline. Every difference must be a recorded
@@ -382,7 +412,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
 | evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
 | evidence-exchange | v2 | `draft` | `amendable` | — |
-| evidence-transport | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
+| evidence-transport | v1 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
 | evidence-transport | v2 | `draft` | `amendable` | — |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
 | firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit pending |
