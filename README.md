@@ -68,7 +68,7 @@ below are checked against those records.
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | `draft` | none recorded | `amendable` |
 | Skill package format (previous) | [skills-package/v1.md](skills-package/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.1, `unassessed`, producer (sdk-python) `implemented-unreleased`, `unassessed`, consumer (skills-hub) `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `pending` |
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | `draft` | consumer (runtime) `shipped` in v2.4.0-rc.3, `unassessed` | `frozen` (2026-08-17), audit `pending` |
-| Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | verifier (evidence-authority) `implemented-unreleased`, `unassessed` | `amendable` |
+| Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
 | Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `implemented-unreleased`, `unassessed` | `amendable` |
 
