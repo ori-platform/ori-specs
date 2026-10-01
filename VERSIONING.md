@@ -411,7 +411,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
 | evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
-| evidence-exchange | v2 | `draft` | `amendable` | — |
+| evidence-exchange | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit pending |
 | evidence-transport | v1 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
 | evidence-transport | v2 | `draft` | `amendable` | — |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
