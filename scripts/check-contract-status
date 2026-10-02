@@ -2008,21 +2008,8 @@ def mutations() -> int:
     vector_frozen = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
                            and r["baseline_audit"].get("pinned_files"))
     pinned_frozen = _first(records, lambda r: r.get("frozen_by", {}).get("pinned_revision"))
-    # An amendable version carrying only unreleased implementations. Releases
-    # turn such records into shipped, frozen ones, so the corpus may hold none;
-    # then an amendable version with no adoption is given one in the scratch
-    # copy, so the cases below never depend on what has not yet shipped.
-    try:
-        impl_only = _first(records, lambda r: r["compatibility"] == "amendable" and r["adoption"]
-                           and all(e["lifecycle"] == "implemented-unreleased" for e in r["adoption"])
-                           and "current" in r["adoption"][0])
-        impl_only_seed: dict | None = None
-    except SystemExit:
-        impl_only = unshipped
-        impl_only_seed = {"role": "producer", "repository": "runtime", "lifecycle": "implemented-unreleased",
-                          "conformance": "unassessed", "claim": {"status": "none"},
-                          "implementation": {"commit": "0" * 12, "release": None, "paths": ["ori/runtime.py"]},
-                          "current": {"commit": "0" * 12}}
+    # The synthetic fixture, installed in every scratch copy and its baseline; never a live record.
+    impl_only = FIXTURE_REL
     claimed_freeze = _first(records, lambda r: r.get("frozen_by", {}).get("event") == "claiming-merge")
 
     def claim(key: str, sentence: str | None = None, **citation: object) -> dict:
@@ -2030,15 +2017,9 @@ def mutations() -> int:
                            "text": sentence or f"This repository implements {key}."}
         return {"status": "claimed", "commit": "0" * 12, "claim_citation": cit}
 
-    def first_entry(rel: str, r: dict) -> dict:
-        """The record's first adoption entry, seeding impl_only's when the corpus holds none."""
-        if rel == impl_only and impl_only_seed is not None and not r["adoption"]:
-            r["adoption"].append(json.loads(json.dumps(impl_only_seed)))
-        return r["adoption"][0]
-
     def entry_update(rel: str, assessment: dict | None = None, **kw: object) -> Callable[[pathlib.Path], None]:
         def edit(r: dict) -> None:
-            e = first_entry(rel, r)
+            e = r["adoption"][0]
             e.update(kw)
             if assessment is not None:
                 e["assessment"] = {"snapshot": "implementation", "commit": e["implementation"].get("commit"),
@@ -2261,7 +2242,7 @@ def mutations() -> int:
         return lambda root: _edit_json(root, f"status/{rel}.json", fn)
 
     def e0(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
-        return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(first_entry(rel, r)))
+        return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(r["adoption"][0]))
 
     def decision(root: pathlib.Path) -> None:
         (root / "decisions").mkdir(exist_ok=True)
@@ -3004,6 +2985,7 @@ def mutations() -> int:
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "specs"
             shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            install_fixture(root)
             for rel in sorted((root / "status").rglob("*.json")):
                 data = json.loads(rel.read_text(encoding="utf-8"))
                 if isinstance(data.get("baseline_audit"), dict) and data["baseline_audit"].get("issue") is None:
@@ -3012,6 +2994,7 @@ def mutations() -> int:
             global BASE_OVERRIDE
             # Every case compares against the records as they stand, as if they were already on main.
             BASE_OVERRIDE = copy.deepcopy(base)
+            BASE_OVERRIDE[FIXTURE] = copy.deepcopy(FIXTURE_RECORD)
             if mutate(root) == "no-history":
                 BASE_OVERRIDE = None
             got = check(root)
@@ -3107,6 +3090,50 @@ def changes_mutations() -> tuple[int, int]:
     return len(cases), failed
 
 
+FIXTURE = ("zz-mutation-fixture", "v1")
+FIXTURE_REL = f"{FIXTURE[0]}/{FIXTURE[1]}"
+FIXTURE_RECORD = {
+    "contract": FIXTURE[0], "version": FIXTURE[1], "maturity": "draft",
+    "adoption": [{"role": "producer", "repository": "runtime", "lifecycle": "implemented-unreleased",
+                  "conformance": "unassessed", "claim": {"status": "none"},
+                  "implementation": {"commit": "0" * 12, "release": None, "paths": ["ori/runtime.py"]},
+                  "current": {"commit": "0" * 12}}],
+    "compatibility": "amendable",
+    "proof": {"end_to_end": {"state": "none"}, "hil": {"state": "none"}, "production": {"state": "none"}},
+}
+
+
+def install_fixture(root: pathlib.Path) -> None:
+    """Add the synthetic amendable version with one unreleased implementation to a scratch tree.
+
+    The cases that need such a version edit this one, never a live record, so a status change on main
+    can neither remove their fixture nor change what each case mutates. The version gets its document,
+    record and both summary rows, rendered by the same writers that render the real ones, so the
+    unmutated fixture produces no finding.
+    """
+    d = root / FIXTURE[0]
+    d.mkdir()
+    (d / f"{FIXTURE[1]}.md").write_text(
+        "# Mutation Fixture Contract v1\n\n> Status: rendered below.\n\n"
+        "A synthetic contract the mutation cases edit. It exists only in their scratch copies.\n",
+        encoding="utf-8")
+    (root / "status" / FIXTURE[0]).mkdir()
+    (root / "status" / f"{FIXTURE_REL}.json").write_text(json.dumps(FIXTURE_RECORD, indent=2) + "\n",
+                                                        encoding="utf-8")
+    for name, header, row in (
+            ("README.md", "| Contract | File |", f"| Mutation fixture | [{FIXTURE_REL}.md]({FIXTURE_REL}.md) | - | - | - |"),
+            ("VERSIONING.md", "| Contract | Version |", f"| {FIXTURE[0]} | {FIXTURE[1]} | - | - | - |")):
+        lines = (root / name).read_text(encoding="utf-8").split("\n")
+        start = next(i for i, line in enumerate(lines) if line.startswith(header))
+        end = start + 2
+        while end < len(lines) and lines[end].startswith("|"):
+            end += 1
+        lines.insert(end, row)
+        (root / name).write_text("\n".join(lines), encoding="utf-8")
+    write_status_lines(root)
+    write_rows(root)
+
+
 def sibling_mutations(rel: str) -> tuple[int, int]:
     """Drive --verify-siblings against a synthetic sibling repository built in a scratch directory."""
     c, v = rel.split("/")
@@ -3176,6 +3203,8 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
             siblings, a, b = build(tmpdir)
             root = tmpdir / "specs"
             shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            if rel == FIXTURE_REL:
+                install_fixture(root)
             for other in (root / "status").rglob("*.json"):
                 if other.relative_to(root).as_posix() != f"status/{rel}.json":
                     other.unlink()
