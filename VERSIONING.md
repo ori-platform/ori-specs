@@ -411,9 +411,9 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
 | evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
-| evidence-exchange | v2 | `draft` | `amendable` | — |
+| evidence-exchange | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit pending |
 | evidence-transport | v1 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
-| evidence-transport | v2 | `draft` | `amendable` | — |
+| evidence-transport | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit pending |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
 | firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit pending |
 | firmware-telemetry | v1 | `draft` | `frozen` | claiming-merge, runtime `8aefc63`, 2026-07-16; audit pending |
@@ -426,7 +426,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | offline-tokens | v2 | `draft` | `frozen` | claiming-merge, runtime `31ef157`, 2026-09-26; audit complete |
 | operator-socket | v1 | `draft` | `frozen` | claiming-merge, runtime `4078762`, 2026-09-29; audit complete |
-| operator-socket | v2 | `draft` | `amendable` | — |
+| operator-socket | v2 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
 | runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-config | v2 | `draft` | `amendable` | — |
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
@@ -435,7 +435,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-evidence-anchor | v2 | `draft` | `frozen` | claiming-merge, runtime `01d614a`, 2026-09-26; audit complete |
 | runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
-| runtime-health | v3 | `draft` | `amendable` | — |
+| runtime-health | v3 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
 | runtime-mobile | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit pending |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
@@ -452,7 +452,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit pending |
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |
-| tier-c-approval | v1 | `draft` | `amendable` | — |
+| tier-c-approval | v1 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
 
 ## Deprecation
 
