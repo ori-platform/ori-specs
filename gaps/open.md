@@ -209,9 +209,7 @@ accurate description of what a repo implements.
   permissions. The commissioned-feedback
   mapping that proves an outcome is still undefined, so that form of
   reconciliation has no contract shape beyond the answer operator-socket/v2
-  fixes for an identical operator request. No consumer enforces the release
-  maximum on `approval_timeout_seconds` from
-  [runtime-config/v2.md](../runtime-config/v2.md).
+  fixes for an identical operator request.
 - **Evidence-carriage consumers cite gateway-api/v1**
   ([gateway-evidence-carriage/v1.md](../gateway-evidence-carriage/v1.md)): the
   runtime-gateway evidence MQTT surface is versioned in its own contract, and
@@ -569,12 +567,6 @@ accurate description of what a repo implements.
   design-target section adds them so that `wrong_authority` is reachable for
   the provisioning document and the provisioning key can rotate. The runtime's
   signature path neither reads `signing_key` nor configures a previous anchor.
-
-- **`skills[].config` is closed to one key**
-  ([runtime-config/v2.md](../runtime-config/v2.md)): the shipped examples
-  carry skill settings that never reach the skill and are refused under v2
-  until `skills-package/v3` gives them a signed schema to be validated
-  against. The delegation flips to pass-through when a runtime implements v3.
 
 ## safety-profile/v1 implementation targets
 

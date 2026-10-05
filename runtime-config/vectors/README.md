@@ -27,8 +27,8 @@ other than the one it names reports coverage that does not exist.
 
 Delegated subtrees follow the contract's rule for a consumer without the
 delegate: sensor protocol keys pass through (`sensor-configuration/v1` is
-implemented wherever v2 is), and `skills[].config` keys other than
-`approval_timeout_seconds` are refused naming `skills-package/v3`.
+implemented wherever v2 is). A skill entry declares no `config`, so
+`skills[i].config` is refused by its full path in any form, `{}` included.
 
 ## Checking it
 
