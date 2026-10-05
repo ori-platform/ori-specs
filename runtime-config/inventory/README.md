@@ -153,7 +153,10 @@ dead configuration, not proof**, since a key could be assembled dynamically. At
 this commit no example leaf name is absent. `actions.relay.active_high` is named
 only by the refusal that sends polarity to the commissioned binding, and the
 example no longer carries skill settings: a skill entry is `name` and
-`version`, and `skills[].config` is read only to refuse it.
+`version`, and `skills[].config` is read only to refuse it. The generator
+records that refusal-only read as `"presence": "required"`, because it reads the
+subscript inside `if "config" in item:` as a required key; the 37 required
+paths count it, and the row is the generator's error, not a requirement.
 
 ## What this forces a decision on
 
@@ -164,11 +167,13 @@ are:
 delegation to per-adapter contracts. Either way the adapter metadata surface
 becomes specified for the first time.
 
-**Skill configuration.** `skills-package/v2` defines `config` as an arbitrary
-object with reserved-name checks and **no per-skill schema**. The withdrawn v2
-draft claimed delegation to a schema that does not exist, and its corpus
-invented a `skill_manifests` table so the vector would pass. A real target has
-to exist before v2 can delegate to one.
+**Skill configuration — settled by refusal.** `skills-package/v2` defines
+`config` as an arbitrary object with reserved-name checks and **no per-skill
+schema**. The withdrawn v2 draft claimed delegation to a schema that does not
+exist, and its corpus invented a `skill_manifests` table so the vector would
+pass. `runtime-config/v2` now declares no `skills[].config` and refuses it by
+full path; a delegation returns only in a successor, once a runtime implements
+`skills-package/v3`.
 
 ## How to check this artifact
 
