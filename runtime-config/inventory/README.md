@@ -24,9 +24,9 @@ rather than transcribed, and the extraction is the artifact.
 
 `runtime-surface-inventory.json` is generated from `ori/config.py` at
 `ori-runtime` commit
-**`e0d17f61128658b114a2473461ef551c2560a193`**.
+**`8adf3f7430a582752a8dc464a321d08c0afa10bf`**.
 
-**177 configuration paths across 19 parse functions**, 39 required.
+**177 configuration paths across 19 parse functions**, 37 required.
 
 ### Receivers are tracked, because a key is not a path
 
@@ -122,7 +122,7 @@ The walk covers `ori/config.py`'s parse functions. It does **not** cover keys
 read elsewhere: `runtime.py` assembles the dict handed to `adapter.connect()`,
 and adapters read from it directly.
 
-Of the shipped example's leaf paths, **80 are not parsed by `config.py`**.
+Of the shipped example's leaf paths, **78 are not parsed by `config.py`**.
 
 **Adapter correlation is applied to `sensors[]` only.** An earlier version
 matched any path whose final segment appeared in any adapter, which credited
@@ -135,11 +135,12 @@ adapter is not evidence of anything.
 | `sensors[].address` | `I2CAdapter` |
 | `sensors[].channel` | `I2CAdapter` |
 | `sensors[].port` | `GrowattAdapter`, `SerialAdapter`, `SolarmanModbusAdapter` |
-| `sensors[].baud_rate` | **`UsbSerialAdapter` only** |
+| `sensors[].baud_rate` | `SerialAdapter`, `UsbSerialAdapter` |
 | `sensors[].calibration.*` | nested block, not top-level metadata |
 
-`baud_rate` is the defect in `ori-runtime` #411, shown mechanically: the
-example's **serial** sensor sets a key only the **USB** adapter reads.
+`baud_rate` was the defect in `ori-runtime` #411: the example's **serial**
+sensor set a key only the **USB** adapter read. The serial adapter reads it
+now, and the regenerated row shows both.
 
 The `calibration` rows carry `nested_block` because `runtime.py` passes
 calibration as its own block rather than merging it into metadata, so its inner
@@ -148,14 +149,14 @@ expected, not a finding.
 
 Outside `sensors[]` no adapter claim is made. The only mechanical statement left
 is whether a leaf key name appears in `ori/` at all — **evidence of probable
-dead configuration, not proof**, since a key could be assembled dynamically:
-
-| Path | |
-| --- | --- |
-| `actions.relay.active_high` | Name absent from `ori/`; the actuator polarity defect in `ori-runtime` #397 |
-| `skills[].config.energy_cost_naira` | Skill config, consumed by the skill |
-| `skills[].config.owner_name` | Skill config, consumed by the skill |
-| `skills[].config.requires_approval_for_soft_actions` | Skill config, consumed by the skill |
+dead configuration, not proof**, since a key could be assembled dynamically. At
+this commit no example leaf name is absent. `actions.relay.active_high` is named
+only by the refusal that sends polarity to the commissioned binding, and the
+example no longer carries skill settings: a skill entry is `name` and
+`version`, and `skills[].config` is read only to refuse it. The generator
+records that refusal-only read as `"presence": "required"`, because it reads the
+subscript inside `if "config" in item:` as a required key; the 37 required
+paths count it, and the row is the generator's error, not a requirement.
 
 ## What this forces a decision on
 
@@ -166,11 +167,13 @@ are:
 delegation to per-adapter contracts. Either way the adapter metadata surface
 becomes specified for the first time.
 
-**Skill configuration.** `skills-package/v2` defines `config` as an arbitrary
-object with reserved-name checks and **no per-skill schema**. The withdrawn v2
-draft claimed delegation to a schema that does not exist, and its corpus
-invented a `skill_manifests` table so the vector would pass. A real target has
-to exist before v2 can delegate to one.
+**Skill configuration — settled by refusal.** `skills-package/v2` defines
+`config` as an arbitrary object with reserved-name checks and **no per-skill
+schema**. The withdrawn v2 draft claimed delegation to a schema that does not
+exist, and its corpus invented a `skill_manifests` table so the vector would
+pass. `runtime-config/v2` now declares no `skills[].config` and refuses it by
+full path; a delegation returns only in a successor, once a runtime implements
+`skills-package/v3`.
 
 ## How to check this artifact
 

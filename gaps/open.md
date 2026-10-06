@@ -209,9 +209,7 @@ accurate description of what a repo implements.
   permissions. The commissioned-feedback
   mapping that proves an outcome is still undefined, so that form of
   reconciliation has no contract shape beyond the answer operator-socket/v2
-  fixes for an identical operator request. No consumer enforces the release
-  maximum on `approval_timeout_seconds` from
-  [runtime-config/v2.md](../runtime-config/v2.md).
+  fixes for an identical operator request.
 - **Evidence-carriage consumers cite gateway-api/v1**
   ([gateway-evidence-carriage/v1.md](../gateway-evidence-carriage/v1.md)): the
   runtime-gateway evidence MQTT surface is versioned in its own contract, and
@@ -564,17 +562,24 @@ accurate description of what a repo implements.
   document, and holds no notion of an inventory generation. Consumer work is
   in `ori-runtime`.
 
+- **`tier-c-approval/v1` reads its lifetime through a setting v2 no longer has**
+  ([tier-c-approval/v1.md](../tier-c-approval/v1.md)): the frozen text gives
+  the lifetime as the release maximum "shortened by `approval_timeout_seconds`
+  where runtime-config/v2 permits", its `policy_digest` row names the deployment
+  settings runtime-config/v2 permits, and its pinned corpus declares
+  runtime-config/v2 and names a case "a deployment shortening the lifetime".
+  v2 now permits no deployment setting. The runtime shortens the lifetime by
+  the trigger's `approval_timeout_seconds` from the skill package, a bound
+  [skills-package/v3.md](../skills-package/v3.md) states and
+  `skills-package/v2`, which the runtime implements, does not. The wording is
+  to be classified in the version's baseline audit; a successor reads the
+  lifetime from the trigger.
+
 - **`signing_key` and the previous provisioning anchor are contract text only**
   ([runtime-config-signing/v1.md](../runtime-config-signing/v1.md)): the
   design-target section adds them so that `wrong_authority` is reachable for
   the provisioning document and the provisioning key can rotate. The runtime's
   signature path neither reads `signing_key` nor configures a previous anchor.
-
-- **`skills[].config` is closed to one key**
-  ([runtime-config/v2.md](../runtime-config/v2.md)): the shipped examples
-  carry skill settings that never reach the skill and are refused under v2
-  until `skills-package/v3` gives them a signed schema to be validated
-  against. The delegation flips to pass-through when a runtime implements v3.
 
 ## safety-profile/v1 implementation targets
 

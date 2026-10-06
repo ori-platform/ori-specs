@@ -22,7 +22,7 @@ Resolved: elevator uses trigger `escalate_to` as a floor in tier selection.
 
 ## G-09 — Per-trigger approval timeout dispatch wiring
 
-Resolved: `approval_timeout_seconds` flows into dispatcher approval wait logic.
+Resolved for the trigger: a trigger's `approval_timeout_seconds`, declared in its skill package (`skill.yaml`), bounds that trigger's Tier C proposal lifetime under the release maximum. The deployment override, `skills[].config.approval_timeout_seconds` in `ori.yaml`, was never wired to a proposal; the runtime now refuses `skills[].config` in any form, and `runtime-config/v2` declares none.
 
 ## G-10 — Basic prompt interpolation + sanitization
 

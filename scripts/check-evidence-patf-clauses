@@ -48,6 +48,7 @@ FILES = (
     "offline-tokens/v1.md",
     "offline-tokens/v2.md",
     "runtime-config/v2.md",
+    "skills-package/v3.md",
 )
 # The in-force safety boundary for an unconfirmed provisioning grant, stated
 # identically wherever the grant's gate is described.
@@ -66,6 +67,30 @@ PROTECTION_UNAVAILABLE = (
 # a clause, which the clause list alone cannot see. Every sentence a pattern
 # matches must be one of its allowlisted sentences; each entry carries a sample
 # contradiction the mutation run appends and requires refused.
+V2_PERMITTED = (
+    (
+        "`config` is undeclared, so a consumer refuses `skills[i].config` by its full path in "
+        "any form, an empty object included."
+    ),
+    (
+        "Drop every `skills[i].config`, an empty one included, and report it by its full path "
+        "together with each key it carried."
+    ),
+)
+
+# Read for contradictions only: the gating scan over FILES is about evidence,
+# and these contracts are held to the deployment-setting rule alone.
+CONTRADICTION_ONLY_FILES = ("runtime-config-orchestration/v1.md",)
+
+DEPLOYMENT_SKILL_SETTING = (
+    r"(?i)skills\[[^\]]*\]\.config\b"
+    r"|\bdeployment\b[^.]*\b(?:shortens?|extends?|lowers?|raises?|overrides?|tunes?|sets?)\b"
+    r"|\b(?:ori\.yaml|provisioning document|site'?s? configuration|operator)\b[^.]*"
+    r"\b(?:sets?|overrides?|tunes?|shortens?|extends?|lowers?)\b[^.]*"
+    r"\b(?:trigger|timeout|lifetime|approval_timeout_seconds)\b"
+    r"|approval_timeout_seconds[^.]*\b(?:may|can)\b[^.]*\b(?:run past|exceed|extend|beyond|be set|carry)"
+)
+
 CONTRADICTIONS = (
     ("tier-c-approval/v1.md", r"\brestart\b.*\b(?:MAY|may|can|will|shall|should)\b.*\b(?:dispatch|execut|replay|actuat)",
      (), "On restart, an approval whose proposal has not expired MAY be dispatched again."),
@@ -140,6 +165,58 @@ CONTRADICTIONS = (
      (), "A token's expiry extends the proposal's authority."),
     ("runtime-config/v2.md", r"approval_timeout_seconds.*\b(?:MAY|may)\b.*\b(?:exceed|extend|beyond)",
      (), "`approval_timeout_seconds` MAY exceed the release maximum for a remote site."),
+    ("skills-package/v3.md", r"approval_timeout_seconds.*\b(?:MAY|may)\b.*\b(?:exceed|extend|beyond)",
+     (), "`approval_timeout_seconds` MAY exceed the release maximum for a remote site."),
+    # No deployment document carries a skill or trigger value, and nothing a site
+    # configures shortens, extends or overrides a trigger's lifetime. Every
+    # sentence naming skills[].config or a deployment acting on a trigger value
+    # is one a reviewer allowlisted here.
+    *(
+        (name, DEPLOYMENT_SKILL_SETTING, permitted, sample)
+        for name, permitted, sample in (
+            (
+                "runtime-config/v2.md",
+                V2_PERMITTED,
+                (
+                    "Deployment configuration may shorten that lifetime through "
+                    "`skills[].config.approval_timeout_seconds`."
+                ),
+            ),
+            (
+                "runtime-config-orchestration/v1.md",
+                (),
+                "An operator may set a trigger timeout in `ori.yaml`.",
+            ),
+            # One sample per alternative, so dropping any one of them fails.
+            ("runtime-config/v2.md", V2_PERMITTED, "Each `skills[0].config` holds a value its trigger reads."),
+            (
+                "runtime-config/v2.md",
+                V2_PERMITTED,
+                "`approval_timeout_seconds` may run past the release maximum on a remote site.",
+            ),
+            (
+                "skills-package/v3.md",
+                (
+                    "`runtime-config/v2` could not close `skills[].config` against a schema that does not exist.",
+                    (
+                        "An earlier draft of that contract claimed the delegation anyway and its corpus invented "
+                        "a table to make the claim pass; v2 now declares no `skills[].config` at all and refuses "
+                        "it by full path."
+                    ),
+                    (
+                        "Those values come from `skill.yaml` alone — `ori.yaml`'s `skills[].config` never reached "
+                        "the loader, and is now refused — and only first-party skills may declare `action_tier: "
+                        "D`, so they are already release-owned."
+                    ),
+                    (
+                        "The trigger's value is the only source of the lifetime: no deployment setting shortens "
+                        "or extends it, and `runtime-config/v2` carries none."
+                    ),
+                ),
+                "A deployment setting shortens the lifetime below the trigger's value.",
+            ),
+        )
+    ),
     *((name, PROTECTION_UNAVAILABLE, (GRANT_BOUNDARY[2],),
        "Where a zone's actuator depends on a capability awaiting evidence confirmation, the runtime reports that "
        "zone's protection unavailable.") for name in FILES),
@@ -321,7 +398,13 @@ def sentences(text: str) -> list[str]:
 
 
 def matches(texts: dict[str, str]) -> list[tuple[str, str]]:
-    return [(name, s) for name, text in texts.items() for s in sentences(text) if GATE.search(s) and ACTION.search(s)]
+    return [
+        (name, s)
+        for name, text in texts.items()
+        if name in FILES
+        for s in sentences(text)
+        if GATE.search(s) and ACTION.search(s)
+    ]
 
 
 def _section(text: str, start: str, end: str) -> str:
@@ -346,6 +429,15 @@ def check(texts: dict[str, str], allowed: set[str] | None = None) -> None:
                 "section. This scan reads one sentence at a time and cannot see a rule split across sentences."
             )
     for name, pattern, permitted, _ in CONTRADICTIONS:
+        # The deployment-setting allowlists are per file and exact, so each entry
+        # must still be present and still match; the older lists are shared.
+        present = sentences(texts[name]) if pattern == DEPLOYMENT_SKILL_SETTING else []
+        for sentence in permitted if pattern == DEPLOYMENT_SKILL_SETTING else ():
+            if _norm(sentence) not in present or not re.search(pattern, _norm(sentence)):
+                raise CheckError(
+                    f"{name}: the allowlisted sentence {sentence[:80]!r} is no longer in the text, or no "
+                    "longer matches its pattern; an allowlist entry that guards nothing is removed, not kept."
+                )
         for sentence in sentences(texts[name]):
             if re.search(pattern, sentence) and sentence not in {_norm(p) for p in permitted}:
                 raise CheckError(
@@ -408,7 +500,10 @@ def mutants(texts: dict[str, str]):
 
 
 def main() -> int:
-    texts = {name: (ROOT / name).read_text(encoding="utf-8") for name in FILES}
+    texts = {
+        name: (ROOT / name).read_text(encoding="utf-8")
+        for name in (*FILES, *CONTRADICTION_ONLY_FILES)
+    }
     if "--print-units" in sys.argv[1:]:
         for name, sentence in matches(texts):
             print(f"{name}: {sentence}")

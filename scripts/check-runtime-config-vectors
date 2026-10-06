@@ -57,7 +57,7 @@ EXTENSIONS = {"description", "pattern", "exclusive_minimum", "entries", "delegat
 TYPES = {"string", "integer", "number", "boolean", "array", "object"}
 NUMERIC = {"integer", "number"}
 VERDICTS = ["malformed", "foreign_field", "forbidden_content"]
-DELEGATES = {"sensor-configuration/v1": "pass_through", "skills-package/v3": "refuse"}
+DELEGATES = {"sensor-configuration/v1": "pass_through"}
 APPENDIX_BEGIN = "<!-- surface:begin -->"
 APPENDIX_END = "<!-- surface:end -->"
 
@@ -181,6 +181,11 @@ def check_descriptor(descriptor: Any, where: str) -> None:
             if delegate not in DELEGATES:
                 fail(
                     f"{where}: delegate {delegate!r} is not a contract this version names"
+                )
+            elif DELEGATES[delegate] != "pass_through":
+                fail(
+                    f"{where}: delegate {delegate!r} has mode {DELEGATES[delegate]!r}; "
+                    "every delegate in this version passes its keys through"
                 )
             if not has_properties:
                 fail(f"{where}: delegate requires declared properties")
@@ -351,13 +356,6 @@ def validate_value(
                 )
             elif delegate is not None and DELEGATES[delegate] == "pass_through":
                 continue
-            elif delegate is not None:
-                collect.append(
-                    (
-                        "malformed",
-                        f"{child_path}: not declared here; validated under {delegate}, which this consumer does not implement",
-                    )
-                )
             else:
                 collect.append(("malformed", f"{child_path}: undeclared key"))
     return collect
@@ -452,12 +450,20 @@ def check_documents(schema: dict, seen: dict[str, set[str]]) -> None:
         or data.get("verdicts") != VERDICTS
     ):
         fail("documents.json: header does not match the contract")
+    check_accepted_cases_carry_their_own_path(data["cases"])
     names: set[str] = set()
+    documents: dict[str, str] = {}
     for case in data["cases"]:
         name = case["name"]
         if name in names:
             fail(f"documents.json: duplicate case name {name}")
         names.add(name)
+        # A case whose document another case already carries proves nothing
+        # of its own; it is what a case left behind by a removed field becomes.
+        canonical = json.dumps(case["document"], sort_keys=True)
+        if canonical in documents:
+            fail(f"{name}: carries the same document as {documents[canonical]}")
+        documents[canonical] = name
         outcome, defects = classify(case["document"], schema)
         if outcome != case["expect"]:
             detail = "; ".join(m for _, m in defects[:3])
@@ -488,7 +494,6 @@ def note_features(case: dict, seen: dict[str, set[str]]) -> None:
         "exclusive_minimum": "exclusive_minimum",
         "coap_command": "entries",
         "delegated": "delegate_pass_through",
-        "dead_key": "delegate_refuse",
         "two_levels_deep": "depth",
         "as_string": "type",
         "float_where_integer": "type",
@@ -528,7 +533,6 @@ def check_coverage(schema: dict, seen: dict[str, set[str]]) -> None:
         "exclusive_minimum",
         "entries",
         "delegate_pass_through",
-        "delegate_refuse",
         "depth",
         "type",
         "enum",
@@ -657,16 +661,16 @@ def migrate_legacy(document: dict, schema: dict) -> tuple[dict, list[str]]:
         if isinstance(node, dict) and parts[-1] in node:
             del node[parts[-1]]
             notes.append(f"dropped {path}: {schema['retired'][path]['destination']}")
-    for skill in doc.get("skills") or []:
-        config = skill.get("config") if isinstance(skill, dict) else None
-        if isinstance(config, dict):
-            dropped = sorted(k for k in config if k != "approval_timeout_seconds")
-            for k in dropped:
-                del config[k]
-            if dropped:
-                notes.append(
-                    f"skills[].config dropped {dropped}: validated under skills-package/v3 when a runtime implements it"
-                )
+    for index, skill in enumerate(doc.get("skills") or []):
+        if not isinstance(skill, dict) or "config" not in skill:
+            continue
+        config = skill.pop("config")
+        nested = sorted(str(k) for k in config) if isinstance(config, dict) else []
+        notes.append(
+            f"skills[{index}].config dropped"
+            + (f" with {', '.join(f'skills[{index}].config.{k}' for k in nested)}" if nested else "")
+            + ": no deployment setting reaches a skill or its triggers"
+        )
     for section, key in (
         ("health_socket", "mode"),
         ("firmware_mqtt_provisioning", "socket_mode"),
@@ -701,6 +705,78 @@ def check_runtime_examples(schema: dict, runtime: pathlib.Path) -> int:
 # ------------------------------------------------------------------- driver
 
 
+def _leaf_paths(node: Any, path: str = "") -> set[str]:
+    if isinstance(node, dict):
+        out: set[str] = set()
+        for key, value in node.items():
+            out |= _leaf_paths(value, f"{path}.{key}" if path else str(key))
+        return out
+    if isinstance(node, list):
+        return set().union(*(_leaf_paths(v, path + "[]") for v in node)) if node else {path}
+    return {path}
+
+
+def check_accepted_cases_carry_their_own_path(cases: list[dict]) -> None:
+    """An accepted case proves something only by a path no other accepted case has.
+
+    The minimal document is the baseline every other case builds on. Any other
+    accepted case whose every path some other accepted case already carries
+    exercises nothing of its own: it is what a case left behind by a removed
+    field becomes, and a byte comparison does not catch it.
+    """
+    accepted = {c["name"]: _leaf_paths(c["document"]) for c in cases if c["expect"] == "accepted"}
+    for name, own in accepted.items():
+        if name == "minimal_document_accepted":
+            continue
+        others = set().union(*(p for n, p in accepted.items() if n != name))
+        if not own - others:
+            fail(f"{name}: an accepted case carrying no path another accepted case lacks")
+
+
+def check_migrations(schema: dict) -> None:
+    """Migration step 4, held by vectors rather than by the examples alone."""
+    with (VECTORS / "documents.json").open(encoding="utf-8") as handle:
+        cases = json.load(handle).get("migrations")
+    if not cases:
+        fail("documents.json: no migration vectors")
+    for case in cases:
+        migrated, notes = migrate_legacy(case["legacy"], schema)
+        skill_notes = [n for n in notes if n.startswith("skills[")]
+        if skill_notes != case["skill_notes"]:
+            fail(f"{case['name']}: migration reports {skill_notes}, not {case['skill_notes']}")
+        for skill in migrated.get("skills") or []:
+            if isinstance(skill, dict) and "config" in skill:
+                fail(f"{case['name']}: migration left a skills[].config in place")
+
+
+def check_delegate_table(schema: dict) -> None:
+    """The prose delegate table names exactly the delegates the schema and checker use."""
+    text = CONTRACT_DOC.read_text(encoding="utf-8")
+    header = "| Delegate | Where | A consumer without it |"
+    if header not in text:
+        fail("v2.md: the delegate table is missing")
+    block = text.split(header, 1)[1].split("\n\n", 1)[0]
+    named = set(re.findall(r"^\| `([a-z0-9-]+/v\d+)` \|", block, re.MULTILINE))
+    used: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("delegate"), str):
+                used.add(node["delegate"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(schema)
+    if named != set(DELEGATES) or used != set(DELEGATES):
+        fail(
+            f"v2.md: the delegate table names {sorted(named)}, the schema uses "
+            f"{sorted(used)} and the checker knows {sorted(DELEGATES)}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--write-appendix", action="store_true")
@@ -717,6 +793,8 @@ def main() -> int:
         check_schema_load(seen)
         check_documents(schema, seen)
         check_coverage(schema, seen)
+        check_migrations(schema)
+        check_delegate_table(schema)
         check_appendix(schema, args.write_appendix)
     except Failure as failure:
         print(f"check-runtime-config-vectors: {failure}", file=sys.stderr)
