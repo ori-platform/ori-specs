@@ -25,7 +25,7 @@ below are checked against those records.
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `pending` |
 | Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `pending` |
 | Event schema | [events/v2.md](events/v2.md) | `draft` | none recorded | `amendable` |
-| Ed25519 key admission | [ed25519-key-admission/v1.md](ed25519-key-admission/v1.md) | `draft` | none recorded | `amendable` |
+| Ed25519 key admission | [ed25519-key-admission/v1.md](ed25519-key-admission/v1.md) | `draft` | verifier (runtime) `implemented-unreleased`, `unassessed` | `amendable` |
 | Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | `draft` | runtime `shipped` in v2.1.0, `unassessed`, producer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-07-24), audit `pending` |
 | Evidence chain | [evidence/v2.md](evidence/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, `unassessed`, verifier (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-08-25), audit `complete` |
 | Evidence chain | [evidence/v3.md](evidence/v3.md) | `draft` | none recorded | `amendable` |
