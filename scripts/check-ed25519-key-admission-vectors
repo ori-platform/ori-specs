@@ -182,22 +182,29 @@ def decode(raw: bytes) -> tuple[int, int] | None:
     return ((P - x) % P if (x & 1) != sign else x, y)
 
 
-def _equation(public: bytes, message: bytes, signature: bytes, cofactor: int) -> bool:
+def _equation(
+    public: bytes, message: bytes, signature: bytes, cofactor: int, *, reduced: bool
+) -> bool:
+    """RFC 8032 section 5.1.7, with k the full SHA-512 integer unless *reduced*."""
     a, r = decode(public), decode(signature[:32])
     s = int.from_bytes(signature[32:], "little")
     if a is None or r is None or s >= L:
         return False
-    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % L
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little")
+    if reduced:
+        k %= L
     left = mul(cofactor, mul(s, BASE))
     return left == add(mul(cofactor, r), mul(cofactor, mul(k, a)))
 
 
 def cofactored_accepts(public: bytes, message: bytes, signature: bytes) -> bool:
-    return _equation(public, message, signature, 8)
+    return _equation(public, message, signature, 8, reduced=False)
 
 
-def cofactorless_accepts(public: bytes, message: bytes, signature: bytes) -> bool:
-    return _equation(public, message, signature, 1)
+def cofactorless_accepts(
+    public: bytes, message: bytes, signature: bytes, *, reduced: bool
+) -> bool:
+    return _equation(public, message, signature, 1, reduced=reduced)
 
 
 def derived_public_point(seed: bytes) -> tuple[int, int]:
@@ -317,8 +324,10 @@ def check(corpus: dict, contract: str, source: dict, *, order=CLAUSES, off="") -
         public = bytes.fromhex(case["public_key_hex"])
         message = bytes.fromhex(case["message_hex"])
         signature = bytes.fromhex(case["signature_hex"])
-        if not cofactorless_accepts(public, message, signature):
-            raise Failure(f"{case['public_key_hex']}: the cofactorless equation does not accept the torsion-shift signature")
+        if not cofactorless_accepts(public, message, signature, reduced=False):
+            raise Failure(f"{case['public_key_hex']}: the cofactorless equation with the full challenge does not accept the torsion-shift signature")
+        if not cofactorless_accepts(public, message, signature, reduced=True):
+            raise Failure(f"{case['public_key_hex']}: the cofactorless equation with the reduced challenge does not accept the torsion-shift signature")
         if (case["expected"], case["clause"]) != ("refused", model(public, order=order, off=off)):
             raise Failure(f"{case['public_key_hex']}: a torsion-shift signature must be refused for its key")
 
@@ -378,6 +387,28 @@ def mutations(corpus: dict, contract: str, source: dict) -> int:
     def drop_torsion_sig(c):
         c["torsion_shift_signatures"].clear()
 
+    def reduced_only_witness(c):
+        """Re-sign at a nonce whose reduced challenge only is a multiple of 8."""
+        shifted_case = next(k for k in c["mixed_order"] if "seed_hex" in k)
+        digest = hashlib.sha512(bytes.fromhex(shifted_case["seed_hex"])).digest()
+        scalar = int.from_bytes(digest[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+        sig_case = c["torsion_shift_signatures"][0]
+        public = bytes.fromhex(sig_case["public_key_hex"])
+        message = bytes.fromhex(sig_case["message_hex"])
+        for counter in range(4096):
+            r = int.from_bytes(
+                hashlib.sha512(digest[32:] + message + counter.to_bytes(4, "little")).digest(),
+                "little",
+            ) % L
+            big_r = encode(mul(r, BASE))
+            k_full = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little")
+            if (k_full % L) % 8 == 0 and k_full % 8:
+                sig_case["signature_hex"] = (
+                    big_r + ((r + (k_full % L) * scalar) % L).to_bytes(32, "little")
+                ).hex()
+                return
+        raise Failure("no nonce gives a reduced-only witness")
+
     def mixed_prime(c):
         c["mixed_order"][0]["public_key_hex"] = encode(BASE).hex()
 
@@ -399,7 +430,8 @@ def mutations(corpus: dict, contract: str, source: dict) -> int:
         ("shifted key's seed changed", shifted_seed_changed, "does not re-derive"),
         ("shifted key's torsion point the identity", shifted_torsion_identity, "not a nonzero point of small order"),
         ("shifted case dropped", drop_shifted_case, "no mixed-order case is a seed-derived key"),
-        ("torsion-shift signature altered", torsion_sig_altered, "cofactorless equation does not accept"),
+        ("torsion-shift signature altered", torsion_sig_altered, "does not accept the torsion-shift signature"),
+        ("torsion-shift witness valid only under the reduced challenge", reduced_only_witness, "with the full challenge does not accept"),
         ("torsion-shift signatures dropped", drop_torsion_sig, "torsion_shift_signatures do not cover"),
         ("contract renamed", lambda c: c.update(contract="ed25519-key-admission/v2"), "does not name"),
     ]
