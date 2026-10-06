@@ -572,8 +572,8 @@ accurate description of what a repo implements.
   the trigger's `approval_timeout_seconds` from the skill package, a bound
   [skills-package/v3.md](../skills-package/v3.md) states and
   `skills-package/v2`, which the runtime implements, does not. The wording is
-  classified in the version's baseline audit; a successor reads the lifetime
-  from the trigger.
+  to be classified in the version's baseline audit; a successor reads the
+  lifetime from the trigger.
 
 - **`signing_key` and the previous provisioning anchor are contract text only**
   ([runtime-config-signing/v1.md](../runtime-config-signing/v1.md)): the
