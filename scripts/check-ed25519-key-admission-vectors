@@ -19,6 +19,8 @@ Held to:
   a seed and a torsion point re-derives from them;
 - each keyless signature: the cofactored equation accepts it under its key, and
   the case is refused for that key;
+- each negated key: the seed's key with bit 255 flipped, both admitted, one
+  identity, and the negated scalar's signature accepted under the negation;
 - each torsion-shift signature: the cofactorless equation accepts it under its
   shifted key, and the case is refused for that key;
 - `public_keys` carry the evidence-exchange/v2 authority key registry corpus's
@@ -317,6 +319,28 @@ def check(corpus: dict, contract: str, source: dict, *, order=CLAUSES, off="") -
         if (case["expected"], case["clause"]) != ("refused", model(public, order=order, off=off)):
             raise Failure(f"{case['public_key_hex']}: a keyless signature must be refused for its key")
 
+    if not corpus["negated_keys"]:
+        raise Failure("negated_keys is empty")
+    for case in corpus["negated_keys"]:
+        public = bytes.fromhex(case["public_key_hex"])
+        negated = bytes.fromhex(case["negated_public_key_hex"])
+        if encode(derived_public_point(bytes.fromhex(case["seed_hex"]))) != public:
+            raise Failure(f"negated key {public.hex()}: does not re-derive from its seed")
+        point = decode(public)
+        if point is None or encode(((P - point[0]) % P, point[1])) != negated:
+            raise Failure(f"negated key {public.hex()}: negated_public_key_hex is not its negation")
+        for raw in (public, negated):
+            if case["expected"] != "accepted" or model(raw, order=order, off=off) is not None:
+                raise Failure(f"negated key {raw.hex()}: must be admitted")
+        identity = public[:31] + bytes([public[31] & 0x7F])
+        if bytes.fromhex(case["identity_hex"]) != identity or negated[:31] + bytes([negated[31] & 0x7F]) != identity:
+            raise Failure(f"negated key {public.hex()}: identity_hex is not the shared identity")
+        message = bytes.fromhex(case["message_hex"])
+        signature = bytes.fromhex(case["signature_hex"])
+        for reduced in (False, True):
+            if not cofactorless_accepts(negated, message, signature, reduced=reduced):
+                raise Failure(f"negated key {public.hex()}: the negated-scalar signature is not accepted")
+
     signed = {c["public_key_hex"] for c in corpus["torsion_shift_signatures"]}
     if not signed or signed != shifted:
         raise Failure("torsion_shift_signatures do not cover exactly the shifted mixed-order keys")
@@ -387,6 +411,23 @@ def mutations(corpus: dict, contract: str, source: dict) -> int:
     def drop_torsion_sig(c):
         c["torsion_shift_signatures"].clear()
 
+    def negation_not_negated(c):
+        n = c["negated_keys"][0]
+        n["negated_public_key_hex"] = n["public_key_hex"]
+
+    def negation_identity_wrong(c):
+        """The identity given as whichever encoding keeps bit 255 set."""
+        n = c["negated_keys"][0]
+        n["identity_hex"] = next(
+            k for k in (n["public_key_hex"], n["negated_public_key_hex"])
+            if bytes.fromhex(k)[31] & 0x80
+        )
+
+    def negation_signature_altered(c):
+        n = c["negated_keys"][0]
+        sig = n["signature_hex"]
+        n["signature_hex"] = sig[:-2] + ("00" if sig[-2:] != "00" else "01")
+
     def reduced_only_witness(c):
         """Re-sign at a nonce whose reduced challenge only is a multiple of 8."""
         shifted_case = next(k for k in c["mixed_order"] if "seed_hex" in k)
@@ -432,6 +473,10 @@ def mutations(corpus: dict, contract: str, source: dict) -> int:
         ("shifted case dropped", drop_shifted_case, "no mixed-order case is a seed-derived key"),
         ("torsion-shift signature altered", torsion_sig_altered, "does not accept the torsion-shift signature"),
         ("torsion-shift witness valid only under the reduced challenge", reduced_only_witness, "with the full challenge does not accept"),
+        ("negated key not negated", negation_not_negated, "is not its negation"),
+        ("negated key identity wrong", negation_identity_wrong, "identity_hex is not the shared identity"),
+        ("negated-scalar signature altered", negation_signature_altered, "negated-scalar signature is not accepted"),
+        ("negated keys dropped", lambda c: c["negated_keys"].clear(), "negated_keys is empty"),
         ("torsion-shift signatures dropped", drop_torsion_sig, "torsion_shift_signatures do not cover"),
         ("contract renamed", lambda c: c.update(contract="ed25519-key-admission/v2"), "does not name"),
     ]
@@ -462,41 +507,55 @@ def mutations(corpus: dict, contract: str, source: dict) -> int:
     else:
         print("SURVIVED: public_keys drifted from the source corpus", file=sys.stderr)
     row = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
-    for label, text in (
-        ("table row removed", contract.replace(f"| `{row}` | two points of order 8 |\n", "")),
-        ("table row altered", contract.replace(row, row[:-2] + "06")),
+    def expect(label: str, reason: str, run) -> None:
+        nonlocal killed, total
+        total += 1
+        try:
+            run()
+        except Failure as exc:
+            if reason in str(exc):
+                killed += 1
+            else:
+                print(f"WRONG REASON: {label}: {exc}", file=sys.stderr)
+        else:
+            print(f"SURVIVED: {label}", file=sys.stderr)
+
+    for label, text, reason in (
+        (
+            "table row removed",
+            contract.replace(f"| `{row}` | two points of order 8 |\n", ""),
+            "does not name exactly the small-order y values",
+        ),
+        (
+            "table row altered",
+            contract.replace(row, row[:-2] + "06"),
+            "does not name exactly the small-order y values",
+        ),
         (
             "table label swapped",
             contract.replace("| the point of order 2 |", "| the two points of order 4 |"),
+            "label does not match the orders of its points",
         ),
     ):
-        total += 1
-        try:
-            check(corpus, text, source)
-        except Failure:
-            killed += 1
-        else:
-            print(f"SURVIVED: {label}", file=sys.stderr)
+        expect(label, reason, lambda text=text: check(corpus, text, source))
     for clause in CLAUSES:
-        total += 1
-        try:
-            check(corpus, contract, source, off=clause)
-        except Failure:
-            killed += 1
-        else:
-            print(f"SURVIVED: rule {clause} switched off", file=sys.stderr)
-    total += 1
-    try:
-        check(
+        expect(
+            f"rule {clause} switched off",
+            f"corpus says refused/{clause}, rules say",
+            lambda clause=clause: check(corpus, contract, source, off=clause),
+        )
+    # small_order and mixed_order are disjoint, so only an order change among
+    # the decoding clauses is observable.
+    expect(
+        "clause order changed",
+        "corpus says refused/invalid_sign, rules say",
+        lambda: check(
             corpus,
             contract,
             source,
             order=("off_curve", "non_canonical", "small_order", "invalid_sign", "mixed_order"),
-        )
-    except Failure:
-        killed += 1
-    else:
-        print("SURVIVED: clause order changed", file=sys.stderr)
+        ),
+    )
     print(f"mutations: {killed} of {total} refused")
     return 0 if killed == total else 1
 
@@ -512,6 +571,7 @@ def main() -> int:
         f"ed25519-key-admission/v1: {len(corpus['public_keys'])} public keys, "
         f"{len(corpus['mixed_order'])} mixed-order, "
         f"{len(corpus['keyless_signatures'])} keyless signatures, "
+        f"{len(corpus['negated_keys'])} negated keys, "
         f"{len(corpus['torsion_shift_signatures'])} torsion-shift signatures agree with the contract"
     )
     if "--mutations" in sys.argv[1:]:

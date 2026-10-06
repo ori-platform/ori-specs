@@ -13,6 +13,8 @@ authority key registry corpus and the fixed constructions below:
   signature R = base point, S = 1 over a numbered message.
 - mixed_order: the base point plus the point of order 2, the base point plus a
   point of order 8, and the key derived from SEED plus that point of order 8.
+- negated_keys: the key derived from SEED and its negation, with a signature
+  the negated scalar makes under the negation.
 - torsion_shift_signatures: one message signed under the shifted key with the
   unshifted key's private scalar, at the first nonce whose challenge the order
   of the torsion point divides both as the full hash and reduced modulo L.
@@ -50,6 +52,7 @@ NAME = "ed25519-key-admission/v1"
 SEED = hashlib.sha256(b"ed25519-key-admission/v1 torsion shift").digest()
 ORDER_8_HEX = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
 SHIFT_MESSAGE = b"a document signed with the original key's private scalar"
+NEGATION_MESSAGE = b"a document signed with the negated private scalar"
 MIXED_SUFFIX = "; of mixed order"
 
 Q = 2**255 - 19
@@ -245,6 +248,38 @@ def torsion_shift_signature(shifted: bytes, scalar: int, prefix: bytes) -> dict:
     raise SystemExit("generate: no nonce gave a challenge divisible by 8")
 
 
+def negated_keys() -> list[dict]:
+    scalar, prefix = seed_scalar_and_prefix(SEED)
+    public = compress(scalar_mul(scalar, BASE))
+    negated = public[:31] + bytes([public[31] ^ 0x80])
+    if compress(scalar_mul(L - scalar % L, BASE)) != negated:
+        raise SystemExit("generate: flipping bit 255 is not the negation")
+    for raw in (public, negated):
+        if verdict(raw) != ("accepted", None):
+            raise SystemExit(f"generate: {raw.hex()} is not admitted")
+    r = int.from_bytes(hashlib.sha512(prefix + NEGATION_MESSAGE).digest(), "little") % L
+    big_r = compress(scalar_mul(r, BASE))
+    k = int.from_bytes(hashlib.sha512(big_r + negated + NEGATION_MESSAGE).digest(), "little")
+    signature = big_r + ((r - k * scalar) % L).to_bytes(32, "little")
+    try:
+        Ed25519PublicKey.from_public_bytes(negated).verify(signature, NEGATION_MESSAGE)
+    except InvalidSignature:
+        raise SystemExit("generate: OpenSSL refuses the negated-scalar signature") from None
+    identity = public[:31] + bytes([public[31] & 0x7F])
+    return [
+        {
+            "seed_hex": SEED.hex(),
+            "public_key_hex": public.hex(),
+            "negated_public_key_hex": negated.hex(),
+            "identity_hex": identity.hex(),
+            "message_hex": NEGATION_MESSAGE.hex(),
+            "signature_hex": signature.hex(),
+            "expected": "accepted",
+            "why": "the negation flips bit 255; the seed's holder signs under it with the negated scalar, so the two share one identity",
+        }
+    ]
+
+
 def build() -> str:
     source = json.loads(SOURCE.read_text(encoding="utf-8"))
     keys = public_keys(source)
@@ -257,11 +292,13 @@ def build() -> str:
             "public_keys carry the encodings of the public_keys cases of evidence-exchange/vectors/authority-key-registry-v2.json, in order, with that corpus's verdicts except for keys of mixed order, which v2 admits and this contract refuses; "
             "keyless_signatures pair each small-order key with one message and the signature R = base point, S = 1. "
             "mixed_order cases are the base point plus a point of order 2 and of order 8, and the key derived from seed_hex under RFC 8032 section 5.1.5 plus torsion_point_hex. "
+            "negated_keys pair the key derived from that seed with its negation, bit 255 flipped, and sign one message under the negation with the negated scalar, using the nonce SHA-512 of the seed's prefix and the message. "
             "torsion_shift_signatures sign one message under that shifted key with the unshifted key's scalar, using the first nonce, SHA-512 of the seed's prefix, the message and a 4-byte little-endian counter, whose challenge is a multiple of 8 both as the full SHA-512 integer and reduced modulo L."
         ),
         "public_keys": keys,
         "mixed_order": mixed_order(shifted),
         "keyless_signatures": keyless(keys),
+        "negated_keys": negated_keys(),
         "torsion_shift_signatures": [torsion_shift_signature(shifted, scalar, prefix)],
     }
     return json.dumps(corpus, indent=2, ensure_ascii=False) + "\n"
