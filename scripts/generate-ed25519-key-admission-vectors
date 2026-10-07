@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the ed25519-key-admission/v1 corpus.
+
+Writes ed25519-key-admission/vectors-v1.json from the evidence-exchange/v2
+authority key registry corpus and the fixed constructions below:
+
+- public_keys: the v2 corpus's encodings in its order. A key v2 admits that is
+  of mixed order is refused here under mixed_order; every other verdict must
+  equal the one this generator computes, or generation stops.
+- keyless_signatures: each small-order key of public_keys, in order, with the
+  signature R = base point, S = 1 over a numbered message.
+- mixed_order: the base point plus the point of order 2, the base point plus a
+  point of order 8, and the key derived from SEED plus that point of order 8.
+- negated_keys: the key derived from SEED and its negation, with a signature
+  the negated scalar makes under the negation.
+- torsion_shift_signatures: one message signed under the shifted key with the
+  unshifted key's private scalar, at the first nonce whose challenge the order
+  of the torsion point divides both as the full hash and reduced modulo L.
+
+The checker, scripts/check-ed25519-key-admission-vectors, shares no code with
+this generator: it uses affine arithmetic of its own, and this uses extended
+coordinates, with OpenSSL (through `cryptography`) deriving the seed's key and
+verifying the torsion-shift signature.
+
+Run from the repository root:
+
+    python3 scripts/generate-ed25519-key-admission-vectors          # write
+    python3 scripts/generate-ed25519-key-admission-vectors --check  # compare
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "ed25519-key-admission" / "vectors-v1.json"
+SOURCE = ROOT / "evidence-exchange" / "vectors" / "authority-key-registry-v2.json"
+NAME = "ed25519-key-admission/v1"
+
+SEED = hashlib.sha256(b"ed25519-key-admission/v1 torsion shift").digest()
+ORDER_8_HEX = "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"
+SHIFT_MESSAGE = b"a document signed with the original key's private scalar"
+NEGATION_MESSAGE = b"a document signed with the negated private scalar"
+MIXED_SUFFIX = "; of mixed order"
+
+Q = 2**255 - 19
+L = 2**252 + 27742317777372353535851937790883648493
+CURVE_D = -121665 * pow(121666, Q - 2, Q) % Q
+ROOT_M1 = pow(2, (Q - 1) // 4, Q)
+
+Point = tuple[int, int, int, int]
+NEUTRAL: Point = (0, 1, 1, 0)
+
+
+def point_add(p: Point, q: Point) -> Point:
+    """RFC 8032, section 5.1.4, extended homogeneous coordinates."""
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % Q
+    b = (y1 + x1) * (y2 + x2) % Q
+    c = 2 * CURVE_D * t1 * t2 % Q
+    d = 2 * z1 * z2 % Q
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % Q, g * h % Q, f * g % Q, e * h % Q)
+
+
+def scalar_mul(k: int, p: Point) -> Point:
+    acc = NEUTRAL
+    while k > 0:
+        if k & 1:
+            acc = point_add(acc, p)
+        p = point_add(p, p)
+        k >>= 1
+    return acc
+
+
+def is_neutral(p: Point) -> bool:
+    return p[0] % Q == 0 and (p[1] - p[2]) % Q == 0
+
+
+def compress(p: Point) -> bytes:
+    zinv = pow(p[2], Q - 2, Q)
+    x, y = p[0] * zinv % Q, p[1] * zinv % Q
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def decompress(raw: bytes) -> tuple[Point | None, str | None]:
+    """RFC 8032, section 5.1.3: the point, or the clause refusing the bytes."""
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, n & ((1 << 255) - 1)
+    if y >= Q:
+        return None, "non_canonical"
+    u, v = (y * y - 1) % Q, (CURVE_D * y * y + 1) % Q
+    x = u * pow(v, 3, Q) * pow(u * pow(v, 7, Q), (Q - 5) // 8, Q) % Q
+    if v * x * x % Q != u:
+        if v * x * x % Q != (-u) % Q:
+            return None, "off_curve"
+        x = x * ROOT_M1 % Q
+    if x == 0 and sign:
+        return None, "invalid_sign"
+    if x & 1 != sign:
+        x = Q - x
+    return (x, y, 1, x * y % Q), None
+
+
+def verdict(raw: bytes) -> tuple[str, str | None]:
+    point, clause = decompress(raw)
+    if point is None:
+        return "refused", clause
+    if is_neutral(scalar_mul(8, point)):
+        return "refused", "small_order"
+    if not is_neutral(scalar_mul(L, point)):
+        return "refused", "mixed_order"
+    return "accepted", None
+
+
+def must(raw: bytes) -> Point:
+    point, clause = decompress(raw)
+    if point is None:
+        raise SystemExit(f"generate: {raw.hex()} does not decode ({clause})")
+    return point
+
+
+BASE = must((4 * pow(5, Q - 2, Q) % Q).to_bytes(32, "little"))
+ORDER_2 = must((Q - 1).to_bytes(32, "little"))
+ORDER_8 = must(bytes.fromhex(ORDER_8_HEX))
+
+
+def case(public: bytes, expected: str, clause: str | None, why: str, **extra: str) -> dict:
+    out: dict = {"public_key_hex": public.hex(), "expected": expected, "clause": clause}
+    out.update(extra)
+    out["why"] = why
+    return out
+
+
+def public_keys(source: dict) -> list[dict]:
+    cases = []
+    for given in source["public_keys"]:
+        raw = bytes.fromhex(given["public_key_hex"])
+        expected, clause = verdict(raw)
+        if clause == "mixed_order":
+            if given["expected"] != "accepted":
+                raise SystemExit(f"generate: v2 does not admit mixed-order {raw.hex()}")
+            cases.append(case(raw, expected, clause, given["why"] + MIXED_SUFFIX))
+            continue
+        if (given["expected"], given.get("clause")) != (expected, clause):
+            raise SystemExit(f"generate: v2 says {given['expected']}/{given.get('clause')} for {raw.hex()}, rules say {expected}/{clause}")
+        cases.append(case(raw, expected, clause, given["why"]))
+    return cases
+
+
+def keyless(cases: list[dict]) -> list[dict]:
+    signature = compress(BASE) + (1).to_bytes(32, "little")
+    out = []
+    small = [c for c in cases if c["clause"] == "small_order"]
+    for i, c in enumerate(small):
+        message = f"ori-specs ed25519-key-admission/v1 keyless message {i}".encode()
+        out.append(
+            {
+                "public_key_hex": c["public_key_hex"],
+                "message_hex": message.hex(),
+                "signature_hex": signature.hex(),
+                "expected": "refused",
+                "clause": "small_order",
+                "why": "R is the base point and S is 1: no private key signed this",
+            }
+        )
+    return out
+
+
+def seed_scalar_and_prefix(seed: bytes) -> tuple[int, bytes]:
+    digest = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(digest[:32], "little")
+    scalar &= (1 << 254) - 8
+    scalar |= 1 << 254
+    return scalar, digest[32:]
+
+
+def shifted_key() -> tuple[bytes, int, bytes]:
+    scalar, prefix = seed_scalar_and_prefix(SEED)
+    unshifted = compress(scalar_mul(scalar, BASE))
+    openssl = (
+        Ed25519PrivateKey.from_private_bytes(SEED)
+        .public_key()
+        .public_bytes(Encoding.Raw, PublicFormat.Raw)
+    )
+    if unshifted != openssl:
+        raise SystemExit("generate: the seed's key disagrees with OpenSSL")
+    return compress(point_add(must(unshifted), ORDER_8)), scalar, prefix
+
+
+def mixed_order(shifted: bytes) -> list[dict]:
+    rows = [
+        case(compress(point_add(BASE, ORDER_2)), "refused", "mixed_order", "the base point plus the point of order 2: of mixed order"),
+        case(compress(point_add(BASE, ORDER_8)), "refused", "mixed_order", "the base point plus a point of order 8: of mixed order"),
+        case(
+            shifted,
+            "refused",
+            "mixed_order",
+            "the key derived from seed_hex plus torsion_point_hex, a point of order 8: its seed signs under it",
+            seed_hex=SEED.hex(),
+            torsion_point_hex=ORDER_8_HEX,
+        ),
+    ]
+    for row in rows:
+        if verdict(bytes.fromhex(row["public_key_hex"])) != ("refused", "mixed_order"):
+            raise SystemExit(f"generate: {row['public_key_hex']} is not of mixed order")
+    return rows
+
+
+def torsion_shift_signature(shifted: bytes, scalar: int, prefix: bytes) -> dict:
+    for counter in range(4096):
+        nonce = hashlib.sha512(prefix + SHIFT_MESSAGE + counter.to_bytes(4, "little")).digest()
+        r = int.from_bytes(nonce, "little") % L
+        big_r = compress(scalar_mul(r, BASE))
+        # RFC 8032 section 5.1.7 puts the full hash in the equation; libraries
+        # reduce it modulo L first. Under a mixed-order key the two differ by a
+        # torsion term, so the witness must satisfy both.
+        k_full = int.from_bytes(hashlib.sha512(big_r + shifted + SHIFT_MESSAGE).digest(), "little")
+        k = k_full % L
+        if k % 8 or k_full % 8:
+            continue
+        signature = big_r + ((r + k * scalar) % L).to_bytes(32, "little")
+        try:
+            Ed25519PublicKey.from_public_bytes(shifted).verify(signature, SHIFT_MESSAGE)
+        except InvalidSignature:
+            raise SystemExit("generate: OpenSSL refuses the torsion-shift signature") from None
+        return {
+            "public_key_hex": shifted.hex(),
+            "message_hex": SHIFT_MESSAGE.hex(),
+            "signature_hex": signature.hex(),
+            "expected": "refused",
+            "clause": "mixed_order",
+            "why": "made with the private scalar of the unshifted key; the cofactorless equation accepts it under the shifted key, with the full challenge and with it reduced modulo L",
+        }
+    raise SystemExit("generate: no nonce gave a challenge divisible by 8")
+
+
+def negated_keys() -> list[dict]:
+    scalar, prefix = seed_scalar_and_prefix(SEED)
+    public = compress(scalar_mul(scalar, BASE))
+    negated = public[:31] + bytes([public[31] ^ 0x80])
+    if compress(scalar_mul(L - scalar % L, BASE)) != negated:
+        raise SystemExit("generate: flipping bit 255 is not the negation")
+    for raw in (public, negated):
+        if verdict(raw) != ("accepted", None):
+            raise SystemExit(f"generate: {raw.hex()} is not admitted")
+    r = int.from_bytes(hashlib.sha512(prefix + NEGATION_MESSAGE).digest(), "little") % L
+    big_r = compress(scalar_mul(r, BASE))
+    k = int.from_bytes(hashlib.sha512(big_r + negated + NEGATION_MESSAGE).digest(), "little")
+    signature = big_r + ((r - k * scalar) % L).to_bytes(32, "little")
+    try:
+        Ed25519PublicKey.from_public_bytes(negated).verify(signature, NEGATION_MESSAGE)
+    except InvalidSignature:
+        raise SystemExit("generate: OpenSSL refuses the negated-scalar signature") from None
+    identity = public[:31] + bytes([public[31] & 0x7F])
+    return [
+        {
+            "seed_hex": SEED.hex(),
+            "public_key_hex": public.hex(),
+            "negated_public_key_hex": negated.hex(),
+            "identity_hex": identity.hex(),
+            "message_hex": NEGATION_MESSAGE.hex(),
+            "signature_hex": signature.hex(),
+            "expected": "accepted",
+            "why": "the negation flips bit 255; the seed's holder signs under it with the negated scalar, so the two share one identity",
+        }
+    ]
+
+
+def build() -> str:
+    source = json.loads(SOURCE.read_text(encoding="utf-8"))
+    keys = public_keys(source)
+    shifted, scalar, prefix = shifted_key()
+    corpus = {
+        "vector_set": NAME,
+        "contract": NAME,
+        "purpose": "Cross-language agreement on which 32-byte Ed25519 public keys an Ori verifier admits, that a signature made with no private key is refused for its key, and that a key shifted by a point of small order is refused although its seed signs under it.",
+        "derivation": (
+            "public_keys carry the encodings of the public_keys cases of evidence-exchange/vectors/authority-key-registry-v2.json, in order, with that corpus's verdicts except for keys of mixed order, which v2 admits and this contract refuses; "
+            "keyless_signatures pair each small-order key with one message and the signature R = base point, S = 1. "
+            "mixed_order cases are the base point plus a point of order 2 and of order 8, and the key derived from seed_hex under RFC 8032 section 5.1.5 plus torsion_point_hex. "
+            "negated_keys pair the key derived from that seed with its negation, bit 255 flipped, and sign one message under the negation with the negated scalar, using the nonce SHA-512 of the seed's prefix and the message. "
+            "torsion_shift_signatures sign one message under that shifted key with the unshifted key's scalar, using the first nonce, SHA-512 of the seed's prefix, the message and a 4-byte little-endian counter, whose challenge is a multiple of 8 both as the full SHA-512 integer and reduced modulo L."
+        ),
+        "public_keys": keys,
+        "mixed_order": mixed_order(shifted),
+        "keyless_signatures": keyless(keys),
+        "negated_keys": negated_keys(),
+        "torsion_shift_signatures": [torsion_shift_signature(shifted, scalar, prefix)],
+    }
+    return json.dumps(corpus, indent=2, ensure_ascii=False) + "\n"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args != ["--check"]:
+        print(__doc__)
+        return 0 if args[0] in ("-h", "--help") else 2
+    text = build()
+    if args == ["--check"]:
+        if OUT.read_text(encoding="utf-8") != text:
+            print(f"generate-ed25519-key-admission-vectors: {OUT.relative_to(ROOT)} is not what the generator produces", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    OUT.write_text(text, encoding="utf-8")
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
