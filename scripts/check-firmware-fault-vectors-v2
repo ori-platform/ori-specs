@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 fault corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-fault-vectors-v2. The key is
+re-derived from the disclosed seed and every signature verified with this
+script's own affine curve arithmetic. The fault codes, the closed detail sets
+at each version and the corpus digest are read from the contract documents,
+never from the corpus or the generator.
+
+Held to:
+
+- each case: canonical bytes, digest, wire message and signature reproduce
+  from its input; the consumer model accepts it;
+- each refusal: signature valid, refused for its declared reason, and accepted
+  once that one rule is switched off, so no other rule refuses it;
+- coverage: every fault code and every closed-set token at v 2, a v 1 case,
+  and rate_limited at v 1 refused;
+- the telemetry v2 command_rejected row names exactly the firmware-commands/v2
+  verdicts, which are v1's plus rate_limited;
+- the digest firmware-telemetry/v2.md pins is the corpus's.
+
+    python3 scripts/check-firmware-fault-vectors-v2
+    python3 scripts/check-firmware-fault-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus and switches off each rule of the model in
+turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-telemetry" / "fault-vectors-v2.json"
+TELEMETRY_V1 = ROOT / "firmware-telemetry" / "v1.md"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+COMMANDS_V1 = ROOT / "firmware-commands" / "v1.md"
+COMMANDS_V2 = ROOT / "firmware-commands" / "v2.md"
+
+P = 2**255 - 19
+D = (-121665 * pow(121666, -1, P)) % P
+L = 2**252 + 27742317777372353535851937790883648493
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+BY = 4 * pow(5, -1, P) % P
+FLEET = re.compile(r"[A-Za-z0-9._-]*\Z")
+FAULT_KEYS = {
+    "v", "alg", "device_id", "boot_id", "seq", "capability_hash", "posture",
+    "device_uptime_ms", "code", "subject", "detail",
+}
+RULES = ("unsupported_version", "detail_not_in_closed_set")
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, affine, verification only --------------------------------------
+
+def _add(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = p
+    x2, y2 = q
+    t = D * x1 * x2 * y1 * y2 % P
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + t, -1, P) % P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, -1, P) % P
+    return x3, y3
+
+
+def _mul(k: int, p: tuple[int, int]) -> tuple[int, int]:
+    acc = (0, 1)
+    while k:
+        if k & 1:
+            acc = _add(acc, p)
+        p = _add(p, p)
+        k >>= 1
+    return acc
+
+
+def _recover_x(y: int, sign: int) -> int | None:
+    if y >= P:
+        return None
+    u = (y * y - 1) % P
+    v = (D * y * y + 1) % P
+    x = u * pow(v, 3, P) * pow(u * pow(v, 7, P), (P - 5) // 8, P) % P
+    if v * x * x % P == (P - u) % P:
+        x = x * SQRT_M1 % P
+    elif v * x * x % P != u:
+        return None
+    if x == 0 and sign:
+        return None
+    if x & 1 != sign:
+        x = P - x
+    return x
+
+
+def _decode(raw: bytes) -> tuple[int, int] | None:
+    n = int.from_bytes(raw, "little")
+    y = n & ((1 << 255) - 1)
+    x = _recover_x(y, n >> 255)
+    return None if x is None else (x, y)
+
+
+def _encode(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+BASE = (_recover_x(BY, 0), BY)
+
+
+def public_key(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return _encode(_mul(a, BASE))  # type: ignore[arg-type]
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if len(signature) != 64 or len(public) != 32:
+        return False
+    a = _decode(public)
+    r = _decode(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= L or _encode(r) != signature[:32]:
+        return False
+    h = int.from_bytes(
+        hashlib.sha512(signature[:32] + public + message).digest(), "little"
+    )
+    left = _mul(s, BASE)  # type: ignore[arg-type]
+    right = _add(r, _mul(h, a))
+    return left == right
+
+
+# --- contract text ------------------------------------------------------------
+
+def _section(text: str, heading: str) -> str:
+    start = text.index(heading)
+    rest = text[start + len(heading):]
+    end = re.search(r"\n#{2,3} ", rest)
+    return rest if end is None else rest[: end.start()]
+
+
+def _first_column_tokens(section: str) -> list[str]:
+    return re.findall(r"^\| `([a-z_]+)` \|", section, re.M)
+
+
+def _row(section: str, code: str) -> str:
+    match = re.search(rf"^\| `{code}` \|(.*)\|\s*$", section, re.M)
+    if match is None:
+        raise Failure(f"no row for {code}")
+    return match.group(1)
+
+
+def contract_model() -> dict:
+    t1 = TELEMETRY_V1.read_text()
+    t2 = TELEMETRY_V2.read_text()
+    c1 = COMMANDS_V1.read_text()
+    c2 = COMMANDS_V2.read_text()
+    codes = _first_column_tokens(_section(t1, "### Fault Codes"))
+    v1_verdicts = _first_column_tokens(_section(c1, "## Error Semantics"))
+    v2_verdicts = _first_column_tokens(_section(c2, "## Error Semantics"))
+    closed_v2_section = _section(t2, "### Closed `detail` sets at `v` 2")
+    v2_sets = {}
+    for code in ("command_rejected", "ingress_degraded", "storage_degraded"):
+        cell = _row(closed_v2_section, code)
+        cell = cell.split(":", 1)[1] if code == "command_rejected" else cell
+        v2_sets[code] = re.findall(r"`([a-z_]+)`", cell)
+    t1_codes = _section(t1, "### Fault Codes")
+    v1_sets = {
+        "command_rejected": v1_verdicts,
+        "ingress_degraded": [
+            t for t in re.findall(r"`([a-z_]+)`", _row(t1_codes, "ingress_degraded"))
+            if t != "detail"
+        ],
+        "storage_degraded": [
+            t for t in re.findall(r"`([a-z_]+)`", _row(t1_codes, "storage_degraded"))
+            if t not in ("detail", "subject", "evidence_buffer")
+        ],
+    }
+    pin = re.search(r"Its SHA-256 is\s+`([0-9a-f]{64})`", t2)
+    if pin is None:
+        raise Failure("firmware-telemetry/v2.md pins no corpus digest")
+    if sorted(set(v2_verdicts)) != sorted(set(v1_verdicts) | {"rate_limited"}):
+        raise Failure("firmware-commands/v2 verdicts are not v1's plus rate_limited")
+    if v2_sets["command_rejected"] != v2_verdicts:
+        raise Failure(
+            "telemetry v2 command_rejected row differs from firmware-commands/v2"
+        )
+    if "rate_limited" in v1_sets["command_rejected"]:
+        raise Failure("rate_limited appears in v1's verdicts")
+    return {
+        "codes": codes,
+        "sets": {1: v1_sets, 2: v2_sets},
+        "pin": pin.group(1),
+    }
+
+
+# --- consumer model -----------------------------------------------------------
+
+def judge(fault: dict, context: dict, model: dict, off: frozenset[str]) -> str | None:
+    """Return None to accept, or the reason the first failing rule names."""
+    if set(fault) != FAULT_KEYS:
+        return "fields"
+    v = fault["v"]
+    version_ok = type(v) is int and v in (1, 2)
+    if not version_ok and "unsupported_version" not in off:
+        return "unsupported_version"
+    if fault["alg"] != "ed25519":
+        return "alg"
+    for name in ("device_id", "capability_hash", "posture"):
+        if fault[name] != context[name]:
+            return name
+    for name in ("boot_id", "seq", "device_uptime_ms"):
+        if type(fault[name]) is not int or not 0 <= fault[name] <= 2**53 - 1:
+            return name
+    if fault["code"] not in model["codes"]:
+        return "code"
+    for name in ("subject", "detail"):
+        token = fault[name]
+        if type(token) is not str or len(token) > 63 or not FLEET.match(token):
+            return name
+    sets = model["sets"].get(v if version_ok else 2, {})
+    closed = sets.get(fault["code"])
+    if closed is not None and fault["detail"] not in closed:
+        if "detail_not_in_closed_set" not in off:
+            return "detail_not_in_closed_set"
+    return None
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+    import base64
+
+    seed = bytes.fromhex(corpus["test_seed_hex"])
+    public = public_key(seed)
+    if corpus["public_key_hex"] != public.hex():
+        raise Failure("public key does not derive from the seed")
+    context = corpus["verifier_context"]
+    if base64.b64decode(context["public_key_b64"], validate=True) != public:
+        raise Failure("verifier context names another key")
+    if base64.b64decode(corpus["public_key_b64"], validate=True) != public:
+        raise Failure("public_key_b64 names another key")
+
+    def common(case: dict) -> None:
+        body = canonical(case["input"])
+        if bytes.fromhex(case["canonical_hex"]) != body:
+            raise Failure(f"{case['name']}: canonical bytes")
+        if case["canonical_sha256_hex"] != hashlib.sha256(body).hexdigest():
+            raise Failure(f"{case['name']}: digest")
+        wire = case["signature"]
+        if not wire.startswith("ed25519:"):
+            raise Failure(f"{case['name']}: signature encoding")
+        raw = base64.b64decode(wire[len("ed25519:"):], validate=True)
+        if base64.b64encode(raw).decode() != wire[len("ed25519:"):]:
+            raise Failure(f"{case['name']}: non-canonical base64")
+        if not verify(public, body, raw):
+            raise Failure(f"{case['name']}: signature does not verify")
+        message = canonical({"fault": case["input"], "signature": wire})
+        if bytes.fromhex(case["message_hex"]) != message:
+            raise Failure(f"{case['name']}: wire message")
+
+    names = set()
+    for case in corpus["cases"] + corpus["reject_cases"]:
+        if case["name"] in names:
+            raise Failure(f"duplicate case {case['name']}")
+        names.add(case["name"])
+
+    for case in corpus["cases"]:
+        common(case)
+        verdict = judge(case["input"], context, model, off)
+        if verdict is not None:
+            raise Failure(f"{case['name']}: refused ({verdict})")
+
+    for case in corpus["reject_cases"]:
+        common(case)
+        if case["signature_valid"] is not True:
+            raise Failure(f"{case['name']}: a refusal here must carry a valid signature")
+        if case["reason"] not in corpus["reasons"] or case["reason"] not in RULES:
+            raise Failure(f"{case['name']}: undeclared reason {case['reason']}")
+        verdict = judge(case["input"], context, model, off)
+        if verdict != case["reason"]:
+            raise Failure(f"{case['name']}: refused for {verdict}, not {case['reason']}")
+        if judge(case["input"], context, model, off | {case["reason"]}) is not None:
+            raise Failure(f"{case['name']}: refused for more than its declared reason")
+
+    accepted = [c["input"] for c in corpus["cases"]]
+    v2 = [f for f in accepted if f["v"] == 2]
+    for code in model["codes"]:
+        if not any(f["code"] == code for f in v2):
+            raise Failure(f"coverage: no v 2 case for {code}")
+    for code, tokens in model["sets"][2].items():
+        for token in tokens:
+            if not any(f["code"] == code and f["detail"] == token for f in v2):
+                raise Failure(f"coverage: no v 2 case for {code}/{token}")
+    if not any(f["v"] == 1 for f in accepted):
+        raise Failure("coverage: no v 1 case")
+    if not any(
+        c["input"]["v"] == 1 and c["input"]["detail"] == "rate_limited"
+        for c in corpus["reject_cases"]
+    ):
+        raise Failure("coverage: rate_limited at v 1 is not refused")
+    if not any(c["reason"] == "unsupported_version" for c in corpus["reject_cases"]):
+        raise Failure("coverage: no unsupported version")
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> None:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
+    check(json.loads(corpus_bytes), model, off)
+
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def find(collection: str, name: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c[collection] if x["name"] == name)
+
+    rate = find("cases", "v2_command_rejected_rate_limited")
+    v1_rate = find("reject_cases", "reject_v1_command_rejected_rate_limited")
+
+    def flip_signature(c: dict) -> None:
+        import base64
+        case = rate(c)
+        raw = bytearray(base64.b64decode(case["signature"][8:]))
+        raw[40] ^= 1
+        case["signature"] = "ed25519:" + base64.b64encode(bytes(raw)).decode()
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("signature bit flipped", corpus_mutant(flip_signature)),
+        ("detail edited after signing",
+         corpus_mutant(lambda c: rate(c)["input"].update(detail="replayed"))),
+        ("refusal relabelled", corpus_mutant(
+            lambda c: v1_rate(c).update(reason="unsupported_version"))),
+        ("refusal marked unsigned", corpus_mutant(
+            lambda c: v1_rate(c).update(signature_valid=False))),
+        ("rate_limited case dropped", corpus_mutant(
+            lambda c: c["cases"].remove(rate(c)))),
+        ("v1 rate_limited refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(v1_rate(c)))),
+        ("seed swapped", corpus_mutant(lambda c: c.update(test_seed_hex="43" * 32))),
+        ("refusal moved to cases", corpus_mutant(
+            lambda c: c["cases"].append(dict(v1_rate(c), name="moved")))),
+        ("rule off: version", lambda: run(
+            corpus_bytes, model, frozenset({"unsupported_version"}))),
+        ("rule off: closed set", lambda: run(
+            corpus_bytes, model, frozenset({"detail_not_in_closed_set"}))),
+        ("v2 sets applied at v1", model_mutant(
+            lambda m: m["sets"].__setitem__(1, m["sets"][2]))),
+        ("rate_limited dropped from v2 set", model_mutant(
+            lambda m: m["sets"][2]["command_rejected"].remove("rate_limited"))),
+        ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("code vocabulary shrunk", model_mutant(
+            lambda m: m["codes"].remove("sensor_fault"))),
+    ]
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    model = contract_model()
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except Failure as failure:
+        print(f"firmware-telemetry/v2 fault corpus: {failure}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(
+        f"firmware-telemetry/v2 fault corpus: {len(corpus['cases'])} cases accepted, "
+        f"{len(corpus['reject_cases'])} refusals each for its declared reason"
+    )
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

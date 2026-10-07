@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 fault corpus.
+
+Signatures come from OpenSSL through `cryptography`. Nothing here is shared
+with scripts/check-firmware-fault-vectors-v2, which verifies them with its own
+curve arithmetic and reads the closed sets from the contracts rather than from
+this file.
+
+    python3 scripts/generate-firmware-fault-vectors-v2          # write
+    python3 scripts/generate-firmware-fault-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-telemetry" / "fault-vectors-v2.json"
+
+SEED_HEX = "42" * 32
+DEVICE_ID = "ori-fw-7c9f2b3a"
+CAPABILITY_HASH = (
+    "sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d"
+)
+POSTURE = "sealed_flash"
+BOOT_ID = 41
+
+COMMAND_VERDICTS = (
+    "malformed",
+    "wrong_device",
+    "bad_signature",
+    "replayed",
+    "capability_mismatch",
+    "unknown_action",
+    "rate_limited",
+    "storage_failure",
+)
+INGRESS = (
+    "inbound_overflow",
+    "subscribe_failed",
+    "anchor_persist_failed",
+    "mqtt_provision_epoch_failed",
+    "provisioning_serial_io_failed",
+    "provisioning_serial_overflow",
+    "liveness_authority_failed",
+)
+STORAGE = ("buffer_write_failed", "buffer_mount_failed")
+
+# (name, code, subject, detail, v, note) for every accepted case.
+ACCEPT = (
+    [
+        (
+            f"v2_command_rejected_{verdict}",
+            "command_rejected",
+            "command",
+            verdict,
+            2,
+            "a firmware-commands/v2 verdict, signed at fault v 2",
+        )
+        for verdict in COMMAND_VERDICTS
+    ]
+    + [
+        (
+            f"v2_ingress_degraded_{token}",
+            "ingress_degraded",
+            "inbound",
+            token,
+            2,
+            "a closed ingress_degraded token, signed at fault v 2",
+        )
+        for token in INGRESS
+    ]
+    + [
+        (
+            f"v2_storage_degraded_{token}",
+            "storage_degraded",
+            "evidence_buffer",
+            token,
+            2,
+            "a closed storage_degraded token, signed at fault v 2",
+        )
+        for token in STORAGE
+    ]
+    + [
+        (
+            f"v2_{code}",
+            code,
+            "relay0",
+            "local_overcurrent_interlock",
+            2,
+            "context-bound detail: an interlock rule name; v 2 changes nothing "
+            "about this category",
+        )
+        for code in ("interlock_tripped", "interlock_input_fault", "interlock_recovered")
+    ]
+    + [
+        (
+            "v2_sensor_fault",
+            "sensor_fault",
+            "pzem0",
+            "crc",
+            2,
+            "open detail: any bounded fleet-safe token",
+        ),
+        (
+            "v2_brownout_relay_fault",
+            "brownout_relay_fault",
+            "relay_bank",
+            "relay_err_6",
+            2,
+            "producer-convention detail, unchanged from v1",
+        ),
+        (
+            "v1_command_rejected_replayed",
+            "command_rejected",
+            "command",
+            "replayed",
+            1,
+            "a v 1 fault is still accepted, under v1's rules, by a consumer of "
+            "this version",
+        ),
+    ]
+)
+
+# (name, reason, code, subject, detail, v, note). Every signature is valid.
+REJECT = (
+    (
+        "reject_v1_command_rejected_rate_limited",
+        "detail_not_in_closed_set",
+        "command_rejected",
+        "command",
+        "rate_limited",
+        1,
+        "rate_limited is not in v1's command_rejected set; the version inside "
+        "the signed bytes decides which set applies",
+    ),
+    (
+        "reject_v2_command_rejected_unknown_verdict",
+        "detail_not_in_closed_set",
+        "command_rejected",
+        "command",
+        "throttled",
+        2,
+        "a fleet-safe token that is no firmware-commands/v2 verdict",
+    ),
+    (
+        "reject_v2_command_rejected_empty_detail",
+        "detail_not_in_closed_set",
+        "command_rejected",
+        "command",
+        "",
+        2,
+        "an empty detail names nothing; a closed set never contains it",
+    ),
+    (
+        "reject_v2_ingress_degraded_rate_limited",
+        "detail_not_in_closed_set",
+        "ingress_degraded",
+        "inbound",
+        "rate_limited",
+        2,
+        "rate_limited belongs to command_rejected only; sets are per code",
+    ),
+    (
+        "reject_v2_storage_degraded_unknown",
+        "detail_not_in_closed_set",
+        "storage_degraded",
+        "evidence_buffer",
+        "buffer_full",
+        2,
+        "a token outside storage_degraded's set",
+    ),
+    (
+        "reject_fault_v3",
+        "unsupported_version",
+        "command_rejected",
+        "command",
+        "rate_limited",
+        3,
+        "no version above 2 is defined",
+    ),
+    (
+        "reject_fault_v0",
+        "unsupported_version",
+        "command_rejected",
+        "command",
+        "replayed",
+        0,
+        "versions start at 1",
+    ),
+    (
+        "reject_fault_v_string",
+        "unsupported_version",
+        "command_rejected",
+        "command",
+        "rate_limited",
+        "2",
+        "v is a JSON integer; the string \"2\" is another type",
+    ),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def build() -> bytes:
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SEED_HEX))
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    seq = 140000
+
+    def signed(code: str, subject: str, detail: str, v: object) -> dict:
+        nonlocal seq
+        seq += 1
+        fault = {
+            "v": v,
+            "alg": "ed25519",
+            "device_id": DEVICE_ID,
+            "boot_id": BOOT_ID,
+            "seq": seq,
+            "capability_hash": CAPABILITY_HASH,
+            "posture": POSTURE,
+            "device_uptime_ms": 925000 + seq - 140000,
+            "code": code,
+            "subject": subject,
+            "detail": detail,
+        }
+        body = canonical(fault)
+        signature = "ed25519:" + base64.b64encode(key.sign(body)).decode("ascii")
+        message = canonical({"fault": fault, "signature": signature})
+        return {
+            "input": fault,
+            "canonical_hex": body.hex(),
+            "canonical_sha256_hex": hashlib.sha256(body).hexdigest(),
+            "signature": signature,
+            "message_hex": message.hex(),
+        }
+
+    cases = []
+    for name, code, subject, detail, v, note in ACCEPT:
+        cases.append({"name": name, **signed(code, subject, detail, v), "note": note})
+    reject_cases = []
+    for name, reason, code, subject, detail, v, note in REJECT:
+        reject_cases.append(
+            {
+                "name": name,
+                "reason": reason,
+                "signature_valid": True,
+                **signed(code, subject, detail, v),
+                "note": note,
+            }
+        )
+
+    corpus = {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for firmware-telemetry/v2 signed fault events. A "
+            "consumer of this version must accept every case in 'cases' and "
+            "refuse every case in 'reject_cases' with the declared reason. Each "
+            "case is judged on its own against verifier_context, with no prior "
+            "message accepted from the device. Signed with a disclosed TEST-ONLY "
+            "seed: never provision it."
+        ),
+        "test_seed_hex": SEED_HEX,
+        "public_key_hex": public.hex(),
+        "public_key_b64": base64.b64encode(public).decode("ascii"),
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "verifier_context": {
+            "device_id": DEVICE_ID,
+            "capability_hash": CAPABILITY_HASH,
+            "posture": POSTURE,
+            "public_key_b64": base64.b64encode(public).decode("ascii"),
+        },
+        "reasons": {
+            "detail_not_in_closed_set": (
+                "the code has a closed detail set at the fault's version and "
+                "the detail is not in it"
+            ),
+            "unsupported_version": "the fault's v is not the integer 1 or 2",
+        },
+        "cases": cases,
+        "reject_cases": reject_cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
