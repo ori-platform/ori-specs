@@ -159,11 +159,18 @@ def _row(section: str, code: str) -> str:
     return match.group(1)
 
 
-def contract_model() -> dict:
-    t1 = TELEMETRY_V1.read_text()
-    t2 = TELEMETRY_V2.read_text()
-    c1 = COMMANDS_V1.read_text()
-    c2 = COMMANDS_V2.read_text()
+def contract_texts() -> dict[str, str]:
+    return {
+        "t1": TELEMETRY_V1.read_text(),
+        "t2": TELEMETRY_V2.read_text(),
+        "c1": COMMANDS_V1.read_text(),
+        "c2": COMMANDS_V2.read_text(),
+    }
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    t1, t2, c1, c2 = texts["t1"], texts["t2"], texts["c1"], texts["c2"]
     codes = _first_column_tokens(_section(t1, "### Fault Codes"))
     v1_verdicts = _first_column_tokens(_section(c1, "## Error Semantics"))
     v2_verdicts = _first_column_tokens(_section(c2, "## Error Semantics"))
@@ -196,6 +203,10 @@ def contract_model() -> dict:
         )
     if "rate_limited" in v1_sets["command_rejected"]:
         raise Failure("rate_limited appears in v1's verdicts")
+    # rate_limited answers relay_close only; a Tier D trip is a relay_open.
+    exemption = "a device MUST NOT return `rate_limited` for it"
+    if exemption not in " ".join(c2.split()):
+        raise Failure("firmware-commands/v2 no longer exempts relay_open")
     return {
         "codes": codes,
         "sets": {1: v1_sets, 2: v2_sets},
@@ -227,7 +238,9 @@ def judge(fault: dict, context: dict, model: dict, off: frozenset[str]) -> str |
         token = fault[name]
         if type(token) is not str or len(token) > 63 or not FLEET.match(token):
             return name
-    sets = model["sets"].get(v if version_ok else 2, {})
+    # An unknown version has no closed sets: its refusal must stand on the
+    # version alone, which the isolation check then proves.
+    sets = model["sets"].get(v, {}) if version_ok else {}
     closed = sets.get(fault["code"])
     if closed is not None and fault["detail"] not in closed:
         if "detail_not_in_closed_set" not in off:
@@ -345,6 +358,15 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         raw[40] ^= 1
         case["signature"] = "ed25519:" + base64.b64encode(bytes(raw)).decode()
 
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts[key]:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = texts[key].replace(old, new, 1)
+            contract_model(texts)
+        return go
+
     def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
         def go() -> None:
             mutated = copy.deepcopy(model)
@@ -376,6 +398,10 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("rate_limited dropped from v2 set", model_mutant(
             lambda m: m["sets"][2]["command_rejected"].remove("rate_limited"))),
         ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("relay_open exemption removed", text_mutant(
+            "c2", "a device MUST NOT return `rate_limited` for it", "")),
+        ("rate_limited added to commands v1", text_mutant(
+            "c1", "| `storage_failure` |", "| `rate_limited` | x |\n| `storage_failure` |")),
         ("code vocabulary shrunk", model_mutant(
             lambda m: m["codes"].remove("sensor_fault"))),
     ]
@@ -392,7 +418,11 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
 
 
 def main(argv: list[str]) -> int:
-    model = contract_model()
+    try:
+        model = contract_model()
+    except (Failure, ValueError) as failure:
+        print(f"firmware-telemetry/v2 contracts: {failure}")
+        return 1
     corpus_bytes = CORPUS.read_bytes()
     try:
         run(corpus_bytes, model)
