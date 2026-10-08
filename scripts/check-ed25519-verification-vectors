@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the ed25519-verification/v1 corpus against the contract's rules.
+
+Every verdict is recomputed here from the contract's clauses with this
+script's own affine curve arithmetic; nothing is read from the corpus but the
+inputs. The points of small order are found by multiplying curve points by L,
+not read from the corpus.
+
+Held to:
+
+- each case: verdict and refusing clause under the contract's clauses, in
+  order, and the same verdict with the challenge reduced modulo L wherever the
+  key is admitted;
+- rfc8032: the published RFC 8032 section 7.1 TEST 1 to 3, restated here;
+- honest: accepted under R with bit 255 clear and set;
+- negated_r: [S]B - [k]A differs from R in bit 255 alone, under both sign
+  bits;
+- flipped_bit_r: for each bit 0 to 254, exactly once, R is a canonical point
+  of order L and [S]B - [k]A differs from it in that bit alone, so with
+  negated_r a final comparison omitting any one bit or byte of R is caught;
+- torsion_component_r: one case per nonzero point of small order, each
+  accepted by the cofactored equation, its R the honest nonce point plus that
+  point;
+- small_order_r: R is each point of small order exactly once, each accepted
+  by the cofactored equation;
+- non_canonical_r: every encoding that a decoder reducing y modulo p maps to a
+  point of small order other than by its canonical encoding, each accepted by
+  the cofactored equation under that decoder, and an off-curve R under both
+  sign bits;
+- s_range: S >= L in every case, one of them an honest signature that the
+  equation accepts once S is reduced, and one also carrying a non-canonical R;
+- refused_keys: every key refused under ed25519-key-admission/v1, and every
+  signature with S < L accepted by the cofactorless equation with the full and
+  with the reduced challenge, so refusing the key first is what refuses it.
+
+    python3 scripts/check-ed25519-verification-vectors
+    python3 scripts/check-ed25519-verification-vectors --mutations
+
+`--mutations` corrupts the corpus, switches off or reorders each rule of the
+model in turn, and weakens the final comparison by omitting each of the 32
+bytes and each of the 256 bits of R in turn; every mutant must be refused for its named reason.
+"""
+
+from __future__ import annotations
+
+import copy
+import functools
+import hashlib
+import json
+import pathlib
+import random
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "ed25519-verification" / "vectors-v1.json"
+NAME = "ed25519-verification/v1"
+
+P = 2**255 - 19
+D = (-121665 * pow(121666, -1, P)) % P
+L = 2**252 + 27742317777372353535851937790883648493
+I = pow(2, (P - 1) // 4, P)
+IDENTITY = (0, 1)
+CLAUSES = ("key_refused", "s_out_of_range", "non_canonical_r", "equation")
+SECTIONS = ("rfc8032", "honest", "negated_r", "flipped_bit_r", "torsion_component_r", "small_order_r", "non_canonical_r", "s_range", "refused_keys")
+
+RFC8032 = {
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a": (
+        "",
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    ),
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c": (
+        "72",
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    ),
+    "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025": (
+        "af82",
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    ),
+}
+
+
+class Failure(Exception):
+    pass
+
+
+def add(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = a, b
+    t = D * x1 * x2 * y1 * y2 % P
+    return (
+        (x1 * y2 + x2 * y1) * pow(1 + t, -1, P) % P,
+        (y1 * y2 + x1 * x2) * pow(1 - t, -1, P) % P,
+    )
+
+
+def neg(a: tuple[int, int]) -> tuple[int, int]:
+    return ((P - a[0]) % P, a[1])
+
+
+@functools.lru_cache(maxsize=None)
+def mul(k: int, point: tuple[int, int]) -> tuple[int, int]:
+    result = IDENTITY
+    while k:
+        if k & 1:
+            result = add(result, point)
+        point = add(point, point)
+        k >>= 1
+    return result
+
+
+@functools.lru_cache(maxsize=None)
+def x_for(y: int) -> int | None:
+    num = (y * y - 1) % P
+    den = (D * y * y + 1) % P
+    xx = num * pow(den, -1, P) % P
+    x = pow(xx, (P + 3) // 8, P)
+    if (x * x - xx) % P:
+        x = x * I % P
+    if (x * x - xx) % P:
+        return None
+    return x
+
+
+def encode(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def decode_strict(raw: bytes) -> tuple[int, int] | None:
+    """RFC 8032 section 5.1.3: y < p, on the curve, and no sign on x = 0."""
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, n & ((1 << 255) - 1)
+    if y >= P:
+        return None
+    x = x_for(y)
+    if x is None or (x == 0 and sign):
+        return None
+    return ((P - x) % P if (x & 1) != sign else x, y)
+
+
+def decode_loose(raw: bytes) -> tuple[int, int] | None:
+    """A decoder that reduces y modulo p and ignores the sign of x = 0."""
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, (n & ((1 << 255) - 1)) % P
+    x = x_for(y)
+    if x is None:
+        return None
+    return ((P - x) % P if (x & 1) != sign else x, y)
+
+
+BASE_Y = 4 * pow(5, -1, P) % P
+BASE = decode_strict(BASE_Y.to_bytes(32, "little"))
+assert BASE is not None
+
+
+def torsion_points() -> set[tuple[int, int]]:
+    rng = random.Random(8032)
+    found: set[tuple[int, int]] = set()
+    while len(found) < 8:
+        y = rng.randrange(P)
+        x = x_for(y)
+        if x is not None:
+            found.add(mul(L, (x, y)))
+    return found
+
+
+TORSION = torsion_points()
+
+
+def key_admitted(raw: bytes) -> bool:
+    """ed25519-key-admission/v1: decodes strictly and has order exactly L."""
+    point = decode_strict(raw)
+    return point is not None and point not in TORSION and mul(L, point) == IDENTITY
+
+
+def challenge(r: bytes, a: bytes, message: bytes) -> int:
+    return int.from_bytes(hashlib.sha512(r + a + message).digest(), "little")
+
+
+def exact(candidate: bytes, r: bytes) -> bool:
+    return candidate == r
+
+
+def cofactorless(public: bytes, message: bytes, signature: bytes, *, reduced: bool = False, compare=exact) -> bool:
+    """Byte compare of R against the encoding of [S]B - [k]A, S reduced if over L."""
+    a = decode_strict(public)
+    if a is None:
+        return False
+    k = challenge(signature[:32], public, message)
+    if reduced:
+        k %= L
+    s = int.from_bytes(signature[32:], "little") % L
+    return compare(encode(add(mul(s, BASE), neg(mul(k, a)))), signature[:32])
+
+
+def cofactored_loose(public: bytes, message: bytes, signature: bytes) -> bool:
+    """[8][S]B = [8]R + [8][k]A, with A and R decoded loosely."""
+    a, r = decode_loose(public), decode_loose(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= L:
+        return False
+    k = challenge(signature[:32], public, message)
+    return mul(8, mul(s, BASE)) == mul(8, add(r, mul(k, a)))
+
+
+def model(public: bytes, message: bytes, signature: bytes, *, order=CLAUSES, off: str = "", reduced: bool = False, compare=exact) -> str | None:
+    s = int.from_bytes(signature[32:], "little")
+    checks = {
+        "key_refused": lambda: not key_admitted(public),
+        "s_out_of_range": lambda: s >= L,
+        "non_canonical_r": lambda: decode_strict(signature[:32]) is None,
+        "equation": lambda: not cofactorless(public, message, signature, reduced=reduced, compare=compare),
+    }
+    for clause in order:
+        if clause != off and checks[clause]():
+            return clause
+    return None
+
+
+def raw(case: dict) -> tuple[bytes, bytes, bytes]:
+    return (
+        bytes.fromhex(case["public_key_hex"]),
+        bytes.fromhex(case["message_hex"]),
+        bytes.fromhex(case["signature_hex"]),
+    )
+
+
+def derive_key(seed: bytes) -> tuple[int, bytes]:
+    digest = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(digest[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+    return scalar, encode(mul(scalar, BASE))
+
+
+def check(corpus: dict, *, order=CLAUSES, off: str = "", compare=exact) -> None:
+    if corpus.get("contract") != NAME or corpus.get("vector_set") != NAME:
+        raise Failure("the corpus does not name ed25519-verification/v1")
+    if [k for k in corpus if isinstance(corpus[k], list)] != list(SECTIONS):
+        raise Failure("the corpus sections are not the contract's, in order")
+
+    seen: set[tuple[bytes, bytes, bytes]] = set()
+    for section in SECTIONS:
+        for case in corpus[section]:
+            public, message, signature = raw(case)
+            if len(public) != 32 or len(signature) != 64 or (public, message, signature) in seen:
+                raise Failure(f"{section}: {case['why']}: wrong length, or repeated")
+            seen.add((public, message, signature))
+            clause = model(public, message, signature, order=order, off=off, compare=compare)
+            want = ("refused", clause) if clause else ("accepted", None)
+            if (case["expected"], case.get("clause")) != want:
+                raise Failure(f"{section}: {case['why']}: corpus says {case['expected']}/{case.get('clause')}, rules say {want}")
+            if key_admitted(public) and model(public, message, signature, reduced=True) != model(public, message, signature):
+                raise Failure(f"{section}: {case['why']}: the reduced challenge changes the verdict under an admitted key")
+
+    rfc = {c["public_key_hex"]: (c["message_hex"], c["signature_hex"]) for c in corpus["rfc8032"]}
+    if rfc != RFC8032:
+        raise Failure("rfc8032 is not RFC 8032 section 7.1 TEST 1 to 3")
+    for case in corpus["rfc8032"]:
+        if derive_key(bytes.fromhex(case["seed_hex"]))[1].hex() != case["public_key_hex"]:
+            raise Failure("an rfc8032 key does not derive from its seed")
+
+    accepted_signs = {bytes.fromhex(c["signature_hex"])[31] >> 7 for c in corpus["honest"] if c["expected"] == "accepted"}
+    if accepted_signs != {0, 1}:
+        raise Failure("honest accepted signatures do not carry R under both sign bits")
+
+    flipped = set()
+    for case in corpus["negated_r"]:
+        public, message, signature = raw(case)
+        a = decode_strict(public)
+        if a is None:
+            raise Failure(f"negated_r: {case['why']}: the key does not decode")
+        s = int.from_bytes(signature[32:], "little")
+        candidate = encode(add(mul(s, BASE), neg(mul(challenge(signature[:32], public, message), a))))
+        if candidate[:31] != signature[:31] or candidate[31] ^ signature[31] != 0x80:
+            raise Failure(f"negated_r: {case['why']}: [S]B - [k]A does not differ from R in bit 255 alone")
+        flipped.add(signature[31] >> 7)
+    if flipped != {0, 1}:
+        raise Failure("negated_r do not cover R under both sign bits")
+
+    bits: list[int] = []
+    for case in corpus["flipped_bit_r"]:
+        if type(case.get("bit")) is not int or not 0 <= case["bit"] < 255:
+            raise Failure(f"flipped_bit_r: {case['why']}: bit is not an integer from 0 to 254")
+        public, message, signature = raw(case)
+        a, r = decode_strict(public), decode_strict(signature[:32])
+        if a is None or r is None or mul(L, r) != IDENTITY or r in TORSION:
+            raise Failure(f"flipped_bit_r: {case['why']}: R is not a canonical point of order L")
+        s = int.from_bytes(signature[32:], "little")
+        candidate = encode(add(mul(s, BASE), neg(mul(challenge(signature[:32], public, message), a))))
+        diff = int.from_bytes(candidate, "little") ^ int.from_bytes(signature[:32], "little")
+        if diff != 1 << case["bit"]:
+            raise Failure(f"flipped_bit_r: {case['why']}: [S]B - [k]A does not differ from R in bit {case['bit']} alone")
+        bits.append(case["bit"])
+    if sorted(bits) != list(range(255)):
+        raise Failure("flipped_bit_r do not cover each of bits 0 to 254 exactly once")
+
+    tcr = corpus["torsion_component_r"]
+    want_t = {encode(t) for t in TORSION if t != IDENTITY}
+    if {bytes.fromhex(c["torsion_point_hex"]) for c in tcr} != want_t or len(tcr) != len(want_t):
+        raise Failure("torsion_component_r do not cover each nonzero point of small order once")
+    for case in tcr:
+        public, message, signature = raw(case)
+        honest_r = add(decode_strict(signature[:32]) or IDENTITY, neg(decode_strict(bytes.fromhex(case["torsion_point_hex"])) or IDENTITY))
+        if honest_r in TORSION or mul(L, honest_r) != IDENTITY:
+            raise Failure(f"torsion_component_r: {case['why']}: R less the torsion point is not a nonce point")
+        if not cofactored_loose(public, message, signature):
+            raise Failure(f"torsion_component_r: {case['why']}: the cofactored equation does not accept it")
+
+    sor = corpus["small_order_r"]
+    if sorted(bytes.fromhex(c["signature_hex"])[:32] for c in sor) != sorted(encode(t) for t in TORSION):
+        raise Failure("small_order_r do not cover each point of small order once")
+    for case in sor:
+        if not cofactored_loose(*raw(case)):
+            raise Failure(f"small_order_r: {case['why']}: the cofactored equation does not accept it")
+
+    ncr = corpus["non_canonical_r"]
+    aliases = set()
+    for y in list(range(P, 2**255)) + [t[1] for t in TORSION]:
+        for sign in (0, 1):
+            enc = (y | (sign << 255)).to_bytes(32, "little")
+            point = decode_loose(enc)
+            if point is not None and point in TORSION and enc != encode(point):
+                aliases.add(enc)
+    given = {bytes.fromhex(c["signature_hex"])[:32] for c in ncr}
+    if not aliases <= given:
+        raise Failure("non_canonical_r lack an encoding a loose decoder maps to a point of small order")
+    for case in ncr:
+        public, message, signature = raw(case)
+        if signature[:32] in aliases and not cofactored_loose(public, message, signature):
+            raise Failure(f"non_canonical_r: {case['why']}: the loose cofactored equation does not accept it")
+    off_curve = [r for r in given if decode_loose(r) is None]
+    if {r[31] >> 7 for r in off_curve} != {0, 1}:
+        raise Failure("non_canonical_r lack an off-curve R under both sign bits")
+
+    sr = corpus["s_range"]
+    if any(int.from_bytes(raw(c)[2][32:], "little") < L for c in sr):
+        raise Failure("an s_range case has S < L")
+    if not any(cofactorless(*raw(c)) and decode_strict(raw(c)[2][:32]) for c in sr):
+        raise Failure("no s_range case is an honest signature that the equation accepts once S is reduced")
+    if not any(decode_strict(raw(c)[2][:32]) is None for c in sr):
+        raise Failure("no s_range case also carries a non-canonical R")
+
+    for case in corpus["refused_keys"]:
+        public, message, signature = raw(case)
+        if key_admitted(public):
+            raise Failure(f"refused_keys: {case['why']}: the key is admitted")
+        if int.from_bytes(signature[32:], "little") >= L:
+            continue
+        a = decode_strict(public)
+        if a is None:
+            raise Failure(f"refused_keys: {case['why']}: the key does not decode")
+        for reduced in (False, True):
+            k = challenge(signature[:32], public, message)
+            k = k % L if reduced else k
+            s = int.from_bytes(signature[32:], "little")
+            if encode(add(mul(s, BASE), neg(mul(k, a)))) != signature[:32]:
+                raise Failure(f"refused_keys: {case['why']}: the cofactorless equation does not accept it")
+        if "seed_hex" in case:
+            _, unshifted = derive_key(bytes.fromhex(case["seed_hex"]))
+            shifted = add(decode_strict(unshifted) or IDENTITY, decode_strict(bytes.fromhex(case["torsion_point_hex"])) or IDENTITY)
+            if encode(shifted) != public:
+                raise Failure(f"refused_keys: {case['why']}: does not re-derive from its seed and torsion point")
+    if not any(int.from_bytes(raw(c)[2][32:], "little") >= L for c in corpus["refused_keys"]):
+        raise Failure("no refused_keys case also has S >= L")
+
+
+def mutations(corpus: dict) -> int:
+    def tweak_last_byte(hexstr: str) -> str:
+        return hexstr[:-2] + ("00" if hexstr[-2:] != "00" else "01")
+
+    def flip(section, i):
+        def run(c):
+            case = c[section][i]
+            case["expected"] = "accepted" if case["expected"] == "refused" else "refused"
+        return run
+
+    def drop(section, pred=lambda _c: True):
+        def run(c):
+            c[section].remove(next(k for k in c[section] if pred(k)))
+        return run
+
+    def resign_honest_r(c):
+        """Make the first torsion-component case honest: R without the torsion point."""
+        case = c["torsion_component_r"][0]
+        case["torsion_point_hex"] = c["torsion_component_r"][1]["torsion_point_hex"]
+
+    def honest_one_sign(c):
+        c["honest"] = [k for k in c["honest"] if k["expected"] != "accepted" or bytes.fromhex(k["signature_hex"])[31] >> 7 == 0]
+
+    def s_below_l(c):
+        case = c["s_range"][1]
+        case["signature_hex"] = case["signature_hex"][:64] + (L - 1).to_bytes(32, "little").hex()
+
+    def rfc_altered(c):
+        c["rfc8032"][0]["signature_hex"] = tweak_last_byte(c["rfc8032"][0]["signature_hex"])
+
+    def refused_key_admitted(c):
+        honest = c["honest"][0]
+        c["refused_keys"][0]["public_key_hex"] = honest["public_key_hex"]
+
+    def refused_key_sig_altered(c):
+        """S = 2 in place of 1: under the identity key every message verifies, so alter S."""
+        case = c["refused_keys"][0]
+        case["signature_hex"] = case["signature_hex"][:64] + (2).to_bytes(32, "little").hex()
+
+    def duplicate(c):
+        c["honest"].append(copy.deepcopy(c["honest"][0]))
+
+    corpus_mutants = [
+        ("rfc8032 verdict flipped", flip("rfc8032", 0), "rules say"),
+        ("rfc8032 signature altered", rfc_altered, "rules say"),
+        ("honest verdict flipped", flip("honest", 0), "rules say"),
+        ("negated R accepted", flip("negated_r", 0), "rules say"),
+        ("negated R dropped", drop("negated_r"), "both sign bits"),
+        ("flipped-bit R accepted", flip("flipped_bit_r", 0), "rules say"),
+        ("flipped-bit R dropped", drop("flipped_bit_r"), "bits 0 to 254 exactly once"),
+        ("flipped-bit R names the wrong bit", lambda c: c["flipped_bit_r"][0].update(bit=c["flipped_bit_r"][0]["bit"] + 1), "alone"),
+        ("flipped-bit R names its bit as text", lambda c: c["flipped_bit_r"][0].update(bit=str(c["flipped_bit_r"][0]["bit"])), "not an integer"),
+        ("honest accepted under one sign bit only", honest_one_sign, "both sign bits"),
+        ("torsion-component case accepted", flip("torsion_component_r", 0), "rules say"),
+        ("torsion-component case dropped", drop("torsion_component_r"), "cover each nonzero point"),
+        ("torsion point named wrongly", resign_honest_r, "cover each nonzero point"),
+        ("identity R refused", flip("small_order_r", 0), "rules say"),
+        ("small-order R dropped", drop("small_order_r"), "cover each point of small order"),
+        ("non-canonical R accepted", flip("non_canonical_r", 0), "rules say"),
+        ("non-canonical R alias dropped", drop("non_canonical_r"), "loose decoder maps"),
+        ("off-curve R dropped", drop("non_canonical_r", lambda k: "on no curve point" in k["why"]), "off-curve R under both sign bits"),
+        ("S below L in s_range", s_below_l, "rules say"),
+        ("refused key admitted", refused_key_admitted, "rules say"),
+        ("refused-key signature altered", refused_key_sig_altered, "cofactorless equation does not accept"),
+        ("refused keys without S >= L", drop("refused_keys", lambda k: int.from_bytes(bytes.fromhex(k["signature_hex"])[32:], "little") >= L), "also has S >= L"),
+        ("case repeated", duplicate, "repeated"),
+        ("section removed", lambda c: c.pop("s_range"), "sections are not the contract's"),
+        ("contract renamed", lambda c: c.update(contract="ed25519-verification/v2"), "does not name"),
+    ]
+    killed = total = 0
+
+    def expect(label: str, reason: str, run) -> None:
+        nonlocal killed, total
+        total += 1
+        try:
+            run()
+        except Failure as exc:
+            if reason in str(exc):
+                killed += 1
+            else:
+                print(f"WRONG REASON: {label}: {exc}", file=sys.stderr)
+        else:
+            print(f"SURVIVED: {label}", file=sys.stderr)
+
+    for label, mutate, reason in corpus_mutants:
+        mutant = copy.deepcopy(corpus)
+        mutate(mutant)
+        expect(label, reason, lambda mutant=mutant: check(mutant))
+    for clause in CLAUSES:
+        expect(f"rule {clause} switched off", f"refused/{clause}, rules say", lambda clause=clause: check(corpus, off=clause))
+    def omitting(mask: int):
+        keep = ((1 << 256) - 1) ^ mask
+        return lambda c, r: int.from_bytes(c, "little") & keep == int.from_bytes(r, "little") & keep
+
+    comparators = [(f"final comparison ignores byte {i}", omitting(0xFF << (8 * i))) for i in range(32)]
+    comparators += [(f"final comparison ignores bit {b}", omitting(1 << b)) for b in range(256)]
+    comparators += [
+        ("final comparison reads the first 16 bytes", lambda c, r: c[:16] == r[:16]),
+        ("final comparison reads the last 16 bytes", lambda c, r: c[16:] == r[16:]),
+    ]
+    for label, compare in comparators:
+        expect(label, "corpus says refused/equation, rules say", lambda compare=compare: check(corpus, compare=compare))
+    expect("S checked after R", "corpus says refused/s_out_of_range, rules say",
+           lambda: check(corpus, order=("key_refused", "non_canonical_r", "s_out_of_range", "equation")))
+    expect("key checked after S", "corpus says refused/key_refused, rules say",
+           lambda: check(corpus, order=("s_out_of_range", "key_refused", "non_canonical_r", "equation")))
+    print(f"mutations: {killed} of {total} refused")
+    return 0 if killed == total else 1
+
+
+def main() -> int:
+    corpus = json.loads(VECTORS.read_text(encoding="utf-8"))
+    try:
+        check(corpus)
+    except Failure as exc:
+        print(f"check-ed25519-verification-vectors: {exc}", file=sys.stderr)
+        return 1
+    counts = ", ".join(f"{len(corpus[s])} {s}" for s in SECTIONS)
+    print(f"ed25519-verification/v1: {counts} agree with the contract")
+    if "--mutations" in sys.argv[1:]:
+        return mutations(corpus)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
