@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the ed25519-verification/v1 corpus.
+
+Writes ed25519-verification/vectors-v1.json from fixed seeds and messages:
+
+- rfc8032: RFC 8032 section 7.1 TEST 1 to 3, signed here with OpenSSL (through
+  `cryptography`) and required to equal the published signatures.
+- honest: signatures OpenSSL makes under the key of SEED, with R under both
+  sign bits, and the same signatures over another message and another key.
+- negated_r: R = -[r]B, its sign bit flipped from the honest nonce point's,
+  and S = r + k*a, under both sign bits; [S]B - [k]A then differs from R in
+  bit 255 alone.
+- flipped_bit_r: for each bit 0 to 254, R is the honest nonce point with that
+  bit flipped, chosen so that R is still a canonical point of order L, and
+  S = r + k*a; [S]B - [k]A then differs from R in that bit alone.
+- torsion_component_r: for each nonzero point T of small order, R = [r]B + T
+  and S = r + k*a, which the cofactored equation accepts.
+- small_order_r: for each point T of small order, R = T and S = k*a; the
+  identity is the honest case, r = 0.
+- non_canonical_r: every encoding a decoder reducing y modulo p maps to a
+  point of small order that is not that point's encoding, with S = k*a; and
+  an off-curve R under both sign bits.
+- s_range: an honest signature with S + L, S = L, and S = 2^256 - 1, and one
+  with S + L and a non-canonical R, which fixes the order of the clauses.
+- refused_keys: signatures the cofactorless equation accepts under a key that
+  ed25519-key-admission/v1 refuses.
+
+OpenSSL must give every case whose key is admitted the expected verdict, or
+generation stops. The checker, scripts/check-ed25519-verification-vectors,
+shares no code with this generator: it uses affine arithmetic of its own, and
+this uses extended coordinates.
+
+Run from the repository root:
+
+    python3 scripts/generate-ed25519-verification-vectors          # write
+    python3 scripts/generate-ed25519-verification-vectors --check  # compare
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "ed25519-verification" / "vectors-v1.json"
+NAME = "ed25519-verification/v1"
+
+SEED = hashlib.sha256(b"ed25519-verification/v1 signer").digest()
+OTHER_SEED = hashlib.sha256(b"ed25519-verification/v1 other signer").digest()
+
+RFC8032 = [
+    (
+        "TEST 1",
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        "",
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    ),
+    (
+        "TEST 2",
+        "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        "72",
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    ),
+    (
+        "TEST 3",
+        "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        "af82",
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    ),
+]
+
+Q = 2**255 - 19
+L = 2**252 + 27742317777372353535851937790883648493
+CURVE_D = -121665 * pow(121666, Q - 2, Q) % Q
+ROOT_M1 = pow(2, (Q - 1) // 4, Q)
+
+Point = tuple[int, int, int, int]
+NEUTRAL: Point = (0, 1, 1, 0)
+
+
+def point_add(p: Point, q: Point) -> Point:
+    """RFC 8032, section 5.1.4, extended homogeneous coordinates."""
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % Q
+    b = (y1 + x1) * (y2 + x2) % Q
+    c = 2 * CURVE_D * t1 * t2 % Q
+    d = 2 * z1 * z2 % Q
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % Q, g * h % Q, f * g % Q, e * h % Q)
+
+
+def scalar_mul(k: int, p: Point) -> Point:
+    acc = NEUTRAL
+    while k > 0:
+        if k & 1:
+            acc = point_add(acc, p)
+        p = point_add(p, p)
+        k >>= 1
+    return acc
+
+
+def compress(p: Point) -> bytes:
+    zinv = pow(p[2], Q - 2, Q)
+    x, y = p[0] * zinv % Q, p[1] * zinv % Q
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def recover_x(y: int, sign: int) -> int | None:
+    u, v = (y * y - 1) % Q, (CURVE_D * y * y + 1) % Q
+    x = u * pow(v, 3, Q) * pow(u * pow(v, 7, Q), (Q - 5) // 8, Q) % Q
+    if v * x * x % Q != u:
+        if v * x * x % Q != (-u) % Q:
+            return None
+        x = x * ROOT_M1 % Q
+    if x & 1 != sign:
+        x = (Q - x) % Q
+    return x
+
+
+def point_at(y: int, sign: int) -> Point:
+    x = recover_x(y, sign)
+    if x is None:
+        raise SystemExit(f"generate: y={y} is not on the curve")
+    return (x, y, 1, x * y % Q)
+
+
+BASE = point_at(4 * pow(5, Q - 2, Q) % Q, 0)
+# The eight points of small order: the identity, the point of order 2, the two
+# of order 4 (y = 0), and the four of order 8 (y = Y8 or p - Y8).
+Y8 = int.from_bytes(bytes.fromhex("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"), "little")
+TORSION = [
+    point_at(1, 0),
+    point_at(Q - 1, 0),
+    point_at(0, 0),
+    point_at(0, 1),
+    point_at(Y8, 0),
+    point_at(Y8, 1),
+    point_at(Q - Y8, 0),
+    point_at(Q - Y8, 1),
+]
+for _t in TORSION:
+    if compress(scalar_mul(8, _t)) != compress(NEUTRAL):
+        raise SystemExit("generate: a listed torsion point is not of small order")
+
+
+def challenge(r: bytes, a: bytes, message: bytes) -> int:
+    """RFC 8032, section 5.1.7: the full SHA-512 integer."""
+    return int.from_bytes(hashlib.sha512(r + a + message).digest(), "little")
+
+
+def expand(seed: bytes) -> tuple[int, bytes, bytes]:
+    digest = hashlib.sha512(seed).digest()
+    scalar = int.from_bytes(digest[:32], "little")
+    scalar &= (1 << 254) - 8
+    scalar |= 1 << 254
+    public = compress(scalar_mul(scalar, BASE))
+    openssl = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes(Encoding.Raw, PublicFormat.Raw)
+    )
+    if public != openssl:
+        raise SystemExit("generate: a seed's key disagrees with OpenSSL")
+    return scalar, digest[32:], public
+
+
+def openssl_sign(seed: bytes, message: bytes) -> bytes:
+    return Ed25519PrivateKey.from_private_bytes(seed).sign(message)
+
+
+def openssl_accepts(public: bytes, message: bytes, signature: bytes) -> bool:
+    try:
+        Ed25519PublicKey.from_public_bytes(public).verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def case(public: bytes, message: bytes, signature: bytes, clause: str | None, why: str, **extra: object) -> dict:
+    out: dict = {
+        "public_key_hex": public.hex(),
+        "message_hex": message.hex(),
+        "signature_hex": signature.hex(),
+        "expected": "refused" if clause else "accepted",
+        "clause": clause,
+    }
+    out.update(extra)
+    out["why"] = why
+    return out
+
+
+def le(n: int) -> bytes:
+    return n.to_bytes(32, "little")
+
+
+def rfc8032() -> list[dict]:
+    out = []
+    for name, seed_hex, message_hex, published in RFC8032:
+        seed, message = bytes.fromhex(seed_hex), bytes.fromhex(message_hex)
+        _, _, public = expand(seed)
+        signature = openssl_sign(seed, message)
+        if signature.hex() != published:
+            raise SystemExit(f"generate: OpenSSL does not reproduce RFC 8032 {name}")
+        out.append(case(public, message, signature, None, f"RFC 8032 section 7.1 {name}", seed_hex=seed_hex))
+    return out
+
+
+def honest() -> list[dict]:
+    _, _, public = expand(SEED)
+    _, _, other = expand(OTHER_SEED)
+    out = []
+    signs: dict[int, tuple[bytes, bytes]] = {}
+    for counter in range(64):
+        message = f"ed25519-verification/v1 honest message {counter}".encode()
+        signature = openssl_sign(SEED, message)
+        signs.setdefault(signature[31] >> 7, (message, signature))
+        if len(signs) == 2:
+            break
+    for sign in (0, 1):
+        message, signature = signs[sign]
+        out.append(case(public, message, signature, None, f"signed with seed_hex; bit 255 of R is {sign}", seed_hex=SEED.hex()))
+    message, signature = signs[0]
+    out.append(case(public, message + b"!", signature, "equation", "the bit-255-0 signature over a different message"))
+    out.append(case(other, message, signature, "equation", "the bit-255-0 signature under a different admitted key"))
+    return out
+
+
+def torsion_component_r() -> list[dict]:
+    scalar, prefix, public = expand(SEED)
+    out = []
+    for i, t in enumerate(TORSION[1:], start=1):
+        message = f"ed25519-verification/v1 torsion component {i}".encode()
+        r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
+        big_r = compress(point_add(scalar_mul(r, BASE), t))
+        k = challenge(big_r, public, message)
+        signature = big_r + le((r + k * scalar) % L)
+        out.append(case(
+            public, message, signature, "equation",
+            "R is the honest nonce point plus torsion_point_hex: the cofactored equation accepts it, the cofactorless one does not",
+            torsion_point_hex=compress(t).hex(),
+        ))
+    return out
+
+
+def negated_r() -> list[dict]:
+    scalar, prefix, public = expand(SEED)
+    found: dict[int, dict] = {}
+    for counter in range(64):
+        message = f"ed25519-verification/v1 negated R {counter}".encode()
+        r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
+        honest_r = compress(scalar_mul(r, BASE))
+        sign = honest_r[31] >> 7
+        if sign in found:
+            continue
+        big_r = honest_r[:31] + bytes([honest_r[31] ^ 0x80])
+        k = challenge(big_r, public, message)
+        found[sign] = case(
+            public, message, big_r + le((r + k * scalar) % L), "equation",
+            f"R is the honest nonce point negated, bit 255 flipped from {sign} to {1 - sign}: [S]B - [k]A differs from R in bit 255 alone",
+        )
+        if len(found) == 2:
+            return [found[0], found[1]]
+    raise SystemExit("generate: no nonce point under both sign bits")
+
+
+def decodes_in_prime_subgroup(raw: bytes) -> bool:
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, n & ((1 << 255) - 1)
+    if y >= Q:
+        return False
+    x = recover_x(y, sign)
+    if x is None or (x == 0 and sign):
+        return False
+    point = (x, y, 1, x * y % Q)
+    return compress(scalar_mul(L, point)) == compress(NEUTRAL)
+
+
+def flipped_bit_r() -> list[dict]:
+    scalar, prefix, public = expand(SEED)
+    out = []
+    for bit in range(255):
+        for counter in range(4096):
+            message = f"ed25519-verification/v1 flipped bit {bit} R {counter}".encode()
+            r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
+            honest_r = compress(scalar_mul(r, BASE))
+            flipped = (int.from_bytes(honest_r, "little") ^ (1 << bit)).to_bytes(32, "little")
+            if not decodes_in_prime_subgroup(flipped):
+                continue
+            k = challenge(flipped, public, message)
+            out.append(case(
+                public, message, flipped + le((r + k * scalar) % L), "equation",
+                f"R is a canonical point of order L that differs from the honest nonce point in bit {bit} alone",
+                bit=bit,
+            ))
+            break
+        else:
+            raise SystemExit(f"generate: no nonce point whose bit {bit} flips to a point of order L")
+    return out
+
+
+def small_order_r() -> list[dict]:
+    scalar, _, public = expand(SEED)
+    out = []
+    for i, t in enumerate(TORSION):
+        message = f"ed25519-verification/v1 small-order R {i}".encode()
+        big_r = compress(t)
+        k = challenge(big_r, public, message)
+        signature = big_r + le(k * scalar % L)
+        if i == 0:
+            out.append(case(public, message, signature, None, "R is the identity and S = k*a: a signature with nonce 0, which only the private key makes"))
+        else:
+            out.append(case(public, message, signature, "equation", "R is a point of small order other than the identity and S = k*a: the cofactored equation accepts it"))
+    return out
+
+
+def non_canonical_r() -> list[dict]:
+    scalar, _, public = expand(SEED)
+    encodings = [
+        ((Q) | 0, "y = p, sign 0: decodes as y = 0 when reduced"),
+        ((Q) | (1 << 255), "y = p, sign 1: decodes as y = 0 when reduced"),
+        ((Q + 1) | 0, "y = p + 1, sign 0: decodes as the identity when reduced"),
+        ((Q + 1) | (1 << 255), "y = p + 1, sign 1: decodes as the identity when reduced and the sign ignored"),
+        (1 | (1 << 255), "the identity with bit 255 set"),
+        ((Q - 1) | (1 << 255), "the point of order 2 with bit 255 set"),
+    ]
+    out = []
+    for i, (n, why) in enumerate(encodings):
+        message = f"ed25519-verification/v1 non-canonical R {i}".encode()
+        big_r = le(n)
+        k = challenge(big_r, public, message)
+        signature = big_r + le(k * scalar % L)
+        out.append(case(public, message, signature, "non_canonical_r", why + "; S = k*a"))
+    off = next(y for y in range(2, 64) if recover_x(y, 0) is None)
+    for sign in (0, 1):
+        message = f"ed25519-verification/v1 off-curve R {sign}".encode()
+        big_r = le(off | (sign << 255))
+        signature = big_r + le(challenge(big_r, public, message) * scalar % L)
+        out.append(case(public, message, signature, "non_canonical_r", f"y = {off} is on no curve point; sign {sign}"))
+    return out
+
+
+def s_range() -> list[dict]:
+    _, _, public = expand(SEED)
+    message = b"ed25519-verification/v1 S range"
+    signature = openssl_sign(SEED, message)
+    big_r, s = signature[:32], int.from_bytes(signature[32:], "little")
+    out = [
+        case(public, message, big_r + le(s + L), "s_out_of_range", "an honest signature with L added to S: the same S modulo L"),
+        case(public, message, big_r + le(L), "s_out_of_range", "S = L"),
+        case(public, message, big_r + le(2**256 - 1), "s_out_of_range", "S = 2^256 - 1"),
+    ]
+    scalar, _, _ = expand(SEED)
+    nc_message = b"ed25519-verification/v1 S range and non-canonical R"
+    nc_r = le(Q + 1)
+    s_nc = challenge(nc_r, public, nc_message) * scalar % L
+    out.append(case(public, nc_message, nc_r + le(s_nc + L), "s_out_of_range", "S >= L and R non-canonical: S is checked first"))
+    return out
+
+
+def refused_keys() -> list[dict]:
+    identity = compress(TORSION[0])
+    order_2 = compress(TORSION[1])
+    keyless = compress(BASE) + le(1)
+    out = [case(identity, b"ed25519-verification/v1 identity key", keyless, "key_refused",
+                "the identity as the key, R the base point and S = 1: the cofactorless equation accepts it for every message")]
+    for counter in range(64):
+        message = f"ed25519-verification/v1 order-2 key {counter}".encode()
+        k = challenge(compress(BASE), order_2, message)
+        if k % 2 == 0 and k % L % 2 == 0:
+            out.append(case(order_2, message, keyless, "key_refused",
+                            "the point of order 2 as the key, R the base point and S = 1, at a message whose challenge is even both in full and reduced modulo L: the cofactorless equation accepts it"))
+            break
+    # A key shifted by a point of order 8, signed with the unshifted scalar.
+    scalar, prefix, unshifted = expand(SEED)
+    shifted = compress(point_add(point_at(int.from_bytes(unshifted, "little") & ((1 << 255) - 1), unshifted[31] >> 7), TORSION[4]))
+    for counter in range(4096):
+        message = f"ed25519-verification/v1 shifted key {counter}".encode()
+        r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
+        big_r = compress(scalar_mul(r, BASE))
+        k = challenge(big_r, shifted, message)
+        if k % 8 == 0 and k % L % 8 == 0:
+            out.append(case(shifted, message, big_r + le((r + k * scalar) % L), "key_refused",
+                            "the key of seed_hex plus torsion_point_hex, signed with the unshifted scalar at a challenge divisible by 8 both in full and reduced modulo L: the cofactorless equation accepts it",
+                            seed_hex=SEED.hex(), torsion_point_hex=compress(TORSION[4]).hex()))
+            break
+    if len(out) != 3:
+        raise SystemExit("generate: a refused-key witness was not found")
+    out.append(case(identity, b"ed25519-verification/v1 identity key", compress(BASE) + le(L + 1), "key_refused",
+                    "the identity key with S >= L: the key is checked first"))
+    return out
+
+
+def build() -> str:
+    sections = {
+        "rfc8032": rfc8032(),
+        "honest": honest(),
+        "negated_r": negated_r(),
+        "flipped_bit_r": flipped_bit_r(),
+        "torsion_component_r": torsion_component_r(),
+        "small_order_r": small_order_r(),
+        "non_canonical_r": non_canonical_r(),
+        "s_range": s_range(),
+        "refused_keys": refused_keys(),
+    }
+    for name, cases in sections.items():
+        if name == "refused_keys":
+            continue
+        for c in cases:
+            got = openssl_accepts(bytes.fromhex(c["public_key_hex"]), bytes.fromhex(c["message_hex"]), bytes.fromhex(c["signature_hex"]))
+            if got != (c["expected"] == "accepted"):
+                raise SystemExit(f"generate: OpenSSL disagrees on {name}: {c['why']}")
+    corpus = {
+        "vector_set": NAME,
+        "contract": NAME,
+        "purpose": "Cross-language agreement on which Ed25519 signatures an Ori verifier accepts under a key ed25519-key-admission/v1 admits, held at the signatures on which the cofactored and cofactorless equations, strict and loose decoding of R, and a reduced or unreduced S disagree.",
+        "derivation": (
+            "rfc8032 are RFC 8032 section 7.1 TEST 1 to 3. "
+            "Every other admitted key is derived under RFC 8032 section 5.1.5 from seed_hex, SHA-256 of 'ed25519-verification/v1 signer', or from SHA-256 of 'ed25519-verification/v1 other signer'. "
+            "honest signatures are the first messages 'ed25519-verification/v1 honest message N' whose R has bit 255 clear and set. "
+            "negated_r flip bit 255 of the nonce point [r]B and sign over the flipped R, at the first messages 'ed25519-verification/v1 negated R N' whose nonce point has bit 255 clear and set. "
+            "flipped_bit_r flip bit N of the nonce point at the first message 'ed25519-verification/v1 flipped bit N R C' for which the flipped encoding is a canonical point of order L, and sign over the flipped R. "
+            "torsion_component_r use the nonce SHA-512 of the seed's prefix and the message, reduced modulo L, with torsion_point_hex added to the nonce point. "
+            "small_order_r and non_canonical_r set S to k*a modulo L, k the full SHA-512 challenge over the given R. "
+            "s_range alter the S of an honest signature. "
+            "refused_keys pair a key the admission contract refuses with a signature the cofactorless equation accepts under it."
+        ),
+        **sections,
+    }
+    return json.dumps(corpus, indent=2, ensure_ascii=False) + "\n"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args != ["--check"]:
+        print(__doc__)
+        return 0 if args[0] in ("-h", "--help") else 2
+    text = build()
+    if args == ["--check"]:
+        if not OUT.exists() or OUT.read_text(encoding="utf-8") != text:
+            print(f"generate-ed25519-verification-vectors: {OUT.relative_to(ROOT)} is not what the generator produces", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    OUT.parent.mkdir(exist_ok=True)
+    OUT.write_text(text, encoding="utf-8")
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
