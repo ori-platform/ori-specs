@@ -1,0 +1,2011 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-commands/v2 liveness corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-liveness-vectors-v2. Object and
+wire bytes come from this script's own serializer, and every signature is
+verified with its own extended-coordinate Ed25519 arithmetic, cofactorless
+with strict decoding as ed25519-verification/v1 requires. The field orders,
+the nonce grammar, the versions, the integer bounds, the identifier alphabet,
+the MQTT binding, the acceptance checks with their reasons and order, and the
+corpus digest are read from firmware-commands/v2.md and v1.md; the seeds are
+read from v1's liveness corpus, as v2.md says they are. Nothing is read from
+the generator.
+
+Held to:
+
+- each accepted case: its object and wire bytes reproduce from its input, its
+  signature verifies under the runtime key, and the device model accepts it
+  and leaves the held nonce the case declares;
+- each refusal: refused for its declared reason, by the first failing check in
+  the text's order, with the held nonce unchanged; its `signature_valid`
+  matches this script's verification, a rogue signature verifies under the
+  rogue seed, and a refusal decided after the signature carries a valid one;
+- each single-rule refusal breaks exactly one check, and each precedence case
+  exactly two adjacent checks, refused for the earlier;
+- v1's liveness corpus, driven through the same v2 device model: every v1
+  case accepted (clearing the held nonce) and every v1 refusal refused for
+  its reason, whose names are the ones the v2 table uses;
+- coverage: every reason, every listed accepted and refused case, every
+  adjacent precedence pair, and each bound's at-edge and past-edge pair
+  across the two corpora;
+- the digest firmware-commands/v2.md pins is the corpus's.
+
+    python3 scripts/check-firmware-liveness-vectors-v2
+    python3 scripts/check-firmware-liveness-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's own
+rule tables and constants in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import types
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-commands" / "liveness-vectors-v2.json"
+CORPUS_V1 = ROOT / "firmware-commands" / "liveness-vectors-v1.json"
+COMMANDS_V1 = ROOT / "firmware-commands" / "v1.md"
+COMMANDS_V2 = ROOT / "firmware-commands" / "v2.md"
+STATUS = ROOT / "status" / "firmware-commands" / "v2.json"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, extended coordinates, verification only -------------------------
+
+Q = 2**255 - 19
+ORDER = 2**252 + 27742317777372353535851937790883648493
+CURVE_D = -121665 * pow(121666, Q - 2, Q) % Q
+ROOT_M1 = pow(2, (Q - 1) // 4, Q)
+
+
+def _x_from_y(y: int, sign: int) -> int | None:
+    if y >= Q:
+        return None
+    x2 = (y * y - 1) * pow(CURVE_D * y * y + 1, Q - 2, Q) % Q
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (Q + 3) // 8, Q)
+    if (x * x - x2) % Q:
+        x = x * ROOT_M1 % Q
+    if (x * x - x2) % Q:
+        return None
+    if x & 1 != sign:
+        x = Q - x
+    return x
+
+
+def _point_add(a: tuple, b: tuple) -> tuple:
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    pa = (y1 - x1) * (y2 - x2) % Q
+    pb = (y1 + x1) * (y2 + x2) % Q
+    pc = 2 * t1 * t2 * CURVE_D % Q
+    pd = 2 * z1 * z2 % Q
+    e, f, g, h = pb - pa, pd - pc, pd + pc, pb + pa
+    return (e * f % Q, g * h % Q, f * g % Q, e * h % Q)
+
+
+def _scalar(k: int, point: tuple) -> tuple:
+    acc = (0, 1, 1, 0)
+    while k:
+        if k & 1:
+            acc = _point_add(acc, point)
+        point = _point_add(point, point)
+        k >>= 1
+    return acc
+
+
+def _to_bytes(point: tuple) -> bytes:
+    x, y, z, _ = point
+    zi = pow(z, Q - 2, Q)
+    x, y = x * zi % Q, y * zi % Q
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _from_bytes(raw: bytes) -> tuple | None:
+    if len(raw) != 32:
+        return None
+    n = int.from_bytes(raw, "little")
+    y = n & ((1 << 255) - 1)
+    x = _x_from_y(y, n >> 255)
+    if x is None:
+        return None
+    point = (x, y, 1, x * y % Q)
+    return point if _to_bytes(point) == raw else None
+
+
+_GY = 4 * pow(5, Q - 2, Q) % Q
+_GX = _x_from_y(_GY, 0)
+assert _GX is not None
+GENERATOR = (_GX, _GY, 1, _GX * _GY % Q)
+
+
+def derive_public(seed: bytes) -> bytes:
+    digest = hashlib.sha512(seed).digest()
+    a = int.from_bytes(digest[:32], "little")
+    a = (a & ((1 << 254) - 8)) | (1 << 254)
+    return _to_bytes(_scalar(a, GENERATOR))
+
+
+_VERIFIED: dict[tuple[bytes, bytes, bytes], bool] = {}
+
+
+def ed25519_verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    key = (public, message, signature)
+    if key not in _VERIFIED:
+        _VERIFIED[key] = _verify(public, message, signature)
+    return _VERIFIED[key]
+
+
+def _verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if len(signature) != 64:
+        return False
+    a = _from_bytes(public)
+    r = _from_bytes(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= ORDER:
+        return False
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little")
+    neg_a = (Q - a[0], a[1], 1, (Q - a[3]) % Q)
+    check = _point_add(_scalar(s, GENERATOR), _scalar(k % ORDER, neg_a))
+    return _to_bytes(check) == signature[:32]
+
+
+# --- serializer ------------------------------------------------------------------
+
+def serialize(value: object) -> str:
+    """Compact JSON, object keys in the order given (a list of pairs or a dict)."""
+    if isinstance(value, list) and value and all(
+        isinstance(p, tuple) and len(p) == 2 for p in value
+    ):
+        return "{" + ",".join(
+            json.dumps(k, ensure_ascii=False) + ":" + serialize(v) for k, v in value
+        ) + "}"
+    if isinstance(value, dict):
+        return serialize(list(value.items())) if value else "{}"
+    if isinstance(value, list):
+        return "[" + ",".join(serialize(v) for v in value) + "]"
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    raise Failure(f"no liveness grammar serializes {value!r}")
+
+
+def _refuse_constant(token: str) -> object:
+    raise ValueError(f"non-finite {token}")
+
+
+def parse_pairs(raw: bytes) -> object:
+    """Parse JSON keeping every object as its list of pairs, duplicates included."""
+    return json.loads(
+        raw.decode("utf-8"),
+        object_pairs_hook=lambda pairs: pairs,
+        parse_constant=_refuse_constant,
+    )
+
+
+# --- contract text -----------------------------------------------------------------
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def section(text: str, heading: str) -> str:
+    """A heading's text and its subsections, by the shared CommonMark recognizer."""
+    return markdown.subtree(text, heading)
+
+
+def need(text: str, sentence: str, where: str) -> None:
+    if sentence not in flat(text):
+        raise Failure(f"{where} no longer says: {sentence!r}")
+
+
+# The checks of the acceptance table, by the words of their `Check` cell. A
+# reworded cell fails here rather than leaving a predicate the text no longer
+# states.
+CHECK_CELLS = {
+    "it was not delivered retained": "retained",
+    "it parses under the grammar of its `v`": "grammar",
+    "`device_id` matches": "device",
+    "the signature verifies": "signature",
+    "`boot_id` equals the current boot": "boot",
+    "`capability_hash` equals the accepted manifest hash": "manifest",
+    "`runtime_seq` exceeds the last accepted value": "seq",
+}
+
+V2_WIRE = (
+    "`nonce` is a JSON string of exactly 32 characters, each one of `0`-`9` or "
+    "`a`-`f`. A string of any other length, one containing an uppercase letter or "
+    "any other character, `null`, and any other JSON type are `malformed`.",
+    "`v` is `2`.",
+    "`boot_id`, `capability_hash`, `device_id` and `runtime_seq`, the signature and "
+    "its encoding, and the rule that any deviation is `malformed` and is refused "
+    "before the signature is verified, are v1's, unchanged.",
+    "A liveness object at `\"v\":1` has v1's grammar exactly, and a `nonce` in it "
+    "is an extra field and `malformed`. A `v` other than the integer `1` or `2` is "
+    "`malformed`.",
+)
+V2_ACCEPTANCE = (
+    "A device accepts a liveness message at either `v` only if it was not "
+    "delivered retained, and then in v1's order",
+    "One high-water mark serves both versions: a `v` `2` message whose "
+    "`runtime_seq` does not exceed that of an accepted `v` `1` message is refused, "
+    "and the reverse. A refused message changes nothing, including the held nonce "
+    "below.",
+    "Each check that fails names the refusal, with the same reason names v1's "
+    "liveness corpus uses. The checks are made in this order, and a message that "
+    "fails more than one is refused for the first that fails:",
+    "Delivery is decided before content, so a retained delivery is refused as "
+    "`retained` whatever its bytes. Checks 2 to 7 are v1's, in v1's order, and "
+    "apply to a `v` `1` message unchanged.",
+)
+# The clauses that keep the nonce age evidence and nothing more, and that
+# protect captured nonces, each with the polarities a mutant reverses. Pinned
+# word for word under "Runtime Liveness at `v` 2"; no case can exercise them.
+GUARDS = (
+    ("A device holds at most one liveness nonce, in memory only, and never persists it.",
+     [("never persists it", "may persist it"), ("at most one", "any number of")]),
+    ("Holding none, which a reading envelope signs as `null`, means the device has no "
+     "usable freshness reference. It does not mean that no runtime was watching.",
+     [("It does not mean", "It means")]),
+    ("Clearing the held nonce, for any of these reasons, never alters a nonce already "
+     "captured for a measurement in progress, or one already signed into an envelope, "
+     "buffered or not.", [("never alters", "may alter")]),
+    ("It never derives one from `runtime_seq`, from its state store, from a clock or from "
+     "another message, and never reuses one, including for a message it signs again under "
+     "a `runtime_seq` it has signed before.",
+     [("It never derives", "It may derive"), ("never reuses one", "may reuse one")]),
+    ("**Independent failure.** A failure to generate, sign or publish the `v` `2` message "
+     "MUST NOT suppress that interval's `v` `1` message.", [("MUST NOT", "MAY")]),
+    ("Reordered or missing messages may leave a reading with no bound, and never give a "
+     "tighter bound than the truth.", [("never give a tighter", "may give a tighter")]),
+    ("**Captured references stand.** Accepting a `v` `1` message never alters a nonce "
+     "already captured for a measurement in progress, or one already signed into an "
+     "envelope, buffered or not.", [("never alters", "may alter")]),
+    ("**No inferred support.** The runtime MUST NOT infer that a device accepts `v` `2` from "
+     "a timeout, from the absence of a refusal, or from anything else its liveness traffic "
+     "shows. A refused liveness message carries no verdict back, so silence proves nothing.",
+     [("MUST NOT", "MAY"), ("silence proves nothing", "silence proves support")]),
+    ("**Authority is unchanged.** Supervision comes from accepted liveness at either `v`, "
+     "exactly as in v1, and nothing about what licenses an action changes. Whether a nonce "
+     "is held governs age evidence only, never supervision or authority.",
+     [("nothing about what licenses an action changes",
+       "a held nonce licenses actions"),
+      ("governs age evidence only", "governs age evidence and authority"),
+      ("never supervision or authority", "and supervision and authority")]),
+)
+ROLLOUT_SENTENCES = (
+    "the runtime publishes two liveness messages to each supervised device in every "
+    "publication interval: one at `v` `1`, then one at `v` `2`.",
+    "It signs the `v` `1` message at a `runtime_seq` N and the `v` `2` message at N+1, both "
+    "from the one durable `runtime_seq` allocator, and never uses one `runtime_seq` for both.",
+    "A device that accepts the `v` `1` message clears its held nonce, and one that then "
+    "accepts the `v` `2` message holds its nonce. A device that accepts only `v` `1` refuses "
+    "the `v` `2` message as `malformed` and is supervised by the `v` `1` message alone. When "
+    "the pair arrives out of order, the `v` `1` message is refused as `seq_not_increasing` "
+    "and the device keeps the `v` `2` nonce,",
+    "When either message is lost, the device holds the nonce of the last message it "
+    "accepted, or none.",
+    "A refused message changes neither supervision nor the held nonce.",
+)
+ROLLOUT_GOLDEN = (
+    "Each is a run of deliveries to one device, from its `verifier_context`, by a device "
+    "that accepts only `v` `1` or one that accepts both, each delivery giving its reason, "
+    "or none when accepted, and the held nonce and last accepted `runtime_seq` after it.",
+)
+# The rollout sequences' cover list, each bullet to the properties that show it.
+ROLLOUT_BULLETS = {
+    "a device that accepts only `v` `1`, which stays supervised and holds no nonce;": (
+        "v1_only_supervised",),
+    "a device that accepts both, which ends holding the last `v` `2` nonce, and holds none "
+    "between an interval's `v` `1` message and its `v` `2` message;": (
+        "ends_holding_v2", "none_between_pair"),
+    "the pair delivered out of order, where the late `v` `1` message is refused and the "
+    "device keeps the `v` `2` nonce;": ("reordered_keeps_v2",),
+    "either message of the pair missing.": ("v1_missing", "v2_missing"),
+}
+V2_HELD = (
+    "Accepting a `v` `2` message sets the held nonce to that message's `nonce`.",
+    "Accepting a `v` `1` message clears it.",
+    "Every boot starts with none held.",
+)
+V2_GOLDEN = (
+    "Each case is a liveness message evaluated against its `verifier_context`: the "
+    "device's current `boot_id`, accepted `capability_hash`, the last `runtime_seq` "
+    "accepted in this boot, and the nonce held, or `null`. Each case gives the "
+    "nonce held afterwards.",
+    "It holds `v` `2` messages that set the held nonce, including ones at the "
+    "smallest and largest `boot_id`, one at the largest `runtime_seq`, and one whose "
+    "nonce is all zeros, which the grammar admits because a device does not judge "
+    "randomness; `v` `1` messages that clear it; and refusals, each refused for one "
+    "declared reason and leaving the held nonce unchanged:",
+    "Each of those breaks exactly one check. The corpus also holds precedence "
+    "cases, each breaking two adjacent checks in the order above and refused for "
+    "the earlier: retained and malformed, malformed and a wrong device, a wrong "
+    "device and a rogue key, a rogue key and a wrong boot, a wrong boot and a "
+    "manifest mismatch, and a manifest mismatch and a replayed `runtime_seq`. "
+    "Every refusal decided after the signature carries a valid signature.",
+    "It signs with OpenSSL through `cryptography`, under the disclosed runtime and "
+    "rogue test seeds of v1's liveness corpus.",
+)
+# The refusal list of the golden-vectors section, bullet by bullet, each mapped
+# to the coverage items that must hold a case of their own.
+REFUSAL_BULLETS = {
+    "`v` `2` without `nonce`, and `v` `1` with one;": ("v2_no_nonce", "v1_with_nonce"),
+    "a `nonce` with an uppercase letter, a character outside the hexadecimal "
+    "digits, 31 or 33 characters, the empty string, `null`, an integer, or a boolean;": (
+        "nonce_upper", "nonce_non_hex", "nonce_short", "nonce_long", "nonce_empty",
+        "nonce_null", "nonce_integer", "nonce_boolean"),
+    "a `v` `2` message with an extra key;": ("v2_extra_key",),
+    "`nonce` out of canonical order, and an unsupported `v`;": (
+        "nonce_out_of_order", "unsupported_v"),
+    "an accepted `v` `2` message replayed byte for byte, a regressing `runtime_seq`, "
+    "the accepted `runtime_seq` reissued under a fresh nonce, a `v` `2` message at the "
+    "`runtime_seq` of an accepted `v` `1` message, and a `v` `1` message at the "
+    "`runtime_seq` of an accepted `v` `2` message;": (
+        "seq_replayed_exact", "seq_regressing", "seq_reissued_fresh",
+        "v2_at_seq_of_accepted_v1", "v1_at_seq_of_accepted_v2"),
+    "a wrong device, a wrong boot, a manifest mismatch, and a rogue key;": (
+        "wrong_device", "wrong_boot", "wrong_manifest", "rogue_key"),
+    "a message delivered retained.": ("retained",),
+}
+V1_WIRE = (
+    "Field order is exactly as shown: `boot_id`, `capability_hash`, `device_id`, "
+    "`runtime_seq`, `v` — the lexicographic canonical order.",
+    "`capability_hash` is `sha256:` plus exactly 64 lowercase hex characters, equal "
+    "to the device's accepted manifest hash.",
+    "`device_id` is a fleet identifier: `[A-Za-z0-9._-]`, non-empty, within the "
+    "receiver's declared length limit.",
+    "`v` must be `1`.",
+    "in the shared `ed25519:<base64>` wire encoding (standard base64, 64-byte "
+    "signature, canonical padding), using **the same runtime command key** the "
+    "device already pins.",
+    "Any deviation — whitespace, reordered or extra fields, non-canonical "
+    "integers, out-of-alphabet identifiers, a malformed signature field — is "
+    "`malformed` and must be rejected before signature verification is attempted.",
+    "and `runtime_seq` strictly exceeds the last accepted value **for this boot**.",
+)
+
+
+def _field_order(sentence_region: str) -> list[str]:
+    match = re.search(
+        r"Field order is exactly as shown: (.*?)(?:,| —) the lexicographic canonical order",
+        flat(sentence_region),
+    )
+    if match is None:
+        raise Failure("no field order sentence")
+    return re.findall(r"`([a-z0-9_]+)`", match.group(1))
+
+
+def _words(text: str) -> str:
+    return r"\s+".join(re.escape(word) for word in text.split())
+
+
+def guard_text(raw: str, clause: str, flip: tuple[str, str] | None) -> str:
+    """The text with a pinned clause deleted, or with one polarity in it reversed."""
+    span = re.search(_words(clause), raw)
+    if span is None:
+        raise AssertionError(f"guard clause missing: {clause!r}")
+    if flip is None:
+        return raw[: span.start()] + raw[span.end():]
+    segment = span.group(0)
+    hit = re.search(_words(flip[0]), segment)
+    if hit is None:
+        raise AssertionError(f"polarity {flip[0]!r} missing from its clause")
+    return (raw[: span.start()] + segment[: hit.start()] + flip[1] + segment[hit.end():]
+            + raw[span.end():])
+
+
+# --- normative sentences ---------------------------------------------------------
+#
+# Every section of firmware-commands/v2.md and firmware-telemetry/v2.md, by its
+# heading path, with the checker that owns its normative sentences. The section
+# list itself is held: a section added, removed or renamed fails every checker
+# until it is assigned here. None marks a section this amendment did not add or
+# change.
+SECTION_OWNERS = {
+    "commands": (
+        ("# Firmware Commands Contract v2", "liveness"),
+        ("## What changed from v1", "liveness"),
+        ("## Error Semantics", None),
+        ("## Rate-Limited Refusal", None),
+        ("## Unresolved Commands", None),
+        ("## Runtime Liveness at `v` 2", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Wire format", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Acceptance", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The held nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The runtime's nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Publication during rollout", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Golden vectors", "liveness"),
+        ("## Runtime Obligations", "liveness"),
+        ("## Required Implementation Artifacts", "liveness"),
+    ),
+    "telemetry": (
+        ("# Firmware Telemetry Contract v2", "envelope"),
+        ("## What changed from v1", "envelope"),
+        ("## Signed Fault Events", "envelope"),
+        ("## Signed Fault Events > ### Closed `detail` sets at `v` 2", None),
+        ("## Signed Fault Events > ### Producers", None),
+        ("## Signed Fault Events > ### Consumers", None),
+        ("## Late Faults", None),
+        ("## Reading Envelope at `v` 2", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Producers", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Consumers", "envelope"),
+        ("## How Old A Reading Is", "reading-age"),
+        ("## How Old A Reading Is > ### What the signed fields do not establish", "reading-age"),
+        ("## How Old A Reading Is > ### The bound", "reading-age"),
+        ("## How Old A Reading Is > ### What a receiver may present", "reading-age"),
+        ("## How Old A Reading Is > ### What it is not", "reading-age"),
+        ("## Device Mode", None),
+        ("## Controller Profiles", None),
+        ("## Controller Profiles > ### The `controller_profile` field", None),
+        ("## Controller Profiles > ### The profile document", None),
+        ("## Controller Profiles > ### Receivers", "reading-age"),
+        ("## Adoption Order", "envelope"),
+        ("## Golden Vectors", "envelope"),
+        ("## Required Implementation Artifacts", "envelope"),
+    ),
+}
+# Every sentence of an owned section is held, not only those carrying MUST,
+# SHOULD, MAY, never, only or exactly: restrictions in these sections are also
+# stated declaratively ("An envelope with no bound is still accepted"), and a
+# keyword filter leaves those reversible. Any added, removed or changed sentence
+# in an owned section fails until this table is updated in review.
+
+
+def split_sections(text: str) -> list[tuple[str, str]]:
+    """(heading path, own body) for every heading at any depth, by the shared
+    CommonMark recognizer; fenced code is left out of each body."""
+    return markdown.section_bodies(text)
+
+
+def split_sentences(body: str) -> list[str]:
+    blocks: list[list[str]] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            stripped = stripped.lstrip(">").strip()
+        if not stripped:
+            blocks.append([])
+            continue
+        if stripped.startswith("|"):
+            if not re.fullmatch(r"\|[\s|:-]+\|", stripped):
+                blocks.append([stripped])
+            blocks.append([])
+            continue
+        if re.match(r"(?:- |\d+\. )", stripped):
+            blocks.append([re.sub(r"^(?:- |\d+\. )", "", stripped)])
+            continue
+        if not blocks:
+            blocks.append([])
+        blocks[-1].append(stripped)
+    sentences = []
+    for block in blocks:
+        text = " ".join(block).strip()
+        if text:
+            sentences += [s for s in re.split(r"(?<=[.!?:;])\s+(?=[A-Z`*\[\"(])", text) if s]
+    return sentences
+
+
+def normative_sentences(text: str, owned: list[str]) -> dict[str, list[str]]:
+    return {path: split_sentences(body) for path, body in split_sections(text) if path in owned}
+
+
+def check_normative(texts: dict[str, str], owner: str, held: dict) -> None:
+    """Fail on any section unassigned, or any owned normative sentence changed."""
+    for doc, table in SECTION_OWNERS.items():
+        crooked = markdown.non_canonical(texts[doc])
+        if crooked:
+            raise Failure(f"non-canonical heading in {doc}: {crooked}")
+        paths = [path for path, _ in split_sections(texts[doc])]
+        if paths != [path for path, _ in table]:
+            extra = [p for p in paths if p not in dict(table)]
+            gone = [p for p, _ in table if p not in paths]
+            raise Failure(f"normative sections of {doc} changed: unassigned {extra}, "
+                          f"gone {gone}, or reordered")
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        for path in owned:
+            want, got = list(held[doc][path]), found[path]
+            if got != want:
+                added = [s for s in got if s not in want]
+                removed = [s for s in want if s not in got]
+                raise Failure(f"normative sentence changed in {doc} {path}: added {added}, "
+                              f"removed {removed}" + ("" if added or removed else ", reordered"))
+
+
+def section_region(raw: str, path: str) -> tuple[int, int]:
+    """Where a section's own body lies in the raw text."""
+    return markdown.section_offsets(raw, path)
+
+
+def sentence_span(raw: str, path: str, sentence: str) -> tuple[int, int] | None:
+    start, end = section_region(raw, path)
+    hit = re.search(r"(?:\s|>)+".join(re.escape(w) for w in sentence.split()), raw[start:end])
+    return None if hit is None else (start + hit.start(), start + hit.end())
+
+
+POLARITY = (("MUST NOT", "MAY"), ("MUST", "MAY"), ("SHOULD", "MAY"), ("MAY", "MUST NOT"),
+            ("is not decided", "is decided"), ("does not decide", "decides"),
+            ("no other", "any other"), ("cannot", "can"), ("does not", "does"),
+            ("never", "may"), ("Never", "Sometimes"), ("only", "also"), ("exactly", "about"),
+            ("not", "also"), ("no", "some"))
+
+
+def normative_text_mutants(texts: dict[str, str], owner: str, must: tuple[str, ...]
+                           ) -> list[tuple[str, str, str]]:
+    """(label, doc, mutated text): sampled deletions and reversals, the listed
+    sentences among them, and one new MUST sentence per owned section."""
+    out = []
+    for doc, table in SECTION_OWNERS.items():
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        flat_list = [(p, s) for p in owned for s in found[p]]
+        for index, (path, sentence) in enumerate(flat_list):
+            if index % 5 and not any(m in sentence for m in must):
+                continue
+            span = sentence_span(texts[doc], path, sentence)
+            if span is None:
+                raise AssertionError(f"held sentence not found in {doc}: {sentence!r}")
+            raw = texts[doc]
+            out.append((f"normative deleted: {sentence[:60]}", doc,
+                        raw[: span[0]] + raw[span[1]:]))
+            segment = raw[span[0]:span[1]]
+            for old, new in POLARITY:
+                hit = re.search(rf"\b{re.escape(old)}\b", segment)
+                if hit:
+                    flipped = segment[: hit.start()] + new + segment[hit.end():]
+                    break
+            else:
+                last = segment.rstrip(".;:").split()[-1]
+                flipped = segment[: segment.rindex(last)] + "otherwise" + segment[
+                    segment.rindex(last) + len(last):]
+            out.append((f"normative reversed: {sentence[:60]}", doc,
+                        raw[: span[0]] + flipped + raw[span[1]:]))
+        for path in owned:
+            raw = texts[doc]
+            at = section_region(raw, path)[0]
+            out.append((f"normative added to {doc} {path}", doc,
+                        raw[:at] + "\nEvery consumer MUST accept this added sentence.\n" + raw[at:]))
+    return out
+
+
+OWNER = 'liveness'
+# The sentences held for each owned section, extracted by normative_sentences and
+# reviewed: a change to any of them is a change to this table.
+HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
+    'commands': {
+        '# Firmware Commands Contract v2': (
+            ('Status: maturity `draft`; compatibility `amendable`; adoption: producer (runtime) '
+             '`implemented-unreleased`, `unassessed`; proof: end-to-end `none`, HIL `none`, '
+             'production `none`.'),
+            ('Record:'),
+            ('[status/firmware-commands/v2.json](../status/firmware-commands/v2.json).'),
+            ('This version exists for one verdict and the runtime obligation it forces.'),
+            ('A device whose release-owned actuation rate policy refuses a command reports that '
+             'refusal as `rate_limited`, and a runtime never reissues a command on its own, so '
+             'that a refusal it did not hear cannot become an actuation it did not time.'),
+            ('It also adds a nonce to runtime liveness, so that the runtime that signed a '
+             'liveness message can bound, from above and on its own clock, how long ago a device '
+             'began the transaction behind a reading it signed after accepting it.'),
+            ('The bound dates that transaction, not the measured quantity, and is defined by '
+             '[firmware-telemetry/v2.md](../firmware-telemetry/v2.md#how-old-a-reading-is).'),
+        ),
+        '## What changed from v1': (
+            ('Four changes, all breaking:'),
+            ('**A verdict is added.** `rate_limited` joins the verdict table, and it answers '
+             '`relay_close` only: no rate policy refuses or delays `relay_open`.'),
+            ('A v1 device never returns it, and a v1 consumer of `command_rejected` faults '
+             'refuses it, because [firmware-telemetry/v1.md](../firmware-telemetry/v1.md) holds '
+             'that detail to a closed set.'),
+            ('**A lost command is never reissued automatically.** v1 requires a runtime to treat '
+             'a command that produced neither a relay action nor a `command_rejected` fault as '
+             'lost and to retry it with a fresh `cmd_seq`, and requires the same after a device '
+             'crash between persist and actuate.'),
+            ('This version forbids that retry.'),
+            ('See [Unresolved Commands](#unresolved-commands).'),
+            ('**Keys and signatures follow the shared Ed25519 contracts.** The device admits the '
+             'provisioning authority key and the runtime command key an approval carries under '
+             '[ed25519-key-admission/v1](../ed25519-key-admission/v1.md), and verifies the '
+             'command, the provisioning approval and the liveness message under '
+             '[ed25519-verification/v1](../ed25519-verification/v1.md). v1 named neither rule, '
+             'and a v1 device whose verifier takes the cofactored equation or decodes R loosely '
+             'accepts signatures this version refuses.'),
+            ('None of them is one a runtime produces by signing under RFC 8032.'),
+            ('A command whose signature that contract refuses, under any of its clauses, is '
+             '`bad_signature`; a liveness message it refuses is refused silently, as v1 refuses '
+             'any liveness message, and carries no verdict back; an approval it refuses, or one '
+             'carrying a key that admission refuses, registers nothing.'),
+            ('**A liveness message may carry a nonce.** A liveness object at `"v":2` carries '
+             '`nonce`, 128 bits the runtime generates fresh for that message.'),
+            ('A device accepts liveness at `v` `1` and at `v` `2`, holds the nonce of the last '
+             'one it accepted, and signs it into each reading it measures afterwards.'),
+            ('A v1 device refuses every `v` `2` liveness message as `malformed`, so it silently '
+             'loses supervision from a runtime that publishes only `v` `2`.'),
+            ('See [Runtime Liveness at `v` 2](#runtime-liveness-at-v-2).'),
+            ("Everything else is [v1](v1.md)'s, as its text stands at ori-specs `d979402`, "
+             'incorporated unchanged: the trust model except for the key admission and signature '
+             'verification above, the wire format, the action vocabulary, the MQTT transport '
+             'binding, the provisioning approval, runtime liveness, the runtime obligations and '
+             'the required artifacts, each except where this document replaces a rule by name.'),
+            ('That text includes sections v1 gained after its freeze, runtime liveness among '
+             "them, whose classification is still owed by v1's baseline audit; this version "
+             'carries them as its own text, whatever that audit decides for v1.'),
+            ("**Runtime liveness is not an Open Gap in this version.** v1's text marks it one, "
+             'and that status stands in v1, which is frozen.'),
+            ('Here it is a defined section with a runtime signer and a device verifier '
+             'implemented against it: the runtime signs and publishes liveness for each '
+             'supervised device, and the reference device firmware verifies it and records '
+             'whether the runtime is reachable.'),
+            ('That is implementation, not proof.'),
+            ('No end-to-end or HIL evidence shows a device losing or regaining supervision '
+             'through it, and no device image yet gates a Local Interlock on it.'),
+            ('A claim that liveness protects anything needs that evidence first.'),
+            ('**The command bytes do not change.** The command object keeps `"v":1`, because its '
+             '`v` names the command grammar and this version does not change the grammar.'),
+            ('A command a v2 runtime signs is byte-identical to the v1 command for the same '
+             'fields.'),
+            ('A signature RFC 8032 produces under an admitted key verifies on a v1 device and on '
+             'a v2 device alike, and the command is then held to every other check v1 makes: '
+             'device binding, manifest, freshness and authority.'),
+            ('What differs is that a v2 device refuses the signatures '
+             '[ed25519-verification/v1](../ed25519-verification/v1.md) refuses, which no honest '
+             'signer makes, that it may decline a verified command as `rate_limited`, and what a '
+             'v2 runtime may do afterwards.'),
+            ('The provisioning approval is likewise unchanged and keeps its `"v":1`.'),
+            ('The liveness message keeps v1\'s grammar at `"v":1` and gains a second grammar at '
+             '`"v":2`.'),
+            ('A device reports v2 verdicts in fault objects of '
+             '[firmware-telemetry/v2.md](../firmware-telemetry/v2.md), whose `v` is `2`.'),
+            ('A device MUST NOT report `rate_limited` in a fault object whose `v` is `1`.'),
+        ),
+        '## Runtime Liveness at `v` 2': (
+        ),
+        '## Runtime Liveness at `v` 2 > ### Wire format': (
+            ('Rules:'),
+            ('Field order is exactly as shown:'),
+            ('`boot_id`, `capability_hash`, `device_id`, `nonce`, `runtime_seq`, `v`, the '
+             'lexicographic canonical order.'),
+            ('`nonce` is a JSON string of exactly 32 characters, each one of `0`-`9` or `a`-`f`.'),
+            ('A string of any other length, one containing an uppercase letter or any other '
+             'character, `null`, and any other JSON type are `malformed`.'),
+            ('`v` is `2`.'),
+            ('`boot_id`, `capability_hash`, `device_id` and `runtime_seq`, the signature and its '
+             'encoding, and the rule that any deviation is `malformed` and is refused before the '
+             "signature is verified, are v1's, unchanged."),
+            ('A liveness object at `"v":1` has v1\'s grammar exactly, and a `nonce` in it is an '
+             'extra field and `malformed`.'),
+            ('A `v` other than the integer `1` or `2` is `malformed`.'),
+        ),
+        '## Runtime Liveness at `v` 2 > ### Acceptance': (
+            ('A device accepts a liveness message at either `v` only if it was not delivered '
+             "retained, and then in v1's order: it parses;"),
+            ('`device_id` matches; the signature verifies against the provisioned runtime key;'),
+            ("`boot_id` equals the device's current boot;"),
+            ("`capability_hash` equals the device's accepted manifest hash; and `runtime_seq` "
+             'strictly exceeds the last value accepted for this boot.'),
+            ('One high-water mark serves both versions: a `v` `2` message whose `runtime_seq` '
+             'does not exceed that of an accepted `v` `1` message is refused, and the reverse.'),
+            ('A refused message changes nothing, including the held nonce below.'),
+            ("Each check that fails names the refusal, with the same reason names v1's liveness "
+             'corpus uses.'),
+            ('The checks are made in this order, and a message that fails more than one is '
+             'refused for the first that fails:'),
+            ('| Order | Check | Reason |'),
+            ('| 1 | it was not delivered retained | `retained` |'),
+            ('| 2 | it parses under the grammar of its `v` | `malformed` |'),
+            ('| 3 | `device_id` matches | `device_mismatch` |'),
+            ('| 4 | the signature verifies | `signature_invalid` |'),
+            ('| 5 | `boot_id` equals the current boot | `boot_mismatch` |'),
+            ('| 6 | `capability_hash` equals the accepted manifest hash | '
+             '`capability_hash_mismatch` |'),
+            ('| 7 | `runtime_seq` exceeds the last accepted value | `seq_not_increasing` |'),
+            ('Delivery is decided before content, so a retained delivery is refused as `retained` '
+             'whatever its bytes.'),
+            ("Checks 2 to 7 are v1's, in v1's order, and apply to a `v` `1` message unchanged."),
+            ('A refusal carries no verdict back to the runtime.'),
+        ),
+        '## Runtime Liveness at `v` 2 > ### The held nonce': (
+            ('A device holds at most one liveness nonce, in memory only, and never persists it.'),
+            ('Holding none, which a reading envelope signs as `null`, means the device has no '
+             'usable freshness reference.'),
+            ('It does not mean that no runtime was watching.'),
+            ("Accepting a `v` `2` message sets the held nonce to that message's `nonce`."),
+            ('Accepting a `v` `1` message clears it.'),
+            ('Every boot starts with none held.'),
+            ("A change of the device's accepted manifest, or of its active runtime command key, "
+             'clears it.'),
+            ("The expiry of v1's liveness expiry window clears it: once the device treats the "
+             'runtime as unreachable, it holds no nonce until it accepts a `v` `2` message again.'),
+            ('Clearing the held nonce, for any of these reasons, never alters a nonce already '
+             'captured for a measurement in progress, or one already signed into an envelope, '
+             'buffered or not.'),
+            ('What the device does with the held nonce is defined in '
+             '[firmware-telemetry/v2.md](../firmware-telemetry/v2.md#how-old-a-reading-is): it '
+             'signs it into each reading envelope it measures afterwards.'),
+        ),
+        "## Runtime Liveness at `v` 2 > ### The runtime's nonce": (
+            ('The runtime generates each `nonce` from a cryptographically secure random source, '
+             '128 bits, fresh for every liveness message it signs.'),
+            ('It never derives one from `runtime_seq`, from its state store, from a clock or from '
+             'another message, and never reuses one, including for a message it signs again under '
+             'a `runtime_seq` it has signed before.'),
+            ('Before using a nonce, the runtime checks it against the nonces its live table holds '
+             '(firmware-telemetry/v2, How Old A Reading Is), and generates another on a collision.'),
+            ('The runtime records the nonce in that table under the signing-start rule of '
+             '[firmware-telemetry/v2.md](../firmware-telemetry/v2.md#the-bound).'),
+            ('The supervision window, the publication interval and every other v1 obligation on '
+             'publishing liveness apply to `v` `2` unchanged.'),
+            ('**Why a nonce and not `runtime_seq`.** `runtime_seq` is persisted across runtime '
+             'restarts, so restoring an older state store reissues a value the runtime has '
+             'already signed.'),
+            ('For the same boot and manifest, the reissued message is byte-identical to the '
+             'earlier one, signature included.'),
+            ('A bound keyed by `runtime_seq`, or by any digest of the message or its signature, '
+             'would then date a reading taken under the first message by the time of the second.'),
+            ('A fresh random nonce does not repeat across a restore.'),
+            ('`runtime_seq` stays because the device still needs it to refuse replays without '
+             'persisting anything, and the nonce gives no order.'),
+        ),
+        '## Runtime Liveness at `v` 2 > ### Publication during rollout': (
+            ('While devices that accept only `v` `1` may still be supervised, the runtime '
+             'publishes two liveness messages to each supervised device in every publication '
+             'interval: one at `v` `1`, then one at `v` `2`.'),
+            ('**Distinct, increasing sequences.** It signs the `v` `1` message at a `runtime_seq` '
+             'N and the `v` `2` message at N+1, both from the one durable `runtime_seq` '
+             'allocator, and never uses one `runtime_seq` for both.'),
+            ('**Independent failure.** A failure to generate, sign or publish the `v` `2` message '
+             "MUST NOT suppress that interval's `v` `1` message."),
+            ('What a failed signing leaves in the liveness table is the signing-start rule of '
+             '[firmware-telemetry/v2.md](../firmware-telemetry/v2.md#the-bound).'),
+            ('**Conservative delivery.** A device that accepts the `v` `1` message clears its '
+             'held nonce, and one that then accepts the `v` `2` message holds its nonce.'),
+            ('A device that accepts only `v` `1` refuses the `v` `2` message as `malformed` and '
+             'is supervised by the `v` `1` message alone.'),
+            ('When the pair arrives out of order, the `v` `1` message is refused as '
+             '`seq_not_increasing` and the device keeps the `v` `2` nonce, whose signing still '
+             'precedes everything the device measures after accepting it.'),
+            ('When either message is lost, the device holds the nonce of the last message it '
+             'accepted, or none.'),
+            ('Reordered or missing messages may leave a reading with no bound, and never give a '
+             'tighter bound than the truth.'),
+            ('A refused message changes neither supervision nor the held nonce.'),
+            ('**Captured references stand.** Accepting a `v` `1` message never alters a nonce '
+             'already captured for a measurement in progress, or one already signed into an '
+             'envelope, buffered or not.'),
+            ('**Liveness never takes command capacity.** The pair arrives milliseconds apart, and '
+             'a device that reconnects on a persistent session can receive several queued pairs '
+             'at once, beside its queued commands and its retained provisioning approval.'),
+            ('A device governed by this contract that accepts both versions MUST NOT let liveness '
+             'messages, however many arrive together, take inbound capacity that a command or '
+             'provisioning message would otherwise have, for example by giving liveness a '
+             'separate inbound lane, or by reserving depth for commands and provisioning that '
+             'liveness cannot use.'),
+            ('It may drop liveness messages instead.'),
+            ('A dropped liveness message loses a bound or a refresh of supervision.'),
+            ('Liveness dropped for longer than the expiry window leaves the device treating the '
+             "runtime as unreachable, with v1's consequences, which with no reachable gateway "
+             'include orphaning.'),
+            ('That is the intended direction of failure: toward local protection, never toward a '
+             'stale claim of supervision.'),
+            ('A device SHOULD also keep inbound capacity for liveness that commands and '
+             'provisioning cannot take, so that command load, including a flood of commands it '
+             'refuses, cannot by itself starve supervision.'),
+            ('This version does not require a clean session.'),
+            ('**No inferred support.** The runtime MUST NOT infer that a device accepts `v` `2` '
+             'from a timeout, from the absence of a refusal, or from anything else its liveness '
+             'traffic shows.'),
+            ('A refused liveness message carries no verdict back, so silence proves nothing.'),
+            ('**Authority is unchanged.** Supervision comes from accepted liveness at either `v`, '
+             'exactly as in v1, and nothing about what licenses an action changes.'),
+            ('Whether a nonce is held governs age evidence only, never supervision or authority.'),
+            ('This version does not decide when the runtime may stop publishing `v` `1`.'),
+        ),
+        '## Runtime Liveness at `v` 2 > ### Golden vectors': (
+            ('The authoritative corpus for this section is '
+             '[liveness-vectors-v2.json](liveness-vectors-v2.json), held here beside this '
+             'document.'),
+            ('Its SHA-256 is `26296ed9e2a9e5b2fafff4dd1be3cf0deccef674c148818e9f1205ff805da13d`.'),
+            ('Implementing repositories copy it byte for byte, pin that digest, and never '
+             'generate its expectations from their own behaviour.'),
+            ('Each case is a liveness message evaluated against its `verifier_context`: the '
+             "device's current `boot_id`, accepted `capability_hash`, the last `runtime_seq` "
+             'accepted in this boot, and the nonce held, or `null`.'),
+            ('Each case gives the nonce held afterwards.'),
+            ('It holds `v` `2` messages that set the held nonce, including ones at the smallest '
+             'and largest `boot_id`, one at the largest `runtime_seq`, and one whose nonce is all '
+             'zeros, which the grammar admits because a device does not judge randomness;'),
+            ('`v` `1` messages that clear it; and refusals, each refused for one declared reason '
+             'and leaving the held nonce unchanged:'),
+            ('`v` `2` without `nonce`, and `v` `1` with one;'),
+            ('a `nonce` with an uppercase letter, a character outside the hexadecimal digits, 31 '
+             'or 33 characters, the empty string, `null`, an integer, or a boolean;'),
+            ('a `v` `2` message with an extra key;'),
+            ('`nonce` out of canonical order, and an unsupported `v`;'),
+            ('an accepted `v` `2` message replayed byte for byte, a regressing `runtime_seq`, the '
+             'accepted `runtime_seq` reissued under a fresh nonce, a `v` `2` message at the '
+             '`runtime_seq` of an accepted `v` `1` message, and a `v` `1` message at the '
+             '`runtime_seq` of an accepted `v` `2` message;'),
+            ('a wrong device, a wrong boot, a manifest mismatch, and a rogue key;'),
+            ('a message delivered retained.'),
+            ('Each of those breaks exactly one check.'),
+            ('The corpus also holds precedence cases, each breaking two adjacent checks in the '
+             'order above and refused for the earlier: retained and malformed, malformed and a '
+             'wrong device, a wrong device and a rogue key, a rogue key and a wrong boot, a wrong '
+             'boot and a manifest mismatch, and a manifest mismatch and a replayed `runtime_seq`.'),
+            ('Every refusal decided after the signature carries a valid signature.'),
+            ('The corpus also holds rollout sequences under [Publication during '
+             'rollout](#publication-during-rollout).'),
+            ('Each is a run of deliveries to one device, from its `verifier_context`, by a device '
+             'that accepts only `v` `1` or one that accepts both, each delivery giving its '
+             'reason, or none when accepted, and the held nonce and last accepted `runtime_seq` '
+             'after it.'),
+            ('They cover:'),
+            ('a device that accepts only `v` `1`, which stays supervised and holds no nonce;'),
+            ('a device that accepts both, which ends holding the last `v` `2` nonce, and holds '
+             "none between an interval's `v` `1` message and its `v` `2` message;"),
+            ('the pair delivered out of order, where the late `v` `1` message is refused and the '
+             'device keeps the `v` `2` nonce;'),
+            ('either message of the pair missing.'),
+            ('`scripts/generate-firmware-liveness-vectors-v2` reproduces the file byte for byte.'),
+            ('It signs with OpenSSL through `cryptography`, under the disclosed runtime and rogue '
+             "test seeds of v1's liveness corpus."),
+            ('Its nonces are fixed fixture values, not random ones.'),
+            ('`scripts/check-firmware-liveness-vectors-v2` shares no code with it: it recomputes '
+             'the object and wire bytes, verifies every signature with its own curve arithmetic, '
+             'applies the grammar and the acceptance order above, and confirms that each case is '
+             'accepted with the declared held nonce and each refusal is refused for its declared '
+             'reason and for no other.'),
+            ('The disclosed test seeds are fixtures only and MUST NOT be used outside '
+             'deterministic tests.'),
+        ),
+        '## Runtime Obligations': (
+            ("v1's obligations hold, with these replacements:"),
+            ("v1's first obligation reads, in this version: maintain one strictly increasing "
+             '`cmd_seq` per target device, continuing across command-key rotation, and never '
+             'reuse a value.'),
+            ('Record every issued command and every fault-event rejection.'),
+            ('A `rate_limited` fault is recorded as a refusal that actuated nothing.'),
+            ('A `bad_signature` or `replayed` fault from a device remains a security signal, not '
+             'noise.'),
+            ('Never reissue a command automatically, as [Unresolved '
+             'Commands](#unresolved-commands) and [Rate-Limited Refusal](#rate-limited-refusal) '
+             'state.'),
+            ('Generate, check and record each liveness nonce as [Runtime Liveness at `v` '
+             '2](#runtime-liveness-at-v-2) states.'),
+        ),
+        '## Required Implementation Artifacts': (
+            ("In addition to v1's:"),
+            ('**Device-side:** a command that passes every acceptance check and that the rate '
+             'policy refuses yields `rate_limited`, writes no output, spends its `cmd_seq` (the '
+             'same bytes delivered again yield `replayed`), and is signed as a `command_rejected` '
+             'fault at `v` `2`.'),
+            ("A command that fails an earlier check yields that check's verdict even while the "
+             'policy would also refuse it.'),
+            ('The Local Interlock acts while the policy would refuse a commanded action on the '
+             'same channel.'),
+            ('A `relay_open` is admitted at once in every state in which the policy refuses a '
+             '`relay_close`, including any period after boot in which it refuses every close.'),
+            ('**Runtime-side:** a `rate_limited` fault is recorded as a refusal and never as an '
+             'execution; no path reissues a command automatically, after `rate_limited` or after '
+             'any unresolved command; a `rate_limited` detail in a fault whose `v` is `1` is '
+             'refused.'),
+            ('A runtime that drives a commissioned zone through firmware commands also tests that '
+             'a latched Tier D trip keeps making fresh `open_protected_circuit` attempts, each '
+             'under a new `cmd_seq`, while every other command is published once.'),
+            ('The fault corpus of [firmware-telemetry/v2.md](../firmware-telemetry/v2.md), which '
+             'carries the signed `rate_limited` refusal.'),
+            ('**Device-side:** the corpora of '
+             '[ed25519-key-admission/v1](../ed25519-key-admission/v1.md) and '
+             '[ed25519-verification/v1](../ed25519-verification/v1.md) driven through the '
+             'verifier that checks commands, approvals and liveness, on the target as well as the '
+             'host, accepting every accepted case and refusing every refused one.'),
+            ("**Device-side:** the liveness corpus above driven through the device's real "
+             'liveness entry point, accepting every case with its declared held nonce and '
+             'refusing every refusal for its declared reason with the held nonce unchanged; tests '
+             'that a boot, a manifest change, a runtime command key change and the expiry of the '
+             'liveness expiry window each leave no nonce held; a test that an expiry during a '
+             "measurement leaves that measurement's captured nonce unchanged; and a test, run in "
+             'three orders, that commands and provisioning messages up to the capacity the '
+             "device's implementation documents for them, delivered with a burst of liveness "
+             'messages larger than any capacity the device has for liveness, are all accepted, '
+             'and only liveness messages are dropped.'),
+            ('The orders are the liveness burst first and then the commands and provisioning '
+             'messages; the commands and provisioning messages first and then the burst; and the '
+             'two interleaved.'),
+            ('**Runtime-side:**'),
+            ('the signer reproduces the object and wire bytes of each accepted `v` `2` case from '
+             "that case's fields and nonce;"),
+            ('two messages signed in sequence, including two under the same `runtime_seq`, never '
+             'carry the same nonce;'),
+            ('a generated nonce that collides with one the live table holds is replaced before '
+             'signing, tested with an injected source;'),
+            ('the signing start is read before signing, and a message whose signing start could '
+             'not be read is recorded as no entry.'),
+        ),
+    },
+    'telemetry': {},
+}
+# Sentences every mutation run reverses and deletes, whatever the sample.
+MUTATE_ALWAYS = (
+    'cryptographically secure random source',
+    'checks it against the nonces its live',
+    'MUST NOT be used outside',
+    'fixed fixture values',
+    'Accepting a `v` `1` message clears it',
+    'or of its active runtime command',
+    'expiry window clears it',
+    'every other v1 obligation',
+    'never takes command capacity',
+    'does not decide when the runtime may stop',
+    'copy it byte for byte',
+    "keeps v1's grammar at",
+)
+
+
+# --- status-record notes ---------------------------------------------------------
+#
+# Every note in status/firmware-commands/v2.json, the top-level one and each adoption
+# entry's, held verbatim: a note states what implements this contract and what
+# proof exists, and the status checker reads neither. A note added, removed or
+# changed fails here until this table is updated in review.
+STATUS_NOTES: tuple[tuple[str, str], ...] = (
+    ('notes',
+     'Exists for the rate_limited verdict, which answers relay_close only, and for the '
+     'rule that a runtime never reissues a command to recover its delivery. Fresh '
+     'open_protected_circuit attempts for a latched Tier D trip are not reissues and '
+     'continue, under the binding the governing safety-profile contract authorizes. '
+     "Command and provisioning approval bytes are v1's and keep v 1. Runtime liveness "
+     "keeps v1's grammar at v 1 and gains v 2, carrying a fresh 128-bit nonce from which "
+     'the signing runtime bounds how long ago a device began the transaction behind a '
+     'reading, under firmware-telemetry/v2; nothing implements liveness v 2 yet. Runtime '
+     'liveness at v 1 is implemented by the runtime signer and the edge firmware '
+     'verifier, which is implementation and not end-to-end or HIL proof; no device image '
+     'gates a Local Interlock on it. The runtime has adopted the rate_limited and '
+     'no-reissue rules; the edge firmware has not. The runtime adopts it before any '
+     'device signs a v 2 fault, and devices accept liveness v 2 before the runtime '
+     'publishes it.'),
+    ('adoption[0] producer runtime notes',
+     'The runtime signs the unchanged command bytes and never reissues a command: egress '
+     'publishes once, held by tests on its call sites, its scheduling and its client. It '
+     'reads rate_limited only as a firmware-telemetry/v2 fault. It drives no '
+     'firmware-commanded zone, so the Tier D attempt carve-out has no runtime path yet. '
+     'No conformance claim is made, so the version is not frozen by this merge. It '
+     'publishes liveness at v 1 only: it generates no nonce and keeps no liveness table.'),
+)
+
+
+def status_notes(record: dict) -> list[tuple[str, str]]:
+    out = [("notes", record["notes"])] if "notes" in record else []
+    for index, entry in enumerate(record.get("adoption", [])):
+        if "notes" in entry:
+            where = f"adoption[{index}] {entry['role']} {entry['repository']} notes"
+            out.append((where, entry["notes"]))
+    return out
+
+
+def check_status_notes(raw: str) -> None:
+    found = status_notes(json.loads(raw))
+    if found != list(STATUS_NOTES):
+        added = [n for n in found if n not in STATUS_NOTES]
+        removed = [n for n in STATUS_NOTES if n not in found]
+        raise Failure(f"status notes changed in status/firmware-commands/v2.json: added {added}, removed {removed}"
+                      + ("" if added or removed else ", reordered"))
+
+
+def contract_texts() -> dict[str, str]:
+    return {"c1": COMMANDS_V1.read_text(), "c2": COMMANDS_V2.read_text()}
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    check_status_notes(texts.get("status") or STATUS.read_text())
+    docs = {"commands": texts["c2"], "telemetry": texts.get("t2") or TELEMETRY_V2.read_text()}
+    check_normative(docs, OWNER, HELD_SENTENCES)
+    c1, c2 = texts["c1"], texts["c2"]
+    live2 = section(c2, "## Runtime Liveness at `v` 2")
+    wire2 = section(live2, "### Wire format")
+    accept2 = section(live2, "### Acceptance")
+    held2 = section(live2, "### The held nonce")
+    golden2 = section(live2, "### Golden vectors")
+    live1 = section(c1, "## Runtime Liveness")
+    wire1 = section(live1, "### Wire format")
+    fresh1 = section(live1, "### Freshness without a device clock")
+    for sentence in V2_WIRE:
+        need(wire2, sentence, "firmware-commands/v2.md Wire format")
+    for sentence in V2_ACCEPTANCE:
+        need(accept2, sentence, "firmware-commands/v2.md Acceptance")
+    for sentence in V2_HELD:
+        need(held2, sentence, "firmware-commands/v2.md The held nonce")
+    for clause, _ in GUARDS:
+        need(live2, clause, "firmware-commands/v2.md Runtime Liveness at v 2")
+    for sentence in ROLLOUT_GOLDEN:
+        need(golden2, sentence, "firmware-commands/v2.md Golden vectors")
+    for sentence in V2_GOLDEN:
+        need(golden2, sentence, "firmware-commands/v2.md Golden vectors")
+    for sentence in V1_WIRE[:-1]:
+        need(wire1, sentence, "firmware-commands/v1.md Wire format")
+    need(fresh1, V1_WIRE[-1], "firmware-commands/v1.md Freshness")
+
+    order2 = _field_order(wire2)
+    order1 = _field_order(wire1)
+    for order in (order1, order2):
+        if order != sorted(order):
+            raise Failure(f"field order {order} is not the lexicographic one the text claims")
+    nonce = re.search(
+        r"`nonce` is a JSON string of exactly (\d+) characters, each one of `(.)`-`(.)` "
+        r"or `(.)`-`(.)`", flat(wire2))
+    assert nonce is not None
+    alphabet = "".join(
+        chr(c) for lo, hi in ((nonce.group(2), nonce.group(3)), (nonce.group(4), nonce.group(5)))
+        for c in range(ord(lo), ord(hi) + 1))
+    versions = re.search(r"A `v` other than the integer `(\d)` or `(\d)` is `malformed`", flat(wire2))
+    assert versions is not None
+    bounds = {}
+    for field in ("boot_id", "runtime_seq"):
+        match = re.search(
+            rf"`{field}` is a canonical decimal integer[^.]*?within `(\d+) \.\. 2\^(\d+) - 1`",
+            flat(wire1))
+        if match is None:
+            raise Failure(f"v1.md states no range for {field}")
+        bounds[field] = (int(match.group(1)), 2 ** int(match.group(2)) - 1)
+    fleet = re.search(r"`device_id` is a fleet identifier: `(\[[^`]+\])`, non-empty", flat(wire1))
+    assert fleet is not None
+    rows = re.findall(r"^\| (\d+) \| (.+?) \| `([a-z0-9_]+)` \|\s*$", accept2, re.M)
+    if [int(r[0]) for r in rows] != list(range(1, len(rows) + 1)):
+        raise Failure("the acceptance table's order column is not 1..n")
+    order = []
+    for _, cell, reason in rows:
+        if cell not in CHECK_CELLS:
+            raise Failure(f"acceptance table check {cell!r} has no predicate here")
+        order.append((reason, CHECK_CELLS[cell]))
+    if sorted(p for _, p in order) != sorted(CHECK_CELLS.values()):
+        raise Failure("the acceptance table does not name every check exactly once")
+    mqtt = re.search(r"^\| `(ori/fw/<device_id>/runtime)` \| (\d) \| \*\*(no|yes)\*\* \|",
+                     section(c1, "## MQTT Transport Binding"), re.M)
+    assert mqtt is not None
+    refusals_part, _, rollout_part = golden2.partition("They cover:")
+    bullets = [flat(b) for b in re.findall(r"^- (.+?)(?=\n- |\n\n)", refusals_part, re.M | re.S)]
+    if bullets != list(REFUSAL_BULLETS):
+        raise Failure(f"the golden-vectors refusal list changed: {bullets}")
+    rollout_bullets = [flat(b) for b in re.findall(r"^- (.+?)(?=\n- |\n\n)", rollout_part,
+                                                   re.M | re.S)]
+    if rollout_bullets != list(ROLLOUT_BULLETS):
+        raise Failure(f"the rollout sequences' cover list changed: {rollout_bullets}")
+    rollout = section(live2, "### Publication during rollout")
+    for sentence in ROLLOUT_SENTENCES:
+        need(rollout, sentence, "firmware-commands/v2.md Publication during rollout")
+    pin = re.search(r"\[liveness-vectors-v2\.json\]\(liveness-vectors-v2\.json\).*?"
+                    r"Its SHA-256 is `([0-9a-f]{64})`", flat(golden2))
+    if pin is None:
+        raise Failure("firmware-commands/v2.md pins no liveness corpus digest")
+    return {
+        "order": order,
+        "fields": {1: order1, 2: order2},
+        "nonce_length": int(nonce.group(1)),
+        "nonce_alphabet": alphabet,
+        "versions": (int(versions.group(1)), int(versions.group(2))),
+        "bounds": bounds,
+        "fleet": fleet.group(1),
+        "hash_hex": 64,
+        "topic": mqtt.group(1),
+        "qos": int(mqtt.group(2)),
+        "retain": mqtt.group(3) == "yes",
+        "sig_prefix": "ed25519:",
+        "sig_length": 64,
+        "seq_strict": True,
+        "closed_keys": True,
+        "v1_seq_exempt": False,
+        "v2_sets_nonce": True,
+        "v1_clears_nonce": True,
+        "refusal_keeps_nonce": True,
+        "pin": pin.group(1),
+    }
+
+
+# --- the device -------------------------------------------------------------------
+
+def _int_ok(value: object, bounds: tuple[int, int]) -> bool:
+    return type(value) is int and bounds[0] <= value <= bounds[1]
+
+
+def split_message(raw: bytes) -> tuple[bytes, bytes] | None:
+    """The liveness object bytes and the signature field bytes, by position."""
+    head, tail = b'{"liveness":', b',"signature":"'
+    cut = raw.rfind(tail)
+    if not raw.startswith(head) or cut < 0 or not raw.endswith(b'"}'):
+        return None
+    return raw[len(head):cut], raw[cut + len(tail):-2]
+
+
+def decode_signature(field: bytes, model: dict) -> bytes | None:
+    try:
+        text = field.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    if not text.startswith(model["sig_prefix"]):
+        return None
+    body = text[len(model["sig_prefix"]):]
+    try:
+        raw = base64.b64decode(body, validate=True)
+    except ValueError:
+        return None
+    if base64.b64encode(raw).decode() != body or len(raw) != model["sig_length"]:
+        return None
+    return raw
+
+
+def grammar_ok(raw: bytes, model: dict) -> bool:
+    """firmware-commands/v2's grammar, by the `v` the object carries."""
+    try:
+        top = parse_pairs(raw)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    if not isinstance(top, list) or [k for k, _ in top] != ["liveness", "signature"]:
+        return False
+    obj, signature = top[0][1], top[1][1]
+    if not isinstance(obj, list) or not isinstance(signature, str):
+        return False
+    if serialize(top).encode() != raw:
+        return False
+    fields = dict(obj)
+    if len(fields) != len(obj):
+        return False
+    v = fields.get("v")
+    if type(v) is not int or v not in model["versions"]:
+        return False
+    keys = [k for k, _ in obj]
+    if not model["closed_keys"]:
+        keys = [k for k in keys if k in model["fields"][v]]
+    if keys != model["fields"][v]:
+        return False
+    if not _int_ok(fields["boot_id"], model["bounds"]["boot_id"]):
+        return False
+    if not _int_ok(fields["runtime_seq"], model["bounds"]["runtime_seq"]):
+        return False
+    if not isinstance(fields["device_id"], str) or not re.fullmatch(
+            model["fleet"] + "+", fields["device_id"]):
+        return False
+    if not isinstance(fields["capability_hash"], str) or not re.fullmatch(
+            "sha256:[0-9a-f]{%d}" % model["hash_hex"], fields["capability_hash"]):
+        return False
+    if "nonce" in fields:
+        nonce = fields["nonce"]
+        if not isinstance(nonce, str) or len(nonce) != model["nonce_length"]:
+            return False
+        if any(ch not in model["nonce_alphabet"] for ch in nonce):
+            return False
+    return decode_signature(signature.encode(), model) is not None
+
+
+def lenient_fields(raw: bytes) -> dict:
+    """Whatever fields a message carries, for judging the later checks alone."""
+    try:
+        top = parse_pairs(raw)
+        assert isinstance(top, list)
+        return dict(dict(top)["liveness"])
+    except (ValueError, UnicodeDecodeError, TypeError, KeyError, AssertionError):
+        return {}
+
+
+def broken_checks(raw: bytes, retained: bool, ctx: dict, model: dict,
+                  runtime_key: bytes) -> set[str]:
+    """Every check this message fails, each judged on its own."""
+    fields = lenient_fields(raw)
+    parts = split_message(raw)
+    signature = decode_signature(parts[1], model) if parts else None
+    signed = parts is not None and signature is not None and ed25519_verify(
+        runtime_key, parts[0], signature)
+    last = ctx["last_accepted_runtime_seq"]
+    seq = fields.get("runtime_seq")
+    fails = {
+        "retained": retained,
+        "grammar": not grammar_ok(raw, model),
+        "device": "device_id" in fields and fields["device_id"] != ctx["device_id"],
+        "signature": not signed,
+        "boot": "boot_id" in fields and fields["boot_id"] != ctx["boot_id"],
+        "manifest": "capability_hash" in fields
+        and fields["capability_hash"] != ctx["capability_hash"],
+        "seq": type(seq) is int and (seq <= last if model["seq_strict"] else seq < last)
+        and not (model["v1_seq_exempt"] and fields.get("v") == 1),
+    }
+    return {name for name, failed in fails.items() if failed}
+
+
+def judge(raw: bytes, retained: bool, ctx: dict, held: object, model: dict,
+          runtime_key: bytes, off: frozenset[str] = frozenset()) -> tuple[str | None, object]:
+    """(None or the reason of the first failing check, the held nonce after)."""
+    broken = broken_checks(raw, retained, ctx, model, runtime_key)
+    for reason, check in model["order"]:
+        if check in broken and check not in off:
+            return reason, (held if model["refusal_keeps_nonce"] else None)
+    fields = lenient_fields(raw)
+    if fields.get("v") == 2:
+        return None, fields.get("nonce") if model["v2_sets_nonce"] else held
+    return None, None if model["v1_clears_nonce"] else held
+
+
+# --- the corpus ---------------------------------------------------------------------
+
+def _rebuild(case: dict, label: str) -> bytes:
+    """The case's wire bytes, recomputed from its input and signature."""
+    obj = serialize(list(case["input"].items()) if case["input"] else {}).encode()
+    if bytes.fromhex(case["liveness_hex"]) != obj:
+        raise Failure(f"{label}: liveness bytes do not reproduce from input")
+    wire = serialize([("liveness", json.loads(obj, object_pairs_hook=lambda p: p)),
+                      ("signature", "ed25519:" + case["signature_b64"])]).encode()
+    if bytes.fromhex(case["message_hex"]) != wire:
+        raise Failure(f"{label}: wire message does not reproduce")
+    return wire
+
+
+def check(corpus: dict, v1_corpus: dict, model: dict,
+          off: frozenset[str] = frozenset()) -> dict:
+    for key in ("runtime_test_seed_hex", "rogue_test_seed_hex"):
+        if corpus[key] != v1_corpus[key]:
+            raise Failure(f"{key} is not v1's liveness corpus seed")
+    runtime_key = derive_public(bytes.fromhex(corpus["runtime_test_seed_hex"]))
+    rogue_key = derive_public(bytes.fromhex(corpus["rogue_test_seed_hex"]))
+    if corpus["runtime_public_key_hex"] != runtime_key.hex() or base64.b64decode(
+            corpus["runtime_public_key_b64"]) != runtime_key:
+        raise Failure("runtime public key does not derive from the seed")
+    if corpus["rogue_public_key_hex"] != rogue_key.hex():
+        raise Failure("rogue public key does not derive from the seed")
+    if (corpus["topic"], corpus["qos"], corpus["retain"]) != (
+            model["topic"], model["qos"], model["retain"]):
+        raise Failure("corpus transport binding differs from v1's MQTT table")
+    reasons = [r for r, _ in model["order"]]
+    if sorted(corpus["reasons"]) != sorted(reasons):
+        raise Failure("corpus reasons differ from the acceptance table")
+    v1_reasons = {c["reason"] for k in ("reject_cases", "transport_reject_cases")
+                  for c in v1_corpus[k]}
+    if v1_reasons != set(reasons):
+        raise Failure(f"v1's liveness corpus uses reasons {sorted(v1_reasons)}, not the table's")
+    position = {r: i for i, (r, _) in enumerate(model["order"])}
+    check_of = dict(model["order"])
+    sig_at = next(i for i, (_, c) in enumerate(model["order"]) if c == "signature")
+
+    names: set[str] = set()
+    sections = ("cases", "reject_cases", "precedence_cases", "transport_reject_cases")
+    for key in sections:
+        for case in corpus[key]:
+            if case["name"] in names:
+                raise Failure(f"duplicate case {case['name']}")
+            names.add(case["name"])
+
+    facts: dict[str, list[str]] = {}
+
+    def note(fact: str, name: str) -> None:
+        facts.setdefault(fact, []).append(name)
+
+    def run_case(case: dict, refused: bool) -> set[str]:
+        label = case["name"]
+        raw = _rebuild(case, label)
+        ctx = case["verifier_context"]
+        transport = case.get("transport")
+        retained = bool(transport and transport["retain"])
+        if transport is not None and transport["topic"] != model["topic"].replace(
+                "<device_id>", ctx["device_id"]):
+            raise Failure(f"{label}: delivered on another topic")
+        held = ctx["held_nonce"]
+        reason, after = judge(raw, retained, ctx, held, model, runtime_key, off)
+        if after != case["expected_held_nonce"]:
+            raise Failure(f"{label}: held nonce after is {after!r}, not "
+                          f"{case['expected_held_nonce']!r}")
+        parts = split_message(raw)
+        assert parts is not None
+        valid = ed25519_verify(runtime_key, parts[0], base64.b64decode(case["signature_b64"]))
+        broken = broken_checks(raw, retained, ctx, model, runtime_key)
+        if not refused:
+            if reason is not None:
+                raise Failure(f"{label}: refused ({reason})")
+            return broken
+        if case["reason"] not in reasons:
+            raise Failure(f"{label}: undeclared reason {case['reason']}")
+        if reason != case["reason"]:
+            raise Failure(f"{label}: refused for {reason}, not {case['reason']}")
+        if case["signature_valid"] is not valid:
+            raise Failure(f"{label}: signature_valid says {case['signature_valid']}")
+        if position[case["reason"]] > sig_at and not valid:
+            raise Failure(f"{label}: refused after the signature without a valid one")
+        if (not valid and len(broken) == 1 and ed25519_verify(
+                rogue_key, parts[0], base64.b64decode(case["signature_b64"]))):
+            note("rogue_key", label)
+        return broken
+
+    for case in corpus["cases"]:
+        run_case(case, refused=False)
+        held = case["verifier_context"]["held_nonce"]
+        v = case["input"]["v"]
+        if v == 2 and held != case["input"]["nonce"]:
+            note("v2_sets", case["name"])
+        if v == 1 and held is not None:
+            note("v1_clears", case["name"])
+        if v == 2 and case["input"]["nonce"] == "0" * model["nonce_length"]:
+            note("zero_nonce", case["name"])
+        for field in ("boot_id", "runtime_seq"):
+            lo, hi = model["bounds"][field]
+            if v == 2 and case["input"][field] == hi:
+                note(f"v2_{field}_max", case["name"])
+            if v == 2 and case["input"][field] == lo:
+                note(f"v2_{field}_min", case["name"])
+        for field in ("boot_id", "runtime_seq"):
+            if case["input"][field] == model["bounds"][field][1]:
+                note(f"{field}_max", case["name"])
+            if case["input"][field] == model["bounds"][field][0]:
+                note(f"{field}_min", case["name"])
+
+    accepted_bytes = {c["message_hex"] for c in corpus["cases"]}
+    single = corpus["reject_cases"] + [
+        c for c in corpus["transport_reject_cases"] if len(_broken(c, model, runtime_key)) == 1]
+    for case in single:
+        broken = run_case(case, refused=True)
+        if broken != {check_of[case["reason"]]}:
+            raise Failure(f"{case['name']}: breaks {sorted(broken)}, not exactly "
+                          f"{check_of[case['reason']]}")
+        for item in _classify(case, model, accepted_bytes):
+            note(item, case["name"])
+    pairs_seen = set()
+    for case in corpus["precedence_cases"] + [
+            c for c in corpus["transport_reject_cases"] if c not in single]:
+        broken = run_case(case, refused=True)
+        index = position[case["reason"]]
+        if index + 1 >= len(model["order"]) or broken != {
+                check_of[case["reason"]], model["order"][index + 1][1]}:
+            raise Failure(f"{case['name']}: breaks {sorted(broken)}, not "
+                          f"{case['reason']} and the check after it")
+        pairs_seen.add(index)
+
+    # v1's corpus through the same device: a v 2 device accepts liveness at v 1.
+    sentinel = "f" * model["nonce_length"]
+    for key in ("cases", "reject_cases", "transport_reject_cases"):
+        for case in v1_corpus[key]:
+            raw = bytes.fromhex(case["message_hex"])
+            transport = case.get("transport")
+            retained = bool(transport and transport["retain"])
+            reason, after = judge(raw, retained, case["verifier_context"], sentinel,
+                                  model, runtime_key, off)
+            want = case.get("reason")
+            if reason != want:
+                raise Failure(f"v1 {case['name']}: {reason} where v1's corpus says {want}")
+            if after != (None if want is None else sentinel):
+                raise Failure(f"v1 {case['name']}: held nonce after is {after!r}")
+            if want is None:
+                fields = lenient_fields(raw)
+                for field in ("boot_id", "runtime_seq"):
+                    if fields[field] == model["bounds"][field][1]:
+                        note(f"{field}_max", "v1 " + case["name"])
+                    if fields[field] == model["bounds"][field][0]:
+                        note(f"{field}_min", "v1 " + case["name"])
+            else:
+                fields = lenient_fields(raw)
+                for field in ("boot_id", "runtime_seq"):
+                    lo, hi = model["bounds"][field]
+                    if fields.get(field) == hi + 1:
+                        note(f"{field}_above", "v1 " + case["name"])
+                    if fields.get(field) == lo - 1:
+                        note(f"{field}_below", "v1 " + case["name"])
+
+    for seq in corpus["rollout_sequences"]:
+        for fact in run_sequence(seq, model, runtime_key, off):
+            note(fact, seq["name"])
+
+    # coverage
+    for reason in reasons:
+        if not any(c["reason"] == reason for k in sections[1:] for c in corpus[k]):
+            raise Failure(f"coverage: no refusal for {reason}")
+    for index in range(len(model["order"]) - 1):
+        if index not in pairs_seen:
+            a, b = model["order"][index][0], model["order"][index + 1][0]
+            raise Failure(f"coverage: no precedence case for {a} before {b}")
+    # v2.md lists v 2 messages at the smallest and largest boot_id and the largest
+    # runtime_seq; the rest of each bound pair is v1's, held by v1's corpus.
+    for fact in ("v2_sets", "v1_clears", "zero_nonce", "v2_runtime_seq_max",
+                 "v2_boot_id_min", "v2_boot_id_max", "runtime_seq_min",
+                 "runtime_seq_above", "runtime_seq_below", "boot_id_above", "boot_id_below"):
+        if fact not in facts:
+            raise Failure(f"coverage: no case for {fact}")
+    for group in ROLLOUT_BULLETS.values():
+        for item in group:
+            if item not in facts:
+                raise Failure(f"coverage: no rollout sequence shows {item}")
+    items = [i for group in REFUSAL_BULLETS.values() for i in group]
+    _match(items, facts)
+    return facts
+
+
+def run_sequence(seq: dict, model: dict, runtime_key: bytes,
+                 off: frozenset[str] = frozenset()) -> set[str]:
+    """Drive one rollout sequence through the device, delivery by delivery."""
+    label = seq["name"]
+    if set(seq) != {"name", "device_accepts_versions", "verifier_context", "note", "deliveries"}:
+        raise Failure(f"{label}: fields {sorted(seq)}")
+    accepts = seq["device_accepts_versions"]
+    if accepts not in ([1], [1, 2]):
+        raise Failure(f"{label}: a device accepts only v 1 or both, not {accepts}")
+    device = dict(model, versions=tuple(v for v in model["versions"] if v in accepts))
+    ctx = dict(seq["verifier_context"])
+    held = ctx["held_nonce"]
+    facts: set[str] = set()
+    v1_seqs = [d["input"]["runtime_seq"] for d in seq["deliveries"] if d["input"]["v"] == 1]
+    v2_seqs = [d["input"]["runtime_seq"] for d in seq["deliveries"] if d["input"]["v"] == 2]
+    if set(v1_seqs) & set(v2_seqs) or any(m - 1 in v2_seqs for m in v2_seqs):
+        raise Failure(f"{label}: one runtime_seq serves both versions, or two v 2 messages")
+    history = []
+    for i, d in enumerate(seq["deliveries"]):
+        if set(d) != {"input", "liveness_hex", "signature_b64", "message_hex", "expected_reason",
+                      "expected_held_nonce", "expected_last_accepted_runtime_seq"}:
+            raise Failure(f"{label} delivery {i}: fields {sorted(d)}")
+        raw = _rebuild(d, f"{label} delivery {i}")
+        parts = split_message(raw)
+        assert parts is not None
+        if not ed25519_verify(runtime_key, parts[0], base64.b64decode(d["signature_b64"])):
+            raise Failure(f"{label} delivery {i}: a rollout message the runtime did not sign")
+        reason, after = judge(raw, False, ctx, held, device, runtime_key, off)
+        last = ctx["last_accepted_runtime_seq"]
+        if reason is None:
+            last = d["input"]["runtime_seq"]
+        got = (reason, after, last)
+        want = (d["expected_reason"], d["expected_held_nonce"],
+                d["expected_last_accepted_runtime_seq"])
+        if got != want:
+            raise Failure(f"{label} delivery {i}: recomputed {got}, expected {want}")
+        history.append((d["input"]["v"], d["input"]["runtime_seq"], reason, held, after))
+        ctx["last_accepted_runtime_seq"], held = last, after
+    accepted = [h for h in history if h[2] is None]
+    if accepts == [1] and any(h[0] == 1 for h in accepted) and all(
+            h[2] == "malformed" for h in history if h[0] == 2) and all(
+            h[4] is None for h in history) and any(h[0] == 2 for h in history):
+        facts.add("v1_only_supervised")
+    if accepts == [1, 2]:
+        last_v2 = [h for h in accepted if h[0] == 2]
+        if last_v2 and held is not None and held == last_v2[-1][4] and accepted[-1] is last_v2[-1]:
+            facts.add("ends_holding_v2")
+        for a, b in zip(history[:-1], history[1:], strict=True):
+            if a[0] == 1 and a[2] is None and a[4] is None and a[3] is not None and (
+                    b[0] == 2 and b[1] == a[1] + 1 and b[2] is None):
+                facts.add("none_between_pair")
+            if a[0] == 2 and a[2] is None and b[0] == 1 and b[1] == a[1] - 1 and (
+                    b[2] == "seq_not_increasing" and b[4] == a[4]):
+                facts.add("reordered_keeps_v2")
+        if any(h[0] == 2 and h[2] is None and h[1] - 1 not in v1_seqs for h in history):
+            facts.add("v1_missing")
+        if any(h[0] == 1 and h[2] is None and h[1] + 1 not in v2_seqs for h in history):
+            facts.add("v2_missing")
+    return facts
+
+
+def _broken(case: dict, model: dict, runtime_key: bytes) -> set[str]:
+    raw = bytes.fromhex(case["message_hex"])
+    transport = case.get("transport")
+    return broken_checks(raw, bool(transport and transport["retain"]),
+                         case["verifier_context"], model, runtime_key)
+
+
+def _classify(case: dict, model: dict, accepted_bytes: set[str]) -> list[str]:
+    """The listed refusals a single-rule case exhibits, by its own content."""
+    out = []
+    inp, ctx = case["input"], case["verifier_context"]
+    nonce = inp.get("nonce", ...)
+    raw_v = inp.get("v")
+    # A JSON boolean is not an integer; Python's True == 1 must not say otherwise.
+    v = raw_v if type(raw_v) is int else None
+    reason = case["reason"]
+    if case.get("transport", {}).get("retain"):
+        out.append("retained")
+    if v == 2 and nonce is ...:
+        out.append("v2_no_nonce")
+    if v == 1 and nonce is not ...:
+        out.append("v1_with_nonce")
+    if v == 2 and isinstance(nonce, str):
+        n = model["nonce_length"]
+        if nonce == "":
+            out.append("nonce_empty")
+        elif len(nonce) == n - 1:
+            out.append("nonce_short")
+        elif len(nonce) == n + 1:
+            out.append("nonce_long")
+        elif len(nonce) == n and nonce.lower() != nonce and all(
+                ch in model["nonce_alphabet"] for ch in nonce.lower()):
+            out.append("nonce_upper")
+        elif len(nonce) == n and nonce == nonce.lower() and any(
+                ch not in model["nonce_alphabet"] for ch in nonce):
+            out.append("nonce_non_hex")
+    if v == 2 and nonce is None:
+        out.append("nonce_null")
+    if v == 2 and type(nonce) is int:
+        out.append("nonce_integer")
+    if v == 2 and type(nonce) is bool:
+        out.append("nonce_boolean")
+    if v == 2 and set(inp) > set(model["fields"][2]):
+        out.append("v2_extra_key")
+    keys = list(inp)
+    if v == 2 and set(keys) == set(model["fields"][2]) and keys != model["fields"][2]:
+        out.append("nonce_out_of_order")
+    if v not in model["versions"]:
+        out.append("unsupported_v")
+    if reason == "seq_not_increasing":
+        seq, last, held = inp["runtime_seq"], ctx["last_accepted_runtime_seq"], ctx["held_nonce"]
+        # A held nonce names the version last accepted: none after a v 1 (the
+        # contexts here are mid-boot, last > 0), the accepted message's after a v 2.
+        if seq == last and v == 2 and case["message_hex"] in accepted_bytes and nonce == held:
+            out.append("seq_replayed_exact")
+        if seq == last and v == 2 and held is not None and nonce != held:
+            out.append("seq_reissued_fresh")
+        if seq == last and v == 2 and held is None and last > 0:
+            out.append("v2_at_seq_of_accepted_v1")
+        if seq == last and v == 1 and held is not None:
+            out.append("v1_at_seq_of_accepted_v2")
+        if seq < last:
+            out.append("seq_regressing")
+    if reason == "device_mismatch":
+        out.append("wrong_device")
+    if reason == "boot_mismatch":
+        out.append("wrong_boot")
+    if reason == "capability_hash_mismatch":
+        out.append("wrong_manifest")
+    return out
+
+
+def _match(items: list[str], facts: dict[str, list[str]]) -> None:
+    """Each listed refusal needs a case of its own: a bipartite matching."""
+    owner: dict[str, str] = {}
+
+    def place(item: str, seen: set[str]) -> bool:
+        for name in facts.get(item, []):
+            if name in seen:
+                continue
+            seen.add(name)
+            if name not in owner or place(owner[name], seen):
+                owner[name] = item
+                return True
+        return False
+
+    for item in items:
+        if not place(item, set()):
+            raise Failure(f"coverage: no case of its own for the listed refusal {item}")
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> dict:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-commands/v2.md pins")
+    return check(json.loads(corpus_bytes), json.loads(CORPUS_V1.read_bytes()), model, off)
+
+
+# --- mutations -------------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+    v1_base = json.loads(CORPUS_V1.read_bytes())
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, v1_base, model)
+        return go
+
+    def v1_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(v1_base)
+            edit(mutated)
+            check(base, mutated, model)
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts[key]:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = texts[key].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def find(name: str) -> Callable[[dict], dict]:
+        def get(c: dict) -> dict:
+            for key in ("cases", "reject_cases", "precedence_cases", "transport_reject_cases"):
+                for case in c[key]:
+                    if case["name"] == name:
+                        return case
+            raise StopIteration(name)
+        return get
+
+    def drop(name: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            for key in ("cases", "reject_cases", "precedence_cases", "transport_reject_cases"):
+                c[key] = [x for x in c[key] if x["name"] != name]
+        return edit
+
+    def flip_signature(name: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = find(name)(c)
+            raw = bytearray(base64.b64decode(case["signature_b64"]))
+            raw[40] ^= 1
+            case["signature_b64"] = base64.b64encode(bytes(raw)).decode()
+            obj = bytes.fromhex(case["liveness_hex"])
+            case["message_hex"] = (b'{"liveness":' + obj + b',"signature":"ed25519:'
+                                   + case["signature_b64"].encode() + b'"}').hex()
+        return edit
+
+    def admit_v3(m: dict) -> None:
+        m.update(versions=(1, 2, 3))
+        m["fields"][3] = m["fields"][2]
+
+    def swap(i: int) -> Callable[[dict], None]:
+        def edit(m: dict) -> None:
+            m["order"][i], m["order"][i + 1] = m["order"][i + 1], m["order"][i]
+        return edit
+
+    def check_off(name: str) -> Callable[[], None]:
+        def go() -> None:
+            run(corpus_bytes, model, frozenset({name}))
+        return go
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("accepted signature bit flipped", corpus_mutant(flip_signature("liveness_v2_first_after_boot"))),
+        ("replay refusal signature bit flipped",
+         corpus_mutant(flip_signature("reject_v2_replayed_exact_bytes"))),
+        ("nonce edited after signing", corpus_mutant(
+            lambda c: find("liveness_v2_replaces_held_nonce")(c)["input"].update(nonce="1" * 32))),
+        ("declared held nonce wrong", corpus_mutant(
+            lambda c: find("liveness_v1_clears_held_nonce")(c).update(
+                expected_held_nonce="ed8e30f48bdd225a9acdd357aaa379f2"))),
+        ("refusal changes the held nonce", corpus_mutant(
+            lambda c: find("reject_v2_wrong_boot")(c).update(expected_held_nonce=None))),
+        ("refusal relabelled", corpus_mutant(
+            lambda c: find("reject_v2_wrong_boot")(c).update(reason="capability_hash_mismatch"))),
+        ("precedence relabelled to the later check", corpus_mutant(
+            lambda c: find("reject_boot_before_manifest")(c).update(
+                reason="capability_hash_mismatch"))),
+        ("signature_valid misstated", corpus_mutant(
+            lambda c: find("reject_v2_wrong_device")(c).update(signature_valid=False))),
+        ("retained flag cleared", corpus_mutant(
+            lambda c: find("reject_v2_retained_delivery")(c)["transport"].update(retain=False))),
+        ("delivered on another device's topic", corpus_mutant(
+            lambda c: find("reject_v2_retained_delivery")(c)["transport"].update(
+                topic="ori/fw/ori-fw-00000000/runtime"))),
+        ("refusal moved to cases", corpus_mutant(
+            lambda c: c["cases"].append(dict(find("reject_v2_nonce_null")(c), name="moved")))),
+        ("runtime seed swapped", corpus_mutant(
+            lambda c: c.update(runtime_test_seed_hex="12" * 32))),
+        ("rogue seed swapped", corpus_mutant(lambda c: c.update(rogue_test_seed_hex="98" * 32))),
+        ("corpus reason renamed", corpus_mutant(
+            lambda c: c["reasons"].__setitem__("bad_signature", c["reasons"].pop("signature_invalid")))),
+        ("v1 corpus reason renamed", v1_mutant(
+            lambda c: c["reject_cases"][0].update(reason="replayed"))),
+        ("v1 corpus case dropped from the bound pairs", v1_mutant(
+            lambda c: c.update(reject_cases=[x for x in c["reject_cases"]
+                                             if x["name"] != "reject_runtime_seq_above_max"]))),
+        ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("nonce one character shorter", model_mutant(
+            lambda m: m.update(nonce_length=m["nonce_length"] - 1))),
+        ("nonce one character longer", model_mutant(
+            lambda m: m.update(nonce_length=m["nonce_length"] + 1))),
+        ("nonce alphabet admits uppercase", model_mutant(
+            lambda m: m.update(nonce_alphabet=m["nonce_alphabet"] + "ABCDEF"))),
+        ("nonce alphabet admits g", model_mutant(
+            lambda m: m.update(nonce_alphabet=m["nonce_alphabet"] + "g"))),
+        ("v 2 takes v1's grammar", model_mutant(
+            lambda m: m["fields"].__setitem__(2, m["fields"][1]))),
+        ("nonce allowed at v 1", model_mutant(
+            lambda m: m["fields"].__setitem__(1, m["fields"][2]))),
+        ("v 3 admitted under v 2's grammar", model_mutant(admit_v3)),
+        ("v 1 refused", model_mutant(lambda m: m.update(versions=(2,)))),
+        ("boot_id ceiling lowered", model_mutant(
+            lambda m: m["bounds"].__setitem__("boot_id", (1, 2**32 - 2)))),
+        ("boot_id ceiling raised", model_mutant(
+            lambda m: m["bounds"].__setitem__("boot_id", (1, 2**32)))),
+        ("boot_id zero admitted", model_mutant(
+            lambda m: m["bounds"].__setitem__("boot_id", (0, 2**32 - 1)))),
+        ("runtime_seq ceiling lowered", model_mutant(
+            lambda m: m["bounds"].__setitem__("runtime_seq", (1, 2**53 - 2)))),
+        ("runtime_seq ceiling raised", model_mutant(
+            lambda m: m["bounds"].__setitem__("runtime_seq", (1, 2**53)))),
+        ("runtime_seq zero admitted", model_mutant(
+            lambda m: m["bounds"].__setitem__("runtime_seq", (0, 2**53 - 1)))),
+        ("equal runtime_seq admitted", model_mutant(lambda m: m.update(seq_strict=False))),
+        ("extra keys admitted", model_mutant(lambda m: m.update(closed_keys=False))),
+        ("a late v 1 message exempt from the high-water mark", model_mutant(
+            lambda m: m.update(v1_seq_exempt=True))),
+        ("rollout held nonce misdeclared", corpus_mutant(
+            lambda c: c["rollout_sequences"][3]["deliveries"][1].update(expected_held_nonce=None))),
+        ("rollout last accepted misdeclared", corpus_mutant(
+            lambda c: c["rollout_sequences"][3]["deliveries"][1].update(
+                expected_last_accepted_runtime_seq=10))),
+        ("rollout device said to accept v 2", corpus_mutant(
+            lambda c: c["rollout_sequences"][0].update(device_accepts_versions=[1, 2]))),
+        ("text: reordered v 1 accepted", text_mutant(
+            "c2", "the `v` `1` message is refused as\n  `seq_not_increasing`",
+            "the `v` `1` message is accepted as\n  `seq_not_increasing`")),
+        ("text: rollout cover bullet dropped", text_mutant(
+            "c2", "- either message of the pair missing.\n", "")),
+        ("v 2 does not set the nonce", model_mutant(lambda m: m.update(v2_sets_nonce=False))),
+        ("v 1 does not clear the nonce", model_mutant(lambda m: m.update(v1_clears_nonce=False))),
+        ("refusal clears the nonce", model_mutant(lambda m: m.update(refusal_keeps_nonce=False))),
+        ("identifier alphabet widened", model_mutant(lambda m: m.update(fleet="[A-Za-z0-9._ /-]"))),
+        ("capability hash length", model_mutant(lambda m: m.update(hash_hex=63))),
+        ("signature prefix", model_mutant(lambda m: m.update(sig_prefix="ed25519-"))),
+        ("signature length", model_mutant(lambda m: m.update(sig_length=32))),
+        ("topic retained", model_mutant(lambda m: m.update(retain=True))),
+        ("text: nonce length", text_mutant("c2", "exactly 32 characters, each one of",
+                                           "exactly 33 characters, each one of")),
+        ("text: uppercase admitted", text_mutant(
+            "c2", "one containing an uppercase letter\n  or any other character, ", "")),
+        ("text: v 3 admitted", text_mutant("c2", "A `v` other than the integer `1` or `2` is",
+                                           "A `v` other than the integer `1` or `3` is")),
+        ("text: field order", text_mutant(
+            "c2", "`device_id`, `nonce`, `runtime_seq`, `v`, the lexicographic",
+            "`device_id`, `runtime_seq`, `nonce`, `v`, the lexicographic")),
+        ("text: retained check reworded", text_mutant(
+            "c2", "| 1 | it was not delivered retained |", "| 1 | it arrived live |")),
+        ("text: reason renamed", text_mutant("c2", "| `signature_invalid` |", "| `bad_signature` |")),
+        ("text: checks reordered", text_mutant(
+            "c2", "| 5 | `boot_id` equals the current boot | `boot_mismatch` |\n"
+                  "| 6 | `capability_hash` equals the accepted manifest hash | `capability_hash_mismatch` |",
+            "| 5 | `capability_hash` equals the accepted manifest hash | `capability_hash_mismatch` |\n"
+            "| 6 | `boot_id` equals the current boot | `boot_mismatch` |")),
+        ("text: refusal keeps nothing", text_mutant(
+            "c2", "A refused message changes nothing, including the held nonce\nbelow.",
+            "A refused message clears the held nonce.")),
+        ("text: v 1 keeps the nonce", text_mutant("c2", "- Accepting a `v` `1` message clears it.",
+                                                  "- Accepting a `v` `1` message keeps it.")),
+        ("text: shared high-water mark dropped", text_mutant(
+            "c2", "One high-water mark serves both versions", "Each version has its own high-water mark")),
+        ("text: precedence list changed", text_mutant(
+            "c2", "a wrong boot and a\nmanifest mismatch, and ", "")),
+        ("text: the reverse dropped from the refusal list", text_mutant(
+            "c2", ", and a `v` `1` message at the\n  `runtime_seq` of an accepted `v` `2` message;", ";")),
+        ("text: refusal bullet dropped", text_mutant("c2", "- a message delivered retained.\n", "")),
+        ("text: boot_id range", text_mutant("c1", "within `1 .. 2^32 - 1`", "within `1 .. 2^31 - 1`")),
+        ("text: runtime_seq range", text_mutant(
+            "c1", "(no leading zeros, no sign)\n  within `1 .. 2^53 - 1`. **Zero",
+            "(no leading zeros, no sign)\n  within `1 .. 2^52 - 1`. **Zero")),
+        ("text: runtime topic retained", text_mutant(
+            "c1", "| `ori/fw/<device_id>/runtime` | 1 | **no** |",
+            "| `ori/fw/<device_id>/runtime` | 1 | **yes** |")),
+        ("text: corpus digest", text_mutant(
+            "c2", "`26296ed9e2a9e5b2fafff4dd1be3cf0deccef674c148818e9f1205ff805da13d`",
+            "`" + "0" * 64 + "`")),
+    ]
+    for index in range(len(model["order"]) - 1):
+        a, b = model["order"][index][0], model["order"][index + 1][0]
+        cases.append((f"checks {a} and {b} swapped", model_mutant(swap(index))))
+    def normative_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts[{'commands': 'c2'}[doc]] = mutated
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def status_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            record = json.loads(STATUS.read_text())
+            edit(record)
+            texts = contract_texts()
+            texts["status"] = json.dumps(record, indent=2)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def reword(old: str, new: str) -> Callable[[dict], None]:
+        def edit(record: dict) -> None:
+            for entry in [record, *record.get("adoption", [])]:
+                if old in entry.get("notes", ""):
+                    entry["notes"] = entry["notes"].replace(old, new, 1)
+                    return
+            raise AssertionError(f"status note phrase missing: {old!r}")
+        return edit
+
+    for label, old, new in (
+        ('status: implementation claimed',
+         'nothing implements liveness v 2 yet',
+         'the runtime and the edge firmware implement liveness v 2'),
+        ('status: proof claimed',
+         'which is implementation and not end-to-end or HIL proof',
+         'which is end-to-end and HIL proof'),
+        ('status: runtime adoption claimed',
+         'It publishes liveness at v 1 only: it generates no nonce and keeps no liveness table.',
+         'It publishes liveness at v 2 and keeps the liveness table.'),
+    ):
+        cases.append((label, status_mutant(reword(old, new))))
+    cases.append(("status: top-level note deleted", status_mutant(lambda r: r.pop("notes"))))
+    for index in range(len(json.loads(STATUS.read_text())["adoption"])):
+        cases.append((f"status: adoption[{index}] note deleted", status_mutant(
+            lambda r, i=index: r["adoption"][i].pop("notes"))))
+    cases.append(("status: a note added", status_mutant(lambda r: r["adoption"].append(
+        dict(r["adoption"][0], notes="The edge firmware implements this version.")))))
+
+    def heading_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        return normative_mutant(doc, mutated)
+
+    docs_now = {"commands": contract_texts().get("c2") or COMMANDS_V2.read_text(),
+                "telemetry": contract_texts().get("t2") or TELEMETRY_V2.read_text()}
+    own_doc = next(doc for doc, table in SECTION_OWNERS.items()
+                   if any(who == OWNER for _, who in table))
+    places = {
+        "owned": next(path for path, who in SECTION_OWNERS[own_doc] if who == OWNER),
+        "unowned": next(path for path, who in SECTION_OWNERS[own_doc] if who is None),
+    }
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        for form_name, form in markdown.HEADING_FORMS:
+            mutated = (docs_now[own_doc][:at] + markdown.form_insertion(form)
+                       + docs_now[own_doc][at:])
+            cases.append((f"heading form in an {where} section: {form_name}",
+                          heading_mutant(own_doc, mutated)))
+
+    current = contract_texts()
+    for label, doc, mutated in normative_text_mutants(
+            {"commands": current.get("c2") or COMMANDS_V2.read_text(),
+              "telemetry": current.get("t2") or TELEMETRY_V2.read_text()}, OWNER, MUTATE_ALWAYS):
+        cases.append((label, normative_mutant(doc, mutated)))
+
+    def guard_mutant(clause: str, flip: tuple[str, str] | None) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts["c2"] = guard_text(texts["c2"], clause, flip)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    for clause, flips in GUARDS:
+        short = clause[:48]
+        cases.append((f"guard deleted: {short}", guard_mutant(clause, None)))
+        for polarity in flips:
+            cases.append((f"guard reversed ({polarity[0]} -> {polarity[1]}): {short}",
+                          guard_mutant(clause, polarity)))
+    for _, check_name in model["order"]:
+        cases.append((f"check off: {check_name}", check_off(check_name)))
+    for key in ("cases", "reject_cases", "precedence_cases", "transport_reject_cases"):
+        for case in base[key]:
+            cases.append((f"case {case['name']} dropped", corpus_mutant(drop(case["name"]))))
+    for index, seq in enumerate(base["rollout_sequences"]):
+        cases.append((f"rollout sequence {seq['name']} dropped", corpus_mutant(
+            lambda c, i=index: c["rollout_sequences"].pop(i))))
+    # Dropping an accepted case that no coverage item needs on its own is not
+    # refusable by coverage: each holds a message beyond the listed ones.
+    equivalent_drops = {
+        "case liveness_v2_after_v1 dropped":
+            "a v 2 accepted after a v 1; other v 2 cases set a held nonce, and the "
+            "shared high-water mark is held by reject_v2_same_seq_as_accepted_v1 and "
+            "reject_v1_same_seq_as_accepted_v2",
+        "rollout sequence rollout_between_pair_holds_none dropped":
+            "rollout_v2_device_ends_holding_v2_nonce also holds none after its second "
+            "interval's v 1 message and before that interval's v 2 message",
+        "rollout sequence rollout_v2_missing dropped":
+            "rollout_between_pair_holds_none also ends on an accepted v 1 message whose v 2 "
+            "message never arrives; a device cannot tell a lost v 2 from one not yet "
+            "delivered",
+        "case liveness_v2_after_sequence_gap dropped":
+            "v2.md does not list a sequence gap among its accepted cases; v1's corpus "
+            "holds one, which this script drives",
+        "case liveness_v2_first_after_boot dropped":
+            "runtime_seq 1 is also accepted at liveness_v2_min_boot_id, "
+            "liveness_v2_max_boot_id and in v1's corpus, and a first message of a boot "
+            "is not a listed item",
+    }
+    equivalent = {label: m for label, m in cases if label in equivalent_drops}
+    cases = [(label, m) for label, m in cases if label not in equivalent_drops]
+    survived = 0
+    for label, mutant in cases + list(equivalent.items()):
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            if label in equivalent:
+                print(f"REFUSED (listed as equivalent) {label}: {refused}")
+                survived += 1
+            else:
+                print(f"refused  {label}: {refused}")
+        else:
+            if label in equivalent:
+                print(f"EQUIVALENT {label}: {equivalent_drops[label]}")
+            else:
+                print(f"SURVIVED {label}")
+                survived += 1
+    # Heading-shaped lines that are not headings must change nothing.
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        before = markdown.sections(docs_now[own_doc])
+        for form_name, inserted in markdown.NOT_HEADINGS:
+            mutated = docs_now[own_doc][:at] + "\n" + inserted + docs_now[own_doc][at:]
+            shifted = [p for p, _, _ in markdown.sections(mutated)]
+            wrong = shifted != [p for p, _, _ in before] or markdown.non_canonical(mutated)
+            if not wrong and "fence" in form_name:
+                try:
+                    normative_mutant(own_doc, mutated)()
+                except Failure as refused:
+                    wrong = str(refused)
+            if wrong:
+                print(f"WRONGLY REFUSED not a heading, in an {where} section: {form_name}: {wrong}")
+                survived += 1
+            else:
+                print(f"accepted not a heading, in an {where} section: {form_name}")
+    print(f"{len(cases)} mutants, {len(equivalent)} known equivalent")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError, AttributeError) as failure:
+        print(f"firmware-commands/v2 liveness contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-commands/v2 liveness corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    v1 = json.loads(CORPUS_V1.read_bytes())
+    print(
+        f"firmware-commands/v2 liveness corpus: {len(corpus['cases'])} cases accepted with "
+        f"their held nonce, {len(corpus['reject_cases'])} refusals each for exactly its "
+        f"check, {len(corpus['precedence_cases']) + len(corpus['transport_reject_cases'])} "
+        f"transport and precedence refusals, and v1's "
+        f"{len(v1['cases']) + len(v1['reject_cases']) + len(v1['transport_reject_cases'])} "
+        f"cases through the same device, and {len(corpus['rollout_sequences'])} rollout "
+        f"sequences of {sum(len(s['deliveries']) for s in corpus['rollout_sequences'])} "
+        f"deliveries replayed"
+    )
+    print(f"{len(STATUS_NOTES)} status notes held, unchanged, in {STATUS.relative_to(ROOT)}")
+    held = [s for doc in HELD_SENTENCES.values() for body in doc.values() for s in body]
+    owned = sum(len(doc) for doc in HELD_SENTENCES.values())
+    print(f"{len(held)} sentences held, unchanged, in the {owned} sections this checker owns")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

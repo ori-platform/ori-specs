@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-commands/v2 runtime liveness corpus (liveness at v 2).
+
+Signatures come from OpenSSL through `cryptography`, under the disclosed
+runtime and rogue test seeds of the v1 liveness corpus. Object bytes are
+written field by field, so a case can carry the non-canonical bytes it is
+refused for. Nonces are fixed fixture values. Nothing here is shared with
+scripts/check-firmware-liveness-vectors-v2, which reads the grammar and the
+acceptance order from the contract.
+
+    python3 scripts/generate-firmware-liveness-vectors-v2          # write
+    python3 scripts/generate-firmware-liveness-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-commands" / "liveness-vectors-v2.json"
+
+RUNTIME_SEED_HEX = "11" * 32
+ROGUE_SEED_HEX = "99" * 32
+DEVICE_ID = "ori-fw-7c9f2b3a"
+OTHER_DEVICE_ID = "ori-fw-00000000"
+CAPABILITY_HASH = (
+    "sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d"
+)
+OTHER_CAPABILITY_HASH = "sha256:" + "ab" * 32
+BOOT_ID = 41
+RUNTIME_SEQ_MAX = 2**53 - 1
+BOOT_ID_MAX = 2**32 - 1
+
+
+def nonce(label: str) -> str:
+    """A fixed fixture nonce; a runtime draws its own from a CSPRNG."""
+    return hashlib.sha256(f"ori-specs liveness-v2 fixture nonce {label}".encode()).hexdigest()[:32]
+
+
+A, B, C, D, E, F = (nonce(x) for x in "ABCDEF")
+ZERO = "0" * 32
+
+
+def js(value: object) -> str:
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
+def fields(boot_id: object = BOOT_ID, capability_hash: object = CAPABILITY_HASH,
+           device_id: object = DEVICE_ID, n: object = A, runtime_seq: object = 1,
+           v: object = 2, *, with_nonce: bool = True,
+           order: tuple[str, ...] | None = None) -> list[tuple[str, str]]:
+    """Ordered (key, raw JSON value) pairs of one liveness object."""
+    pairs = {
+        "boot_id": js(boot_id),
+        "capability_hash": js(capability_hash),
+        "device_id": js(device_id),
+        "nonce": js(n),
+        "runtime_seq": js(runtime_seq),
+        "v": js(v),
+    }
+    keys = order or ("boot_id", "capability_hash", "device_id", "nonce", "runtime_seq", "v")
+    return [(k, pairs[k]) for k in keys if with_nonce or k != "nonce"]
+
+
+def obj_bytes(pairs: list[tuple[str, str]]) -> bytes:
+    return ("{" + ",".join(f'"{k}":{v}' for k, v in pairs) + "}").encode("utf-8")
+
+
+def context(last: int, held: str | None, boot_id: int = BOOT_ID) -> dict:
+    return {
+        "device_id": DEVICE_ID,
+        "boot_id": boot_id,
+        "capability_hash": CAPABILITY_HASH,
+        "last_accepted_runtime_seq": last,
+        "held_nonce": held,
+    }
+
+
+# (name, pairs, verifier_context, expected_held_nonce, note)
+ACCEPT = (
+    ("liveness_v2_first_after_boot", fields(n=A, runtime_seq=1), context(0, None), A,
+     "the first liveness of a boot sets the held nonce"),
+    ("liveness_v2_replaces_held_nonce", fields(n=B, runtime_seq=2), context(1, A), B,
+     "a later v 2 message replaces the held nonce"),
+    ("liveness_v1_clears_held_nonce", fields(runtime_seq=3, v=1, with_nonce=False),
+     context(2, B), None,
+     "an accepted v 1 message clears the held nonce; v1's grammar is unchanged"),
+    ("liveness_v2_after_v1", fields(n=C, runtime_seq=4), context(3, None), C,
+     "one high-water mark serves both versions; 4 exceeds the v 1 message's 3"),
+    ("liveness_v2_after_sequence_gap", fields(n=D, runtime_seq=90), context(4, C), D,
+     "a gap in runtime_seq is accepted, as in v1"),
+    ("liveness_v2_all_zero_nonce", fields(n=ZERO, runtime_seq=91), context(90, D), ZERO,
+     "the grammar admits any 32 lowercase hex digits; a device does not judge randomness"),
+    ("liveness_v2_max_runtime_seq", fields(n=E, runtime_seq=RUNTIME_SEQ_MAX),
+     context(9007, A), E, "runtime_seq at its largest value"),
+    ("liveness_v2_min_boot_id", fields(boot_id=1, n=F, runtime_seq=1),
+     context(0, None, boot_id=1), F, "boot_id at its smallest value, 1"),
+    ("liveness_v2_max_boot_id", fields(boot_id=BOOT_ID_MAX, n=F, runtime_seq=1),
+     context(0, None, boot_id=BOOT_ID_MAX), F, "boot_id at its largest value"),
+)
+
+# (name, reason, pairs, verifier_context, rogue, note)
+REJECT = (
+    ("reject_v2_missing_nonce", "malformed", fields(runtime_seq=3, with_nonce=False),
+     context(2, B), False, "v 2 requires nonce"),
+    ("reject_v1_with_nonce", "malformed", fields(n=C, runtime_seq=3, v=1), context(2, B), False,
+     "v 1 has v1's grammar exactly; nonce is an extra field there"),
+    ("reject_v2_nonce_uppercase", "malformed", fields(n=C.upper(), runtime_seq=3),
+     context(2, B), False, "hex digits are lowercase only"),
+    ("reject_v2_nonce_non_hex", "malformed", fields(n="g" + C[1:], runtime_seq=3),
+     context(2, B), False, "g is not a hexadecimal digit"),
+    ("reject_v2_nonce_31_chars", "malformed", fields(n=C[:31], runtime_seq=3), context(2, B),
+     False, "exactly 32 characters"),
+    ("reject_v2_nonce_33_chars", "malformed", fields(n=C + "0", runtime_seq=3), context(2, B),
+     False, "exactly 32 characters"),
+    ("reject_v2_nonce_empty", "malformed", fields(n="", runtime_seq=3), context(2, B), False,
+     "the empty string is not 32 characters"),
+    ("reject_v2_nonce_null", "malformed", fields(n=None, runtime_seq=3), context(2, B), False,
+     "a v 2 message always carries a nonce; null is the envelope's spelling for none held, "
+     "never liveness's"),
+    ("reject_v2_nonce_integer", "malformed", fields(n=12345, runtime_seq=3), context(2, B),
+     False, "nonce is a JSON string"),
+    ("reject_v2_nonce_boolean", "malformed", fields(n=True, runtime_seq=3), context(2, B),
+     False, "nonce is a JSON string; true is a boolean"),
+    ("reject_v2_extra_field", "malformed",
+     fields(n=C, runtime_seq=3)[:5] + [("ttl_ms", "60000")] + fields(n=C, runtime_seq=3)[5:],
+     context(2, B), False,
+     "a key outside the v 2 grammar, in canonical position; there is deliberately no TTL "
+     "field"),
+    ("reject_v2_nonce_out_of_order", "malformed",
+     fields(n=C, runtime_seq=3,
+            order=("boot_id", "capability_hash", "device_id", "runtime_seq", "nonce", "v")),
+     context(2, B), False,
+     "nonce sits between device_id and runtime_seq in canonical order; the signature is "
+     "valid over these exact bytes"),
+    ("reject_unsupported_version", "malformed", fields(n=C, runtime_seq=3, v=3), context(2, B),
+     False, "only v 1 and v 2 are defined"),
+    ("reject_v2_replayed_exact_bytes", "seq_not_increasing", fields(n=B, runtime_seq=2),
+     context(2, B), False,
+     "byte-identical to liveness_v2_replaces_held_nonce, which the device already accepted, "
+     "replayed: equal is not above"),
+    ("reject_v2_regressing_runtime_seq", "seq_not_increasing", fields(n=C, runtime_seq=1),
+     context(2, B), False, "a lower runtime_seq is refused"),
+    ("reject_v2_reissued_runtime_seq_fresh_nonce", "seq_not_increasing",
+     fields(n=F, runtime_seq=2), context(2, B), False,
+     "a runtime whose state store was restored reissues runtime_seq 2 under a fresh nonce; "
+     "the device refuses it and keeps the nonce it holds, so readings it signs still carry "
+     "the earlier nonce"),
+    ("reject_v2_same_seq_as_accepted_v1", "seq_not_increasing", fields(n=C, runtime_seq=3),
+     context(3, None), False,
+     "one high-water mark serves both versions: 3 was accepted at v 1"),
+    ("reject_v1_same_seq_as_accepted_v2", "seq_not_increasing",
+     fields(runtime_seq=2, v=1, with_nonce=False), context(2, B), False,
+     "and the reverse: 2 was accepted at v 2"),
+    ("reject_v2_wrong_device", "device_mismatch", fields(device_id=OTHER_DEVICE_ID, n=C,
+                                                         runtime_seq=3),
+     context(2, B), False, "signed for another device"),
+    ("reject_v2_wrong_boot", "boot_mismatch", fields(boot_id=BOOT_ID - 1, n=C, runtime_seq=3),
+     context(2, B), False, "signed for an earlier boot"),
+    ("reject_v2_manifest_mismatch", "capability_hash_mismatch",
+     fields(capability_hash=OTHER_CAPABILITY_HASH, n=C, runtime_seq=3), context(2, B), False,
+     "signed for another manifest"),
+    ("reject_v2_rogue_key", "signature_invalid", fields(n=C, runtime_seq=3), context(2, B), True,
+     "signed by a key the device does not hold"),
+)
+
+# Each breaks two adjacent checks and is refused for the earlier.
+PRECEDENCE = (
+    ("reject_malformed_before_device", "malformed",
+     fields(device_id=OTHER_DEVICE_ID, runtime_seq=3, with_nonce=False), context(2, B), False,
+     "a v 2 message without nonce, for another device: grammar is checked first"),
+    ("reject_device_before_signature", "device_mismatch",
+     fields(device_id=OTHER_DEVICE_ID, n=C, runtime_seq=3), context(2, B), True,
+     "for another device and signed by a rogue key: the device is checked first"),
+    ("reject_signature_before_boot", "signature_invalid",
+     fields(boot_id=BOOT_ID - 1, n=C, runtime_seq=3), context(2, B), True,
+     "a rogue key and an earlier boot: the signature is checked first"),
+    ("reject_boot_before_manifest", "boot_mismatch",
+     fields(boot_id=BOOT_ID - 1, capability_hash=OTHER_CAPABILITY_HASH, n=C, runtime_seq=3),
+     context(2, B), False, "an earlier boot and another manifest: the boot is checked first"),
+    ("reject_manifest_before_seq", "capability_hash_mismatch",
+     fields(capability_hash=OTHER_CAPABILITY_HASH, n=C, runtime_seq=2), context(2, B), False,
+     "another manifest and a replayed runtime_seq: the manifest is checked first"),
+)
+
+
+# Rollout: the runtime publishes v 1 at N, then v 2 at N+1, each interval.
+# (name, versions the device accepts, deliveries as (v, runtime_seq, nonce label), note)
+SEQUENCES = (
+    ("rollout_v1_only_device_stays_supervised", [1],
+     [(1, 10, None), (2, 11, "P"), (1, 12, None), (2, 13, "Q")],
+     "a device that implements only v 1 accepts every v 1 message and refuses every v 2 "
+     "message as malformed: it stays supervised and never holds a nonce"),
+    ("rollout_v2_device_ends_holding_v2_nonce", [1, 2],
+     [(1, 10, None), (2, 11, "P"), (1, 12, None), (2, 13, "Q")],
+     "each pair clears the held nonce and then sets it; the device ends holding the last v 2 "
+     "nonce"),
+    ("rollout_between_pair_holds_none", [1, 2],
+     [(1, 10, None), (2, 11, "P"), (1, 12, None)],
+     "after the next interval's v 1 message and before its v 2 message the device holds none"),
+    ("rollout_reordered_pair_keeps_v2_nonce", [1, 2],
+     [(2, 11, "P"), (1, 10, None)],
+     "the v 2 message arrives first and is accepted; the v 1 message is then refused as "
+     "seq_not_increasing and changes nothing, so the device keeps a nonce whose signing still "
+     "precedes everything it measures afterwards"),
+    ("rollout_v1_missing", [1, 2],
+     [(2, 11, "P")],
+     "only the v 2 message arrives: the device holds its nonce"),
+    ("rollout_v2_missing", [1, 2],
+     [(1, 10, None)],
+     "only the v 1 message arrives: the device is supervised and holds none"),
+)
+
+
+def run_sequence(versions: list, deliveries: list, last: int, held: str | None) -> list:
+    """Each delivery's verdict and the device state after it."""
+    out = []
+    for v, seq, label in deliveries:
+        n = nonce(label) if label else None
+        if v not in versions:
+            reason = "malformed"
+        elif seq <= last:
+            reason = "seq_not_increasing"
+        else:
+            reason = None
+            last = seq
+            held = n if v == 2 else None
+        out.append((v, seq, n, reason, held, last))
+    return out
+
+
+def build() -> bytes:
+    runtime = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(RUNTIME_SEED_HEX))
+    rogue = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(ROGUE_SEED_HEX))
+    runtime_public = runtime.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    rogue_public = rogue.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    def signed(pairs: list[tuple[str, str]], use_rogue: bool = False) -> dict:
+        body = obj_bytes(pairs)
+        key = rogue if use_rogue else runtime
+        signature_b64 = base64.b64encode(key.sign(body)).decode("ascii")
+        message = b'{"liveness":' + body + b',"signature":"ed25519:' + signature_b64.encode() + b'"}'
+        return {
+            "input": json.loads(body),
+            "liveness_hex": body.hex(),
+            "signature_b64": signature_b64,
+            "message_hex": message.hex(),
+        }
+
+    cases = []
+    for name, pairs, ctx, held_after, note in ACCEPT:
+        cases.append({"name": name, "note": note, "verifier_context": ctx,
+                      **signed(pairs), "expected_held_nonce": held_after})
+    reject_cases = []
+    for name, reason, pairs, ctx, use_rogue, note in REJECT:
+        reject_cases.append({"name": name, "reason": reason, "signature_valid": not use_rogue,
+                             "note": note, "verifier_context": ctx, **signed(pairs, use_rogue),
+                             "expected_held_nonce": ctx["held_nonce"]})
+    precedence_cases = []
+    for name, reason, pairs, ctx, use_rogue, note in PRECEDENCE:
+        precedence_cases.append({"name": name, "reason": reason,
+                                 "signature_valid": not use_rogue, "note": note,
+                                 "verifier_context": ctx, **signed(pairs, use_rogue),
+                                 "expected_held_nonce": ctx["held_nonce"]})
+    transport = [{
+        "name": "reject_v2_retained_delivery",
+        "reason": "retained",
+        "signature_valid": True,
+        "note": "byte-identical to a v 2 message the device must accept when delivered live",
+        "verifier_context": context(2, B),
+        "transport": {"topic": f"ori/fw/{DEVICE_ID}/runtime", "retain": True},
+        **signed(fields(n=C, runtime_seq=3)),
+        "expected_held_nonce": B,
+    }, {
+        "name": "reject_retained_before_malformed",
+        "reason": "retained",
+        "signature_valid": True,
+        "note": "a retained delivery of a v 2 message without nonce: delivery is decided "
+                "before content",
+        "verifier_context": context(2, B),
+        "transport": {"topic": f"ori/fw/{DEVICE_ID}/runtime", "retain": True},
+        **signed(fields(runtime_seq=3, with_nonce=False)),
+        "expected_held_nonce": B,
+    }]
+
+    sequences = []
+    for name, versions, deliveries, note in SEQUENCES:
+        start = context(9, None)
+        steps = []
+        for v, seq, n, reason, held_after, last_after in run_sequence(versions, deliveries, 9,
+                                                                     None):
+            pairs = fields(n=n, runtime_seq=seq) if v == 2 else fields(runtime_seq=seq, v=1,
+                                                                       with_nonce=False)
+            steps.append({**signed(pairs), "expected_reason": reason,
+                          "expected_held_nonce": held_after,
+                          "expected_last_accepted_runtime_seq": last_after})
+        sequences.append({"name": name, "device_accepts_versions": versions,
+                          "verifier_context": start, "deliveries": steps, "note": note})
+
+    corpus = {
+        "contract": "ori-specs/firmware-commands/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for runtime liveness at v 2, under firmware-commands/v2 Runtime "
+            "Liveness at v 2. A device must accept every case in 'cases', leaving the held "
+            "nonce its 'expected_held_nonce' gives, and refuse every case in 'reject_cases', "
+            "'precedence_cases' and 'transport_reject_cases' with the declared reason, leaving the held nonce "
+            "unchanged. Each case is evaluated against its own verifier_context. Signed with "
+            "the TEST-ONLY runtime and rogue seeds of the v1 liveness corpus; never use them "
+            "in production. Nonces are fixed fixture values; a runtime draws its own from a "
+            "cryptographically secure source. Each rollout sequence is a run of "
+            "deliveries to one device that accepts the listed versions, starting from its "
+            "verifier_context; each delivery gives its reason, null when accepted, and the "
+            "device state after it."
+        ),
+        "acceptance_order": ["retained", "parses", "device_id", "signature", "boot_id",
+                             "capability_hash", "runtime_seq"],
+        "runtime_test_seed_hex": RUNTIME_SEED_HEX,
+        "runtime_public_key_hex": runtime_public.hex(),
+        "runtime_public_key_b64": base64.b64encode(runtime_public).decode("ascii"),
+        "rogue_test_seed_hex": ROGUE_SEED_HEX,
+        "rogue_public_key_hex": rogue_public.hex(),
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "topic": "ori/fw/<device_id>/runtime",
+        "retain": False,
+        "qos": 1,
+        "reasons": {
+            "malformed": "the message violates the fixed grammar of its v",
+            "device_mismatch": "device_id names another device",
+            "signature_invalid": "the signature does not verify against the runtime key",
+            "boot_mismatch": "boot_id is not the device's current boot",
+            "capability_hash_mismatch": "capability_hash is not the accepted manifest hash",
+            "seq_not_increasing": "runtime_seq does not exceed the last accepted in this boot",
+            "retained": "the message was delivered retained",
+        },
+        "cases": cases,
+        "reject_cases": reject_cases,
+        "precedence_cases": precedence_cases,
+        "transport_reject_cases": transport,
+        "rollout_sequences": sequences,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

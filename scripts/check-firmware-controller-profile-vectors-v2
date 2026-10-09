@@ -82,6 +82,9 @@ import copy
 import decimal
 import fractions
 import hashlib
+import importlib.machinery
+import importlib.util
+import types
 import json
 import math
 import pathlib
@@ -90,6 +93,21 @@ import sys
 import unicodedata
 from collections.abc import Callable
 from typing import Any
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
@@ -170,11 +188,67 @@ PINNED = (
      "`2^(16 × register_count) − 1`, which a consumer reads by value whether it is "
      "encoded as `5` or `5.0`."),
 )
+# The Receivers clauses that restrict who may bound a poll's age, what a state
+# or a time may be presented as, and what an alarm or a qualification licenses,
+# each with the polarities a mutant reverses. Each is pinned word for word.
+RECEIVER_GUARDS = (
+    ("A receiver MUST NOT present a reading as qualified unless the manifest the reading "
+     "was accepted under says `qualified` for its channel",
+     [("MUST NOT", "MAY"), ("unless", "even when")]),
+    ("It is not a permission, it is not proof that the foreign controller reports "
+     "truthfully, and it is not physical proof of anything. It never changes a tier, an "
+     "approval, a trust grade or any authority.",
+     [("It is not a permission", "It is a permission"), ("It never changes", "It may change")]),
+    ("A receiver presents an alarm's state as of the reading it was read from, never as the "
+     "controller's state now. Not asserted means not asserted at that poll and nothing more: "
+     "a receiver MUST NOT present it as proof that the alarm did not occur between polls, "
+     "that it cleared at any particular time, or that it is clear now.",
+     [("never as the controller's state now", "or as the controller's state now"),
+      ("MUST NOT", "MAY")]),
+    ("How long ago a reading's poll was can be bounded only by the runtime that signed the "
+     "liveness message the reading's `liveness_nonce` names, only from above, and only as "
+     "[How Old A Reading Is](#how-old-a-reading-is) states. Every other receiver cannot "
+     "bound it.",
+     [("only by the runtime", "by any runtime"), ("only from above", "from above or below"),
+      ("cannot bound it", "can bound it")]),
+    ("so a receiver never infers from accepting a reading recently, or from its "
+     "`device_uptime_ms`, that the poll was recent.", [("never infers", "may infer")]),
+    ("The bound dates the device's poll, not the controller's own sampling of its alarm "
+     "register. It never presents the state as the controller's state now, or as current "
+     "within any interval: a recent poll does not establish what the controller has done "
+     "since. Without a bound, and at every other receiver, the state is presented as of its "
+     "reading.",
+     [("not the controller's own sampling", "and the controller's own sampling"),
+      ("It never presents", "It may present"),
+      ("does not establish", "establishes")]),
+    ("A receiver MUST NOT treat silence, a refused reading or a fault as an alarm clearing.",
+     [("MUST NOT", "MAY")]),
+    ("The word value of a `controller_alarm_word` channel is never a measurement: it is not "
+     "averaged, compared with a numeric threshold or presented as a quantity.",
+     [("is never a measurement", "may be a measurement")]),
+    ("any time shown with it is named for where it came from, the receiver's acceptance "
+     "time, the device's own report or the runtime liveness bound, and never as the time of "
+     "the poll.", [("and never as the time of the poll", "or as the time of the poll")]),
+    ("An alarm's `id` or `meaning` confers no authority.",
+     [("confers no authority", "confers authority")]),
+)
 RECEIVER_PINNED = (
     ("A receiver presents an alarm's state as of the reading it was read from, never "
      "as the controller's state now."),
-    ("How long ago a reading's poll was is not something a receiver can bound from "
-     "this version."),
+    ("How long ago a reading's poll was can be bounded only by the runtime that "
+     "signed the liveness message the reading's `liveness_nonce` names, only from "
+     "above, and only as [How Old A Reading Is](#how-old-a-reading-is) states. Every "
+     "other receiver cannot bound it."),
+    ("The signing runtime may present an alarm's state from a reading with a bound as "
+     "a snapshot polled no more than A ago, as of T, where A is the reading's bound "
+     "when it is computed and T anchors it as [How Old A Reading Is]"
+     "(#how-old-a-reading-is) requires. The bound dates the device's poll, not the "
+     "controller's own sampling of its alarm register. It never presents the state as "
+     "the controller's state now, or as current within any interval: a recent poll "
+     "does not establish what the controller has done since. Without a bound, and at "
+     "every other receiver, the state is presented as of its reading."),
+    ("Any accepted reading of the channel restarts the bound, whether or not its age "
+     "is bounded."),
     ("The channel's latest reading is the last reading for the channel the receiver "
      "accepted under the device's active anchor, with its active key epoch and active "
      "manifest. Any change to the active anchor, the promotion of a manifest, the "
@@ -318,10 +392,9 @@ def _flat(text: str) -> str:
 
 
 def _section(text: str, heading: str) -> str:
-    start = text.index(heading)
-    rest = text[start + len(heading):]
-    end = re.search(r"\n#{2,3} ", rest)
-    return rest if end is None else rest[: end.start()]
+    """A heading's own text, to the next heading of any depth, by the shared
+    CommonMark recognizer, so a heading-shaped line in a fence ends nothing."""
+    return markdown.own_body(text, heading)
 
 
 def _after(section: str, phrase: str) -> list[tuple[list[str], str]]:
@@ -372,6 +445,25 @@ def _alphabet(spec: str) -> frozenset[str]:
     return frozenset(chars)
 
 
+def _words(text: str) -> str:
+    return r"\s+".join(re.escape(word) for word in text.split())
+
+
+def guard_text(raw: str, clause: str, flip: tuple[str, str] | None) -> str:
+    """The text with a pinned clause deleted, or with one polarity in it reversed."""
+    span = re.search(_words(clause), raw)
+    if span is None:
+        raise AssertionError(f"guard clause missing: {clause!r}")
+    if flip is None:
+        return raw[: span.start()] + raw[span.end():]
+    segment = span.group(0)
+    hit = re.search(_words(flip[0]), segment)
+    if hit is None:
+        raise AssertionError(f"polarity {flip[0]!r} missing from its clause")
+    return (raw[: span.start()] + segment[: hit.start()] + flip[1] + segment[hit.end():]
+            + raw[span.end():])
+
+
 def contract_texts() -> dict[str, str]:
     return {"t2": TELEMETRY_V2.read_text(), "dp": PROVISIONING.read_text()}
 
@@ -399,7 +491,7 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
         if sentence not in flat:
             raise Failure(f"v2 profile document no longer says {sentence!r}")
     receivers = _flat(_section(t2, "### Receivers"))
-    for sentence in RECEIVER_PINNED:
+    for sentence in RECEIVER_PINNED + tuple(clause for clause, _ in RECEIVER_GUARDS):
         if sentence not in receivers:
             raise Failure(f"v2 Receivers no longer says {sentence!r}")
     golden = _section(t2, "## Golden Vectors")
@@ -2402,6 +2494,19 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("every float-integer refusal dropped", corpus_mutant(ints_only("float_is_int"))),
         ("dependent rules judged before their premise", rule_off("dependents")),
     ]
+    def guard_mutant(clause: str, flip: tuple[str, str] | None) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts["t2"] = guard_text(texts["t2"], clause, flip)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    for clause, flips in RECEIVER_GUARDS:
+        short = clause[:48]
+        cases.append((f"guard deleted: {short}", guard_mutant(clause, None)))
+        for polarity in flips:
+            cases.append((f"guard reversed ({polarity[0]} -> {polarity[1]}): {short}",
+                          guard_mutant(clause, polarity)))
     for state in base["states"]:
         cases.append((f"state case {state['name']} dropped",
                       corpus_mutant(drop("states", state["name"]))))
@@ -2440,6 +2545,18 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             else:
                 print(f"SURVIVED {label}")
                 survived += 1
+    # A heading-shaped line inside a fence in Receivers must not end the section.
+    texts = contract_texts()
+    at = texts["t2"].index("\n### Receivers\n") + len("\n### Receivers\n")
+    for fence in ("```text\n### Not A Heading\n## Nor This\n```\n\n", "~~~\n#### Not A Heading\n~~~\n\n"):
+        texts["t2"] = contract_texts()["t2"][:at] + "\n" + fence + contract_texts()["t2"][at:]
+        try:
+            run(corpus_bytes, contract_model(texts))
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"WRONGLY REFUSED a fenced heading-shaped line in Receivers: {refused}")
+            survived += 1
+        else:
+            print(f"accepted a fenced heading-shaped line in Receivers: {fence.split(chr(10))[1]!r}")
     print(f"{len(cases)} mutants, {len(equivalent)} known equivalent")
     return survived
 

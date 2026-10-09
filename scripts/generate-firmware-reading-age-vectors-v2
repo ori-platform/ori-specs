@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 reading-age corpus (How Old A Reading Is).
+
+Each case is a sequence of events at the signing runtime, on its
+suspend-counting clock in nanoseconds, with every query's expected bound
+computed here by a small model of the liveness table. Nothing here is shared
+with scripts/check-firmware-reading-age-vectors-v2, which recomputes every
+query from the contract's text. Nonces are fixed fixture values.
+
+    python3 scripts/generate-firmware-reading-age-vectors-v2          # write
+    python3 scripts/generate-firmware-reading-age-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-telemetry" / "reading-age-vectors-v2.json"
+
+S = 1_000_000_000  # nanoseconds per second
+RETENTION_NS = 3600 * S
+DEVICE = "ori-fw-7c9f2b3a"
+OTHER_DEVICE = "ori-fw-00000000"
+HASH = "sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d"
+OTHER_HASH = "sha256:" + "ab" * 32
+BOOT = 41
+PER_DEVICE = 240
+TOTAL = 100000
+
+
+def nonce(label: str) -> str:
+    return hashlib.sha256(f"ori-specs reading-age fixture nonce {label}".encode()).hexdigest()[:32]
+
+
+N = {x: nonce(x) for x in "ABCDEFGH"}
+
+
+def sign(t: int | None, n: str, seq: int, device: str = DEVICE, boot: int = BOOT,
+         chash: str = HASH) -> dict:
+    return {"kind": "sign_liveness", "t_ns": t, "device_id": device, "boot_id": boot,
+            "capability_hash": chash, "runtime_seq": seq, "nonce": n}
+
+
+def sign_v1(t: int, seq: int, device: str = DEVICE, boot: int = BOOT,
+            chash: str = HASH) -> dict:
+    return {"kind": "sign_liveness_v1", "t_ns": t, "device_id": device, "boot_id": boot,
+            "capability_hash": chash, "runtime_seq": seq}
+
+
+def sign_failed(t: int, n: str, seq: int, device: str = DEVICE, boot: int = BOOT,
+                chash: str = HASH) -> dict:
+    return {"kind": "sign_failed", "t_ns": t, "device_id": device, "boot_id": boot,
+            "capability_hash": chash, "runtime_seq": seq, "nonce": n}
+
+
+def accept(t: int, seq: int, n: str | None, channels: list | None = None, v: int = 2,
+           device: str = DEVICE, boot: int = BOOT, chash: str = HASH) -> dict:
+    e = {"kind": "accept", "t_ns": t, "v": v, "device_id": device, "boot_id": boot,
+         "capability_hash": chash, "seq": seq,
+         "channels": ["ch0"] if channels is None else channels}
+    if v == 2:
+        e["liveness_nonce"] = n
+    return e
+
+
+def restart(t: int) -> dict:
+    return {"kind": "restart", "t_ns": t}
+
+
+def restore(t: int) -> dict:
+    return {"kind": "store_restore", "t_ns": t}
+
+
+def suspend(t: int, resume: int) -> dict:
+    return {"kind": "suspend", "t_ns": t, "resume_t_ns": resume}
+
+
+def q_msg(t: int, seq: int, device: str = DEVICE, boot: int = BOOT) -> dict:
+    return {"kind": "query", "t_ns": t, "message": {"device_id": device, "boot_id": boot,
+                                                     "seq": seq}}
+
+
+def q_chan(t: int, channel: str = "ch0", device: str = DEVICE) -> dict:
+    return {"kind": "query", "t_ns": t, "channel": {"device_id": device, "channel": channel}}
+
+
+def run(per_device: int, total: int, events: list) -> list:
+    """Return the events with each query's expected result attached."""
+    table: dict[str, dict] = {}
+    held: dict[tuple, int | None] = {}  # accepted since the last restart -> signing start
+    history: set[tuple] = set()  # every accepted message, which survives a restart
+    latest: dict[tuple, tuple] = {}  # (device, channel) -> message key, since the last restart
+    out = []
+    last_t = -1
+    for e in events:
+        e = dict(e)
+        t = e["t_ns"]
+        if t is not None:
+            assert t >= last_t, "events are in clock order"
+            last_t = e.get("resume_t_ns", t)
+        kind = e["kind"]
+        if kind in ("sign_liveness", "sign_failed"):
+            assert e["nonce"] not in table, "a runtime regenerates a colliding nonce"
+            if t is not None:
+                for k in [k for k, v in table.items() if t - v["t"] > RETENTION_NS]:
+                    del table[k]
+                # Earliest signing start first; a tie goes to the nonce first in byte order.
+                order = lambda k: (table[k]["t"], k.encode("ascii"))  # noqa: E731
+                mine = [k for k, v in table.items() if v["device_id"] == e["device_id"]]
+                if len(mine) >= per_device:
+                    del table[min(mine, key=order)]
+                if len(table) >= total:
+                    del table[min(table, key=order)]
+                # A failed signing's entry is discarded; evictions its recording made stand.
+                if kind == "sign_liveness":
+                    table[e["nonce"]] = {"device_id": e["device_id"], "boot_id": e["boot_id"],
+                                         "capability_hash": e["capability_hash"], "t": t}
+        elif kind == "accept":
+            key = (e["device_id"], e["boot_id"], e["seq"])
+            assert key not in history, "each accepted message is new"
+            history.add(key)
+            start = None
+            n = e.get("liveness_nonce")
+            if e["v"] == 2 and n is not None:
+                entry = table.get(n)
+                if (entry is not None and entry["device_id"] == e["device_id"]
+                        and entry["boot_id"] == e["boot_id"]
+                        and entry["capability_hash"] == e["capability_hash"]
+                        and t - entry["t"] <= RETENTION_NS):
+                    start = entry["t"]
+            held[key] = start
+            for ch in e["channels"]:
+                latest[(e["device_id"], ch)] = key
+        elif kind == "restart":
+            table.clear()
+            held.clear()
+            latest.clear()
+        elif kind in ("sign_liveness_v1", "store_restore", "suspend"):
+            pass  # neither changes the table; the clock counts suspended time
+        elif kind == "query":
+            if "message" in e:
+                m = e["message"]
+                key = (m["device_id"], m["boot_id"], m["seq"])
+                assert key in history, "a query names an accepted message"
+                found = key
+            else:
+                c = e["channel"]
+                found = latest.get((c["device_id"], c["channel"]))
+            start = held.get(found) if found is not None else None
+            expected: dict = {}
+            if "channel" in e:
+                expected["latest"] = (None if found is None
+                                      else {"boot_id": found[1], "seq": found[2]})
+            if start is None:
+                expected["bound"] = "none"
+            else:
+                ns = t - start
+                expected["bound"] = "upper"
+                expected["age_upper_ns"] = ns
+                expected["age_upper_ms_rounded_up"] = -(-ns // 1_000_000)
+            e["expected"] = expected
+        else:
+            raise AssertionError(kind)
+        out.append(e)
+    return out
+
+
+A, B, C, D, E, F, G, H = (N[x] for x in "ABCDEFGH")
+
+# (name, per_device, total, events, note)
+CASES = (
+    ("matched_and_growing", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, A), q_msg(4 * S, 100), q_msg(64 * S, 100),
+      q_chan(64 * S)],
+     "the bound is computed at use and grows after receipt"),
+    ("rounds_up", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(1 * S + 2_500_001, 100, A), q_msg(1 * S + 2_500_001, 100)],
+     "2500001 ns is shown as 3 ms, never 2"),
+    ("unknown_nonce", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, B), q_msg(4 * S, 100)],
+     "a nonce the runtime never signed bounds nothing"),
+    ("null_nonce", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, None), q_msg(4 * S, 100)],
+     "a reading measured while the device held no nonce has no bound"),
+    ("v1_envelope", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, None, v=1), q_msg(4 * S, 100)],
+     "a v 1 envelope carries no nonce and has no bound"),
+    ("other_device", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, A, device=OTHER_DEVICE),
+      q_msg(4 * S, 100, device=OTHER_DEVICE)],
+     "an entry matches only the device it was signed for"),
+    ("other_boot", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, A, boot=BOOT + 1),
+      q_msg(4 * S, 100, boot=BOOT + 1)],
+     "an entry matches only the boot it was signed for"),
+    ("other_manifest", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, A, chash=OTHER_HASH), q_msg(4 * S, 100)],
+     "an entry matches only the manifest it was signed for"),
+    ("accepted_exactly_an_hour_after_signing", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(1 * S + RETENTION_NS, 100, A),
+      q_msg(1 * S + RETENTION_NS, 100)],
+     "an entry still serves a lookup exactly one hour after its signing start"),
+    ("accepted_past_the_hour", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(1 * S + RETENTION_NS + 1, 100, A),
+      q_msg(1 * S + RETENTION_NS + 1, 100)],
+     "one nanosecond later the entry no longer serves one"),
+    ("matched_reading_older_than_an_hour", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(11 * S, 100, A), q_msg(1 * S + 2 * RETENTION_NS, 100)],
+     "the hour limits matching, not age: a matched reading keeps its signing start"),
+    ("per_device_eviction", 2, TOTAL,
+     [sign(1 * S, A, 1), sign(16 * S, B, 2), sign(31 * S, C, 3), accept(32 * S, 100, A),
+      accept(33 * S, 101, B), q_msg(33 * S, 100), q_msg(33 * S, 101)],
+     "the third entry for a device with room for two evicts its earliest"),
+    ("total_eviction", 2, 2,
+     [sign(1 * S, A, 1), sign(2 * S, B, 1, device=OTHER_DEVICE),
+      sign(3 * S, C, 2, device=OTHER_DEVICE), accept(4 * S, 100, A),
+      accept(5 * S, 200, B, device=OTHER_DEVICE), q_msg(5 * S, 100),
+      q_msg(5 * S, 200, device=OTHER_DEVICE)],
+     "with room for two in total, the third entry evicts the table's earliest, another "
+     "device's"),
+    ("eviction_tie_goes_to_first_nonce_in_byte_order", 2, TOTAL,
+     [sign(1 * S, A, 1), sign(1 * S, B, 2), sign(16 * S, C, 3), accept(17 * S, 100, A),
+      accept(17 * S, 101, B), q_msg(17 * S, 100), q_msg(17 * S, 101)],
+     "two entries share a signing start; the one whose nonce sorts first in byte order is "
+     "evicted"),
+    ("hour_old_entry_survives_a_recording_with_room", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), sign(1 * S + RETENTION_NS, B, 2),
+      accept(1 * S + RETENTION_NS, 100, A), q_msg(1 * S + RETENTION_NS, 100)],
+     "recording another entry exactly an hour after the first, with room to spare, does not "
+     "expire the first: its age is exactly one hour, which is still usable"),
+    ("per_device_bound_before_total_bound", 2, 3,
+     [sign(1 * S, nonce("X1"), 1, device=OTHER_DEVICE), sign(2 * S, nonce("Y1"), 1),
+      sign(3 * S, nonce("Y2"), 2), sign(4 * S, nonce("Y3"), 3),
+      accept(5 * S, 200, nonce("X1"), device=OTHER_DEVICE), accept(5 * S, 100, nonce("Y1")),
+      accept(5 * S, 101, nonce("Y2")),
+      q_msg(5 * S, 200, device=OTHER_DEVICE), q_msg(5 * S, 100), q_msg(5 * S, 101)],
+     "the per-device bound is applied first: it evicts Y1, after which the table is under its "
+     "total bound, so the other device's earlier X1 survives"),
+    ("per_device_bound_spans_boots", 2, TOTAL,
+     [sign(1 * S, A, 1), sign(2 * S, B, 1, boot=BOOT + 1), sign(3 * S, C, 2, boot=BOOT + 1),
+      accept(4 * S, 100, A), q_msg(4 * S, 100)],
+     "the per-device bound counts every entry for the device_id, whatever its boot_id: the "
+     "third entry evicts the earlier boot's"),
+    ("entry_at_the_hour_still_counts", 2, TOTAL,
+     [sign(1 * S, A, 1), sign(10 * S, B, 2), sign(1 * S + RETENTION_NS, C, 3),
+      accept(1 * S + RETENTION_NS, 100, A), accept(1 * S + RETENTION_NS, 101, B),
+      q_msg(1 * S + RETENTION_NS, 100), q_msg(1 * S + RETENTION_NS, 101)],
+     "at exactly one hour the first entry is still usable and still counts, so recording a "
+     "third evicts it: size eviction removes a usable entry"),
+    ("rollout_failed_v2_signing_leaves_no_entry", PER_DEVICE, TOTAL,
+     [sign_v1(1 * S, 10), sign_failed(1 * S + 1_000_000, A, 11),
+      accept(2 * S, 100, None), accept(3 * S, 101, A), q_msg(3 * S, 100), q_msg(3 * S, 101)],
+     "the interval's v 1 message is published; its v 2 signing fails and leaves no entry, so "
+     "the device holds no nonce and a nonce from the failed signing matches nothing"),
+    ("failed_signing_eviction_stands", 2, TOTAL,
+     [sign(1 * S, A, 1), sign(2 * S, B, 2), sign_failed(3 * S, C, 3), accept(4 * S, 100, A),
+      accept(4 * S, 101, B), q_msg(4 * S, 100), q_msg(4 * S, 101)],
+     "recording the failed signing's entry evicted the earliest; discarding it does not "
+     "restore what it evicted"),
+    ("rollout_reading_after_pair_bounded_by_v2", PER_DEVICE, TOTAL,
+     [sign_v1(1 * S, 10), sign(1 * S + 1_000_000, A, 11), accept(3 * S, 100, A),
+      q_msg(3 * S, 100)],
+     "a reading measured after the device accepted the pair carries the v 2 nonce and is "
+     "bounded by its signing start"),
+    ("rollout_reading_between_pair_unbounded", PER_DEVICE, TOTAL,
+     [sign_v1(1 * S, 10), accept(1 * S + 500_000, 100, None), sign(1 * S + 1_000_000, A, 11),
+      q_msg(2 * S, 100)],
+     "a reading measured after the device accepted the v 1 message and before the v 2 "
+     "message carries null and has no bound"),
+    ("restart_before_acceptance", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), restart(2 * S), accept(4 * S, 100, A), q_msg(4 * S, 100)],
+     "a restart empties the table"),
+    ("restart_after_acceptance", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(4 * S, 100, A), q_msg(4 * S, 100), restart(5 * S),
+      q_msg(6 * S, 100), q_chan(6 * S)],
+     "a restart drops the signing start held with an accepted message; the stored reading "
+     "has no bound and the channel has no latest reading"),
+    ("live_store_restore_reissues_runtime_seq", PER_DEVICE, TOTAL,
+     [sign(10 * S, A, 5), accept(12 * S, 100, A), restore(20 * S),
+      sign(30 * S, B, 5), accept(40 * S, 101, A), q_msg(40 * S, 101), q_msg(40 * S, 100)],
+     "a store restore while the runtime runs reissues runtime_seq 5 under a fresh nonce; the "
+     "device refuses it and keeps signing the first nonce, which the table still dates by "
+     "its own signing start"),
+    ("restart_and_restore_reissue_with_fresh_nonce", PER_DEVICE, TOTAL,
+     [sign(10 * S, A, 5), restart(20 * S), restore(21 * S), sign(30 * S, B, 5),
+      accept(3600 * S, 100, A), q_msg(3600 * S, 100), sign(3601 * S, C, 6),
+      accept(3602 * S, 101, C), q_msg(3602 * S, 101)],
+     "after a restart and a restore, runtime_seq 5 is reissued under nonce B; an old reading "
+     "carrying nonce A has no bound, where a bound keyed by runtime_seq would date it by B's "
+     "signing; the next runtime_seq the device accepts bounds again"),
+    ("heartbeat_does_not_refresh_channel", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), accept(2 * S, 100, A), sign(16 * S, B, 2),
+      accept(17 * S, 101, B, channels=[]), q_chan(20 * S), q_msg(20 * S, 101)],
+     "the channel's latest reading is still the reading; the heartbeat's own bound is "
+     "newer and says nothing about the channel"),
+    ("unclocked_signing", PER_DEVICE, TOTAL,
+     [sign(None, A, 1), accept(4 * S, 100, A), q_msg(4 * S, 100)],
+     "a signing whose start could not be read records no entry"),
+    ("suspended_time_counts", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), suspend(2 * S, 1802 * S), accept(1803 * S, 100, A),
+      q_msg(1803 * S, 100)],
+     "the clock counts the thirty minutes the host was suspended, so the bound includes them"),
+    ("drained_backlog", PER_DEVICE, TOTAL,
+     [sign(1 * S, A, 1), sign(16 * S, B, 2), sign(31 * S, C, 3),
+      accept(900 * S, 100, A), accept(900 * S, 101, A), accept(900 * S, 102, B),
+      accept(901 * S, 103, C), q_msg(901 * S, 100), q_msg(901 * S, 102),
+      q_msg(901 * S, 103), q_chan(901 * S)],
+     "readings polled under older nonces and delivered together after an outage are each "
+     "bounded by the nonce they were measured under"),
+)
+
+
+def build() -> bytes:
+    cases = [{"name": name, "per_device_bound": per, "total_bound": tot,
+              "events": run(per, tot, events), "note": note}
+             for name, per, tot, events, note in CASES]
+    corpus = {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for firmware-telemetry/v2 How Old A Reading Is, at the signing "
+            "runtime. Each case runs its events in order, on a clock that counts suspended "
+            "time, in nanoseconds, under the case's per-device and total table bounds. Every "
+            "accept event is a message already accepted under every check; the corpus does "
+            "not exercise verification. A conforming runtime reproduces every query's "
+            "'expected'. Nonces are fixed fixture values."
+        ),
+        "clock": "monotonic, nanoseconds, counting suspended time",
+        "retention_ns": RETENTION_NS,
+        "event_kinds": {
+            "sign_liveness": "the runtime signs a v 2 liveness message; t_ns is its signing "
+                             "start, or null when the clock could not be read",
+            "sign_liveness_v1": "the runtime signs a v 1 liveness message, which carries no "
+                                "nonce and records nothing",
+            "sign_failed": "the runtime begins signing a v 2 liveness message at t_ns and the "
+                           "signing fails; its entry is discarded and nothing is published",
+            "accept": "the runtime accepts an envelope; channels lists its readings' "
+                      "channels, empty for a heartbeat",
+            "restart": "the runtime's process restarts",
+            "store_restore": "the runtime's state store is restored while it runs",
+            "suspend": "the host is suspended from t_ns until resume_t_ns",
+            "query": "the bound of a message, or of a channel's latest reading, at t_ns",
+        },
+        "cases": cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

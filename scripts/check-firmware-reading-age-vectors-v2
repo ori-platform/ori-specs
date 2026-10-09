@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 reading-age corpus against the contract.
+
+Shares no code with scripts/generate-firmware-reading-age-vectors-v2. Every
+query is recomputed by this script's own model of the signing runtime's
+liveness table, built from "How Old A Reading Is" in firmware-telemetry/v2.md:
+the retention and its edges, the entry's fields, the eviction order and its
+tie-breaker, what a restart, a store restore and a suspension do, matching at
+acceptance, the age at use and its rounding. The retention, the matching
+fields, the display unit, the event kinds and the cases the corpus must cover
+are read from the text, whose governing sentences are pinned word for word.
+Nothing is read from the generator.
+
+Held to:
+
+- each case: its events are of the six kinds, carry exactly their fields, and
+  run in clock order; each nonce has the grammar of firmware-commands/v2;
+- each query: its bound, in nanoseconds and rounded up to whole milliseconds,
+  or no bound, and a channel query's latest reading, recomputed;
+- coverage: every event kind, every item the text says the cases cover (each
+  as a property of the run, not of a case name), and each bound at its edge
+  and one past it: matching at the hour and one nanosecond later, expiry at
+  the hour and one nanosecond later, each size bound reached and not, and a
+  bound a whole number of milliseconds and one that is not;
+- the digest v2.md pins is the corpus's.
+
+    python3 scripts/check-firmware-reading-age-vectors-v2
+    python3 scripts/check-firmware-reading-age-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's own
+rule table and constants in turn; every mutant must be refused, except those
+listed as equivalent with the reason no corpus could refuse them.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import types
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-telemetry" / "reading-age-vectors-v2.json"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+COMMANDS_V2 = ROOT / "firmware-commands" / "v2.md"
+
+
+class Failure(Exception):
+    pass
+
+
+# --- contract text ------------------------------------------------------------------
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def section(text: str, heading: str) -> str:
+    """A heading's text and its subsections, by the shared CommonMark recognizer."""
+    return markdown.subtree(text, heading)
+
+
+def need(text: str, sentence: str, where: str) -> None:
+    if sentence not in flat(text):
+        raise Failure(f"{where} no longer says: {sentence!r}")
+
+
+BOUND_SENTENCES = (
+    "The signing runtime keeps one entry per nonce it signs. An entry holds the liveness "
+    "object's `device_id`, `boot_id` and `capability_hash`, and the signing start.",
+    "**The signing start** is a reading of the runtime's clock taken before it begins "
+    "signing the message, and is never changed afterwards. The entry is recorded at that "
+    "same instant: expiry and both size bounds are judged as of the signing start, and "
+    "the entry serves lookups from then on. A signing that fails discards its entry, "
+    "which then holds no slot; any eviction made when it was recorded stands.",
+    "**The clock** is monotonic, counts in nanoseconds, and keeps counting while the "
+    "runtime's host is suspended",
+    "**No clock, no entry.** If the clock cannot be read before signing, the runtime "
+    "records no entry.",
+    "**Memory only.** The table is never persisted and never restored. A process restart "
+    "or a host reboot empties it. Restoring the runtime's state store while the process "
+    "runs neither empties it nor changes any entry.",
+    "and is expired once its age exceeds that. An expired entry is evicted, and no longer "
+    "counts toward either size bound. The hour limits how late a reading can be matched. "
+    "It does not limit how old a matched reading can be shown to be.",
+    "**Size.** The runtime bounds the table per device, counting every entry for a "
+    "`device_id` whatever its `boot_id` or `capability_hash`, and in total, at sizes it "
+    "chooses,",
+    "Before recording an entry, the runtime evicts every expired entry. Then, first, if the "
+    "device holds as many entries as its bound, it evicts one of them; and second, if the "
+    "table then holds as many entries as the total bound, it evicts one from the whole "
+    "table. Each eviction "
+    "removes, within its scope, the entry with the earliest signing start, and among "
+    "entries with the same signing start the one whose nonce sorts first in byte order. "
+    "Size eviction may remove an entry that is still usable. An evicted entry no longer "
+    "counts toward either bound.",
+    "An envelope at `v` `1`, or one whose `liveness_nonce` is `null`, has no bound.",
+    "and the acceptance time is no more than one hour after the entry's signing start. A "
+    "matched envelope takes the entry's signing start, which the runtime holds with the "
+    "accepted message, in memory only, and never changes. A later eviction of the entry "
+    "does not remove it. A restart does.",
+    "Matching never reads `runtime_seq`.",
+    "It is computed each time the age is used or presented, and is never stored and "
+    "compared later, because it grows after receipt. A bound displayed in a coarser unit "
+    "is the smallest whole unit not less than it. A message the runtime holds no signing "
+    "start for has no bound, including one read back from storage after a restart.",
+)
+# The clauses that restrict who may bound an age, how a bound is delivered and
+# what it licenses, each with the polarities a mutant reverses. Pinned word for
+# word under "How Old A Reading Is"; none is an input to a query.
+GUARDS = (
+    ("A receiver MUST NOT infer from a reading's `device_uptime_ms`, its `seq`, or the time "
+     "it accepted it, that the measurement was recent.", [("MUST NOT", "MAY")]),
+    ("Only the runtime that signed the liveness message whose nonce a reading carries can "
+     "bound the reading's age, the time since the device began the transaction that produced "
+     "it, and only from above.", [("Only the runtime", "Any runtime"),
+                                 ("and only from above", "and from above or below")]),
+    ("A bound that leaves the process that computed it, in an operator message, a health "
+     "report, an exported snapshot or any other delivered record, names the instant it was "
+     "computed: \"polled no more than A ago, as of T\",",
+     [("names the instant", "need not name the instant")]),
+    ("T only labels the bound; the bound itself is computed on the clock above.",
+     [("T only labels the bound", "T adjusts the bound")]),
+    ("T never changes the bound, and no receiver corrects it.",
+     [("T never changes", "T may change"), ("no receiver corrects", "a receiver corrects")]),
+    ("An unanchored A MUST NOT appear in a delivered message or an exported snapshot, "
+     "because it is read later than it was computed, and the receiver never refreshes it "
+     "after delivery.", [("MUST NOT", "MAY")]),
+    ("Inside the process that computed it, a bound is used at once or computed again.",
+     [("used at once or computed again", "stored and reused later")]),
+    ("The bound covers the time since the device began the transaction that produced the "
+     "reading. That transaction began after the device accepted the liveness message.",
+     [("That transaction began after", "That transaction began before")]),
+    ("**What it dates.** The bound dates the device's transaction, not the measured "
+     "quantity.", [("not the measured quantity", "and the measured quantity")]),
+    ("so the bound says nothing about when the controller sampled the value it reported",
+     [("says nothing about", "says")]),
+    ("**What it rests on.** The bound is only as good as the producer's conformance to the "
+     "capture point the producers' rules in [Reading Envelope at `v` 2]"
+     "(#reading-envelope-at-v-2) set, which no receiver can check.",
+     [("which no receiver can check", "which every receiver checks")]),
+    ("A device that holds its own key can sign any nonce it has received into any reading. "
+     "That is fabrication by the signer, which the trust model already concedes for values.",
+     [("That is fabrication by the signer", "That is conformant")]),
+    ("A receiver other than the signing runtime MUST NOT compute or present a bound. Nor may "
+     "the signing runtime for a nonce its current process did not generate.",
+     [("MUST NOT", "MAY"), ("Nor may", "And may")]),
+    ("**Every reading** is presented as of its reading, named by its key epoch and its "
+     "`(boot_id, seq)`, never as current, live or now.",
+     [("never as current", "or as current")]),
+    ("**The signing runtime, for a matched reading,** may also present it as polled no more "
+     "than A ago, where A is `age_upper` when it is computed, named as the runtime liveness "
+     "bound and anchored as above whenever it is delivered. That dates the device's poll, "
+     "never the measured quantity.",
+     [("anchored as above whenever", "unanchored whenever"),
+      ("never the measured quantity", "and the measured quantity")]),
+    ("**Health** never calls a reading fresh, current or live. Per device, it shows the "
+     "bound of its latest accepted reading, anchored as above, or \"unbounded\".",
+     [("never calls", "may call")]),
+    ("**An operator message**, the Tier C approval request among them, does not report a "
+     "firmware reading's measurement time, because the device does not report one. A "
+     "\"Measured\" line reads \"not reported by device\", followed by \"polled no more than "
+     "A ago, as of T\" when the reading has a bound. A receipt time is shown only as the time "
+     "the runtime received or detected it.",
+     [("does not report a firmware", "reports a firmware"),
+      ("\"not reported by device\"", "the receipt time"),
+      ("shown only as the time", "shown as the measurement time or the time")]),
+    ("It never refreshes a channel's latest reading, and is never presented as a recent "
+     "measurement.", [("It never refreshes", "It may refresh"),
+                      ("is never presented as", "may be presented as")]),
+    ("**Not authority.** A bound confers no authority, changes no trust grade, tier or "
+     "approval, and is not a safety input.",
+     [("confers no authority", "confers authority"), ("is not a safety input", "is a safety input")]),
+    ("A rule that required a bound before protection could act would gate protection on "
+     "liveness, and nothing here licenses that.", [("nothing here licenses", "this licenses")]),
+    ("**Not a fault's time.** Faults carry no nonce, and nothing here locates a condition "
+     "that [Late Faults](#late-faults) reports.", [("Faults carry no nonce", "Faults carry a nonce")]),
+    ("**Not evidence.** This version defines no evidence field for a reading's age.",
+     [("defines no evidence field", "defines an evidence field")]),
+    ("must forbid treating a value fixed at receipt as the age at a later use.",
+     [("must forbid treating", "may allow treating")]),
+)
+PRESENT_SENTENCES = (
+    "**A heartbeat's bound** says only that the heartbeat was signed after its signing "
+    "start. It never refreshes a channel's latest reading, and is never presented as a "
+    "recent measurement.",
+)
+GOLDEN_SENTENCES = (
+    "Each case runs at the signing runtime, on that section's clock, in nanoseconds, under "
+    "the per-device and total table bounds the case declares.",
+    "Every envelope event is a message the runtime has already accepted under every check "
+    "of v1 and of this version; the corpus does not exercise verification. Each query is "
+    "made at a time, of a message by its `(boot_id, seq)` or of a channel's latest "
+    "reading. A channel's latest reading is the last envelope accepted since the last "
+    "restart carrying a reading of that channel; a heartbeat never is one.",
+)
+# The six kinds, by the words of their bullets, each to the corpus's name and
+# the fields its events carry.
+KINDS = {
+    "`v` `2` liveness messages the runtime signs, each with its nonce and its signing "
+    "start, or with none when the clock could not be read;":
+        ("sign_liveness", ("t_ns", "device_id", "boot_id", "capability_hash", "runtime_seq",
+                           "nonce")),
+    "`v` `1` liveness messages the runtime signs, which carry no nonce and record nothing "
+    "in the table;":
+        ("sign_liveness_v1", ("t_ns", "device_id", "boot_id", "capability_hash", "runtime_seq")),
+    "`v` `2` signings that fail, each with the nonce and signing start it was given, whose "
+    "entry is recorded and then discarded, and whose message is never published;":
+        ("sign_failed", ("t_ns", "device_id", "boot_id", "capability_hash", "runtime_seq",
+                         "nonce")),
+    "envelopes the runtime accepts, each with its `v`, `device_id`, `boot_id`, "
+    "`capability_hash`, `seq`, the channels of its readings, none for a heartbeat, and its "
+    "`liveness_nonce`;":
+        ("accept", ("t_ns", "v", "device_id", "boot_id", "capability_hash", "seq", "channels",
+                    "liveness_nonce")),
+    "restarts;": ("restart", ("t_ns",)),
+    "restores of the runtime's state store while it runs;": ("store_restore", ("t_ns",)),
+    "intervals during which the runtime's host was suspended, which the clock counts, so "
+    "they change nothing the runtime records;": ("suspend", ("t_ns", "resume_t_ns")),
+    "queries.": ("query", ("t_ns", "expected")),
+}
+# What the cases cover, by the words of their bullets, each to the properties
+# of a run that show it.
+COVER = {
+    "a matched reading, and its bound growing after receipt;": ("matched", "growing"),
+    "rounding up;": ("rounded",),
+    "an unknown nonce, a `null` nonce and a `v` `1` envelope;": (
+        "unknown_nonce", "null_nonce", "v1_envelope"),
+    "a nonce signed for another device, another boot or another manifest;": (
+        "other_device_id", "other_boot_id", "other_capability_hash"),
+    "acceptance exactly one hour after the signing start, and one nanosecond later;": (
+        "match_at_edge", "match_past_edge"),
+    "an entry exactly an hour old when another is recorded, which survives when there is "
+    "room and, when there is not, still counts and is evicted although it is usable;": (
+        "hour_old_survives_with_room", "hour_old_size_evicted"),
+    "the per-device bound applied before the total bound, and a per-device bound counting "
+    "a device's entries under two `boot_id`s;": ("device_before_total", "device_spans_boots"),
+    "two entries with the same signing start, where the one whose nonce sorts first in "
+    "byte order is evicted;": ("tie",),
+    "a matched reading queried more than an hour after its signing start;": ("queried_late",),
+    "eviction by the per-device bound and by the total bound;": ("evict_device",
+                                                                 "evict_total"),
+    "a restart before acceptance and one after;": ("restart_before", "restart_after"),
+    "a store restore while the runtime runs that reissues a `runtime_seq`;": (
+        "live_restore_reissue",),
+    "a restart followed by a restore that reissues a `runtime_seq` under a fresh nonce, "
+    "with an old reading still carrying the first nonce;": ("restart_restore_reissue",),
+    "a heartbeat that does not refresh a channel;": ("heartbeat_no_refresh",),
+    "a signing whose start could not be read;": ("unclocked",),
+    "time during which the host was suspended;": ("suspended",),
+    "a drained backlog;": ("drained_backlog",),
+    "a failed signing whose recording evicted another entry, which stays evicted;": (
+        "failed_eviction_stands",),
+    "rollout: a `v` `2` signing that fails after its interval's `v` `1` message, leaving no "
+    "entry, and readings measured after the pair, bounded by the `v` `2` nonce, and between "
+    "its messages, with no bound.": (
+        "rollout_failed_after_v1", "rollout_after_pair_bounded", "rollout_between_unbounded"),
+}
+# Edges the run must show beside the listed items: each size bound reached and
+# not, and a bound a whole number of display units.
+EDGES = ("device_fits", "total_fits", "whole_unit")
+
+
+def _bullets(region: str, after: str) -> list[str]:
+    tail = region[region.index(after) + len(after):]
+    block = re.match(r"\s*\n((?:- .+\n(?:  .+\n)*)+)", tail)
+    if block is None:
+        raise Failure(f"no bullet list after {after!r}")
+    return [flat(b) for b in re.findall(r"^- (.+?)(?=\n- |\Z)", block.group(1), re.M | re.S)]
+
+
+def _words(text: str) -> str:
+    return r"\s+".join(re.escape(word) for word in text.split())
+
+
+def guard_text(raw: str, clause: str, flip: tuple[str, str] | None) -> str:
+    """The text with a pinned clause deleted, or with one polarity in it reversed."""
+    span = re.search(_words(clause), raw)
+    if span is None:
+        raise AssertionError(f"guard clause missing: {clause!r}")
+    if flip is None:
+        return raw[: span.start()] + raw[span.end():]
+    segment = span.group(0)
+    hit = re.search(_words(flip[0]), segment)
+    if hit is None:
+        raise AssertionError(f"polarity {flip[0]!r} missing from its clause")
+    return (raw[: span.start()] + segment[: hit.start()] + flip[1] + segment[hit.end():]
+            + raw[span.end():])
+
+
+# --- normative sentences ---------------------------------------------------------
+#
+# Every section of firmware-commands/v2.md and firmware-telemetry/v2.md, by its
+# heading path, with the checker that owns its normative sentences. The section
+# list itself is held: a section added, removed or renamed fails every checker
+# until it is assigned here. None marks a section this amendment did not add or
+# change.
+SECTION_OWNERS = {
+    "commands": (
+        ("# Firmware Commands Contract v2", "liveness"),
+        ("## What changed from v1", "liveness"),
+        ("## Error Semantics", None),
+        ("## Rate-Limited Refusal", None),
+        ("## Unresolved Commands", None),
+        ("## Runtime Liveness at `v` 2", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Wire format", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Acceptance", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The held nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The runtime's nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Publication during rollout", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Golden vectors", "liveness"),
+        ("## Runtime Obligations", "liveness"),
+        ("## Required Implementation Artifacts", "liveness"),
+    ),
+    "telemetry": (
+        ("# Firmware Telemetry Contract v2", "envelope"),
+        ("## What changed from v1", "envelope"),
+        ("## Signed Fault Events", "envelope"),
+        ("## Signed Fault Events > ### Closed `detail` sets at `v` 2", None),
+        ("## Signed Fault Events > ### Producers", None),
+        ("## Signed Fault Events > ### Consumers", None),
+        ("## Late Faults", None),
+        ("## Reading Envelope at `v` 2", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Producers", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Consumers", "envelope"),
+        ("## How Old A Reading Is", "reading-age"),
+        ("## How Old A Reading Is > ### What the signed fields do not establish", "reading-age"),
+        ("## How Old A Reading Is > ### The bound", "reading-age"),
+        ("## How Old A Reading Is > ### What a receiver may present", "reading-age"),
+        ("## How Old A Reading Is > ### What it is not", "reading-age"),
+        ("## Device Mode", None),
+        ("## Controller Profiles", None),
+        ("## Controller Profiles > ### The `controller_profile` field", None),
+        ("## Controller Profiles > ### The profile document", None),
+        ("## Controller Profiles > ### Receivers", "reading-age"),
+        ("## Adoption Order", "envelope"),
+        ("## Golden Vectors", "envelope"),
+        ("## Required Implementation Artifacts", "envelope"),
+    ),
+}
+# Every sentence of an owned section is held, not only those carrying MUST,
+# SHOULD, MAY, never, only or exactly: restrictions in these sections are also
+# stated declaratively ("An envelope with no bound is still accepted"), and a
+# keyword filter leaves those reversible. Any added, removed or changed sentence
+# in an owned section fails until this table is updated in review.
+
+
+def split_sections(text: str) -> list[tuple[str, str]]:
+    """(heading path, own body) for every heading at any depth, by the shared
+    CommonMark recognizer; fenced code is left out of each body."""
+    return markdown.section_bodies(text)
+
+
+def split_sentences(body: str) -> list[str]:
+    blocks: list[list[str]] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            stripped = stripped.lstrip(">").strip()
+        if not stripped:
+            blocks.append([])
+            continue
+        if stripped.startswith("|"):
+            if not re.fullmatch(r"\|[\s|:-]+\|", stripped):
+                blocks.append([stripped])
+            blocks.append([])
+            continue
+        if re.match(r"(?:- |\d+\. )", stripped):
+            blocks.append([re.sub(r"^(?:- |\d+\. )", "", stripped)])
+            continue
+        if not blocks:
+            blocks.append([])
+        blocks[-1].append(stripped)
+    sentences = []
+    for block in blocks:
+        text = " ".join(block).strip()
+        if text:
+            sentences += [s for s in re.split(r"(?<=[.!?:;])\s+(?=[A-Z`*\[\"(])", text) if s]
+    return sentences
+
+
+def normative_sentences(text: str, owned: list[str]) -> dict[str, list[str]]:
+    return {path: split_sentences(body) for path, body in split_sections(text) if path in owned}
+
+
+def check_normative(texts: dict[str, str], owner: str, held: dict) -> None:
+    """Fail on any section unassigned, or any owned normative sentence changed."""
+    for doc, table in SECTION_OWNERS.items():
+        crooked = markdown.non_canonical(texts[doc])
+        if crooked:
+            raise Failure(f"non-canonical heading in {doc}: {crooked}")
+        paths = [path for path, _ in split_sections(texts[doc])]
+        if paths != [path for path, _ in table]:
+            extra = [p for p in paths if p not in dict(table)]
+            gone = [p for p, _ in table if p not in paths]
+            raise Failure(f"normative sections of {doc} changed: unassigned {extra}, "
+                          f"gone {gone}, or reordered")
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        for path in owned:
+            want, got = list(held[doc][path]), found[path]
+            if got != want:
+                added = [s for s in got if s not in want]
+                removed = [s for s in want if s not in got]
+                raise Failure(f"normative sentence changed in {doc} {path}: added {added}, "
+                              f"removed {removed}" + ("" if added or removed else ", reordered"))
+
+
+def section_region(raw: str, path: str) -> tuple[int, int]:
+    """Where a section's own body lies in the raw text."""
+    return markdown.section_offsets(raw, path)
+
+
+def sentence_span(raw: str, path: str, sentence: str) -> tuple[int, int] | None:
+    start, end = section_region(raw, path)
+    hit = re.search(r"(?:\s|>)+".join(re.escape(w) for w in sentence.split()), raw[start:end])
+    return None if hit is None else (start + hit.start(), start + hit.end())
+
+
+POLARITY = (("MUST NOT", "MAY"), ("MUST", "MAY"), ("SHOULD", "MAY"), ("MAY", "MUST NOT"),
+            ("is not decided", "is decided"), ("does not decide", "decides"),
+            ("no other", "any other"), ("cannot", "can"), ("does not", "does"),
+            ("never", "may"), ("Never", "Sometimes"), ("only", "also"), ("exactly", "about"),
+            ("not", "also"), ("no", "some"))
+
+
+def normative_text_mutants(texts: dict[str, str], owner: str, must: tuple[str, ...]
+                           ) -> list[tuple[str, str, str]]:
+    """(label, doc, mutated text): sampled deletions and reversals, the listed
+    sentences among them, and one new MUST sentence per owned section."""
+    out = []
+    for doc, table in SECTION_OWNERS.items():
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        flat_list = [(p, s) for p in owned for s in found[p]]
+        for index, (path, sentence) in enumerate(flat_list):
+            if index % 5 and not any(m in sentence for m in must):
+                continue
+            span = sentence_span(texts[doc], path, sentence)
+            if span is None:
+                raise AssertionError(f"held sentence not found in {doc}: {sentence!r}")
+            raw = texts[doc]
+            out.append((f"normative deleted: {sentence[:60]}", doc,
+                        raw[: span[0]] + raw[span[1]:]))
+            segment = raw[span[0]:span[1]]
+            for old, new in POLARITY:
+                hit = re.search(rf"\b{re.escape(old)}\b", segment)
+                if hit:
+                    flipped = segment[: hit.start()] + new + segment[hit.end():]
+                    break
+            else:
+                last = segment.rstrip(".;:").split()[-1]
+                flipped = segment[: segment.rindex(last)] + "otherwise" + segment[
+                    segment.rindex(last) + len(last):]
+            out.append((f"normative reversed: {sentence[:60]}", doc,
+                        raw[: span[0]] + flipped + raw[span[1]:]))
+        for path in owned:
+            raw = texts[doc]
+            at = section_region(raw, path)[0]
+            out.append((f"normative added to {doc} {path}", doc,
+                        raw[:at] + "\nEvery consumer MUST accept this added sentence.\n" + raw[at:]))
+    return out
+
+
+OWNER = 'reading-age'
+# The sentences held for each owned section, extracted by normative_sentences and
+# reviewed: a change to any of them is a change to this table.
+HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
+    'commands': {},
+    'telemetry': {
+        '## How Old A Reading Is': (
+        ),
+        '## How Old A Reading Is > ### What the signed fields do not establish': (
+            ('A device signs a reading at measurement and buffers the signed bytes.'),
+            ("The reading reaches a receiver after a delay nothing bounds: the device's offline "
+             'buffer, which drains oldest first and survives power loss, then any transport '
+             'queue, broker or receiver queue. v1 relates neither `device_uptime_ms` nor `seq` to '
+             "any receiver's clock, and `emitted_at_ms` is advisory."),
+            ("A reading's `device_uptime_ms` is not the start of its measurement either."),
+            ('A producer may read the uptime after the transaction.'),
+            ('It may publish a fault owed from an earlier condition, and flush its buffer, '
+             'between the read and the signing.'),
+            ('And its sequence reservation may hold an uptime up to the latest the stream has '
+             'signed.'),
+            ("A receiver MUST NOT infer from a reading's `device_uptime_ms`, its `seq`, or the "
+             'time it accepted it, that the measurement was recent.'),
+            ("[runtime-telemetry/v2.md](../runtime-telemetry/v2.md) defines a record's age as the "
+             'greater of the interval since the receiver received it and the interval since the '
+             'producer says it was measured.'),
+            ('For a firmware reading that gives a lower bound, the time since receipt, and no '
+             'upper bound.'),
+        ),
+        '## How Old A Reading Is > ### The bound': (
+            ('Only the runtime that signed the liveness message whose nonce a reading carries can '
+             "bound the reading's age, the time since the device began the transaction that "
+             'produced it, and only from above.'),
+            ('This section calls it the signing runtime.'),
+            ('**The liveness table.** The signing runtime keeps one entry per nonce it signs.'),
+            ("An entry holds the liveness object's `device_id`, `boot_id` and `capability_hash`, "
+             'and the signing start.'),
+            ("**The signing start** is a reading of the runtime's clock taken before it begins "
+             'signing the message, and is never changed afterwards.'),
+            ('The entry is recorded at that same instant: expiry and both size bounds are judged '
+             'as of the signing start, and the entry serves lookups from then on.'),
+            ('A signing that fails discards its entry, which then holds no slot; any eviction '
+             'made when it was recorded stands.'),
+            ('**The clock** is monotonic, counts in nanoseconds, and keeps counting while the '
+             "runtime's host is suspended:"),
+            ('`CLOCK_BOOTTIME` on Linux and Android, `CLOCK_MONOTONIC` on macOS.'),
+            ('Never a wall clock, and never a clock that stops during suspend.'),
+            ('**No clock, no entry.** If the clock cannot be read before signing, the runtime '
+             'records no entry.'),
+            ('It may still publish the message, whose nonce then bounds nothing.'),
+            ('**Memory only.** The table is never persisted and never restored.'),
+            ('A process restart or a host reboot empties it.'),
+            ("Restoring the runtime's state store while the process runs neither empties it nor "
+             'changes any entry.'),
+            ('**Retention.** An entry is usable while its age, the time on the clock since its '
+             'signing start, is at most one hour, 3600000000000 nanoseconds, and is expired once '
+             'its age exceeds that.'),
+            ('An expired entry is evicted, and no longer counts toward either size bound.'),
+            ('The hour limits how late a reading can be matched.'),
+            ('It does not limit how old a matched reading can be shown to be.'),
+            ('**Size.** The runtime bounds the table per device, counting every entry for a '
+             '`device_id` whatever its `boot_id` or `capability_hash`, and in total, at sizes it '
+             "chooses, and SHOULD make the per-device bound hold one hour of that device's "
+             'liveness messages at its publication interval.'),
+            ('Before recording an entry, the runtime evicts every expired entry.'),
+            ('Then, first, if the device holds as many entries as its bound, it evicts one of '
+             'them; and second, if the table then holds as many entries as the total bound, it '
+             'evicts one from the whole table.'),
+            ('Each eviction removes, within its scope, the entry with the earliest signing start, '
+             'and among entries with the same signing start the one whose nonce sorts first in '
+             'byte order.'),
+            ('Size eviction may remove an entry that is still usable.'),
+            ('An evicted entry no longer counts toward either bound.'),
+            ('**Matching, at acceptance.** When the signing runtime accepts an envelope, after '
+             'every check of v1 and of this version, it matches its nonce:'),
+            ('An envelope at `v` `1`, or one whose `liveness_nonce` is `null`, has no bound.'),
+            ('Otherwise the envelope has a bound only if the table holds an entry for its '
+             '`liveness_nonce` whose `device_id`, `boot_id` and `capability_hash` equal the '
+             "envelope's, and the acceptance time is no more than one hour after the entry's "
+             'signing start.'),
+            ("A matched envelope takes the entry's signing start, which the runtime holds with "
+             'the accepted message, in memory only, and never changes.'),
+            ('A later eviction of the entry does not remove it.'),
+            ('A restart does.'),
+            ('Matching never reads `runtime_seq`.'),
+            ('An envelope with no bound is still accepted.'),
+            ('Its readings are presented as of their reading, as every reading is.'),
+            ('**Age, at use.** For a matched message, `age_upper = now − signing_start`, in '
+             'nanoseconds on the same clock.'),
+            ('It is computed each time the age is used or presented, and is never stored and '
+             'compared later, because it grows after receipt.'),
+            ('A bound displayed in a coarser unit is the smallest whole unit not less than it.'),
+            ('A message the runtime holds no signing start for has no bound, including one read '
+             'back from storage after a restart.'),
+            ('**Anchoring.** A bound that leaves the process that computed it, in an operator '
+             'message, a health report, an exported snapshot or any other delivered record, names '
+             'the instant it was computed:'),
+            ('"polled no more than A ago, as of T", where T is the runtime\'s wall-clock time at '
+             'that instant, the clock it names receipt times by.'),
+            ('T only labels the bound; the bound itself is computed on the clock above.'),
+            ('T is read from the runtime\'s wall clock, the clock its "Detected" and receipt times '
+             "use, and carries that clock's error: a clock running ahead makes the poll look more "
+             'recent to anyone comparing T with another clock.'),
+            ('T never changes the bound, and no receiver corrects it.'),
+            ('An unanchored A MUST NOT appear in a delivered message or an exported snapshot, '
+             'because it is read later than it was computed, and the receiver never refreshes it '
+             'after delivery.'),
+            ('Inside the process that computed it, a bound is used at once or computed again.'),
+            ('**Why it holds.** The bound covers the time since the device began the transaction '
+             'that produced the reading.'),
+            ('That transaction began after the device accepted the liveness message.'),
+            ('The device accepted it after the runtime signed it, and the runtime read the '
+             'signing start before signing.'),
+            ("Every delay in between, in the device's buffer, a broker or a queue, only widens "
+             'the bound, and a broker that withholds or delays liveness only makes readings look '
+             'older.'),
+            ("**What it dates.** The bound dates the device's transaction, not the measured "
+             'quantity.'),
+            ("For a bridged channel the transaction is the device's poll of the foreign "
+             'controller, so the bound says nothing about when the controller sampled the value '
+             'it reported: a hung controller, or a communications processor that caches values, '
+             'can hold a value for hours.'),
+            ("**What it rests on.** The bound is only as good as the producer's conformance to "
+             "the capture point the producers' rules in [Reading Envelope at `v` "
+             '2](#reading-envelope-at-v-2) set, which no receiver can check.'),
+            ('A device that holds its own key can sign any nonce it has received into any reading.'),
+            ('That is fabrication by the signer, which the trust model already concedes for '
+             'values.'),
+            ('A receiver other than the signing runtime MUST NOT compute or present a bound.'),
+            ('Nor may the signing runtime for a nonce its current process did not generate.'),
+        ),
+        '## How Old A Reading Is > ### What a receiver may present': (
+            ('**Every reading** is presented as of its reading, named by its key epoch and its '
+             '`(boot_id, seq)`, never as current, live or now.'),
+            ('**The signing runtime, for a matched reading,** may also present it as polled no '
+             'more than A ago, where A is `age_upper` when it is computed, named as the runtime '
+             'liveness bound and anchored as above whenever it is delivered.'),
+            ("That dates the device's poll, never the measured quantity."),
+            ('For an alarm word the presentation is a snapshot polled no more than A ago: see '
+             '[Receivers](#receivers).'),
+            ('**Health** never calls a reading fresh, current or live.'),
+            ('Per device, it shows the bound of its latest accepted reading, anchored as above, '
+             'or "unbounded".'),
+            ('**An operator message**, the Tier C approval request among them, does not report a '
+             "firmware reading's measurement time, because the device does not report one."),
+            ('A "Measured" line reads "not reported by device", followed by "polled no more than '
+             'A ago, as of T" when the reading has a bound.'),
+            ('A receipt time is shown only as the time the runtime received or detected it.'),
+            ("**A heartbeat's bound** says only that the heartbeat was signed after its signing "
+             'start.'),
+            ("It never refreshes a channel's latest reading, and is never presented as a recent "
+             'measurement.'),
+        ),
+        '## How Old A Reading Is > ### What it is not': (
+            ('**Not authority.** A bound confers no authority, changes no trust grade, tier or '
+             'approval, and is not a safety input.'),
+            ('Whether a reading may be an input to a safety condition, and whether any rule may '
+             'require a bound, is not decided here.'),
+            ('A rule that required a bound before protection could act would gate protection on '
+             'liveness, and nothing here licenses that.'),
+            ("**Not a fault's time.** Faults carry no nonce, and nothing here locates a condition "
+             'that [Late Faults](#late-faults) reports.'),
+            ("**Not evidence.** This version defines no evidence field for a reading's age."),
+            ('A later evidence change that records one must define how the bound is attributed, '
+             'to the signing runtime and its clock, and must forbid treating a value fixed at '
+             'receipt as the age at a later use.'),
+        ),
+        '## Controller Profiles > ### Receivers': (
+            ("A receiver interprets a bridged channel's reading only through a profile document "
+             'whose digest is the one named by the manifest the reading was accepted under, which '
+             "the reading's own `capability_hash` identifies, never by whichever manifest is "
+             'pinned when the reading is read again.'),
+            ('It holds that document locally, so that it can interpret readings with no network.'),
+            ('It never fetches a document from the device whose reading it interprets, and never '
+             'interprets through a document with another digest, however close its `id`.'),
+            ('Before using a document it checks that the document is valid under the grammar '
+             "above, that its `id` is the manifest's, that it has the named `profile_channel`, "
+             'and that the profile channel agrees with the manifest channel: a `measurement` '
+             "channel's `sensor_type` and `unit` equal the manifest channel's, and an "
+             "`alarm_word` channel's manifest channel declares `controller_alarm_word` and "
+             '`bitmask`; a document that fails any of these is not used, and the receiver reports '
+             'the disagreement rather than interpreting.'),
+            ('Without a usable document, the profile is unknown to that receiver.'),
+            ("It presents the channel's readings as bridged values from an unknown profile and an "
+             'alarm word as its raw value, interprets no bit, and names no alarm.'),
+            ('For qualification:'),
+            ('A receiver MUST NOT present a reading as qualified unless the manifest the reading '
+             'was accepted under says `qualified` for its channel, and presents a reading whose '
+             'channel says `unqualified` as unqualified wherever it describes it.'),
+            ("Qualification is the device's attested statement that the reviewed release shipped "
+             'a qualification record for the profile.'),
+            ('It is not a permission, it is not proof that the foreign controller reports '
+             'truthfully, and it is not physical proof of anything.'),
+            ('It never changes a tier, an approval, a trust grade or any authority.'),
+            ('For an alarm word, read through a usable document:'),
+            ("A reading is a snapshot of the controller's word at the poll it reports."),
+            ('A mapped alarm is asserted in that reading when its bit has the value its `active` '
+             'names, and not asserted otherwise.'),
+            ("A receiver presents an alarm's state as of the reading it was read from, never as "
+             "the controller's state now."),
+            ('Not asserted means not asserted at that poll and nothing more: a receiver MUST NOT '
+             'present it as proof that the alarm did not occur between polls, that it cleared at '
+             'any particular time, or that it is clear now.'),
+            ("How long ago a reading's poll was can be bounded only by the runtime that signed "
+             "the liveness message the reading's `liveness_nonce` names, only from above, and "
+             'only as [How Old A Reading Is](#how-old-a-reading-is) states.'),
+            ('Every other receiver cannot bound it.'),
+            ("A device delivers buffered readings long after their polls, and the device's uptime "
+             "and the receiver's clock run at rates this version does not relate, so a receiver "
+             'never infers from accepting a reading recently, or from its `device_uptime_ms`, '
+             'that the poll was recent.'),
+            ("The signing runtime may present an alarm's state from a reading with a bound as a "
+             "snapshot polled no more than A ago, as of T, where A is the reading's bound when it "
+             'is computed and T anchors it as [How Old A Reading Is](#how-old-a-reading-is) '
+             'requires.'),
+            ("The bound dates the device's poll, not the controller's own sampling of its alarm "
+             'register.'),
+            ("It never presents the state as the controller's state now, or as current within any "
+             'interval: a recent poll does not establish what the controller has done since.'),
+            ('Without a bound, and at every other receiver, the state is presented as of its '
+             'reading.'),
+            ("The channel's latest reading is the last reading for the channel the receiver "
+             "accepted under the device's active anchor, with its active key epoch and active "
+             'manifest.'),
+            ('Any change to the active anchor, the promotion of a manifest, the promotion of a '
+             'rotated key or a revocation, leaves the channel with no latest reading until the '
+             'receiver accepts one under the new state.'),
+            ('While no anchor is active there is none, and a reinstated anchor is active only '
+             'once a promotion makes it so.'),
+            ('Creating or replacing a pending anchor, for a new manifest or a re-provisioned key, '
+             'changes nothing here: under [device-provisioning/v1](../device-provisioning/v1.md) '
+             "a pending anchor affects nothing about the active one, so the channel's latest "
+             'reading, any fault hold and the silence bound continue under the active anchor, and '
+             'a reading signed under the pending anchor is refused.'),
+            ("A message v1's freshness rules refuse, including a duplicate of one already "
+             'accepted, is not accepted and changes nothing here.'),
+            ('Every alarm on the channel is unknown while the channel has no latest reading, and '
+             'while the receiver has accepted no reading for the channel within `3 × '
+             'poll_interval_ms + 30000` milliseconds on a monotonic clock that keeps counting '
+             "while the receiver's host is suspended: three missed polls and a transport "
+             'allowance, which the profile grammar holds to an hour at most.'),
+            ('A receiver MAY use a shorter bound and MUST NOT use a longer one.'),
+            ('A receiver that restarts has accepted nothing, so every alarm is unknown until it '
+             'accepts a reading after the restart.'),
+            ('Any accepted reading of the channel restarts the bound, whether or not its age is '
+             'bounded.'),
+            ('When the receiver accepts a `sensor_fault` naming the channel, every alarm on the '
+             'channel is unknown until it accepts a later reading for the channel, or until the '
+             'active anchor changes, which leaves no latest reading anyway.'),
+            ('This orders the fault and the reading by when each was signed and locates nothing: '
+             'under [Late Faults](#late-faults) a fault signed after a recovered reading reports '
+             'an earlier condition, and the channel is then unknown until its next reading, which '
+             'is expected.'),
+            ('A receiver MUST NOT treat silence, a refused reading or a fault as an alarm '
+             'clearing.'),
+            ('An alarm-word reading is interpreted only from an envelope in which it is the only '
+             'reading.'),
+            ('One from an envelope carrying any other reading, a second reading of the same '
+             'channel included, is not interpreted: two values under one label could be read two '
+             'ways, and a reading refused beside it would leave conforming receivers with '
+             'different latest readings.'),
+            ('A receiver does not refuse an alarm-word reading because its `quality` is below its '
+             "channel's `quality_floor`: quality describes a measurement. v1's grammar for "
+             '`quality` still applies.'),
+            ('A reading that is accepted and not interpreted, because it shares its envelope or '
+             "because its `value` is not an integer in the word's range, is still the channel's "
+             'latest reading, and every alarm on the channel is unknown while it is.'),
+            ("A message that is not a reading of the channel, a heartbeat or another channel's "
+             'reading, never becomes its latest reading and never restarts its bound.'),
+            ('A bit no alarm maps is unknown: neither its meaning nor its polarity is known.'),
+            ('A receiver may present the unmapped bits that are set, as set and unmapped, and '
+             'MUST NOT name an unmapped bit, present it as an alarm, or present it as clear.'),
+            ('Whether or not a receiver holds the document:'),
+            ('The word value of a `controller_alarm_word` channel is never a measurement: it is '
+             'not averaged, compared with a numeric threshold or presented as a quantity.'),
+            ("These rules bind every use of an alarm word, a rule's or a model's input as much as "
+             'a display.'),
+            ('A state presented as of a reading names that reading by its key epoch and its '
+             '`(boot_id, seq)`; any time shown with it is named for where it came from, the '
+             "receiver's acceptance time, the device's own report or the runtime liveness bound, "
+             'and never as the time of the poll.'),
+            ("A foreign controller's alarm is evidence about that controller, read by the device."),
+            ('It is not a fault of the device: it is never signed as a fault event, never mapped '
+             'onto the fault code vocabulary, and its absence from the fault stream means nothing.'),
+            ("An alarm's `id` or `meaning` confers no authority."),
+            ('A receiver may reason about an alarm, and anything it then does is decided by its '
+             "own rules for that action's tier, approval and safety conditions, exactly as for "
+             'any other reading.'),
+            ('A separate signed event for individual alarm transitions is not defined here.'),
+            ("It would be a successor's, if equipment is shown to need transitions that polling "
+             'cannot capture.'),
+        ),
+    },
+}
+# Sentences every mutation run reverses and deletes, whatever the sample.
+MUTATE_ALWAYS = (
+    'Never a wall clock',
+    'CLOCK_BOOTTIME',
+    'after every check of v1 and of this version',
+    'An envelope with no bound is still accepted',
+    'is not decided here',
+    "carries that clock's error",
+    'SHOULD make the per-device bound',
+    'Every other receiver cannot bound it',
+)
+
+
+def contract_texts() -> dict[str, str]:
+    return {"t2": TELEMETRY_V2.read_text(), "c2": COMMANDS_V2.read_text()}
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    check_normative({"commands": texts["c2"], "telemetry": texts["t2"]}, OWNER, HELD_SENTENCES)
+    t2, c2 = texts["t2"], texts["c2"]
+    age = section(t2, "## How Old A Reading Is")
+    bound = section(age, "### The bound")
+    present = section(age, "### What a receiver may present")
+    golden = section(t2, "## Golden Vectors")
+    golden = golden[golden.index("[reading-age-vectors-v2.json]"):]
+    for sentence in BOUND_SENTENCES:
+        need(bound, sentence, "v2.md The bound")
+    for clause, _ in GUARDS:
+        need(age, clause, "v2.md How Old A Reading Is")
+    for sentence in PRESENT_SENTENCES:
+        need(present, sentence, "v2.md What a receiver may present")
+    for sentence in GOLDEN_SENTENCES:
+        need(golden, sentence, "v2.md Golden Vectors")
+    text = flat(bound)
+    retention = re.search(
+        r"An entry is usable while its age, the time on the clock since its signing start, "
+        r"is at most one hour, (\d+) nanoseconds,", text)
+    fields = re.search(r"An entry holds the liveness object's `(\w+)`, `(\w+)` and `(\w+)`", text)
+    matching = re.search(r"has a bound only if the table holds an entry for its "
+                         r"`liveness_nonce` whose `(\w+)`, `(\w+)` and `(\w+)` equal the "
+                         r"envelope's", text)
+    age_rule = re.search(r"`age_upper = now − signing_start`, in (\w+) on the same clock", text)
+    unit = re.search(r"Each query gives the bound in nanoseconds and rounded up to whole "
+                     r"(\w+), or no bound\.", flat(golden))
+    kinds = re.search(r"Its events are in clock order, and are of (\w+) kinds:", flat(golden))
+    if None in (retention, fields, matching, age_rule, unit, kinds):
+        raise Failure("v2.md no longer states the retention, the entry, matching, the age, "
+                      "the display unit or the event kinds as this checker reads them")
+    assert retention and fields and matching and age_rule and unit and kinds
+    if int(retention.group(1)) != 3600 * 10**9:
+        raise Failure("the retention is not one hour in nanoseconds")
+    if fields.groups() != matching.groups():
+        raise Failure("matching does not compare exactly the fields an entry holds")
+    if age_rule.group(1) != "nanoseconds":
+        raise Failure("the age is not in nanoseconds")
+    units = {"milliseconds": 10**6, "microseconds": 10**3, "seconds": 10**9}
+    kind_bullets = _bullets(golden, "and are of eight kinds:")
+    if kinds.group(1) != "eight" or kind_bullets != list(KINDS):
+        raise Failure(f"the event kinds changed: {kind_bullets}")
+    cover = _bullets(golden, "The cases cover:")
+    if cover != list(COVER):
+        raise Failure(f"the cases the corpus covers changed: {cover}")
+    nonce = re.search(r"`nonce` is a JSON string of exactly (\d+) characters, each one of "
+                      r"`(.)`-`(.)` or `(.)`-`(.)`", flat(c2))
+    assert nonce is not None
+    pin = re.search(r"Its SHA-256 is `([0-9a-f]{64})`", flat(golden))
+    if pin is None:
+        raise Failure("v2.md pins no reading-age corpus digest")
+    return {
+        "retention": int(retention.group(1)),
+        "retention_stated": int(retention.group(1)),
+        "usable_inclusive": True,    # usable at most the retention; expired once it exceeds
+        "match_inclusive": True,     # acceptance no more than the retention after the start
+        "match_fields": list(matching.groups()),
+        "unit": units[unit.group(1)],
+        "round_up": True,
+        "evict_expired": True,
+        "evict_device": True,
+        "evict_total": True,
+        "device_first": True,
+        "device_scope": ("device_id",),
+        "earliest_first": True,
+        "tie_first_byte": True,
+        "tie_by_nonce": True,
+        "restart_empties": True,
+        "restart_drops_starts": True,
+        "restart_drops_latest": True,
+        "restore_empties": False,
+        "suspend_stops_clock": False,
+        "unclocked_records": False,
+        "match_by_runtime_seq": False,
+        "age_fixed_at_receipt": False,
+        "heartbeat_refreshes": False,
+        "null_matches": False,
+        "failed_discards": True,
+        "failed_eviction_stands": True,
+        "v1_matches": False,
+        "expiry_slack": 0,
+        "nonce_pattern": "[%s-%s%s-%s]{%s}" % (nonce.group(2), nonce.group(3), nonce.group(4),
+                                               nonce.group(5), nonce.group(1)),
+        "kinds": {name: keys for name, keys in KINDS.values()},
+        "pin": pin.group(1),
+    }
+
+
+# --- the signing runtime ---------------------------------------------------------------
+
+class Runtime:
+    def __init__(self, model: dict, per_device: int, total: int) -> None:
+        self.m = model
+        self.per_device = per_device
+        self.total = total
+        self.table: dict[str, dict] = {}      # nonce -> entry
+        self.messages: dict[tuple, int | None] = {}  # (device, boot, seq) -> signing start
+        self.latest: dict[tuple, tuple] = {}   # (device, channel) -> message key
+        self.signed_seqs: dict[str, int] = {}  # nonce -> runtime_seq, the state store's view
+        self.process_seqs: set[tuple] = set()
+        self.ever_signed: set[str] = set()
+        self.suspended_ns = 0
+        self.facts: set[str] = set()
+        self.hour_old_survivors: set[str] = set()
+        self.last_evicted: list[str] = []
+        self.given: set[str] = set()
+        self.v1_signed: set[tuple] = set()
+        self.v1_pending: set[tuple] = set()
+        self.pair_nonces: set[str] = set()
+        self.failed_evicted: set[str] = set()
+        self.between_null: set[tuple] = set()
+
+    def clock(self, t: int) -> int:
+        return t - self.suspended_ns if self.m["suspend_stops_clock"] else t
+
+    def _usable(self, age: int) -> bool:
+        r = self.m["retention"] + self.m["expiry_slack"]
+        return age <= r if self.m["usable_inclusive"] else age < r
+
+    def _evict_one(self, scope: list[str]) -> str:
+        def key(nonce: str) -> tuple:
+            start = self.table[nonce]["start"]
+            tie = nonce.encode() if self.m["tie_by_nonce"] else self.table[nonce]["order"]
+            if not self.m["tie_first_byte"]:
+                tie = bytes(255 - b for b in tie) if isinstance(tie, bytes) else -tie
+            return (start if self.m["earliest_first"] else -start, tie)
+        ordered = sorted(scope, key=key)
+        if len(ordered) > 1 and self.table[ordered[0]]["start"] == self.table[ordered[1]]["start"]:
+            self.facts.add("tie")
+        victim = ordered[0]
+        del self.table[victim]
+        return victim
+
+    def sign(self, ev: dict, failed: bool = False) -> None:
+        self.given.add(ev["nonce"])
+        if not failed:
+            self.ever_signed.add(ev["nonce"])
+            self.signed_seqs[ev["nonce"]] = ev["runtime_seq"]
+        seq_key = (ev["device_id"], ev["boot_id"], ev["runtime_seq"])
+        if seq_key in self.process_seqs:
+            self.facts.add("reissued_in_process")
+        self.process_seqs.add(seq_key)
+        if ev["t_ns"] is None:
+            self.facts.add("unclocked")
+            if not self.m["unclocked_records"]:
+                return
+            now = 0
+        else:
+            now = self.clock(ev["t_ns"])
+        if ev["nonce"] in self.table:
+            raise Failure("a nonce signed twice while its entry is held")
+        device = tuple(ev[f] for f in self.m["device_scope"])
+        mine = [n for n, e in self.table.items() if e["scope"] == device]
+        for n in list(self.table):
+            age = now - self.table[n]["start"]
+            if self.m["evict_expired"] and not self._usable(age):
+                del self.table[n]
+        hour_old = {n for n, e in self.table.items() if now - e["start"] == self.m["retention"]}
+        mine = [n for n, e in self.table.items() if e["device_id"] == ev["device_id"]]
+        if (len(mine) >= self.per_device and len(self.table) >= self.total
+                and min(self.table, key=lambda n: self.table[n]["start"]) not in mine):
+            self.facts.add("device_before_total")
+
+        def device_step() -> None:
+            mine = [n for n, e in self.table.items() if e["scope"] == device]
+            if self.m["evict_device"] and len(mine) >= self.per_device:
+                held = dict(self.table)
+                victim = self._evict_one(mine)
+                self.last_evicted.append(victim)
+                self.facts.add("evict_device")
+                if now - held[victim]["start"] == self.m["retention"]:
+                    self.facts.add("hour_old_size_evicted")
+                if held[victim]["boot_id"] != ev["boot_id"]:
+                    self.facts.add("device_spans_boots")
+            elif len(mine) == self.per_device - 1:
+                self.facts.add("device_fits")
+
+        def total_step() -> None:
+            if self.m["evict_total"] and len(self.table) >= self.total:
+                self.last_evicted.append(self._evict_one(list(self.table)))
+                self.facts.add("evict_total")
+            elif len(self.table) == self.total - 1:
+                self.facts.add("total_fits")
+
+        for step in ((device_step, total_step) if self.m["device_first"]
+                     else (total_step, device_step)):
+            step()
+        self.hour_old_survivors |= hour_old & set(self.table)
+        self.table[ev["nonce"]] = {
+            "device_id": ev["device_id"], "boot_id": ev["boot_id"],
+            "capability_hash": ev["capability_hash"], "start": now, "scope": device,
+            "runtime_seq": ev["runtime_seq"], "order": len(self.ever_signed),
+        }
+
+    def accept(self, ev: dict) -> None:
+        now = self.clock(ev["t_ns"])
+        key = (ev["device_id"], ev["boot_id"], ev["seq"])
+        if key in self.messages:
+            raise Failure(f"message {key} accepted twice")
+        start = None
+        nonce = ev.get("liveness_nonce")
+        if ev["v"] == 1:
+            self.facts.add("v1_envelope")
+            if self.m["v1_matches"] and nonce in self.table:
+                start = self.table[nonce]["start"]
+        elif nonce is None:
+            self.facts.add("null_nonce")
+            if self.m["null_matches"] and None in self.table:
+                start = self.table[None]["start"]  # type: ignore[index]
+        else:
+            if nonce not in self.given:
+                self.facts.add("unknown_nonce")
+            entry = self.table.get(nonce)
+            if self.m["match_by_runtime_seq"] and nonce in self.signed_seqs:
+                same = [e for e in self.table.values()
+                        if e["runtime_seq"] == self.signed_seqs[nonce]
+                        and e["device_id"] == ev["device_id"]]
+                entry = max(same, key=lambda e: e["start"]) if same else None
+            if entry is not None:
+                differ = [f for f in self.m["match_fields"] if entry[f] != ev[f]]
+                late = now - entry["start"]
+                in_hour = (late <= self.m["retention"] if self.m["match_inclusive"]
+                           else late < self.m["retention"])
+                if len(differ) == 1 and in_hour:
+                    self.facts.add(f"other_{differ[0]}")
+                if not differ and late == self.m["retention"] + 1:
+                    self.facts.add("match_past_edge")
+                if not differ and in_hour:
+                    start = entry["start"]
+                    if nonce in self.hour_old_survivors:
+                        self.facts.add("hour_old_survives_with_room")
+                    self.facts.add("matched")
+                    if late == self.m["retention"]:
+                        self.facts.add("match_at_edge")
+            if start is None and nonce in self.restarted_away:
+                self.facts.add("restart_before")
+            if start is None and nonce in self.reissued_after_restore:
+                self.facts.add("restart_restore_reissue")
+        self.messages[key] = start
+        self.receipt[key] = now
+        self.accept_times.append((now, nonce, start))
+        channels = ev["channels"]
+        if not channels:
+            self.heartbeats.add(key)
+            if self.m["heartbeat_refreshes"]:
+                for (dev, ch) in list(self.latest):
+                    if dev == ev["device_id"]:
+                        self.latest[(dev, ch)] = key
+        for ch in channels:
+            self.latest[(ev["device_id"], ch)] = key
+
+    restarted_away: set
+    reissued_after_restore: set
+    receipt: dict
+    accept_times: list
+    heartbeats: set
+
+    def restart(self) -> None:
+        self.restarted_away |= set(self.table)
+        self.matched_before_restart |= {k for k, s in self.messages.items() if s is not None}
+        if self.m["restart_empties"]:
+            self.table.clear()
+        if self.m["restart_drops_starts"]:
+            self.messages = {k: None for k in self.messages}
+        if self.m["restart_drops_latest"]:
+            self.latest.clear()
+        self.process_seqs = set()
+        self.restarted = True
+
+    def restore(self) -> None:
+        if self.m["restore_empties"]:
+            self.table.clear()
+        self.restored_after_restart = self.restarted
+        self.restored_live = not self.restarted
+        self.restore_seen = True
+
+    matched_before_restart: set
+
+    def bound(self, start: int | None, key: tuple, now: int) -> dict:
+        if start is None:
+            return {"bound": "none"}
+        at = self.receipt[key] if self.m["age_fixed_at_receipt"] else now
+        ns = at - start
+        unit = self.m["unit"]
+        shown = -(-ns // unit) if self.m["round_up"] else ns // unit
+        if ns % unit:
+            self.facts.add("rounded")
+        else:
+            self.facts.add("whole_unit")
+        return {"bound": "upper", "age_upper_ns": ns, "age_upper_ms_rounded_up": shown}
+
+    def query(self, ev: dict) -> dict:
+        now = self.clock(ev["t_ns"])
+        if "message" in ev:
+            m = ev["message"]
+            key = (m["device_id"], m["boot_id"], m["seq"])
+            if key not in self.messages:
+                raise Failure(f"query of a message never accepted: {key}")
+            start = self.messages[key]
+            out = self.bound(start, key, now)
+            if start is None and key in self.between_null:
+                self.facts.add("rollout_between_unbounded")
+            if start is not None:
+                self.queried.setdefault(key, []).append(out["age_upper_ns"])
+                if now - start > self.m["retention"]:
+                    self.facts.add("queried_late")
+            elif key in self.matched_before_restart:
+                self.facts.add("restart_after")
+            return out
+        c = ev["channel"]
+        key = self.latest.get((c["device_id"], c["channel"]))
+        if key is None:
+            return {"latest": None, "bound": "none"}
+        if any(h[0] == c["device_id"] and h[2] > key[2] and h[1] == key[1]
+               for h in self.heartbeats):
+            self.facts.add("heartbeat_no_refresh")
+        out = self.bound(self.messages[key], key, now)
+        return {"latest": {"boot_id": key[1], "seq": key[2]}, **out}
+
+    queried: dict
+
+
+def run_case(case: dict, model: dict) -> set[str]:
+    rt = Runtime(model, case["per_device_bound"], case["total_bound"])
+    rt.restarted_away, rt.reissued_after_restore = set(), set()
+    rt.receipt, rt.accept_times, rt.heartbeats = {}, [], set()
+    rt.matched_before_restart, rt.queried = set(), {}
+    rt.restarted, rt.restored_after_restart, rt.restored_live = False, False, False
+    rt.restore_seen = False
+    label = case["name"]
+    last = None
+    for i, ev in enumerate(case["events"]):
+        kind = ev["kind"]
+        if kind not in model["kinds"]:
+            raise Failure(f"{label} event {i}: kind {kind}")
+        keys = {"kind", *model["kinds"][kind]}
+        if kind == "accept" and ev.get("v") == 1:
+            keys -= {"liveness_nonce"}
+        shapes = [keys | {"message"}, keys | {"channel"}] if kind == "query" else [keys]
+        if set(ev) not in shapes:
+            raise Failure(f"{label} event {i}: fields {sorted(ev)}")
+        t = ev["t_ns"]
+        if t is not None:
+            if type(t) is not int or t < 0 or (last is not None and t < last):
+                raise Failure(f"{label} event {i}: not in clock order")
+            last = t
+        elif kind != "sign_liveness":
+            raise Failure(f"{label} event {i}: only a signing may have no clock reading")
+        if kind == "sign_liveness":
+            if not re.fullmatch(model["nonce_pattern"], ev["nonce"]):
+                raise Failure(f"{label} event {i}: nonce grammar")
+            before = (ev["device_id"], ev["boot_id"], ev["runtime_seq"])
+            if rt.restore_seen and before in rt.process_seqs and rt.restored_live:
+                rt.facts.add("live_restore_reissue")
+            if rt.restored_after_restart and any(
+                    s == ev["runtime_seq"] and n not in rt.table for n, s in rt.signed_seqs.items()
+                    if n in rt.restarted_away):
+                rt.reissued_after_restore |= {n for n, s in rt.signed_seqs.items()
+                                              if s == ev["runtime_seq"] and n in rt.restarted_away}
+            v1_before = (ev["device_id"], ev["boot_id"], ev["runtime_seq"] - 1)
+            if v1_before in rt.v1_signed:
+                rt.pair_nonces.add(ev["nonce"])
+                rt.v1_pending.discard(v1_before)
+            rt.sign(ev)
+        elif kind == "sign_liveness_v1":
+            if type(t) is not int:
+                raise Failure(f"{label} event {i}: a v 1 signing without a clock reading")
+            key = (ev["device_id"], ev["boot_id"], ev["runtime_seq"])
+            rt.v1_signed.add(key)
+            rt.v1_pending.add(key)
+            rt.process_seqs.add(key)
+        elif kind == "sign_failed":
+            if type(t) is not int or not re.fullmatch(model["nonce_pattern"], ev["nonce"]):
+                raise Failure(f"{label} event {i}: a failed signing needs its start and nonce")
+            if (ev["device_id"], ev["boot_id"], ev["runtime_seq"] - 1) in rt.v1_signed:
+                rt.v1_pending.discard((ev["device_id"], ev["boot_id"], ev["runtime_seq"] - 1))
+                after_v1 = True
+            else:
+                after_v1 = False
+            snapshot = dict(rt.table)
+            rt.last_evicted = []
+            rt.sign(ev, failed=True)
+            evicted = list(rt.last_evicted)
+            if model["failed_discards"]:
+                rt.table.pop(ev["nonce"], None)
+            if not model["failed_eviction_stands"]:
+                for n in evicted:
+                    rt.table[n] = snapshot[n]
+            rt.failed_evicted |= set(evicted)
+            if after_v1 and ev["nonce"] not in rt.table:
+                rt.facts.add("rollout_failed_after_v1")
+        elif kind == "accept":
+            nonce = ev.get("liveness_nonce")
+            if type(ev["v"]) is not int or ev["v"] not in (1, 2) or (nonce is not None and not re.fullmatch(
+                    model["nonce_pattern"], nonce)) or type(ev["channels"]) is not list:
+                raise Failure(f"{label} event {i}: an envelope v2.md would refuse")
+            if nonce is None and ev["v"] == 2 and any(
+                    k[0] == ev["device_id"] and k[1] == ev["boot_id"] for k in rt.v1_pending):
+                rt.between_null.add((ev["device_id"], ev["boot_id"], ev["seq"]))
+            rt.accept(ev)
+            key = (ev["device_id"], ev["boot_id"], ev["seq"])
+            if rt.messages[key] is not None and nonce in rt.pair_nonces:
+                rt.facts.add("rollout_after_pair_bounded")
+            if rt.messages[key] is None and nonce in rt.failed_evicted:
+                rt.facts.add("failed_eviction_stands")
+        elif kind == "restart":
+            rt.restart()
+        elif kind == "store_restore":
+            rt.restore()
+        elif kind == "suspend":
+            if ev["resume_t_ns"] < t:
+                raise Failure(f"{label} event {i}: resumes before it suspends")
+            rt.facts.add("suspended")
+            rt.suspended_ns += ev["resume_t_ns"] - t
+            last = ev["resume_t_ns"]
+        else:
+            got = rt.query(ev)
+            if got != ev["expected"]:
+                raise Failure(f"{label} event {i}: expected {ev['expected']}, recomputed {got}")
+    for samples in rt.queried.values():
+        if len(samples) > 1 and samples[-1] > samples[0]:
+            rt.facts.add("growing")
+    burst = [a for a in rt.accept_times if a[2] is not None]
+    for i in range(len(burst)):
+        window = [a for a in burst if 0 <= a[0] - burst[i][0] <= 10**9]
+        if len(window) >= 3 and len({a[1] for a in window}) >= 2:
+            rt.facts.add("drained_backlog")
+    return rt.facts
+
+
+def check(corpus: dict, model: dict, coverage_model: dict | None = None) -> dict[str, list[str]]:
+    """Recompute every query under `model`; judge coverage under `coverage_model`.
+
+    Coverage is a property of the corpus against the text, so a mutant of the
+    rules is refused only where a recomputed query differs.
+    """
+    if corpus["retention_ns"] != model["retention_stated"]:
+        raise Failure("the corpus states another retention")
+    if set(corpus["event_kinds"]) != set(model["kinds"]):
+        raise Failure("the corpus's event kinds are not the text's six")
+    names: set[str] = set()
+    facts: dict[str, list[str]] = {}
+    for case in corpus["cases"]:
+        if case["name"] in names:
+            raise Failure(f"duplicate case {case['name']}")
+        names.add(case["name"])
+        if set(case) != {"name", "per_device_bound", "total_bound", "events", "note"}:
+            raise Failure(f"{case['name']}: fields {sorted(case)}")
+        for bound in ("per_device_bound", "total_bound"):
+            if type(case[bound]) is not int or case[bound] < 1:
+                raise Failure(f"{case['name']}: {bound}")
+        shown = run_case(case, model)
+        if coverage_model is not None:
+            shown = run_case(case, coverage_model)
+        for fact in shown:
+            facts.setdefault(fact, []).append(case["name"])
+        for ev in case["events"]:
+            facts.setdefault(f"kind {ev['kind']}", []).append(case["name"])
+    for kind in model["kinds"]:
+        if f"kind {kind}" not in facts:
+            raise Failure(f"coverage: no {kind} event")
+    for items in COVER.values():
+        for item in items:
+            if item not in facts:
+                raise Failure(f"coverage: no case shows {item}")
+    for item in EDGES:
+        if item not in facts:
+            raise Failure(f"coverage: no case shows {item}")
+    return facts
+
+
+def run(corpus_bytes: bytes, model: dict,
+        coverage_model: dict | None = None) -> dict[str, list[str]]:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
+    return check(json.loads(corpus_bytes), model, coverage_model)
+
+
+# --- mutations ----------------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def model_mutant(**changes: object) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            mutated.update(changes)
+            run(corpus_bytes, mutated, coverage_model=model)
+        return go
+
+    def text_mutant(old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts["t2"]:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            texts["t2"] = texts["t2"].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def case(c: dict, name: str) -> dict:
+        return next(x for x in c["cases"] if x["name"] == name)
+
+    def drop(name: str) -> Callable[[dict], None]:
+        return lambda c: c.update(cases=[x for x in c["cases"] if x["name"] != name])
+
+    r = model["retention"]
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("expected bound off by one", corpus_mutant(
+            lambda c: case(c, "rounds_up")["events"][2]["expected"].update(age_upper_ns=2500000))),
+        ("expected rounding down", corpus_mutant(
+            lambda c: case(c, "rounds_up")["events"][2]["expected"].update(
+                age_upper_ms_rounded_up=2))),
+        ("expected bound where none", corpus_mutant(
+            lambda c: case(c, "unknown_nonce")["events"][2].update(expected={
+                "bound": "upper", "age_upper_ns": 3000000000, "age_upper_ms_rounded_up": 3000}))),
+        ("events out of clock order", corpus_mutant(
+            lambda c: case(c, "drained_backlog")["events"].reverse())),
+        ("nonce in uppercase", corpus_mutant(
+            lambda c: case(c, "matched_and_growing")["events"][0].update(
+                nonce="C9A1DA7F16443010253A43946E2D92FA"))),
+        ("an event with an extra field", corpus_mutant(
+            lambda c: case(c, "matched_and_growing")["events"][1].update(runtime_seq=1))),
+        ("retention restated", corpus_mutant(lambda c: c.update(retention_ns=r + 1))),
+        ("an event kind renamed", corpus_mutant(
+            lambda c: c["event_kinds"].__setitem__("reboot", c["event_kinds"].pop("restart")))),
+        ("corpus digest pin wrong", model_mutant(pin="0" * 64)),
+        ("retention one nanosecond shorter", model_mutant(retention=r - 1)),
+        ("retention one nanosecond longer", model_mutant(retention=r + 1)),
+        ("matching exclusive at the hour", model_mutant(match_inclusive=False)),
+        ("matching ignores device_id", model_mutant(match_fields=["boot_id", "capability_hash"])),
+        ("matching ignores boot_id", model_mutant(match_fields=["device_id", "capability_hash"])),
+        ("matching ignores capability_hash", model_mutant(match_fields=["device_id", "boot_id"])),
+        ("matching keyed by runtime_seq", model_mutant(match_by_runtime_seq=True)),
+        ("bound rounded down", model_mutant(round_up=False)),
+        ("display unit microseconds", model_mutant(unit=10**3)),
+        ("no per-device eviction", model_mutant(evict_device=False)),
+        ("no total eviction", model_mutant(evict_total=False)),
+        ("latest evicted first", model_mutant(earliest_first=False)),
+        ("tie goes to the last nonce in byte order", model_mutant(tie_first_byte=False)),
+        ("tie goes to the first signed", model_mutant(tie_by_nonce=False)),
+        ("restart keeps the table", model_mutant(restart_empties=False)),
+        ("restart keeps held signing starts", model_mutant(restart_drops_starts=False)),
+        ("restart keeps latest readings", model_mutant(restart_drops_latest=False)),
+        ("store restore empties the table", model_mutant(restore_empties=True)),
+        ("suspension stops the clock", model_mutant(suspend_stops_clock=True)),
+        ("unclocked signing records an entry", model_mutant(unclocked_records=True)),
+        ("age fixed at receipt", model_mutant(age_fixed_at_receipt=True)),
+        ("heartbeat refreshes the channel", model_mutant(heartbeat_refreshes=True)),
+        ("a failed signing leaves a usable entry", model_mutant(failed_discards=False)),
+        ("a failed signing's eviction undone", model_mutant(failed_eviction_stands=False)),
+        ("text: failed eviction undone", text_mutant(
+            "which then holds no slot; any eviction made\n  when it was recorded stands.",
+            "which then holds no slot, and what it evicted\n  is restored.")),
+        ("text: kind dropped from eight", text_mutant(
+            "- `v` `1` liveness messages the runtime signs, which carry no nonce and\n  record nothing in the table;\n",
+            "")),
+        ("total bound applied before the device bound", model_mutant(device_first=False)),
+        ("device scope keyed by device and boot", model_mutant(
+            device_scope=("device_id", "boot_id"))),
+        ("an entry exactly an hour old expired", model_mutant(usable_inclusive=False)),
+        ("text: retention", text_mutant("at most one hour, 3600000000000 nanoseconds",
+                                        "at most one hour, 3599999999999 nanoseconds")),
+        ("text: matching drops the manifest", text_mutant(
+            "whose `device_id`, `boot_id` and `capability_hash` equal the\n  envelope's",
+            "whose `device_id`, `boot_id` and `seq` equal the\n  envelope's")),
+        ("text: tie-breaker reversed", text_mutant(
+            "the one whose nonce\n  sorts first in byte order", "the one whose nonce\n  sorts last in byte order")),
+        ("text: restore empties", text_mutant(
+            "while the process runs neither empties it nor changes any entry",
+            "while the process runs empties it")),
+        ("text: rounding down", text_mutant("the smallest whole unit not\nless than it",
+                                            "the largest whole unit not\ngreater than it")),
+        ("text: heartbeats refresh", text_mutant("It never refreshes a channel's latest reading",
+                                                 "It refreshes a channel's latest reading")),
+        ("text: per-device bound per boot", text_mutant(
+            "counting every entry for\n  a `device_id` whatever its `boot_id` or `capability_hash`, ",
+            "counting the entries for\n  a `device_id` and `boot_id`, ")),
+        ("text: total bound first", text_mutant(
+            "Then, first, if the device\n  holds as many entries as its bound",
+            "Then, after the total bound, if the device\n  holds as many entries as its bound")),
+        ("text: cover item dropped", text_mutant("- a drained backlog;\n", "")),
+        ("text: kind dropped", text_mutant("- restarts;\n", "")),
+        ("text: corpus digest", text_mutant(
+            "`909ef412cec0da86683aea72c2fdd430ce4797089166750f97c3c72db3696d83`",
+            "`" + "0" * 64 + "`")),
+    ]
+    def normative_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts[{'telemetry': 't2'}[doc]] = mutated
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def heading_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        return normative_mutant(doc, mutated)
+
+    docs_now = {"commands": contract_texts().get("c2") or COMMANDS_V2.read_text(),
+                "telemetry": contract_texts().get("t2") or TELEMETRY_V2.read_text()}
+    own_doc = next(doc for doc, table in SECTION_OWNERS.items()
+                   if any(who == OWNER for _, who in table))
+    places = {
+        "owned": next(path for path, who in SECTION_OWNERS[own_doc] if who == OWNER),
+        "unowned": next(path for path, who in SECTION_OWNERS[own_doc] if who is None),
+    }
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        for form_name, form in markdown.HEADING_FORMS:
+            mutated = (docs_now[own_doc][:at] + markdown.form_insertion(form)
+                       + docs_now[own_doc][at:])
+            cases.append((f"heading form in an {where} section: {form_name}",
+                          heading_mutant(own_doc, mutated)))
+
+    current = contract_texts()
+    for label, doc, mutated in normative_text_mutants(
+            {"commands": current.get("c2") or COMMANDS_V2.read_text(),
+              "telemetry": current.get("t2") or TELEMETRY_V2.read_text()}, OWNER, MUTATE_ALWAYS):
+        cases.append((label, normative_mutant(doc, mutated)))
+
+    def guard_mutant(clause: str, flip: tuple[str, str] | None) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts["t2"] = guard_text(texts["t2"], clause, flip)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    for clause, flips in GUARDS:
+        short = clause[:48]
+        cases.append((f"guard deleted: {short}", guard_mutant(clause, None)))
+        for polarity in flips:
+            cases.append((f"guard reversed ({polarity[0]} -> {polarity[1]}): {short}",
+                          guard_mutant(clause, polarity)))
+    for c in base["cases"]:
+        cases.append((f"case {c['name']} dropped", corpus_mutant(drop(c["name"]))))
+    # Cases whose every covered item another case also shows.
+    redundant = {
+        "case accepted_exactly_an_hour_after_signing dropped":
+            "hour_old_entry_survives_a_recording_with_room also accepts exactly one hour "
+            "after the signing start and expects the bound",
+        "case per_device_eviction dropped": "the tie, hour-old, bound-order and spans-boots "
+                                            "cases also evict by the per-device bound, and "
+                                            "other cases fit below it",
+        "case null_nonce dropped": "rollout_failed_v2_signing_leaves_no_entry and "
+                                   "rollout_reading_between_pair_unbounded also accept a v 2 "
+                                   "envelope whose nonce is null",
+        "case restart_before_acceptance dropped": "restart_and_restore_reissue_with_fresh_nonce "
+                                                  "also accepts a nonce signed before a restart",
+    }
+    equivalent = [(label, m) for label, m in cases if label in redundant]
+    cases = [(label, m) for label, m in cases if label not in redundant]
+    # Mutants no corpus can refuse, each for the reason given.
+    equivalent_reasons = {**redundant,
+        "expired entries kept and counted":
+            "eviction takes the earliest signing start in its scope, and every expired "
+            "entry starts before every usable one, so a scope holding an expired entry "
+            "evicts an expired one; usable entries are the same with or without the expiry "
+            "sweep, and matching checks the hour itself, so no query can differ",
+        "an entry expired only one nanosecond past the hour":
+            "it keeps an expired entry one nanosecond longer, which by the reason above no "
+            "query can observe",
+        "a v 1 envelope matched by its nonce":
+            "a v 1 envelope carries no liveness_nonce, so there is nothing to match",
+        "a null nonce matched":
+            "the table holds no entry for null, since every signed nonce has the grammar",
+    }
+    equivalent += [
+        ("expired entries kept and counted", model_mutant(evict_expired=False)),
+        ("an entry expired only one nanosecond past the hour", model_mutant(expiry_slack=1)),
+        ("a v 1 envelope matched by its nonce", model_mutant(v1_matches=True)),
+        ("a null nonce matched", model_mutant(null_matches=True)),
+    ]
+    survived = 0
+    for label, mutant in cases + equivalent:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError, IndexError) as refused:
+            if label in equivalent_reasons:
+                print(f"REFUSED (listed as equivalent) {label}: {refused}")
+                survived += 1
+            else:
+                print(f"refused  {label}: {refused}")
+        else:
+            if label in equivalent_reasons:
+                print(f"EQUIVALENT {label}: {equivalent_reasons[label]}")
+            else:
+                print(f"SURVIVED {label}")
+                survived += 1
+    # Heading-shaped lines that are not headings must change nothing.
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        before = markdown.sections(docs_now[own_doc])
+        for form_name, inserted in markdown.NOT_HEADINGS:
+            mutated = docs_now[own_doc][:at] + "\n" + inserted + docs_now[own_doc][at:]
+            shifted = [p for p, _, _ in markdown.sections(mutated)]
+            wrong = shifted != [p for p, _, _ in before] or markdown.non_canonical(mutated)
+            if not wrong and "fence" in form_name:
+                try:
+                    normative_mutant(own_doc, mutated)()
+                except Failure as refused:
+                    wrong = str(refused)
+            if wrong:
+                print(f"WRONGLY REFUSED not a heading, in an {where} section: {form_name}: {wrong}")
+                survived += 1
+            else:
+                print(f"accepted not a heading, in an {where} section: {form_name}")
+    print(f"{len(cases)} mutants, {len(equivalent)} known equivalent")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError) as failure:
+        print(f"firmware-telemetry/v2 reading-age contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-telemetry/v2 reading-age corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    queries = sum(1 for c in corpus["cases"] for e in c["events"] if e["kind"] == "query")
+    print(
+        f"firmware-telemetry/v2 reading-age corpus: {len(corpus['cases'])} cases, "
+        f"{queries} queries recomputed from How Old A Reading Is"
+    )
+    held = [s for doc in HELD_SENTENCES.values() for body in doc.values() for s in body]
+    owned = sum(len(doc) for doc in HELD_SENTENCES.values())
+    print(f"{len(held)} sentences held, unchanged, in the {owned} sections this checker owns")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

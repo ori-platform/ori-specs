@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 reading envelope corpus (envelope at v 2).
+
+Signatures come from OpenSSL through `cryptography`, under the disclosed
+device test seed the fault and manifest corpora use. Nonces are fixed fixture
+values. Nothing here is shared with scripts/check-firmware-envelope-vectors-v2,
+which reads the envelope's version rule, the nonce grammar and the refusal
+reasons from the contract.
+
+    python3 scripts/generate-firmware-envelope-vectors-v2          # write
+    python3 scripts/generate-firmware-envelope-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-telemetry" / "envelope-vectors-v2.json"
+
+SEED_HEX = "42" * 32
+OTHER_SEED_HEX = "43" * 32  # signs the precedence case whose signature fails
+OTHER_HASH = "sha256:" + "ab" * 32
+UNKNOWN_CHANNEL = {"channel": "ch9", "sensor_type": "current", "unit": "ampere", "value": 1.0,
+                   "quality": 1.0}
+DEVICE_ID = "ori-fw-7c9f2b3a"
+CAPABILITY_HASH = (
+    "sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d"
+)
+POSTURE = "sealed_flash"
+BOOT_ID = 41
+CHANNELS = (
+    {"channel": "ch0", "sensor_type": "current", "unit": "ampere"},
+    {"channel": "ch1", "sensor_type": "voltage", "unit": "volt"},
+)
+CURRENT = {"channel": "ch0", "sensor_type": "current", "unit": "ampere", "value": 8.21,
+           "quality": 1.0}
+VOLTAGE = {"channel": "ch1", "sensor_type": "voltage", "unit": "volt", "value": 229.5,
+           "quality": 1.0}
+NONCE = hashlib.sha256(b"ori-specs envelope-v2 fixture nonce").hexdigest()[:32]
+ABSENT = object()
+
+# (name, v, liveness_nonce or ABSENT, readings, note)
+ACCEPT = (
+    ("v2_reading_with_nonce", 2, NONCE, [CURRENT],
+     "a reading measured while the device held a liveness nonce"),
+    ("v2_reading_null_nonce", 2, None, [CURRENT],
+     "a reading measured while the device held none; always present, null"),
+    ("v2_two_readings_with_nonce", 2, NONCE, [CURRENT, VOLTAGE],
+     "one nonce for the envelope: the one held before the first transaction began"),
+    ("v2_heartbeat_with_nonce", 2, NONCE, [],
+     "a heartbeat carries the nonce held when it is signed"),
+    ("v2_heartbeat_null_nonce", 2, None, [], "a heartbeat while no nonce is held"),
+    ("v2_all_zero_nonce", 2, "0" * 32, [CURRENT],
+     "the grammar admits any 32 lowercase hex digits"),
+    ("v1_reading", 1, ABSENT, [CURRENT],
+     "a v 1 envelope is still accepted, under v1's grammar, with no liveness_nonce"),
+    ("v1_heartbeat", 1, ABSENT, [], "a v 1 heartbeat is still accepted"),
+)
+
+# (name, reason, v, liveness_nonce or ABSENT, readings, note). Every signature is valid.
+REJECT = (
+    ("reject_v2_missing_nonce", "liveness_nonce_missing", 2, ABSENT, [CURRENT],
+     "v 2 requires liveness_nonce, null when none is held"),
+    ("reject_v1_with_nonce", "liveness_nonce_at_v1", 1, NONCE, [CURRENT],
+     "v 1 keeps v1's grammar exactly"),
+    ("reject_v1_with_null_nonce", "liveness_nonce_at_v1", 1, None, [CURRENT],
+     "the field is forbidden at v 1 whatever its value"),
+    ("reject_v2_nonce_uppercase", "invalid_liveness_nonce", 2, NONCE.upper(), [CURRENT],
+     "hex digits are lowercase only"),
+    ("reject_v2_nonce_non_hex", "invalid_liveness_nonce", 2, "g" + NONCE[1:], [CURRENT],
+     "g is not a hexadecimal digit"),
+    ("reject_v2_nonce_31_chars", "invalid_liveness_nonce", 2, NONCE[:31], [CURRENT],
+     "exactly 32 characters"),
+    ("reject_v2_nonce_33_chars", "invalid_liveness_nonce", 2, NONCE + "0", [CURRENT],
+     "exactly 32 characters"),
+    ("reject_v2_nonce_empty", "invalid_liveness_nonce", 2, "", [CURRENT],
+     "the empty string is not the spelling of none held; null is"),
+    ("reject_v2_nonce_integer", "invalid_liveness_nonce", 2, 12345, [CURRENT],
+     "liveness_nonce is a string or null"),
+    ("reject_v2_nonce_boolean", "invalid_liveness_nonce", 2, False, [CURRENT],
+     "false is not null"),
+    ("reject_envelope_v0", "unsupported_version", 0, NONCE, [CURRENT],
+     "versions start at 1; the nonce is valid, so only the version refuses it"),
+    ("reject_envelope_v3", "unsupported_version", 3, NONCE, [CURRENT],
+     "no version above 2 is defined"),
+    ("reject_envelope_v_string", "unsupported_version", "2", NONCE, [CURRENT],
+     "v is a JSON integer; the string \"2\" is another type"),
+    ("reject_envelope_v_true", "unsupported_version", True, NONCE, [CURRENT],
+     "true is a JSON boolean, not the integer 1"),
+)
+
+# Refusals that need a key outside the envelope's grammar.
+# (name, reason, v, liveness_nonce or ABSENT, readings, overrides, note)
+EXTRA_REJECT = (
+    ("reject_v2_extra_field", "unexpected_field", 2, NONCE, [CURRENT],
+     {"extra": ("emitted_at_source", "device")},
+     "the field set is closed at v 2: eleven keys and no other"),
+)
+
+# Precedence: each breaks two checks and is refused for the earlier.
+# (name, reason, v, liveness_nonce or ABSENT, readings, overrides, note)
+PRECEDENCE = (
+    ("reject_capability_hash_before_nonce", "capability_hash_mismatch", 2, NONCE.upper(),
+     [CURRENT], {"capability_hash": OTHER_HASH},
+     "v1's fourth step precedes the field checks of its sixth: the manifest hash refuses it "
+     "before the malformed nonce is read"),
+    ("reject_signature_before_nonce", "signature_verification_failed", 2, NONCE.upper(),
+     [CURRENT], {"other_key": True},
+     "the signature step precedes the field checks; this case's signature does not verify"),
+    ("reject_nonce_at_v1_before_channel", "liveness_nonce_at_v1", 1, NONCE, [UNKNOWN_CHANNEL],
+     {}, "the nonce checks precede v1's validation of channels and readings at v 1 too"),
+    ("reject_nonce_before_channel", "liveness_nonce_missing", 2, ABSENT, [UNKNOWN_CHANNEL], {},
+     "the nonce checks precede v1's validation of channels and readings"),
+    ("reject_nonce_before_extra_field", "invalid_liveness_nonce", 2, NONCE.upper(), [CURRENT],
+     {"extra": ("emitted_at_source", "device")},
+     "the nonce grammar precedes the field-set check"),
+    ("reject_extra_field_before_channel", "unexpected_field", 2, NONCE, [UNKNOWN_CHANNEL],
+     {"extra": ("emitted_at_source", "device")},
+     "the field-set check precedes v1's validation of channels and readings"),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def build() -> bytes:
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SEED_HEX))
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    seq = 150000
+
+    other = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(OTHER_SEED_HEX))
+
+    def signed(v: object, liveness_nonce: object, readings: list,
+               overrides: dict | None = None) -> dict:
+        nonlocal seq
+        overrides = overrides or {}
+        seq += 1
+        envelope: dict = {
+            "v": v,
+            "alg": "ed25519",
+            "device_id": DEVICE_ID,
+            "boot_id": BOOT_ID,
+            "seq": seq,
+            "capability_hash": overrides.get("capability_hash", CAPABILITY_HASH),
+            "posture": POSTURE,
+            "device_uptime_ms": 918233 + seq - 150000,
+            "emitted_at_ms": None,
+        }
+        if liveness_nonce is not ABSENT:
+            envelope["liveness_nonce"] = liveness_nonce
+        if "extra" in overrides:
+            key_name, value = overrides["extra"]
+            envelope[key_name] = value
+        envelope["readings"] = readings
+        body = canonical(envelope)
+        signer = other if overrides.get("other_key") else key
+        signature = "ed25519:" + base64.b64encode(signer.sign(body)).decode("ascii")
+        message = canonical({"envelope": envelope, "signature": signature})
+        return {
+            "input": envelope,
+            "canonical_hex": body.hex(),
+            "canonical_sha256_hex": hashlib.sha256(body).hexdigest(),
+            "signature": signature,
+            "message_hex": message.hex(),
+        }
+
+    cases = [{"name": name, **signed(v, n, readings), "note": note}
+             for name, v, n, readings, note in ACCEPT]
+    reject_cases = [{"name": name, "reason": reason, "signature_valid": True,
+                     **signed(v, n, readings), "note": note}
+                    for name, reason, v, n, readings, note in REJECT]
+    reject_cases += [{"name": name, "reason": reason, "signature_valid": True,
+                      **signed(v, n, readings, over), "note": note}
+                     for name, reason, v, n, readings, over, note in EXTRA_REJECT]
+    precedence_cases = [{"name": name, "reason": reason,
+                         "signature_valid": not over.get("other_key", False),
+                         **signed(v, n, readings, over), "note": note}
+                        for name, reason, v, n, readings, over, note in PRECEDENCE]
+
+    corpus = {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for firmware-telemetry/v2 Reading Envelope at v 2. A consumer of "
+            "this version must accept every case in 'cases' and refuse every case in "
+            "'reject_cases' and 'precedence_cases' with the declared reason. Each case is judged on its own against "
+            "verifier_context, with no prior message accepted from the device. Signed with a "
+            "disclosed TEST-ONLY seed: never provision it. Nonces are fixed fixture values."
+        ),
+        "test_seed_hex": SEED_HEX,
+        "public_key_hex": public.hex(),
+        "public_key_b64": base64.b64encode(public).decode("ascii"),
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "verifier_context": {
+            "device_id": DEVICE_ID,
+            "capability_hash": CAPABILITY_HASH,
+            "posture": POSTURE,
+            "public_key_b64": base64.b64encode(public).decode("ascii"),
+            "accepted_channels": list(CHANNELS),
+        },
+        "reasons": {
+            "unsupported_version": "the envelope's v is not the integer 1 or 2",
+            "liveness_nonce_missing": "v is 2 and the envelope has no liveness_nonce",
+            "liveness_nonce_at_v1": "v is 1 and the envelope has liveness_nonce",
+            "invalid_liveness_nonce": (
+                "v is 2 and liveness_nonce is neither null nor 32 characters each one of "
+                "0-9 or a-f"
+            ),
+            "unexpected_field": "v is 2 and the envelope has a key outside its eleven",
+            "capability_hash_mismatch": "v1's fourth step: the envelope's capability_hash is "
+                                        "not the accepted manifest hash",
+            "signature_verification_failed": "v1's fifth step: the signature does not verify",
+        },
+        "check_order": ["capability_hash_mismatch", "signature_verification_failed",
+                        "unsupported_version", "liveness_nonce_at_v1",
+                        "liveness_nonce_missing", "invalid_liveness_nonce",
+                        "unexpected_field"],
+        "cases": cases,
+        "reject_cases": reject_cases,
+        "precedence_cases": precedence_cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
