@@ -1,0 +1,723 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 manifest corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-manifest-vectors-v2. Canonical
+bytes come from this script's own serializer, the key is re-derived from the
+disclosed seed and every signature verified with this script's own affine
+curve arithmetic. The mode table, the bridged source, the refusal reasons and
+the corpus digest are read from firmware-telemetry/v2.md; the manifest's
+fields and enumerated values from v1's example manifest. Nothing is read from
+the generator.
+
+Held to:
+
+- each case: canonical bytes, digest, manifest_hash, wire message and
+  signature reproduce from its message, and the manifest is valid under the
+  v1 checks modelled here;
+- each case: its device_mode is the mode this script derives from its arrays;
+- each refusal: signature valid, and the set of v2 rules it breaks names
+  exactly its declared reason, so no other rule refuses it;
+- coverage: every single-role mode and every multi-role combination accepted,
+  no actuator_node accepted, each defined mode refused over arrays that
+  determine another, integer and null modes, and no_channels alone;
+- the digest firmware-telemetry/v2.md pins is the corpus's.
+
+    python3 scripts/check-firmware-manifest-vectors-v2
+    python3 scripts/check-firmware-manifest-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, re-signs edited manifests with this
+script's own signer so that an edit reaches the mode rules rather than the
+signature, edits copies of the contract text, and switches off each rule in
+turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import itertools
+import json
+import math
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-telemetry" / "manifest-vectors-v2.json"
+TELEMETRY_V1 = ROOT / "firmware-telemetry" / "v1.md"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+
+P = 2**255 - 19
+D = (-121665 * pow(121666, -1, P)) % P
+L = 2**252 + 27742317777372353535851937790883648493
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+BY = 4 * pow(5, -1, P) % P
+ROLE_WORDS = {
+    "metering channels": "metering",
+    "bridged channels": "bridged",
+    "actions": "actions",
+}
+RULES = ("mode_undefined", "mode_disagrees", "channels_empty")
+# What each rule refuses, as v2.md words it. The checker evaluates each rule by
+# its own predicate below, so the clause it is held to must say exactly that: a
+# clause whose meaning changes, its polarity included, fails here rather than
+# leaving a predicate the text no longer states.
+RULE_CLAUSES = {
+    "mode_undefined": "`device_mode` is not one of the four values above, "
+                      "including a value of another JSON type",
+    "mode_disagrees": "`device_mode` is not the value its `channels` and "
+                      "`actions` determine",
+    "channels_empty": "`channels` is empty",
+}
+OPTIONAL_MANIFEST_FIELD = "deployment_maintenance_limit_ms"
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, affine -------------------------------------------------------
+
+def _add(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = p
+    x2, y2 = q
+    t = D * x1 * x2 * y1 * y2 % P
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + t, -1, P) % P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, -1, P) % P
+    return x3, y3
+
+
+def _mul(k: int, p: tuple[int, int]) -> tuple[int, int]:
+    acc = (0, 1)
+    while k:
+        if k & 1:
+            acc = _add(acc, p)
+        p = _add(p, p)
+        k >>= 1
+    return acc
+
+
+def _recover_x(y: int, sign: int) -> int | None:
+    if y >= P:
+        return None
+    u = (y * y - 1) % P
+    v = (D * y * y + 1) % P
+    x = u * pow(v, 3, P) * pow(u * pow(v, 7, P), (P - 5) // 8, P) % P
+    if v * x * x % P == (P - u) % P:
+        x = x * SQRT_M1 % P
+    elif v * x * x % P != u:
+        return None
+    if x == 0 and sign:
+        return None
+    if x & 1 != sign:
+        x = P - x
+    return x
+
+
+def _decode(raw: bytes) -> tuple[int, int] | None:
+    n = int.from_bytes(raw, "little")
+    y = n & ((1 << 255) - 1)
+    x = _recover_x(y, n >> 255)
+    return None if x is None else (x, y)
+
+
+def _encode(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+_BX = _recover_x(BY, 0)
+assert _BX is not None
+BASE = (_BX, BY)
+
+
+def _expand(seed: bytes) -> tuple[int, bytes]:
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return a, h[32:]
+
+
+def public_key(seed: bytes) -> bytes:
+    return _encode(_mul(_expand(seed)[0], BASE))
+
+
+def sign(seed: bytes, message: bytes) -> bytes:
+    """Used only by --mutations, to re-sign an edited manifest."""
+    a, prefix = _expand(seed)
+    public = _encode(_mul(a, BASE))
+    r = int.from_bytes(hashlib.sha512(prefix + message).digest(), "little") % L
+    big_r = _encode(_mul(r, BASE))
+    h = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little")
+    return big_r + ((r + h * a) % L).to_bytes(32, "little")
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if len(signature) != 64 or len(public) != 32:
+        return False
+    a = _decode(public)
+    r = _decode(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= L or _encode(r) != signature[:32]:
+        return False
+    h = int.from_bytes(
+        hashlib.sha512(signature[:32] + public + message).digest(), "little"
+    )
+    return _mul(s, BASE) == _add(r, _mul(h, a))
+
+
+# --- canonical JSON, per firmware-telemetry/v1 "Canonical JSON" -------------
+
+_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f",
+                  "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _string(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        if ch in _SHORT_ESCAPES:
+            out.append(_SHORT_ESCAPES[ch])
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _number(n: int | float) -> str:
+    if type(n) is int:
+        if abs(n) > 2**53 - 1:
+            raise Failure(f"integer {n} outside the canonical range")
+        return str(n)
+    if not math.isfinite(n):
+        raise Failure("non-finite number")
+    if n != 0 and not 1e-4 <= abs(n) < 1e16:
+        raise Failure(f"number {n!r} outside the canonical zone")
+    text = repr(n)
+    if "e" in text or "E" in text or "." not in text:
+        raise Failure(f"number {n!r} has no fixed-notation form")
+    return text
+
+
+def _emit(value: object) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if type(value) in (int, float):
+        return _number(value)  # type: ignore[arg-type]
+    if type(value) is str:
+        return _string(value)
+    if type(value) is list:
+        return "[" + ",".join(_emit(v) for v in value) + "]"
+    if type(value) is dict:
+        return "{" + ",".join(
+            _string(k) + ":" + _emit(value[k]) for k in sorted(value)
+        ) + "}"
+    raise Failure(f"no canonical form for {type(value).__name__}")
+
+
+def canonical(value: object) -> bytes:
+    return _emit(value).encode("utf-8")
+
+
+# --- contract text ---------------------------------------------------------
+
+def _section(text: str, heading: str) -> str:
+    start = text.index(heading)
+    rest = text[start + len(heading):]
+    end = re.search(r"\n#{2,3} ", rest)
+    return rest if end is None else rest[: end.start()]
+
+
+def contract_texts() -> dict[str, str]:
+    return {"t1": TELEMETRY_V1.read_text(), "t2": TELEMETRY_V2.read_text()}
+
+
+def _v1_manifest(t1: str) -> dict:
+    block = re.search(r"```json\n(\{\n  \"manifest\".*?)\n```",
+                      _section(t1, "## Capability Manifest"), re.S)
+    if block is None:
+        raise Failure("v1 carries no example manifest message")
+    example = json.loads(block.group(1))["manifest"]
+
+    def options(value: str) -> set[str]:
+        return set(value.split("|"))
+
+    channel = example["channels"][0]
+    return {
+        "fields": set(example) - {OPTIONAL_MANIFEST_FIELD},
+        "postures": options(example["posture"]),
+        "key_storage": options(example["key_storage"]),
+        "transports": set(example["transports"]),
+        "channel_fields": set(channel),
+        # v1 names no closed sensor_type or unit vocabulary; only the example's
+        # values are held supported here.
+        "sensor_types": {channel["sensor_type"]},
+        "units": {channel["unit"]},
+        "protocols": options(channel["protocol"]),
+        "sources": options(channel["source"]),
+        "action_fields": set(example["actions"][0]),
+        "action_names": {example["actions"][0]["action"]},
+        "authorities": options(example["actions"][0]["authority"]),
+        "interlock_fields": set(example["interlocks"][0]),
+    }
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    t1, t2 = texts["t1"], texts["t2"]
+    section = _section(t2, "## Device Mode")
+    bridged = re.search(
+        r"A channel whose `source` is `([a-z_]+)` is bridged;\s+every other "
+        r"channel meters\.", section)
+    if bridged is None:
+        raise Failure("v2 Device Mode does not say which source is bridged")
+    modes: dict[str, object] = {}
+    for value, cell in re.findall(r"^\| `([a-z_]+)` \| (.*?) \|\s*$", section, re.M):
+        single = re.fullmatch(r"(Metering channels|Bridged channels|Actions) only"
+                              r"(?:, and no (?:actions|channels))?\.", cell)
+        several = re.fullmatch(r"More than one of the three: (.*)\.", cell)
+        if single is not None:
+            modes[value] = frozenset({ROLE_WORDS[single.group(1).lower()]})
+        elif several is not None:
+            listed = [w.strip().lower() for w in several.group(1).split(",")]
+            if sorted(ROLE_WORDS.get(w, w) for w in listed) != sorted(ROLE_WORDS.values()):
+                raise Failure(f"the {value} row does not list the three roles")
+            modes[value] = "several"
+        else:
+            raise Failure(f"cannot read the {value} row: {cell!r}")
+    if sorted(m for m in modes.values() if m != "several") != sorted(
+        frozenset({r}) for r in ROLE_WORDS.values()
+    ) or list(modes.values()).count("several") != 1:
+        raise Failure("the mode table does not give each role one mode and "
+                      "one mode to several roles")
+    rules_text = section[section.index("MUST reject a manifest when:"):]
+    bullets = re.findall(r"^- (.*?)(?=^- |^\S|\Z)", rules_text, re.M | re.S)
+    codes = [re.findall(r"`([a-z_]+)`\)", " ".join(b.split())) for b in bullets]
+    if len(codes) != len(RULES) or any(len(c) != 1 for c in codes):
+        raise Failure("v2 Device Mode does not list three rules, each with one error")
+    for rule, bullet in zip(RULES, bullets):
+        # Only the trailing error annotation is removed; every other word of
+        # the bullet, a parenthesis included, is part of the clause.
+        annotated = re.fullmatch(r"(.*) \((?:recommended error )?`[a-z_]+`\)[;.]",
+                                 " ".join(bullet.split()))
+        clause = annotated.group(1) if annotated else " ".join(bullet.split())
+        if clause != RULE_CLAUSES[rule]:
+            raise Failure(f"v2 Device Mode's {rule} clause reads {clause!r}, "
+                          f"not {RULE_CLAUSES[rule]!r}")
+    golden = _section(t2, "## Golden Vectors")
+    pin = re.search(r"\[manifest-vectors-v2\.json\]\(manifest-vectors-v2\.json\)"
+                    r"[^`]*?Its\s+SHA-256\s+is\s+`([0-9a-f]{64})`", golden)
+    if pin is None:
+        raise Failure("firmware-telemetry/v2.md pins no manifest corpus digest")
+    return {
+        "v1": _v1_manifest(t1),
+        "bridged_source": bridged.group(1),
+        "modes": modes,
+        "reasons": {rule: c[0] for rule, c in zip(RULES, codes)},
+        "pin": pin.group(1),
+    }
+
+
+# --- consumer model --------------------------------------------------------
+
+def derive_mode(manifest: dict, model: dict) -> str | None:
+    roles = {
+        "bridged" if c["source"] == model["bridged_source"] else "metering"
+        for c in manifest["channels"]
+    }
+    if manifest["actions"]:
+        roles.add("actions")
+    for mode, wanted in model["modes"].items():
+        if wanted == "several" and len(roles) > 1:
+            return mode
+        if wanted == frozenset(roles):
+            return mode
+    return None
+
+
+def v1_fault(message: dict, context: dict, public: bytes, model: dict) -> str | None:
+    """Return why the v1 checks modelled here refuse the message, or None."""
+    v1 = model["v1"]
+    if type(message) is not dict or set(message) != {"manifest", "manifest_hash", "signature"}:
+        return "message fields"
+    m = message["manifest"]
+    if type(m) is not dict or not v1["fields"] <= set(m) <= v1["fields"] | {OPTIONAL_MANIFEST_FIELD}:
+        return "manifest fields"
+    if OPTIONAL_MANIFEST_FIELD in m:
+        return "the corpus does not exercise the optional field"
+    if type(m["v"]) is not int or m["v"] != 1 or m["alg"] != "ed25519":
+        return "v or alg"
+    if m["device_id"] != context["device_id"]:
+        return "device_id"
+    if m["public_key_b64"] != context["public_key_b64"]:
+        return "public_key_b64"
+    body = canonical(m)
+    if message["manifest_hash"] != "sha256:" + hashlib.sha256(body).hexdigest():
+        return "manifest_hash"
+    wire = message["signature"]
+    if type(wire) is not str or not wire.startswith("ed25519:"):
+        return "signature encoding"
+    try:
+        raw = base64.b64decode(wire[8:], validate=True)
+    except ValueError:
+        return "signature base64"
+    if base64.b64encode(raw).decode() != wire[8:] or not verify(public, body, raw):
+        return "signature"
+    for name in ("firmware_version", "board_profile"):
+        if type(m[name]) is not str or not m[name]:
+            return name
+    if m["posture"] not in v1["postures"] or m["key_storage"] not in v1["key_storage"]:
+        return "posture or key_storage"
+    flags = (m["secure_boot_enabled"], m["flash_encryption_enabled"])
+    if any(type(f) is not bool for f in flags):
+        return "posture booleans"
+    if m["posture"] != "development" and not all(flags):
+        return "posture disagrees with its booleans"
+    if (type(m["transports"]) is not list or not m["transports"]
+            or not set(m["transports"]) <= v1["transports"]):
+        return "transports"
+    for name in ("channels", "actions", "interlocks"):
+        if type(m[name]) is not list:
+            return name
+    seen = set()
+    for c in m["channels"]:
+        if type(c) is not dict or set(c) != v1["channel_fields"]:
+            return "channel fields"
+        if c["channel"] in seen:
+            return "duplicate channel"
+        seen.add(c["channel"])
+        if (c["sensor_type"] not in v1["sensor_types"] or c["unit"] not in v1["units"]
+                or c["protocol"] not in v1["protocols"] or c["source"] not in v1["sources"]):
+            return "unsupported channel"
+        q = c["quality_floor"]
+        if type(q) not in (int, float) or not 0 <= q <= 1:
+            return "quality_floor"
+    for a in m["actions"]:
+        if (type(a) is not dict or set(a) != v1["action_fields"]
+                or a["action"] not in v1["action_names"]
+                or a["authority"] not in v1["authorities"]):
+            return "action"
+    for i in m["interlocks"]:
+        if type(i) is not dict or set(i) != v1["interlock_fields"]:
+            return "interlock"
+        if i["channel"] not in seen or i["action"] not in {a["action"] for a in m["actions"]}:
+            return "interlock names an undeclared channel or action"
+    return None
+
+
+def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
+    """Every v2 Device Mode rule the manifest breaks, not only the first."""
+    mode = manifest["device_mode"]
+    broken = set()
+    defined = type(mode) is str and mode in model["modes"]
+    if not defined:
+        broken.add("mode_undefined")
+    elif mode != derive_mode(manifest, model):
+        broken.add("mode_disagrees")
+    if not manifest["channels"]:
+        broken.add("channels_empty")
+    return broken - off
+
+
+def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+    seed = bytes.fromhex(corpus["test_seed_hex"])
+    public = public_key(seed)
+    if corpus["public_key_hex"] != public.hex():
+        raise Failure("public key does not derive from the seed")
+    context = corpus["verifier_context"]
+    if set(context) != {"device_id", "public_key_b64"}:
+        raise Failure("verifier context is not a provisioning anchor")
+    for where in (context["public_key_b64"], corpus["public_key_b64"]):
+        if base64.b64decode(where, validate=True) != public:
+            raise Failure("a public_key_b64 names another key")
+    declared = set(model["reasons"].values())
+    if set(corpus["reasons"]) != declared:
+        raise Failure(f"corpus reasons {sorted(corpus['reasons'])} are not the "
+                      f"contract's {sorted(declared)}")
+
+    def common(case: dict) -> dict:
+        message = case["message"]
+        manifest = message["manifest"]
+        body = canonical(manifest)
+        if bytes.fromhex(case["canonical_hex"]) != body:
+            raise Failure(f"{case['name']}: canonical bytes")
+        if case["canonical_sha256_hex"] != hashlib.sha256(body).hexdigest():
+            raise Failure(f"{case['name']}: digest")
+        if bytes.fromhex(case["message_hex"]) != canonical(message):
+            raise Failure(f"{case['name']}: wire message")
+        why = v1_fault(message, context, public, model)
+        if why is not None:
+            raise Failure(f"{case['name']}: not otherwise valid under v1 ({why})")
+        return manifest
+
+    names = set()
+    for case in corpus["cases"] + corpus["reject_cases"]:
+        if case["name"] in names:
+            raise Failure(f"duplicate case {case['name']}")
+        names.add(case["name"])
+
+    for case in corpus["cases"]:
+        manifest = common(case)
+        broken = broken_rules(manifest, model, off)
+        if broken:
+            raise Failure(f"{case['name']}: refused ({sorted(broken)})")
+        if "mode_disagrees" not in off and manifest["device_mode"] != derive_mode(manifest, model):
+            raise Failure(f"{case['name']}: mode is not the one its arrays determine")
+
+    for case in corpus["reject_cases"]:
+        manifest = common(case)
+        if case["signature_valid"] is not True:
+            raise Failure(f"{case['name']}: a refusal here must carry a valid signature")
+        if case["reason"] not in declared:
+            raise Failure(f"{case['name']}: undeclared reason {case['reason']}")
+        reasons = {model["reasons"][r] for r in broken_rules(manifest, model, off)}
+        if reasons != {case["reason"]}:
+            raise Failure(f"{case['name']}: refused for {sorted(reasons)}, "
+                          f"not exactly {case['reason']}")
+
+    accepted = [c["message"]["manifest"] for c in corpus["cases"]]
+    refused = [(c["reason"], c["message"]["manifest"]) for c in corpus["reject_cases"]]
+    roles = sorted(ROLE_WORDS.values())
+    for size in (1, 2, 3):
+        for combo in itertools.combinations(roles, size):
+            if combo == ("actions",):
+                continue
+            if not any(_roles(m, model) == set(combo) for m in accepted):
+                raise Failure(f"coverage: no accepted case over {combo}")
+    if any(_roles(m, model) == {"actions"} or not m["channels"] for m in accepted):
+        raise Failure("coverage: a manifest with no channel is accepted")
+    undefined = model["reasons"]["mode_undefined"]
+    for mode in model["modes"]:
+        if not any(r == model["reasons"]["mode_disagrees"] and m["device_mode"] == mode
+                   and m["channels"] for r, m in refused):
+            raise Failure(f"coverage: {mode} is never refused over other arrays")
+    for kind in (int, type(None), str):
+        if not any(r == undefined and type(m["device_mode"]) is kind
+                   for r, m in refused):
+            raise Failure(f"coverage: no undefined {kind.__name__} mode")
+    if not any(m["device_mode"] == "sensor_node" and m["actions"] for _, m in refused):
+        raise Failure("coverage: sensor_node with an action is not refused")
+    if not any(r == model["reasons"]["channels_empty"] and m["actions"]
+               and derive_mode(m, model) == m["device_mode"] for r, m in refused):
+        raise Failure("coverage: no refusal for empty channels alone")
+
+
+def _roles(manifest: dict, model: dict) -> set[str]:
+    roles = {
+        "bridged" if c["source"] == model["bridged_source"] else "metering"
+        for c in manifest["channels"]
+    }
+    return roles | ({"actions"} if manifest["actions"] else set())
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> None:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
+    check(json.loads(corpus_bytes), model, off)
+
+
+# --- mutations -------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+    seed = bytes.fromhex(base["test_seed_hex"])
+
+    def resign(case: dict) -> None:
+        manifest = case["message"]["manifest"]
+        body = canonical(manifest)
+        case["message"]["manifest_hash"] = "sha256:" + hashlib.sha256(body).hexdigest()
+        case["message"]["signature"] = "ed25519:" + base64.b64encode(sign(seed, body)).decode()
+        case["canonical_hex"] = body.hex()
+        case["canonical_sha256_hex"] = hashlib.sha256(body).hexdigest()
+        case["message_hex"] = canonical(case["message"]).hex()
+
+    def find(collection: str, name: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c[collection] if x["name"] == name)
+
+    bridge = find("cases", "bridge_node")
+    mixed_all = find("cases", "mixed_all_three")
+    no_channels = find("reject_cases", "reject_actuator_node_no_channels")
+    null_mode = find("reject_cases", "reject_mode_null")
+    sensor_action = find("reject_cases", "reject_sensor_node_with_action")
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def edited(pick: Callable[[dict], dict], **fields: object) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = pick(c)
+            case["message"]["manifest"].update(fields)
+            resign(case)
+        return edit
+
+    def flip_signature(c: dict) -> None:
+        case = bridge(c)
+        raw = bytearray(base64.b64decode(case["message"]["signature"][8:]))
+        raw[40] ^= 1
+        case["message"]["signature"] = "ed25519:" + base64.b64encode(bytes(raw)).decode()
+        case["message_hex"] = canonical(case["message"]).hex()
+
+    def two_reasons(c: dict) -> None:
+        case = copy.deepcopy(no_channels(c))
+        case["name"] = "two_reasons"
+        case["message"]["manifest"].update(actions=[])
+        resign(case)
+        c["reject_cases"].append(case)
+
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts[key]:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = texts[key].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    bridge_row = "| `bridge_node` | Bridged channels only, and no actions. |\n"
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("signature bit flipped", corpus_mutant(flip_signature)),
+        ("mode edited after signing", corpus_mutant(
+            lambda c: bridge(c)["message"]["manifest"].update(device_mode="sensor_node"))),
+        ("accepted mode changed and re-signed", corpus_mutant(
+            edited(bridge, device_mode="sensor_node"))),
+        ("mixed case re-signed as sensor_node", corpus_mutant(
+            edited(mixed_all, device_mode="sensor_node"))),
+        ("refusal's arrays made to agree and re-signed", corpus_mutant(
+            edited(sensor_action, actions=[], interlocks=[]))),
+        ("refusal's expected reason flipped", corpus_mutant(
+            lambda c: no_channels(c).update(reason="invalid_device_mode"))),
+        ("mode refusal relabelled no_channels", corpus_mutant(
+            lambda c: null_mode(c).update(reason="no_channels"))),
+        ("refusal marked unsigned", corpus_mutant(
+            lambda c: null_mode(c).update(signature_valid=False))),
+        ("refusal breaking two rules added", corpus_mutant(two_reasons)),
+        ("unsupported protocol re-signed", corpus_mutant(
+            edited(bridge, channels=[dict(bridge(base)["message"]["manifest"]["channels"][0],
+                                          protocol="can")]))),
+        ("null mode refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(null_mode(c)))),
+        ("bridge_node case dropped", corpus_mutant(
+            lambda c: c["cases"].remove(bridge(c)))),
+        ("refusal moved to cases", corpus_mutant(
+            lambda c: c["cases"].append(dict(no_channels(c), name="moved")))),
+        ("seed swapped", corpus_mutant(lambda c: c.update(test_seed_hex="43" * 32))),
+        ("anchor names another device", corpus_mutant(
+            lambda c: c["verifier_context"].update(device_id="ori-fw-00000000"))),
+        ("rule off: undefined mode", lambda: run(
+            corpus_bytes, model, frozenset({"mode_undefined"}))),
+        ("rule off: disagreeing mode", lambda: run(
+            corpus_bytes, model, frozenset({"mode_disagrees"}))),
+        ("rule off: empty channels", lambda: run(
+            corpus_bytes, model, frozenset({"channels_empty"}))),
+        ("bridge_node row dropped from v2.md", text_mutant("t2", bridge_row, "")),
+        ("bridge_node row dropped past the table guard", model_mutant(
+            lambda m: m["modes"].pop("bridge_node"))),
+        ("bridged source renamed in v2.md", text_mutant(
+            "t2", "`source` is `foreign_device` is bridged", "`source` is `pzem` is bridged")),
+        ("mixed row narrowed in v2.md", text_mutant(
+            "t2", "More than one of the three: metering channels, bridged channels, actions.",
+            "More than one of the three: metering channels, actions.")),
+        ("no_channels error renamed in v2.md", text_mutant(
+            "t2", "- `channels` is empty (`no_channels`).", "- `channels` is empty (`empty_channels`).")),
+        ("sensor_node and bridge_node rows swapped", model_mutant(
+            lambda m: m["modes"].update(sensor_node=m["modes"]["bridge_node"],
+                                        bridge_node=m["modes"]["sensor_node"]))),
+        ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("undefined-mode clause inverted in v2.md", text_mutant(
+            "t2", "- `device_mode` is not one of the four values above",
+            "- `device_mode` is one of the four values above")),
+        ("disagreeing-mode clause inverted in v2.md", text_mutant(
+            "t2", "- `device_mode` is not the value its `channels` and `actions` determine",
+            "- `device_mode` is the value its `channels` and `actions` determine")),
+        ("empty-channels clause inverted in v2.md", text_mutant(
+            "t2", "- `channels` is empty (", "- `channels` is not empty (")),
+        ("other-JSON-type clause dropped in v2.md", text_mutant(
+            "t2", "above, including a value of\n  another JSON type", "above")),
+        ("empty-channels clause qualified in a parenthesis in v2.md", text_mutant(
+            "t2", "- `channels` is empty (`no_channels`).",
+            "- `channels` is empty (except when actions are present) (`no_channels`).")),
+        ("undefined-mode clause qualified in a parenthesis in v2.md", text_mutant(
+            "t2", "  another JSON type (recommended error `invalid_device_mode`);",
+            "  another JSON type (unless it is a string) (recommended error "
+            "`invalid_device_mode`);")),
+        ("annotation's trailing punctuation dropped in v2.md", text_mutant(
+            "t2", "- `channels` is empty (`no_channels`).",
+            "- `channels` is empty (`no_channels`) when actions are absent.")),
+        ("fourth rule added in v2.md", text_mutant(
+            "t2", "- `channels` is empty (`no_channels`).",
+            "- `channels` is empty (`no_channels`).\n- placeholder (`x`).")),
+        ("first two rules swapped in v2.md", text_mutant(
+            "t2",
+            "- `device_mode` is not one of the four values above, including a value of\n"
+            "  another JSON type (recommended error `invalid_device_mode`);\n"
+            "- `device_mode` is not the value its `channels` and `actions` determine\n"
+            "  (`invalid_device_mode`);",
+            "- `device_mode` is not the value its `channels` and `actions` determine\n"
+            "  (`invalid_device_mode`);\n"
+            "- `device_mode` is not one of the four values above, including a value of\n"
+            "  another JSON type (recommended error `invalid_device_mode`);")),
+    ]
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError, KeyError) as failure:
+        print(f"firmware-telemetry/v2 contracts: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-telemetry/v2 manifest corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(
+        f"firmware-telemetry/v2 manifest corpus: {len(corpus['cases'])} cases "
+        f"accepted, {len(corpus['reject_cases'])} refusals each for its declared reason"
+    )
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
