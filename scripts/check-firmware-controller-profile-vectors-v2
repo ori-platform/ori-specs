@@ -1,0 +1,2482 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 controller profile corpus against the contract.
+
+Shares no code with scripts/generate-firmware-controller-profile-vectors-v2.
+Canonical bytes come from this script's own serializer. The grammar's field
+sets, bounds and closed sets are read from the tables of "The profile
+document" in firmware-telemetry/v2.md, each table cell matched whole so that
+a reworded cell fails here rather than leaving a predicate the text no longer
+states; the fleet identifier is read from its definition in the Controller
+Profiles introduction; the interpretation rules are held to the
+sentences of "Receivers" that state them. Nothing is read from the generator.
+
+Held to:
+
+- each accepted document: valid under every grammar rule, and its canonical
+  bytes and `sha256:` digest reproduce;
+- each refusal: reason `invalid_profile_document`, and the set of grammar
+  rules the document breaks, by this script's own predicates, is exactly the
+  one its `rule` names;
+- each byte string: refused on its bytes (not UTF-8, a duplicate key at any
+  depth, or not the canonical bytes of its parse), and each accepted
+  document's canonical bytes pass the same test;
+- each interpretation: its registers combine, in the channel's word order, to
+  its value, and the alarms are recomputed from the value, read by value;
+- each state case: the channel's alarm state at the query, recomputed from
+  the Receivers rules (the last reading accepted under the active key epoch
+  and manifest, none after a rotation or promotion, the silence bound and its
+  cap read from the text, a fault held until a later reading, which a
+  receiver can order only within one key epoch, or until the epoch or
+  manifest changes, a restart forgetting what the receiver holds), with v1's
+  freshness deciding what is accepted: a message under a superseded epoch,
+  or whose `seq` is not above the epoch's high-water mark or whose `boot_id`
+  is below it, is not accepted, and neither a promotion nor a receiver
+  restart resets that mark;
+- each interpretation is computed through the document of the manifest the
+  reading was accepted under, never through the pinned one; an accepted
+  uninterpretable reading is the latest and its alarms are unknown, and
+  another message advances freshness and nothing else;
+- each agreement case: recomputed from the Receivers agreement sentence (the
+  document's digest is the binding's, its `id` is the binding's, it holds the
+  named profile channel, and that channel's kind, `sensor_type` and `unit`
+  agree with the manifest channel), with each way to disagree refused alone;
+- every section and entry carries exactly its keys, events and verdicts
+  included; every state case's poll interval is within the text's bounds, its
+  times are non-negative integers and its counters within 0 to 2^53 - 1;
+  every pinned document is an accepted one of the same `id` holding the
+  channel; and every state case's event order is legal under
+  device-provisioning/v1;
+- every bound pair the text states: each end accepted and one past each end
+  refused, wherever the grammar allows it, including each decode bound and
+  each word width's interpretable range;
+- coverage: both kinds, both widths, both word orders, signed and unsigned
+  ranges, a negative offset, both polarities, every rule refused, booleans
+  and integral floats refused as integers, a non-string refused, U+0000
+  refused, the decode's scale, offset, term, sum and value bounds each alone,
+  byte strings refused as not UTF-8, as a duplicate key and as not
+  canonical, each but one re-serializing to a pinned digest, a duplicate key
+  with opposite polarities, registers combined in both word orders, and an
+  uninterpretable value past the width, negative, and fractional;
+- the digest firmware-telemetry/v2.md pins is the corpus's.
+
+A rule that depends on another field is judged only once that field is
+valid, as v2.md states and this script pins: a word order against a valid
+register count, the raw range against a boolean `raw_signed`, a valid
+register count and present bounds, the fields a channel carries against a
+known kind, a bit against a valid register count, and the decode rule against
+a valid `raw_signed`, range, scale, offset and register count. A channel with
+no `kind` breaks the kind rule.
+
+    python3 scripts/check-firmware-controller-profile-vectors-v2
+    python3 scripts/check-firmware-controller-profile-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, edits copies of the contract text, and
+switches off each rule in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import decimal
+import fractions
+import hashlib
+import json
+import math
+import pathlib
+import re
+import sys
+import unicodedata
+from collections.abc import Callable
+from typing import Any
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+REASON = "invalid_profile_document"
+PROVISIONING = ROOT / "device-provisioning" / "v1.md"
+HOUR_MS = 3_600_000  # "an hour", as the Receivers bound and the poll row say it
+CONTRACT = "ori-specs/firmware-telemetry/v2.md"
+CORPUS_VERSION = 2
+# The device-provisioning/v1 sentences the state-case legality model and
+# anchor activity rest on, whitespace-normalised.
+PROVISIONING_PINNED = (
+    ("A pending anchor MUST NOT affect anything about the active one — not acceptance, "
+     "not freshness, not authority."),
+    "2. moves the retained **revoked** anchor back to **pending**.",
+    "It **never activates anything**.",
+    "Promotion MUST refuse if the identity is revoked.",
+    ("After revocation the identity has no active and no pending anchor. Nothing is "
+     "accepted."),
+)
+
+# Each grammar rule, keyed by the table row (or structural clause) that states
+# it. A row the tables gain or lose fails here: no predicate would hold it.
+TOP_ROWS = {"v": "version", "id": "id", "source": "source", "baud_rate": "baud_rate",
+            "poll_interval_ms": "poll_interval_ms", "channels": "channels"}
+CHANNEL_ROWS = {"name": "channel_name", "kind": "kind", "function": "function",
+                "start_register": "start_register", "register_count": "register_count",
+                "word_order": "word_order"}
+MEASUREMENT_ROWS = {("raw_signed",): "raw_signed", ("raw_min", "raw_max"): "raw_range",
+                    ("scale",): "scale", ("offset",): "offset",
+                    ("sensor_type", "unit"): "sensor_type"}
+ALARM_ROWS = {"bit": "alarm_bit", "active": "alarm_active", "id": "alarm_id",
+              "meaning": "alarm_meaning"}
+RULES = (
+    "top_fields", "version", "id", "source", "baud_rate", "poll_interval_ms",
+    "channels", "channel_name", "kind", "function", "start_register",
+    "register_count", "register_span", "word_order", "channel_fields",
+    "raw_signed", "raw_range", "scale", "offset", "sensor_type", "unit",
+    "alarms", "alarm_bit", "alarm_id", "alarm_active", "alarm_meaning",
+    "alarm_fields", "decode",
+)
+BYTES_REASON = "non_canonical_document"
+# Sentences each predicate below relies on, whitespace-normalised. A change to
+# any of them fails the checker.
+PINNED = (
+    ("A profile document is a JSON object, hashed as its canonical bytes under "
+     "v1's [canonical JSON](v1.md#canonical-json). Every number in it is an integer."),
+    "Top-level fields, exactly these:",
+    "Every channel carries:",
+    ("A rule that depends on another field is judged only once that field is valid: "
+     "`word_order` against a `register_count` of `1` or `2`, the range against a "
+     "boolean `raw_signed`, a valid `register_count` and present bounds, the fields a "
+     "channel carries against a known `kind`, and a `bit` against a valid "
+     "`register_count`. A channel with no `kind` breaks the `kind` rule. The decode rule "
+     "is judged only once `raw_signed`, the range, `scale`, `offset` and `register_count` "
+     "are valid. A document whose "
+     "`register_count` is `3` breaks the `register_count` rule, not also the "
+     "`word_order` rule."),
+    ("A document is held, published and hashed as bytes. A receiver hashes the bytes it "
+     "holds, and uses them only if they are exactly the canonical bytes of the object they "
+     "parse to: valid UTF-8, no duplicate key at any depth, and nothing a canonical "
+     "serializer would write differently. A document whose bytes are not canonical is "
+     "refused, even when re-serializing its parse would yield the pinned digest"),
+    ("The decoded value is `raw × scale + offset`. A device never signs a bridged "
+     "measurement whose `value` is not the decode of some raw count in "
+     "`[raw_min, raw_max]`; a receiver holding a usable document for the reading's "
+     "channel, the one the manifest it was accepted under names, that receives one "
+     "reports the producer defect and does not use the reading. Let f be the smaller of the two "
+     "exponents. Each of `m_scale × 10^(e_scale − f)` and `m_offset × 10^(e_offset − f)` "
+     "is at most 999999999999999 in magnitude, and at `raw_min` and at `raw_max` so are "
+     "`raw × m_scale × 10^(e_scale − f)` and its sum with the offset term, and the "
+     "decoded value is at most 10^15 in magnitude. A channel outside these bounds breaks "
+     "the decode rule."),
+    ("The word value of an `alarm_word` channel is its registers as one unsigned "
+     "integer, combined in its `word_order`: for `high_first` the first register is "
+     "the high 16 bits."),
+    ("its reading's `value` is the word value, an integer in `0` to "
+     "`2^(16 × register_count) − 1`, which a consumer reads by value whether it is "
+     "encoded as `5` or `5.0`."),
+)
+RECEIVER_PINNED = (
+    ("A receiver presents an alarm's state as of the reading it was read from, never "
+     "as the controller's state now."),
+    ("How long ago a reading's poll was is not something a receiver can bound from "
+     "this version."),
+    ("The channel's latest reading is the last reading for the channel the receiver "
+     "accepted under the device's active anchor, with its active key epoch and active "
+     "manifest. Any change to the active anchor, the promotion of a manifest, the "
+     "promotion of a rotated key or a revocation, leaves the channel with no latest "
+     "reading until the receiver accepts one under the new state. While no anchor is "
+     "active there is none, and a reinstated anchor is active only once a promotion "
+     "makes it so."),
+    ("Creating or replacing a pending anchor, for a new manifest or a re-provisioned key, "
+     "changes nothing here: under [device-provisioning/v1](../device-provisioning/v1.md) "
+     "a pending anchor affects nothing about the active one, so the channel's latest "
+     "reading, any fault hold and the silence bound continue under the active anchor, "
+     "and a reading signed under the pending anchor is refused."),
+    ("An alarm-word reading is interpreted only from an envelope in which it is the "
+     "only reading."),
+    ("A receiver does not refuse an alarm-word reading because its `quality` is below "
+     "its channel's `quality_floor`: quality describes a measurement. v1's grammar for "
+     "`quality` still applies."),
+    ("A reading that is accepted and not interpreted, because it shares its envelope or "
+     "because its `value` is not an integer in the word's range, is still the channel's "
+     "latest reading, and every alarm on the channel is unknown while it is. A message that is "
+     "not a reading of the channel, a heartbeat or another channel's reading, never "
+     "becomes its latest reading and never restarts its bound."),
+    ("Before using a document it checks that the document is valid under the grammar "
+     "above, that its `id` is the manifest's, that it has the named `profile_channel`, "
+     "and that the profile channel agrees with the manifest channel: a `measurement` "
+     "channel's `sensor_type` and `unit` equal the manifest channel's, and an "
+     "`alarm_word` channel's manifest channel declares `controller_alarm_word` and "
+     "`bitmask`; a document that fails any of these is not used"),
+    ("never interprets through a document with another digest, however close its `id`."),
+    ("the manifest the reading was accepted under, which the reading's own "
+     "`capability_hash` identifies, never by whichever manifest is pinned when the "
+     "reading is read again."),
+    ("A message v1's freshness rules refuse, including a duplicate of one already "
+     "accepted, is not accepted and changes nothing here."),
+    ("Every alarm on the channel is unknown while the channel has no latest reading, "
+     "and while the receiver has accepted no reading for the channel within "),
+    ("A receiver MAY use a shorter bound and MUST NOT use a longer one. A receiver "
+     "that restarts has accepted nothing, so every alarm is unknown until it accepts "
+     "a reading after the restart."),
+    ("When the receiver accepts a `sensor_fault` naming the channel, every alarm on "
+     "the channel is unknown until it accepts a later reading for the channel, or until "
+     "the active anchor changes, which leaves no latest reading anyway."),
+    "Whether or not a receiver holds the document:",
+    ("These rules bind every use of an alarm word, a rule's or a model's input as much "
+     "as a display. A state presented as of a reading names that reading by its key "
+     "epoch and its `(boot_id, seq)`;"),
+    ("A mapped alarm is asserted in that reading when its bit has the value its "
+     "`active` names, and not asserted otherwise."),
+    ("A bit no alarm maps is unknown: neither its meaning nor its polarity is known. "
+     "A receiver may present the unmapped bits that are set, as set and unmapped, and "
+     "MUST NOT name an unmapped bit, present it as an alarm, or present it as clear."),
+)
+GOLDEN_PINNED = (
+    ("agreement cases, each a manifest channel and a document, giving whether the "
+     "receiver may use the document for that channel;"),
+    ("faults, pending anchors for a new manifest or a re-provisioned key and readings "
+     "signed under them, promotions of rotated keys, manifest promotions,"),
+    ("covering the silence bound at the alarm-word poll ceiling, faults, key rotation with "
+     "restarted counters, a superseded epoch, manifest promotion, receiver restart, a "
+     "drained backlog, a reboot, and refused replays, duplicates and boot rollbacks."),
+    ("byte strings refused as not canonical, each but one of which re-serializes to a "
+     "pinned digest, among them a duplicate key whose two values give opposite "
+     "polarities"),
+    ("read through the document of the manifest it was accepted under, with the "
+     "registers it combines from and the document pinned when it is read again, which "
+     "in some cases is another document of the same `id`,"),
+    ("range cases, each a measurement `value` read through a document, giving whether it "
+     "lies within the decode of the channel's range;"),
+    ("each sequence legal under [device-provisioning/v1](../device-provisioning/v1.md),"),
+    ("giving every mapped alarm as asserted or not asserted and the unmapped bits "
+     "that are set, or the value as not interpreted;"),
+)
+
+
+class Failure(Exception):
+    pass
+
+
+# --- canonical JSON, per firmware-telemetry/v1 "Canonical JSON" -------------
+
+_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f",
+                  "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _string(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        if ch in _SHORT_ESCAPES:
+            out.append(_SHORT_ESCAPES[ch])
+        elif ord(ch) < 0x20:
+            out.append(f"\\u{ord(ch):04x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _number(n: float) -> str:
+    if type(n) is int:
+        if abs(n) > 2**53 - 1:
+            raise Failure(f"integer {n} outside the canonical range")
+        return str(n)
+    if not math.isfinite(n):
+        raise Failure("non-finite number")
+    if n != 0 and not 1e-4 <= abs(n) < 1e16:
+        raise Failure(f"number {n!r} outside the canonical zone")
+    text = repr(n)
+    if "e" in text or "E" in text or "." not in text:
+        raise Failure(f"number {n!r} has no fixed-notation form")
+    return text
+
+
+def _emit(value: object) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if type(value) in (int, float):
+        return _number(value)  # type: ignore[arg-type]
+    if type(value) is str:
+        return _string(value)
+    if type(value) is list:
+        return "[" + ",".join(_emit(v) for v in value) + "]"
+    if type(value) is dict:
+        return "{" + ",".join(
+            _string(k) + ":" + _emit(value[k]) for k in sorted(value)
+        ) + "}"
+    raise Failure(f"no canonical form for {type(value).__name__}")
+
+
+def canonical(value: object) -> bytes:
+    return _emit(value).encode("utf-8")
+
+
+# --- contract text ---------------------------------------------------------
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _section(text: str, heading: str) -> str:
+    start = text.index(heading)
+    rest = text[start + len(heading):]
+    end = re.search(r"\n#{2,3} ", rest)
+    return rest if end is None else rest[: end.start()]
+
+
+def _after(section: str, phrase: str) -> list[tuple[list[str], str]]:
+    """The rows of the table that follows `phrase`, as (field names, rule)."""
+    pattern = r"\s+".join(re.escape(w) for w in phrase.split())
+    found = re.search(pattern, section)
+    if found is None:
+        raise Failure(f"v2 profile document has no {phrase!r}")
+    lines = section[found.end():].lstrip("\n").split("\n")
+    table = []
+    for line in lines:
+        if not line.startswith("|"):
+            break
+        table.append(line)
+    if len(table) < 3:
+        raise Failure(f"no table follows {phrase!r}")
+    rows = []
+    for line in table[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 2:
+            raise Failure(f"cannot read the row {line!r}")
+        rows.append((re.findall(r"`([a-z_]+)`", cells[0]), cells[1]))
+    return rows
+
+
+def _cell(rows: list[tuple[list[str], str]], fields: tuple[str, ...],
+          pattern: str) -> tuple[str, ...]:
+    for names, rule in rows:
+        if tuple(names) == fields:
+            match = re.fullmatch(pattern, rule)
+            if match is None:
+                raise Failure(f"the {'/'.join(fields)} row reads {rule!r}")
+            return match.groups()
+    raise Failure(f"no {'/'.join(fields)} row")
+
+
+def _alphabet(spec: str) -> frozenset[str]:
+    chars: set[str] = set()
+    for item in re.split(r", (?:and )?| and ", spec):
+        pair = re.fullmatch(r"`(.)`–`(.)`", item)
+        single = re.fullmatch(r"`(.)`", item)
+        if pair is not None:
+            chars.update(chr(c) for c in range(ord(pair.group(1)), ord(pair.group(2)) + 1))
+        elif single is not None:
+            chars.add(single.group(1))
+        else:
+            raise Failure(f"cannot read the fleet alphabet item {item!r}")
+    return frozenset(chars)
+
+
+def contract_texts() -> dict[str, str]:
+    return {"t2": TELEMETRY_V2.read_text(), "dp": PROVISIONING.read_text()}
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    t2 = texts["t2"]
+    provisioning = _flat(texts["dp"])
+    for sentence in PROVISIONING_PINNED:
+        if sentence not in provisioning:
+            raise Failure(f"device-provisioning/v1 no longer says {sentence!r}")
+    intro = _section(t2, "## Controller Profiles").strip().split("\n\n")
+    fleet_paragraph = next((p for p in intro if p.startswith("A fleet identifier")), "")
+    fleet = re.fullmatch(r"A fleet identifier, wherever Controller Profiles names one, is a "
+                         r"string of (\d+) to (\d+) characters, each from the fleet "
+                         r"alphabet: (.*)\.", _flat(fleet_paragraph))
+    if fleet is None:
+        raise Failure("v2 does not define the fleet identifier")
+    producer = "A device signs each alarm-word reading alone in its envelope."
+    if producer not in _flat(_section(t2, "### The `controller_profile` field")):
+        raise Failure(f"v2 no longer says {producer!r}")
+    doc = _section(t2, "### The profile document")
+    flat = _flat(doc)
+    for sentence in PINNED:
+        if sentence not in flat:
+            raise Failure(f"v2 profile document no longer says {sentence!r}")
+    receivers = _flat(_section(t2, "### Receivers"))
+    for sentence in RECEIVER_PINNED:
+        if sentence not in receivers:
+            raise Failure(f"v2 Receivers no longer says {sentence!r}")
+    golden = _section(t2, "## Golden Vectors")
+    for sentence in GOLDEN_PINNED:
+        if sentence not in _flat(golden):
+            raise Failure(f"v2 Golden Vectors no longer says {sentence!r}")
+
+    kinds = re.search(r"A `([a-z_]+)` channel also carries exactly these, and no other "
+                      r"field:", flat)
+    alarm_intro = re.search(r"An `([a-z_]+)` channel also carries exactly one more field, "
+                            r"`([a-z_]+)`: at least one object, each with exactly these "
+                            r"fields:", flat)
+    if kinds is None or alarm_intro is None:
+        raise Failure("v2 does not introduce the two kinds' fields")
+    top = _after(doc, "Top-level fields, exactly these:")
+    common = _after(doc, "Every channel carries:")
+    meas = _after(doc, kinds.group(0))
+    alarm = _after(doc, alarm_intro.group(0))
+    for rows, wanted in ((top, set(TOP_ROWS)), (common, set(CHANNEL_ROWS)),
+                         (alarm, set(ALARM_ROWS))):
+        if {n for names, _ in rows for n in names} != wanted or any(
+                len(names) != 1 for names, _ in rows):
+            raise Failure(f"v2 table rows {[n for n, _ in rows]} are not {sorted(wanted)}")
+    if {tuple(n) for n, _ in meas} != set(MEASUREMENT_ROWS):
+        raise Failure(f"v2 measurement rows {[n for n, _ in meas]} differ")
+
+    version, = _cell(top, ("v",), r"`(\d+)`\.")
+    _cell(top, ("id",), r"A fleet identifier\.")
+    src = _cell(top, ("source",), r"The document the map is taken from: (\d+) to (\d+) "
+                r"printable ASCII characters, U\+([0-9A-F]{4}) to U\+([0-9A-F]{4})\. "
+                r"Never parsed\.")
+    bauds, = _cell(top, ("baud_rate",), r"One of ((?:`\d+`, )+`\d+`)\. Framing is 8N1; a "
+                   r"controller that needs another is not describable by this document\.")
+    poll = _cell(top, ("poll_interval_ms",), r"`(\d+)` to `(\d+)`; at most `(\d+)` in a "
+                 r"profile with an `alarm_word` channel, so that three missed polls and "
+                 r"the transport allowance fit within the receiver's one-hour bound\.")
+    chans = _cell(top, ("channels",), r"(\d+) to (\d+) channel objects\.")
+    _cell(common, ("name",), r"A fleet identifier; unique in the profile\.")
+    kind_set = set(_cell(common, ("kind",), r"`([a-z_]+)` or `([a-z_]+)`\."))
+    if kind_set != {kinds.group(1), alarm_intro.group(1)}:
+        raise Failure("the kind row does not name the two kinds the tables describe")
+    functions = _cell(common, ("function",), r"`([a-z_]+)` or `([a-z_]+)`\.")
+    start = _cell(common, ("start_register",), r"`(\d+)` to `(\d+)`\.")
+    count = _cell(common, ("register_count",), r"`(\d+)` or `(\d+)`, with "
+                  r"`start_register \+ register_count <= (\d+)`\.")
+    order = _cell(common, ("word_order",), r"`null` when `register_count` is `(\d+)`; "
+                  r"`([a-z_]+)` or `([a-z_]+)` when it is `(\d+)`\. Declared, never assumed\.")
+    if (order[0], order[3]) != count[:2]:
+        raise Failure("the word_order row does not follow the register counts")
+    _cell(meas, ("raw_signed",), r"Boolean: the register, or register pair, is two's "
+          r"complement\.")
+    _cell(meas, ("raw_min", "raw_max"), r"The validity range in raw counts, inclusive, "
+          r"`raw_min <= raw_max`, each representable at the channel's width and "
+          r"signedness\. A frame outside it is a failed read, never a reading\.")
+    dec = _cell(meas, ("scale",), r"`\{\"mantissa\": m, \"exponent\": e\}`: the decimal "
+                r"m × 10\^e, with m a nonzero integer, `(-\d+) <= m <= (\d+)`, and "
+                r"`(-\d+) <= e <= (\d+)`\.")
+    _cell(meas, ("offset",), r"The same form; its mantissa may be zero\.")
+    forbidden = _cell(meas, ("sensor_type", "unit"), r"What a manifest channel reading "
+                      r"this profile channel declares: fleet identifiers, never "
+                      r"`([a-z_]+)` or `([a-z_]+)`\.")
+    bits, = _cell(alarm, ("bit",), r"`0` to `(\d+) × register_count − 1`, counted from the "
+                  r"least significant bit of the word value; unique in the channel\.")
+    polarity = _cell(alarm, ("active",), r"`([a-z_]+)` when the alarm is asserted by a 1 "
+                     r"in that bit, `([a-z_]+)` when it is asserted by a 0\.")
+    _cell(alarm, ("id",), r"A fleet identifier; unique in the profile\.")
+    meaning = _cell(alarm, ("meaning",), r"The condition that holds while the alarm is "
+                    r"asserted, as the controller's documentation states it: (\d+) to "
+                    r"(\d+) printable ASCII characters, U\+([0-9A-F]{4}) to "
+                    r"U\+([0-9A-F]{4})\. An operator and a model read it, and nothing "
+                    r"outside that range can hide, break or reorder what they read\.")
+    decode = re.search(r"`m_offset × 10\^\(e_offset − f\)` is at most (\d+) in magnitude, "
+                       r".*? the decoded value is at most 10\^(\d+) in magnitude", flat)
+    silence = re.search(r"within `(\d+) × poll_interval_ms \+ (\d+)` milliseconds on a "
+                        r"monotonic clock that keeps counting while the receiver's host is "
+                        r"suspended: three missed polls and a transport allowance, which the "
+                        r"profile grammar holds to an hour at most\.", receivers)
+    if silence is None:
+        raise Failure("v2 Receivers states no silence bound")
+    multiplier, allowance = (int(g) for g in silence.groups())
+    if multiplier * int(poll[2]) + allowance > HOUR_MS:
+        raise Failure("the alarm-word poll ceiling does not hold the bound to an hour")
+    if decode is None:
+        raise Failure("v2 states no decode bound")
+    high = re.search(r"combined in its `word_order`: for `([a-z_]+)` the first register is "
+                     r"the high (\d+) bits\.", flat)
+    if high is None or high.group(1) not in order[1:3] or high.group(2) != bits:
+        raise Failure("v2 does not say how a register pair combines")
+    reading = re.search(r"A manifest channel reading an `alarm_word` channel declares "
+                        r"`sensor_type` `([a-z_]+)` and `unit` `([a-z_]+)`", flat)
+    if reading is None or set(reading.groups()) != set(forbidden):
+        raise Failure("v2 does not say what a manifest channel reading an alarm word declares")
+    word_bits = re.search(r"integer in `0` to `2\^\((\d+) × register_count\) − 1`", flat)
+    if word_bits is None or word_bits.group(1) != bits:
+        raise Failure("the word range and the bit row disagree on bits per register")
+    if int(dec[0]) != -int(dec[1]):
+        raise Failure("the mantissa bound is not symmetric")
+    pin = re.search(r"\[controller-profile-vectors-v2\.json\]\(controller-profile-vectors-"
+                    r"v2\.json\)[^`]*?Its\s+SHA-256\s+is\s+`([0-9a-f]{64})`", golden)
+    if pin is None:
+        raise Failure("firmware-telemetry/v2.md pins no controller profile corpus digest")
+    return {
+        "top": frozenset(TOP_ROWS),
+        "common": frozenset(CHANNEL_ROWS),
+        "measurement_kind": kinds.group(1),
+        "measurement": frozenset(n for names in MEASUREMENT_ROWS for n in names),
+        "alarm_kind": alarm_intro.group(1),
+        "alarms_field": alarm_intro.group(2),
+        "alarm": frozenset(ALARM_ROWS),
+        "version": int(version),
+        "fleet": (int(fleet.group(1)), int(fleet.group(2)), _alphabet(fleet.group(3))),
+        "source": (int(src[0]), int(src[1]), int(src[2], 16), int(src[3], 16)),
+        "bauds": frozenset(int(b) for b in re.findall(r"\d+", bauds)),
+        "poll": (int(poll[0]), int(poll[1])),
+        "alarm_poll": int(poll[2]),
+        "channels": (int(chans[0]), int(chans[1])),
+        "functions": frozenset(functions),
+        "start": (int(start[0]), int(start[1])),
+        "counts": (int(count[0]), int(count[1])),
+        "span": int(count[2]),
+        "orders": frozenset(order[1:3]),
+        "mantissa": int(dec[1]),
+        "exponent": (int(dec[2]), int(dec[3])),
+        "forbidden": frozenset(forbidden),
+        "alarm_tokens": (reading.group(1), reading.group(2)),
+        "bits": int(bits),
+        "polarity": {polarity[0]: 1, polarity[1]: 0},
+        "meaning": (int(meaning[0]), int(meaning[1]), int(meaning[2], 16),
+                    int(meaning[3], 16)),
+        "term_bound": int(decode.group(1)),
+        "silence": (int(silence.group(1)), int(silence.group(2))),
+        "high_first": high.group(1),
+        "value_exponent": int(decode.group(2)),
+        "pin": pin.group(1),
+    }
+
+
+# --- grammar ---------------------------------------------------------------
+
+def _int(x: object, off: frozenset[str]) -> bool:
+    """An integer in the document's sense: never a boolean, never a float."""
+    if "bool_is_int" in off and type(x) is bool:
+        return True
+    if "float_is_int" in off and type(x) is float and x.is_integer():
+        return True
+    return type(x) is int
+
+
+def _fleet(x: object, model: dict) -> bool:
+    low, high, chars = model["fleet"]
+    return type(x) is str and low <= len(x) <= high and set(x) <= chars
+
+
+def _text(x: object, rule: tuple[int, int, int, int]) -> bool:
+    """A string of a bounded number of characters, each in the row's range."""
+    shortest, longest, low, high = rule
+    return (type(x) is str and shortest <= len(x) <= longest
+            and all(low <= ord(ch) <= high for ch in x))
+
+
+def _decimal(x: object, nonzero: bool, model: dict, off: frozenset[str]) -> bool:
+    if type(x) is not dict or set(x) != {"mantissa", "exponent"}:
+        return False
+    m, e = x["mantissa"], x["exponent"]
+    low, high = model["exponent"]
+    return (_int(m, off) and _int(e, off) and abs(m) <= model["mantissa"]
+            and low <= e <= high and not (nonzero and m == 0))
+
+
+def _decodes(c: dict, model: dict) -> bool:
+    return not decode_faults(c, model)
+
+
+def decode_faults(c: dict, model: dict) -> set[str]:
+    """Which decode bounds a channel breaks: scale, offset, raw term, sum, value."""
+    faults: set[str] = set()
+    ms, es = c["scale"]["mantissa"], c["scale"]["exponent"]
+    mo, eo = c["offset"]["mantissa"], c["offset"]["exponent"]
+    f = min(es, eo)
+    bound, exponent = model["term_bound"], model["value_exponent"]
+    coefficient = ms * 10 ** (es - f)
+    base = mo * 10 ** (eo - f)
+    if abs(coefficient) > bound:
+        faults.add("scale")
+    if abs(base) > bound:
+        faults.add("offset")
+    for raw in (c["raw_min"], c["raw_max"]):
+        term = raw * coefficient
+        total = term + base
+        if abs(term) > bound:
+            faults.add("term")
+        if abs(total) > bound:
+            faults.add("sum")
+        # |total × 10^f| <= 10^exponent, in integers.
+        if (abs(total) * 10 ** f > 10 ** exponent if f >= 0
+                else abs(total) > 10 ** (exponent - f)):
+            faults.add("value")
+    return faults
+
+
+def broken_rules(doc: object, model: dict, off: frozenset[str] = frozenset()) -> set[str]:
+    """Every grammar rule the document breaks, not only the first."""
+    broken: set[str] = set()
+    if type(doc) is not dict:
+        return {"top_fields"} - off
+    if set(doc) != model["top"]:
+        broken.add("top_fields")
+    if "v" in doc and not (_int(doc["v"], off) and doc["v"] == model["version"]):
+        broken.add("version")
+    if "id" in doc and not _fleet(doc["id"], model):
+        broken.add("id")
+    if "source" in doc and not _text(doc["source"], model["source"]):
+        broken.add("source")
+    if "baud_rate" in doc and not (_int(doc["baud_rate"], off)
+                                   and doc["baud_rate"] in model["bauds"]):
+        broken.add("baud_rate")
+    if "poll_interval_ms" in doc:
+        p, (low, high) = doc["poll_interval_ms"], model["poll"]
+        if not (_int(p, off) and low <= p <= high):
+            broken.add("poll_interval_ms")
+    channels = doc.get("channels")
+    if "channels" in doc:
+        low, high = model["channels"]
+        if (type(channels) is not list or not low <= len(channels) <= high
+                or any(type(c) is not dict for c in channels)):
+            broken.add("channels")
+    if type(channels) is not list:
+        return broken - off
+    names: list[str] = []
+    alarm_ids: list[str] = []
+    for c in channels:
+        if type(c) is not dict:
+            continue
+        broken |= _channel(c, model, off, names, alarm_ids)
+    if len(names) != len(set(names)):
+        broken.add("channel_name")
+    poll = doc.get("poll_interval_ms")
+    if (_int(poll, off) and poll > model["alarm_poll"] and "alarm_poll" not in off
+            and any(type(c) is dict and c.get("kind") == model["alarm_kind"]
+                    for c in channels)):
+        broken.add("poll_interval_ms")
+    if len(alarm_ids) != len(set(alarm_ids)):
+        broken.add("alarm_id")
+    return broken - off
+
+
+def _channel(c: dict, model: dict, off: frozenset[str],
+             names: list[str], alarm_ids: list[str]) -> set[str]:
+    broken: set[str] = set()
+    kind = c.get("kind")
+    if type(kind) is str and kind == model["measurement_kind"]:
+        if set(c) != model["common"] | model["measurement"]:
+            broken.add("channel_fields")
+    elif type(kind) is str and kind == model["alarm_kind"]:
+        if set(c) != model["common"] | {model["alarms_field"]}:
+            broken.add("channel_fields")
+    else:
+        broken.add("kind")
+    if "name" in c:
+        if _fleet(c["name"], model):
+            names.append(c["name"])
+        else:
+            broken.add("channel_name")
+    if "function" in c and not (type(c["function"]) is str
+                                and c["function"] in model["functions"]):
+        broken.add("function")
+    start: Any = c.get("start_register")
+    count: Any = c.get("register_count")
+    start_ok = _int(start, off) and model["start"][0] <= start <= model["start"][1]
+    count_ok = _int(count, off) and count in model["counts"]
+    if "start_register" in c and not start_ok:
+        broken.add("start_register")
+    if "register_count" in c and not count_ok:
+        broken.add("register_count")
+    if start_ok and count_ok and start + count > model["span"]:
+        broken.add("register_span")
+    if "dependents" in off and "word_order" in c and not count_ok:
+        broken.add("word_order")
+    if count_ok and "word_order" in c:
+        order = c["word_order"]
+        if count == model["counts"][0]:
+            if order is not None:
+                broken.add("word_order")
+        elif not (type(order) is str and order in model["orders"]):
+            broken.add("word_order")
+    width = 16 * count if count_ok else None
+    if kind == model["measurement_kind"]:
+        signed = c.get("raw_signed")
+        if "raw_signed" in c and type(signed) is not bool:
+            broken.add("raw_signed")
+        judged = (type(signed) is bool and width is not None) or "dependents" in off
+        range_ok = False
+        if "raw_min" in c and "raw_max" in c and judged:
+            lo, hi = c["raw_min"], c["raw_max"]
+            if not (_int(lo, off) and _int(hi, off) and lo <= hi):
+                broken.add("raw_range")
+            elif width is not None:
+                floor, ceiling = ((-(1 << (width - 1)), (1 << (width - 1)) - 1)
+                                  if signed else (0, (1 << width) - 1))
+                if not (floor <= lo and hi <= ceiling):
+                    broken.add("raw_range")
+                else:
+                    range_ok = True
+        scale_ok = "scale" in c and _decimal(c["scale"], True, model, off)
+        offset_ok = "offset" in c and _decimal(c["offset"], False, model, off)
+        if "scale" in c and not scale_ok:
+            broken.add("scale")
+        if "offset" in c and not offset_ok:
+            broken.add("offset")
+        if range_ok and scale_ok and offset_ok and not _decodes(c, model):
+            broken.add("decode")
+        for name in ("sensor_type", "unit"):
+            if name in c:
+                v = c[name]
+                if not _fleet(v, model) or v in model["forbidden"]:
+                    broken.add(name)
+    elif kind == model["alarm_kind"] and model["alarms_field"] in c:
+        alarms = c[model["alarms_field"]]
+        if (type(alarms) is not list or not alarms
+                or any(type(a) is not dict for a in alarms)):
+            broken.add("alarms")
+        if type(alarms) is list:
+            broken |= _alarms([a for a in alarms if type(a) is dict],
+                              count if count_ok else 0, model, off, alarm_ids)
+    return broken
+
+
+def _alarms(alarms: list[dict], count: int, model: dict, off: frozenset[str],
+            alarm_ids: list[str]) -> set[str]:
+    broken: set[str] = set()
+    bits: list[int] = []
+    for a in alarms:
+        if set(a) != model["alarm"]:
+            broken.add("alarm_fields")
+        if "bit" in a:
+            bit = a["bit"]
+            top = model["bits"] * count - 1 if count else None
+            if not _int(bit, off) or bit < 0 or (top is not None and bit > top):
+                broken.add("alarm_bit")
+            else:
+                bits.append(bit)
+        if "active" in a and not (type(a["active"]) is str
+                                  and a["active"] in model["polarity"]):
+            broken.add("alarm_active")
+        if "id" in a:
+            if _fleet(a["id"], model):
+                alarm_ids.append(a["id"])
+            else:
+                broken.add("alarm_id")
+        if "meaning" in a and not _text(a["meaning"], model["meaning"]):
+            broken.add("alarm_meaning")
+    if len(bits) != len(set(bits)):
+        broken.add("alarm_bit")
+    return broken
+
+
+# --- interpretation --------------------------------------------------------
+
+def interpret(channel: dict, value: object, model: dict) -> dict:
+    if type(value) is int:
+        word = value
+    elif type(value) is float and math.isfinite(value) and value.is_integer():
+        word = int(value)
+    else:
+        return {"interpreted": False}
+    width = model["bits"] * channel["register_count"]
+    if not 0 <= word <= (1 << width) - 1:
+        return {"interpreted": False}
+    mapped = {}
+    for a in channel[model["alarms_field"]]:
+        bit = (word >> a["bit"]) & 1
+        mapped[a["id"]] = ("asserted" if bit == model["polarity"][a["active"]]
+                           else "not_asserted")
+    taken = {a["bit"] for a in channel[model["alarms_field"]]}
+    unmapped = [b for b in range(width) if (word >> b) & 1 and b not in taken]
+    return {"interpreted": True, "alarms": mapped, "unmapped_set_bits": unmapped}
+
+
+# --- corpus ----------------------------------------------------------------
+
+SHAPES = {
+    "cases": {"name", "document", "canonical_hex", "digest", "note"},
+    "reject_cases": {"name", "reason", "rule", "document", "note"},
+    "reject_bytes": {"name", "reason", "bytes_hex", "note"},
+    "interpretations": {"name", "document", "pinned_document", "profile_channel",
+                        "registers", "value", "expected", "note"},
+    "states": {"name", "poll_interval_ms", "events", "query_ms", "expected", "note"},
+    "agreements": {"name", "manifest_channel", "document", "expected", "note"},
+    "ranges": {"name", "document", "pinned_document", "profile_channel", "value",
+               "expected", "note"},
+}
+TOP_KEYS = {"contract", "version", "comment", "reasons"} | set(SHAPES)
+SIGNED_EVENT = {"t", "kind", "epoch", "boot_id", "seq"}
+EVENT_SHAPES = {"reading": SIGNED_EVENT, "fault": SIGNED_EVENT,
+                "uninterpretable": SIGNED_EVENT, "other": SIGNED_EVENT,
+                "pending_reading": SIGNED_EVENT,
+                **{k: {"t", "kind"} for k in ("rotate", "promote", "revoke", "reinstate",
+                                              "restart", "stage_manifest", "stage_key")}}
+
+
+def _shapes(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+    """Every section and entry carries exactly its keys."""
+    if set(corpus) != TOP_KEYS:
+        raise Failure(f"corpus keys {sorted(corpus)} are not {sorted(TOP_KEYS)}")
+    if not (_same(corpus["contract"], CONTRACT) and _same(corpus["version"], CORPUS_VERSION)):
+        raise Failure(f"corpus names {corpus['contract']!r} v{corpus['version']!r}, not "
+                      f"{CONTRACT} v{CORPUS_VERSION}")
+    for section, keys in SHAPES.items():
+        for entry in corpus[section]:
+            if type(entry) is not dict or set(entry) != keys:
+                raise Failure(f"{section} entry {entry.get('name')!r} has keys "
+                              f"{sorted(entry)}, not {sorted(keys)}")
+    docs = {c["name"]: c["document"] for c in corpus["cases"]}
+    for case in corpus["ranges"]:
+        doc = docs.get(case["document"]) if type(case["document"]) is str else None
+        channel = next((c for c in _channels(doc) if c.get("name") == case["profile_channel"]),
+                       None) if doc else None
+        if (channel is None or channel.get("kind") != model["measurement_kind"]
+                or type(case["value"]) not in (int, float)
+                or (type(case["value"]) is float and not math.isfinite(case["value"]))
+                or case["expected"] not in ("in_range", "out_of_range")):
+            raise Failure(f"{case['name']}: not a closed range case on an accepted "
+                          f"measurement channel")
+    for case in corpus["interpretations"] + corpus["agreements"]:
+        names = ([case["document"], case["pinned_document"]] if "pinned_document" in case
+                 else [case["document"]])
+        if any(type(n) is not str or n not in docs for n in names):
+            raise Failure(f"{case['name']}: names a document the corpus does not accept")
+    for case in corpus["agreements"]:
+        mc = case["manifest_channel"]
+        if (type(mc) is not dict or set(mc) != AGREEMENT_CHANNEL
+                or any(type(v) is not str for v in mc.values())
+                or case["expected"] not in ("use", "disagree")):
+            raise Failure(f"{case['name']}: not a closed agreement case")
+    for case in corpus["interpretations"] + corpus["ranges"]:
+        if type(case["pinned_document"]) is not str or case["pinned_document"] not in docs:
+            raise Failure(f"{case['name']}: names a document the corpus does not accept")
+        doc, pinned = docs[case["document"]], docs[case["pinned_document"]]
+        if pinned["id"] != doc["id"] or not any(
+                c.get("name") == case["profile_channel"] for c in _channels(pinned)):
+            raise Failure(f"{case['name']}: its pinned document is not one of the same id "
+                          f"holding {case['profile_channel']}")
+    for case in corpus["interpretations"]:
+        wanted = ({"interpreted"} if case["expected"].get("interpreted") is False
+                  else {"interpreted", "alarms", "unmapped_set_bits"})
+        if set(case["expected"]) != wanted:
+            raise Failure(f"{case['name']}: expected keys {sorted(case['expected'])}")
+    for case in corpus["states"]:
+        for event in case["events"]:
+            if (type(event) is not dict or event.get("kind") not in EVENT_SHAPES
+                    or set(event) != EVENT_SHAPES[event["kind"]]
+                    or any(type(v) is not int for k, v in event.items() if k != "kind")):
+                raise Failure(f"{case['name']}: event {event} is not a closed event")
+        # A state case is an alarm word's state, so its poll interval is held to
+        # the alarm-word ceiling.
+        low, high = model["poll"][0], model["alarm_poll"]
+        if "state_poll_to_grammar_max" in off:
+            high = model["poll"][1]
+        poll = case["poll_interval_ms"]
+        if type(poll) is not int or not low <= poll <= high:
+            raise Failure(f"{case['name']}: poll_interval_ms {poll!r} is outside the text's")
+        if type(case["query_ms"]) is not int or case["query_ms"] < 0 or any(
+                e["t"] < 0 for e in case["events"]):
+            raise Failure(f"{case['name']}: a receiver time is not a non-negative integer")
+        if any(not 0 <= e[k] <= 2**53 - 1 for e in case["events"]
+               for k in ("epoch", "boot_id", "seq") if k in e):
+            raise Failure(f"{case['name']}: an epoch or counter is outside 0 to 2^53 - 1")
+        why = _illegal(case["events"], off)
+        if why is not None:
+            raise Failure(f"{case['name']}: {why}")
+        times = [e["t"] for e in case["events"]]
+        if times != sorted(times) or (times and case["query_ms"] < times[-1]):
+            raise Failure(f"{case['name']}: events or query out of receiver time order")
+        expected = case["expected"]
+        wanted = ({"state"} if expected.get("state") == "unknown"
+                  else {"state", "epoch", "boot_id", "seq"})
+        if set(expected) != wanted or expected["state"] not in ("unknown", "as_of"):
+            raise Failure(f"{case['name']}: expected {expected} is not a closed verdict")
+
+
+AGREEMENT_CHANNEL = {"sensor_type", "unit", "controller_profile_id", "digest",
+                     "profile_channel"}
+
+
+def disagreements(binding: dict, doc: dict, model: dict,
+                  off: frozenset[str] = frozenset()) -> set[str]:
+    """Every check of the Receivers agreement sentence the document fails."""
+    found = set()
+    digest = "sha256:" + hashlib.sha256(canonical(doc)).hexdigest()
+    if digest != binding["digest"] and "agree_digest" not in off:
+        found.add("digest")
+    if doc["id"] != binding["controller_profile_id"] and "agree_id" not in off:
+        found.add("id")
+    named = [c for c in doc["channels"] if c["name"] == binding["profile_channel"]]
+    if not named:
+        if "agree_channel" not in off:
+            found.add("profile_channel")
+        return found
+    channel = named[0]
+    tokens = (binding["sensor_type"], binding["unit"])
+    if channel["kind"] == model["alarm_kind"]:
+        if tokens != model["alarm_tokens"] and "agree_alarm" not in off:
+            found.add("alarm_word_read_as_measurement")
+    elif tokens == model["alarm_tokens"]:
+        if "agree_measurement_tokens" not in off:
+            found.add("measurement_read_as_alarm_word")
+    else:
+        if channel["sensor_type"] != tokens[0] and "agree_sensor_type" not in off:
+            found.add("sensor_type")
+        if channel["unit"] != tokens[1] and "agree_unit" not in off:
+            found.add("unit")
+    return found
+
+
+def _same(a: object, b: object) -> bool:
+    """Equal, and of the same JSON type at every depth: false is not 0, 1.0 is not 1."""
+    if type(a) is not type(b):
+        return False
+    if type(a) is dict:
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)  # type: ignore[union-attr,index]
+    if type(a) is list:
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))  # type: ignore[arg-type]
+    return a == b
+
+
+def _exact(value: object) -> fractions.Fraction:
+    """A JSON number read exactly, a float through its shortest decimal form."""
+    if type(value) in (int, fractions.Fraction):
+        return fractions.Fraction(value)  # type: ignore[arg-type]
+    if type(value) is float and math.isfinite(value):
+        return fractions.Fraction(decimal.Decimal(repr(value)))
+    raise Failure(f"{value!r} is not a finite JSON number")
+
+
+def raw_count(channel: dict, value: object, binary: bool = False) -> fractions.Fraction:
+    """The raw count a measurement value decodes from: (value − offset) / scale."""
+    if binary and type(value) is float:
+        value = fractions.Fraction(value)  # the double's binary value, not its decimal
+    scale = (fractions.Fraction(channel["scale"]["mantissa"])
+             * fractions.Fraction(10) ** channel["scale"]["exponent"])
+    offset = (fractions.Fraction(channel["offset"]["mantissa"])
+              * fractions.Fraction(10) ** channel["offset"]["exponent"])
+    return (_exact(value) - offset) / scale
+
+
+def _illegal(events: list[dict], off: frozenset[str] = frozenset()) -> str | None:
+    """Why an event sequence is impossible under device-provisioning/v1, or None.
+
+    A revocation needs an identity that is not revoked; it leaves no active
+    anchor and discards any pending one, so it is legal again after a
+    reinstatement. A reinstatement needs a revoked identity, clears the flag
+    and returns the retained anchor to pending, activating nothing. A
+    promotion, and so the promotion of a rotated key, needs an identity that
+    is not revoked, and makes an anchor active. Creating or replacing a pending
+    anchor, for a new manifest or a re-provisioned key, needs an identity that
+    is not revoked, and changes nothing about the active one.
+    """
+    revoked = reinstated = False
+    for e in events:
+        kind = e["kind"]
+        if kind == "revoke":
+            if revoked:
+                return "a revocation of an identity already revoked"
+            if reinstated and "no_revoke_after_reinstate" in off:
+                return "a revocation of a reinstated identity"
+            revoked = True
+        elif kind == "reinstate":
+            if not revoked:
+                return "a reinstatement of an identity that is not revoked"
+            revoked, reinstated = False, True
+        elif kind in ("promote", "rotate"):
+            if revoked:
+                return f"a {kind} of a revoked identity"
+            reinstated = False
+        elif kind in ("stage_manifest", "stage_key"):
+            if revoked and "stage_while_revoked" not in off:
+                return f"a {kind} for a revoked identity"
+    return None
+
+
+def alarm_state(case: dict, model: dict,
+                off: frozenset[str] = frozenset()) -> tuple[dict, set[str]]:
+    """The channel's alarm state at the query, by the Receivers rules, and why.
+
+    The receiver's state: whether the device has an active anchor
+    (device-provisioning/v1: a revocation leaves none, a reinstatement only
+    returns the retained anchor to pending and never activates anything, and
+    only a promotion, or a rotation's promotion of the new key, makes one
+    active; nothing is accepted while none is), the active key epoch (the
+    corpus numbers epochs from 0, a rotation activating the next), the anchor's
+    replay high-water mark
+    per epoch (v1 Sequence And Freshness: `seq` above the mark and `boot_id`
+    not below it, shared by readings and faults, kept across a manifest
+    promotion and a receiver restart), and in memory the latest reading, when
+    a reading was last accepted, and an outstanding fault.
+    """
+    epoch = 0
+    active = True
+    high_water: dict[int, tuple[int, int]] = {}
+    latest: tuple[int, int] | None = None
+    interpretable = True
+    accepted_at: int | None = None
+    fault: tuple[int, int, int] | None = None
+    notes: set[str] = set()
+    boots: dict[int, set[int]] = {}
+    epoch_latest: dict[int, tuple[int, int]] = {}
+    for event in case["events"]:
+        kind = event["kind"]
+        if kind in ("rotate", "promote", "revoke", "reinstate"):
+            if kind == "rotate":
+                epoch += 1
+            if kind in ("rotate", "promote"):
+                active = True
+            elif kind == "revoke":
+                active = False
+            elif "reinstate_activates" in off:
+                active = True
+            if f"{kind}_keeps_latest" not in off:
+                latest = None
+            if f"{kind}_keeps_fault" not in off:
+                fault = None
+            if kind == "revoke" and "reinstated" in notes:
+                notes.add("revoked_after_reinstatement")
+            notes.add({"rotate": "rotated", "promote": "promoted", "revoke": "revoked",
+                       "reinstate": "reinstated"}[kind])
+            continue
+        if kind in ("stage_manifest", "stage_key"):
+            # A pending anchor affects nothing about the active one.
+            if "stage_clears_latest" in off:
+                latest = None
+            if "stage_clears_fault" in off:
+                fault = None
+            if "stage_restarts_bound" in off:
+                accepted_at = event["t"]
+            notes.add("staged")
+            notes.add(kind)
+            continue
+        if kind == "pending_reading" and "pending_accepted" not in off:
+            # Signed under the pending anchor: refused, and freshness is the
+            # active anchor's, so nothing moves.
+            if "pending_consumes_freshness" in off:
+                high_water[event["epoch"]] = (event["boot_id"], event["seq"])
+            notes.add("refused_pending")
+            continue
+        if kind == "restart":
+            if "restart_memory" not in off:
+                latest, accepted_at, fault = None, None, None
+            if "restart_keeps_freshness" in off:
+                high_water.clear()
+            notes.add("restarted")
+            continue
+        key = (event["boot_id"], event["seq"])
+        if not active and "inactive_refusal" not in off:
+            notes.add("refused_inactive")
+            continue
+        if event["epoch"] != epoch and "epoch_refusal" not in off:
+            notes.add("refused_epoch")
+            continue
+        mark = high_water.get(event["epoch"])
+        if mark is not None and "freshness" not in off:
+            seq_ok = key[1] > mark[1] or ("equal_seq" in off and key[1] == mark[1])
+            boot_ok = key[0] >= mark[0] or "boot_rollback" in off
+            if not (seq_ok and boot_ok):
+                if not boot_ok:
+                    notes.add("refused_rollback")
+                elif key == mark:
+                    notes.add("refused_duplicate")
+                for state in ("restarted", "promoted"):
+                    if state in notes:
+                        notes.add(f"refused_replay_after_{state}")
+                notes.add("refused_replay")
+                continue
+        if kind == "other" and "other_skips_freshness" in off:
+            continue
+        high_water[event["epoch"]] = key
+        if kind == "other":
+            # Accepted, so it moves the anchor's freshness, and nothing else here.
+            notes.add("other")
+            if "other_restarts_bound" in off:
+                accepted_at = event["t"]
+            continue
+        if kind == "uninterpretable" and "uninterpretable_ignored" in off:
+            continue
+        if kind == "fault":
+            fault = (event["epoch"], *key)
+            notes.add("fault")
+            continue
+        if any(event["epoch"] != e and key < k for e, k in epoch_latest.items()):
+            notes.add("lower_counters_in_new_epoch")
+        if any(b < key[0] for b in boots.get(event["epoch"], set())):
+            notes.add("later_boot")
+        boots.setdefault(event["epoch"], set()).add(key[0])
+        epoch_latest[event["epoch"]] = key
+        # A later reading, in the only signing order a receiver can establish:
+        # the same key epoch and a greater (boot_id, seq). Across epochs it is the
+        # epoch change that ends the hold.
+        if (fault is not None and "fault" not in off and fault[0] == event["epoch"]
+                and key > fault[1:]):
+            fault = None
+            notes.add("fault_cleared")
+        for state in ("restarted", "promoted", "rotated"):
+            if state in notes:
+                notes.add(f"accepted_after_{state}")
+        if "uninterpretable" in notes:
+            notes.add("accepted_after_uninterpretable")
+        latest = key
+        interpretable = kind == "reading" or "uninterpretable_interpreted" in off
+        if kind == "uninterpretable":
+            notes.add("uninterpretable")
+        accepted_at = event["t"]
+        notes.add("accepted")
+    multiplier, allowance = model["silence"]
+    bound = multiplier * case["poll_interval_ms"] + allowance
+    if "hour_cap" in off:
+        bound = min(bound, HOUR_MS)
+    if case["poll_interval_ms"] == model["alarm_poll"]:
+        notes.add("at_ceiling")
+    causes = set()
+    if latest is None:
+        causes.add("no_latest")
+    elif not interpretable:
+        causes.add("uninterpretable")
+    elif accepted_at is None or case["query_ms"] - accepted_at > bound or (
+            "bound_exclusive" in off and case["query_ms"] - accepted_at == bound):
+        causes.add("silence")
+    if accepted_at is not None and case["query_ms"] - accepted_at == bound:
+        notes.add("at_bound")
+    if fault is not None and "fault" not in off:
+        causes.add("fault")
+    notes |= {f"unknown_{c}" for c in causes}
+    if causes:
+        return {"state": "unknown"}, notes
+    assert latest is not None
+    return {"state": "as_of", "epoch": epoch, "boot_id": latest[0], "seq": latest[1]}, notes
+
+
+def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+    if set(corpus["reasons"]) != {REASON, BYTES_REASON}:
+        raise Failure(f"corpus reasons {sorted(corpus['reasons'])} are not "
+                      f"{REASON} and {BYTES_REASON}")
+    _shapes(corpus, model, off)
+    names = set()
+    for case in (corpus["cases"] + corpus["reject_cases"] + corpus["reject_bytes"]
+                 + corpus["interpretations"] + corpus["ranges"] + corpus["agreements"]
+                 + corpus["states"]):
+        if case["name"] in names:
+            raise Failure(f"duplicate case {case['name']}")
+        names.add(case["name"])
+
+    documents = {}
+    for case in corpus["cases"]:
+        doc = case["document"]
+        broken = broken_rules(doc, model, off)
+        if broken:
+            raise Failure(f"{case['name']}: refused ({sorted(broken)})")
+        body = canonical(doc)
+        if bytes.fromhex(case["canonical_hex"]) != body:
+            raise Failure(f"{case['name']}: canonical bytes")
+        if case["digest"] != "sha256:" + hashlib.sha256(body).hexdigest():
+            raise Failure(f"{case['name']}: digest")
+        documents[case["name"]] = doc
+
+    for case in corpus["reject_cases"]:
+        if case["reason"] != REASON:
+            raise Failure(f"{case['name']}: reason {case['reason']}")
+        if case["rule"] not in RULES:
+            raise Failure(f"{case['name']}: rule {case['rule']} is not one this "
+                          f"checker reads from the text")
+        broken = broken_rules(case["document"], model, off)
+        if broken != {case["rule"]}:
+            raise Failure(f"{case['name']}: breaks {sorted(broken)}, not exactly "
+                          f"{case['rule']}")
+
+    pinned = {case["digest"] for case in corpus["cases"]}
+    for case in corpus["reject_bytes"]:
+        if case["reason"] != BYTES_REASON:
+            raise Failure(f"{case['name']}: reason {case['reason']}")
+        if byte_fault(bytes.fromhex(case["bytes_hex"]), off) is None:
+            raise Failure(f"{case['name']}: its bytes are canonical")
+    for case in corpus["cases"]:
+        if byte_fault(bytes.fromhex(case["canonical_hex"]), off) is not None:
+            raise Failure(f"{case['name']}: its canonical bytes are refused")
+
+    for case in corpus["ranges"]:
+        # Through the manifest the reading was accepted under, never the pinned one.
+        source = "pinned_document" if "range_through_pinned" in off else "document"
+        channel = next(c for c in documents[case[source]]["channels"]
+                       if c["name"] == case["profile_channel"])
+        raw = raw_count(channel, case["value"], "range_binary" in off)
+        whole = raw.denominator == 1 or "range_fraction" in off
+        within = channel["raw_min"] <= raw <= channel["raw_max"] or "range_bounds" in off
+        verdict = "in_range" if whole and within else "out_of_range"
+        if not _same(verdict, case["expected"]):
+            raise Failure(f"{case['name']}: {verdict} (raw {raw}), not {case['expected']}")
+
+    for case in corpus["agreements"]:
+        found = disagreements(case["manifest_channel"], documents[case["document"]],
+                              model, off)
+        verdict = "disagree" if found else "use"
+        if not _same(verdict, case["expected"]):
+            raise Failure(f"{case['name']}: {verdict} ({sorted(found)}), not "
+                          f"{case['expected']}")
+
+    for case in corpus["states"]:
+        got, _ = alarm_state(case, model, off)
+        if not _same(got, case["expected"]):
+            raise Failure(f"{case['name']}: state {got}, not {case['expected']}")
+
+    _coverage(corpus, model, pinned, off)
+
+    for case in corpus["interpretations"]:
+        # Through the manifest the reading was accepted under, never the pinned one.
+        doc = documents[case["pinned_document" if "through_pinned" in off else "document"]]
+        channel = next(c for c in doc["channels"] if c["name"] == case["profile_channel"])
+        if channel["kind"] != model["alarm_kind"]:
+            raise Failure(f"{case['name']}: reads a channel that is not an alarm word")
+        why = register_fault(channel, case, model)
+        if why is not None:
+            raise Failure(f"{case['name']}: {why}")
+        got = interpret(channel, case["value"], model)
+        if not _same(got, case["expected"]) or list(got) != list(case["expected"]):
+            raise Failure(f"{case['name']}: interpreted as {got}, not {case['expected']}")
+
+
+def _duplicate_refusing(pairs: list[tuple[str, object]]) -> dict:
+    keys = [k for k, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+def byte_fault(raw: bytes, off: frozenset[str] = frozenset()) -> str | None:
+    """Why a document's bytes are not the canonical bytes of their parse."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "utf8"
+    try:
+        hook = dict if "duplicates" in off else _duplicate_refusing
+        parsed = json.loads(text, object_pairs_hook=hook)
+    except ValueError:
+        return "parse"
+    try:
+        if canonical(parsed) != raw and "canonical_bytes" not in off:
+            return "not_canonical"
+    except (Failure, UnicodeEncodeError):
+        # A lone surrogate, escaped, parses but has no UTF-8 bytes.
+        return "not_canonical"
+    return None
+
+
+def _first_wins(pairs: list[tuple[str, object]]) -> dict:
+    out: dict = {}
+    for k, v in pairs:
+        out.setdefault(k, v)
+    return out
+
+
+def _leaf_diffs(a: object, b: object, key: str = "") -> list[tuple[str, object, object]]:
+    if type(a) is dict and type(b) is dict and set(a) == set(b):
+        return [d for k in a for d in _leaf_diffs(a[k], b[k], k)]
+    if type(a) is list and type(b) is list and len(a) == len(b):
+        return [d for x, y in zip(a, b) for d in _leaf_diffs(x, y, key)]
+    return [] if a == b and type(a) is type(b) else [(key, a, b)]
+
+
+def register_fault(channel: dict, case: dict, model: dict) -> str | None:
+    """Why a case's registers do not combine to its value in the channel's order."""
+    registers, value = case["registers"], case["value"]
+    if registers is None:
+        return None if case["expected"] == {"interpreted": False} else "no registers"
+    count = channel["register_count"]
+    if (type(registers) is not list or len(registers) != count
+            or any(type(r) is not int or not 0 <= r < 1 << model["bits"] for r in registers)):
+        return f"registers {registers} are not {count} register values"
+    if count == 1:
+        word = registers[0]
+    else:
+        high, low = (registers if channel["word_order"] == model["high_first"]
+                     else registers[::-1])
+        word = (high << model["bits"]) | low
+    if type(value) not in (int, float) or word != value:
+        return f"registers combine to {word}, not {value!r}"
+    return None
+
+
+def _coverage(corpus: dict, model: dict, pinned: set[str],
+              off: frozenset[str] = frozenset()) -> None:
+    channels = [c for case in corpus["cases"] for c in case["document"]["channels"]]
+    meas = [c for c in channels if c["kind"] == model["measurement_kind"]]
+    wanted: dict[str, bool] = {
+        "measurement kind": bool(meas),
+        "alarm_word kind": any(c["kind"] == model["alarm_kind"] for c in channels),
+        "signed range": any(c["raw_signed"] is True for c in meas),
+        "unsigned range": any(c["raw_signed"] is False for c in meas),
+        "negative offset": any(c["offset"]["mantissa"] < 0 for c in meas),
+    }
+    for n in model["counts"]:
+        wanted[f"width {n}"] = any(c["register_count"] == n for c in channels)
+    for order in model["orders"]:
+        wanted[f"word order {order}"] = any(c["word_order"] == order for c in channels)
+    for active in model["polarity"]:
+        wanted[f"polarity {active}"] = any(
+            a["active"] == active for c in channels for a in c.get(model["alarms_field"], []))
+    refused = {case["rule"] for case in corpus["reject_cases"]}
+    for trap in ("bool_is_int", "float_is_int"):
+        wanted[f"a refusal that {trap} would admit"] = any(
+            broken_rules(c["document"], model, frozenset({trap})) != {c["rule"]}
+            for c in corpus["reject_cases"])
+    wanted["a non-string where the grammar names a string"] = any(
+        _non_string(c["document"]) for c in corpus["reject_cases"])
+    for rule in RULES:
+        wanted[f"refusal under {rule}"] = rule in refused
+    modes: list[set[str]] = [decode_faults(m, model) for case in corpus["reject_cases"]
+                             if case["rule"] == "decode" for m in case["document"]["channels"]
+                             if m.get("kind") == model["measurement_kind"]
+                             and decode_faults(m, model)]
+    for mode in ("scale", "offset", "term", "sum", "value"):
+        wanted[f"a decode refusal past the {mode} bound alone"] = {mode} in modes
+    # Each way a string leaves the printable range, and a letter beyond ASCII in
+    # each of the two fields that hold one.
+    def offending(field: str) -> list[str]:
+        return [v for case in corpus["reject_cases"]
+                for v in _field_strings(case["document"], field)
+                if type(v) is str and not _text(v, (0, 1 << 30) + model[field][2:])]
+    texts = offending("source") + offending("meaning")
+    low, high = model["source"][2:]
+    for label, test in (
+            ("U+0000", lambda ch: ch == "\x00"),
+            ("a control below the range, short of its edge",
+             lambda ch: 0 < ord(ch) < low - 1),
+            ("a C1 control past the range, short of its edge",
+             lambda ch: high + 1 < ord(ch) <= 0x9F),
+            ("a format character", lambda ch: unicodedata.category(ch) == "Cf"
+             and ord(ch) <= 0xFFFF),
+            ("a character beyond the BMP", lambda ch: ord(ch) > 0xFFFF)):
+        wanted[f"a string with {label} refused"] = any(
+            any(test(ch) for ch in v) for v in texts)
+    # Both edges of the range: each accepted, and the character just outside
+    # each refused.
+    for field in ("source", "meaning"):
+        first, last = model[field][2:]
+        accepted = [v for case in corpus["cases"]
+                    for v in _field_strings(case["document"], field) if type(v) is str]
+        for edge in (first, last):
+            wanted[f"U+{edge:04X} accepted in a {field}"] = any(
+                chr(edge) in v for v in accepted)
+        for outside in (first - 1, last + 1):
+            wanted[f"U+{outside:04X} refused in a {field}"] = any(
+                chr(outside) in v for v in offending(field))
+    for field in ("source", "meaning"):
+        wanted[f"a {field} with a letter beyond ASCII refused"] = any(
+            any(unicodedata.category(ch).startswith("L") and ord(ch) > high for ch in v)
+            for v in offending(field))
+    faults = [byte_fault(bytes.fromhex(c["bytes_hex"]), off) for c in corpus["reject_bytes"]]
+    for fault in ("utf8", "parse", "not_canonical"):
+        wanted[f"a byte string refused as {fault}"] = fault in faults
+    reserialized = 0
+    for case in corpus["reject_bytes"]:
+        try:
+            lenient = json.loads(bytes.fromhex(case["bytes_hex"]).decode("utf-8"))
+            if "sha256:" + hashlib.sha256(canonical(lenient)).hexdigest() in pinned:
+                reserialized += 1
+        except (UnicodeDecodeError, ValueError, Failure):
+            pass
+    wanted["each byte string but one re-serializes to a pinned digest"] = (
+        reserialized == len(corpus["reject_bytes"]) - 1)
+    opposite = False
+    for case in corpus["reject_bytes"]:
+        try:
+            text = bytes.fromhex(case["bytes_hex"]).decode("utf-8")
+            first = json.loads(text, object_pairs_hook=_first_wins)
+            last = json.loads(text)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        diffs = _leaf_diffs(first, last)
+        if (len(diffs) == 1 and diffs[0][0] == "active"
+                and {diffs[0][1], diffs[0][2]} == set(model["polarity"])):
+            opposite = True
+    wanted["a duplicate key giving opposite polarities"] = opposite
+    orders = {(d["name"], c["name"]): c["word_order"]
+              for d in corpus["cases"] for c in d["document"]["channels"]}
+    for order in model["orders"]:
+        wanted[f"distinct registers combined {order}"] = any(
+            orders.get((r["document"], r["profile_channel"])) == order
+            and type(r["registers"]) is list and len(set(r["registers"])) == 2
+            for r in corpus["interpretations"])
+    readings = corpus["interpretations"]
+
+    def uninterpreted(test: Callable[[Any], bool]) -> bool:
+        return any(not r["expected"]["interpreted"] and test(r["value"]) for r in readings)
+    wanted["value past width"] = uninterpreted(
+        lambda v: type(v) is int and v > 0)
+    wanted["negative value"] = uninterpreted(lambda v: type(v) in (int, float) and v < 0)
+    wanted["fractional value"] = uninterpreted(
+        lambda v: type(v) is float and not v.is_integer())
+    wanted["integral value encoded as a float"] = any(
+        r["expected"]["interpreted"] and type(r["value"]) is float for r in readings)
+    for kind in (True, False):
+        wanted[f"interpreted {kind}"] = any(r["expected"]["interpreted"] is kind
+                                            for r in readings)
+    traces = [(alarm_state(c, model, off), c) for c in corpus["states"]]
+    def has_refusal(n: set[str]) -> bool:
+        return any(k.startswith("refused") for k in n)
+
+    classes = {
+        "nothing accepted": lambda v, n, c: not c["events"] and v["state"] == "unknown",
+        "as of a single reading inside the silence bound":
+            lambda v, n, c: v["state"] == "as_of" and len(c["events"]) == 1
+            and "at_bound" not in n,
+        "as of a reading exactly at the silence bound, under the cap":
+            lambda v, n, c: v["state"] == "as_of" and "at_bound" in n
+            and "at_ceiling" not in n,
+        "unknown past the silence bound alone":
+            lambda v, n, c: "unknown_silence" in n and not has_refusal(n) and not n & {
+                "unknown_no_latest", "unknown_fault", "at_ceiling", "rotated", "promoted",
+                "restarted", "other"},
+        "unknown past the bound at the alarm-word poll ceiling":
+            lambda v, n, c: {"at_ceiling", "unknown_silence"} <= n,
+        "as of a reading exactly at the bound at the alarm-word poll ceiling":
+            lambda v, n, c: v["state"] == "as_of" and {"at_ceiling", "at_bound"} <= n,
+        "unknown after a revocation": lambda v, n, c: v["state"] == "unknown"
+            and "revoked" in n and "reinstated" not in n and not has_refusal(n),
+        "a reading while revoked refused": lambda v, n, c: "refused_inactive" in n
+            and "reinstated" not in n,
+        "unknown after a reinstatement": lambda v, n, c: v["state"] == "unknown"
+            and "reinstated" in n and not has_refusal(n),
+        "a reading after a reinstatement, before any promotion, refused":
+            lambda v, n, c: "reinstated" in n and "refused_inactive" in n
+            and "revoked_after_reinstatement" not in n,
+        "a reading after a revocation of a reinstated identity refused":
+            lambda v, n, c: {"revoked_after_reinstatement", "refused_inactive"} <= n,
+        "a reading after a reinstatement and a promotion":
+            lambda v, n, c: v["state"] == "as_of" and {"reinstated", "promoted"} <= n,
+        "unknown under a fault alone":
+            lambda v, n, c: "unknown_fault" in n and not n & {"unknown_silence",
+                                                             "unknown_no_latest"},
+        "a fault cleared by a later reading": lambda v, n, c: v["state"] == "as_of"
+            and "fault_cleared" in n and not n & {"rotated", "promoted"},
+        "unknown after a rotation": lambda v, n, c: v["state"] == "unknown"
+            and "rotated" in n and "unknown_no_latest" in n and not has_refusal(n),
+        "lower counters latest in a new epoch":
+            lambda v, n, c: v["state"] == "as_of" and "lower_counters_in_new_epoch" in n,
+        "a superseded epoch's reading refused":
+            lambda v, n, c: v["state"] == "unknown" and "refused_epoch" in n,
+        "a superseded epoch's fault not holding the new epoch":
+            lambda v, n, c: v["state"] == "as_of" and {"rotated", "fault"} <= n,
+        "unknown after a promotion": lambda v, n, c: v["state"] == "unknown"
+            and "promoted" in n and "unknown_no_latest" in n and not has_refusal(n),
+        "a reading after a promotion of a live anchor": lambda v, n, c: v["state"] == "as_of"
+            and "accepted_after_promoted" in n and not n & {"fault", "revoked"},
+        "a promotion ending a fault's hold":
+            lambda v, n, c: v["state"] == "as_of" and {"promoted", "fault"} <= n,
+        "a replay after a promotion refused":
+            lambda v, n, c: "refused_replay_after_promoted" in n,
+        "unknown after a receiver restart": lambda v, n, c: v["state"] == "unknown"
+            and "restarted" in n and "accepted_after_restarted" not in n
+            and not has_refusal(n),
+        "a reading after a restart":
+            lambda v, n, c: v["state"] == "as_of" and "accepted_after_restarted" in n,
+        "a drained backlog as of its latest reading":
+            lambda v, n, c: v["state"] == "as_of" and sum(
+                e["kind"] == "reading" for e in c["events"]) >= 3,
+        "a later boot with seq running on":
+            lambda v, n, c: v["state"] == "as_of" and "later_boot" in n,
+        "a lower seq refused": lambda v, n, c: "refused_replay" in n and not n & {
+            "refused_duplicate", "refused_rollback", "restarted", "promoted", "other"},
+        "a replay after a restart refused":
+            lambda v, n, c: "refused_replay_after_restarted" in n,
+        "a duplicate refused": lambda v, n, c: "refused_duplicate" in n
+            and not n & {"restarted", "promoted"},
+        "a boot rollback refused": lambda v, n, c: "refused_rollback" in n,
+        "an uninterpretable reading latest and unknown": lambda v, n, c:
+            v["state"] == "unknown" and "unknown_uninterpretable" in n
+            and "accepted_after_uninterpretable" not in n,
+        "a reading after an uninterpretable one":
+            lambda v, n, c: v["state"] == "as_of" and "accepted_after_uninterpretable" in n,
+        "another message not restarting the bound":
+            lambda v, n, c: v["state"] == "unknown" and "unknown_silence" in n
+            and "other" in n,
+        "another message advancing freshness":
+            lambda v, n, c: "other" in n and "refused_replay" in n,
+    }
+    def stages(c: dict) -> int:
+        return sum(e["kind"] in ("stage_manifest", "stage_key") for e in c["events"])
+
+    staged_classes = {
+        "a staged manifest leaving the reading standing": lambda v, n, c:
+            v["state"] == "as_of" and stages(c) == 1 and "stage_manifest" in n
+            and not has_refusal(n),
+        "a staged key leaving the reading standing": lambda v, n, c:
+            v["state"] == "as_of" and stages(c) == 1 and "stage_key" in n
+            and "rotated" not in n,
+        "a replaced pending anchor leaving the reading standing":
+            lambda v, n, c: v["state"] == "as_of" and stages(c) == 2,
+        "a staged anchor keeping a fault hold":
+            lambda v, n, c: "unknown_fault" in n and "unknown_silence" not in n,
+        "a staged anchor not restarting the bound": lambda v, n, c:
+            "unknown_silence" in n and "refused_pending" not in n,
+        "a pending reading refused, not restarting the bound": lambda v, n, c:
+            v["state"] == "unknown" and "refused_pending" in n,
+        "a pending reading leaving freshness to the active reading": lambda v, n, c:
+            v["state"] == "as_of" and "refused_pending" in n,
+        "a promotion of a rotated key after it was staged":
+            lambda v, n, c: v["state"] == "unknown" and {"stage_key", "rotated"} <= n,
+    }
+    for label, test in classes.items():
+        wanted[f"state case: {label}"] = any(
+            test(v, n, c) for (v, n), c in traces if "staged" not in n)
+    for label, test in staged_classes.items():
+        wanted[f"state case: {label}"] = any(
+            test(v, n, c) for (v, n), c in traces if "staged" in n)
+    docs_by_name = {case["name"]: case["document"] for case in corpus["cases"]}
+    verdicts = [(disagreements(a["manifest_channel"], docs_by_name[a["document"]], model,
+                               off), docs_by_name[a["document"]], a)
+                for a in corpus["agreements"]]
+    for kind in (model["measurement_kind"], model["alarm_kind"]):
+        wanted[f"an agreement on a {kind} channel used"] = any(
+            not found and any(c["name"] == a["manifest_channel"]["profile_channel"]
+                              and c["kind"] == kind for c in doc["channels"])
+            for found, doc, a in verdicts)
+    for way in ("digest", "id", "profile_channel", "sensor_type", "unit",
+                "measurement_read_as_alarm_word", "alarm_word_read_as_measurement"):
+        wanted[f"an agreement refused for {way} alone"] = any(
+            found == {way} for found, _, _ in verdicts)
+    for label, test in (
+            ("in range at raw_min", lambda r, c: r == c["raw_min"]),
+            ("in range at raw_max", lambda r, c: r == c["raw_max"]),
+            ("out of range past raw_max", lambda r, c: r.denominator == 1 and r > c["raw_max"]),
+            ("out of range below raw_min", lambda r, c: r.denominator == 1 and r < c["raw_min"]),
+            ("out of range between counts", lambda r, c: r.denominator != 1),
+            ("in range at a negative raw count inside the range",
+             lambda r, c: r.denominator == 1 and c["raw_min"] < r < 0),
+            ("in range at a signed range's raw_min",
+             lambda r, c: c["raw_signed"] is True and r == c["raw_min"]),
+            ("in range under a negative offset",
+             lambda r, c: c["offset"]["mantissa"] < 0 and r.denominator == 1
+             and c["raw_min"] <= r <= c["raw_max"])):
+        wanted[f"a range case {label}"] = any(
+            test(raw_count(ch, rc["value"]), ch)
+            for rc in corpus["ranges"] for ch in _channels(docs_by_name[rc["document"]])
+            if ch.get("name") == rc["profile_channel"])
+    def range_verdict(rc: dict, name: str) -> bool | None:
+        for ch in _channels(docs_by_name[name]):
+            if ch.get("name") == rc["profile_channel"]:
+                raw = raw_count(ch, rc["value"])
+                return raw.denominator == 1 and ch["raw_min"] <= raw <= ch["raw_max"]
+        return None
+    wanted["a range case whose pinned document differs in the verdict"] = any(
+        rc["pinned_document"] != rc["document"]
+        and range_verdict(rc, rc["pinned_document"]) != range_verdict(rc, rc["document"])
+        for rc in corpus["ranges"])
+    # Escaping: each character canonical JSON escapes in printable ASCII, in an
+    # accepted string.
+    accepted_strings = [v for case in corpus["cases"] for v in _strings(case["document"])]
+    for ch in ('"', "\\"):
+        wanted[f"an accepted string containing {ch}"] = any(ch in v for v in accepted_strings)
+    # A reading read again under another pinned document of the same id, where
+    # the two documents disagree on it.
+    docs = {case["name"]: case["document"] for case in corpus["cases"]}
+    wanted["an interpretation whose pinned document differs and disagrees"] = any(
+        r["pinned_document"] != r["document"]
+        and docs[r["pinned_document"]]["id"] == docs[r["document"]]["id"]
+        and _reading_of(docs[r["pinned_document"]], r, model)
+        != _reading_of(docs[r["document"]], r, model)
+        for r in corpus["interpretations"])
+    wanted.update(_bound_coverage(corpus, model))
+    missing = sorted(k for k, ok in wanted.items() if not ok)
+    if missing:
+        raise Failure(f"coverage: {missing}")
+
+
+def _channels(doc: dict) -> list[dict]:
+    chans = doc.get("channels")
+    return [c for c in chans if type(c) is dict] if type(chans) is list else []
+
+
+def _alarm_list(c: dict) -> list[dict]:
+    alarms = c.get("alarms")
+    return [a for a in alarms if type(a) is dict] if type(alarms) is list else []
+
+
+def _bound_values(doc: dict, model: dict) -> dict[str, list[int]]:
+    """Each quantity a bound pair limits, as this document carries it."""
+    out: dict[str, list[int]] = {}
+
+    def put(label: str, value: object) -> None:
+        if type(value) is int:
+            out.setdefault(label, []).append(value)
+
+    def put_len(label: str, value: object) -> None:
+        if type(value) is str:
+            out.setdefault(label, []).append(len(value))
+
+    put_len("fleet identifier length", doc.get("id"))
+    put_len("source length", doc.get("source"))
+    put("poll_interval_ms", doc.get("poll_interval_ms"))
+    if any(c.get("kind") == model["alarm_kind"] for c in _channels(doc)):
+        put("poll_interval_ms with an alarm word", doc.get("poll_interval_ms"))
+    if type(doc.get("channels")) is list:
+        put("channel count", len(doc["channels"]))
+    for c in _channels(doc):
+        for f in ("name", "sensor_type", "unit"):
+            put_len("fleet identifier length", c.get(f))
+        put("start_register", c.get("start_register"))
+        count: Any = c.get("register_count")
+        put("register_count", count)
+        if type(c.get("start_register")) is int and type(count) is int:
+            put("register span end", c["start_register"] + count)
+        for f in ("scale", "offset"):
+            d = c.get(f)
+            if type(d) is dict:
+                put("decimal mantissa", d.get("mantissa"))
+                put("decimal exponent", d.get("exponent"))
+        if type(c.get("raw_signed")) is bool and count in model["counts"]:
+            label = f"raw {'signed' if c['raw_signed'] else 'unsigned'} {16 * count}-bit"
+            put(label, c.get("raw_min"))
+            put(label, c.get("raw_max"))
+        if _decode_inputs_valid(c, model):
+            for magnitude in _decode_magnitudes(c):
+                put("decode magnitude", magnitude)
+            if _decoded_at_value_bound(c, model):
+                put("decoded value at the value bound", 1)
+        if type(c.get("alarms")) is list:
+            put("alarm count", len(c["alarms"]))
+        for a in _alarm_list(c):
+            put_len("fleet identifier length", a.get("id"))
+            put_len("meaning length", a.get("meaning"))
+            put("bit", a.get("bit"))
+            if count in model["counts"]:
+                put(f"bit in a {16 * count}-bit word", a.get("bit"))
+    return out
+
+
+def _decode_inputs_valid(c: dict, model: dict) -> bool:
+    if c.get("kind") != model["measurement_kind"]:
+        return False
+    try:
+        return not ({"raw_signed", "raw_range", "scale", "offset", "register_count"}
+                    & _channel(c, model, frozenset(), [], []))
+    except (KeyError, TypeError):
+        return False
+
+
+def _decode_magnitudes(c: dict) -> list[int]:
+    """The integer magnitudes the decode rule bounds at fifteen nines."""
+    ms, es = c["scale"]["mantissa"], c["scale"]["exponent"]
+    mo, eo = c["offset"]["mantissa"], c["offset"]["exponent"]
+    f = min(es, eo)
+    coefficient, base = ms * 10 ** (es - f), mo * 10 ** (eo - f)
+    out = [abs(coefficient), abs(base)]
+    for raw in (c["raw_min"], c["raw_max"]):
+        out += [abs(raw * coefficient), abs(raw * coefficient + base)]
+    return out
+
+
+def _decoded_at_value_bound(c: dict, model: dict) -> bool:
+    ms, es = c["scale"]["mantissa"], c["scale"]["exponent"]
+    mo, eo = c["offset"]["mantissa"], c["offset"]["exponent"]
+    f = min(es, eo)
+    limit = 10 ** model["value_exponent"]
+    for raw in (c["raw_min"], c["raw_max"]):
+        total = abs(raw * ms * 10 ** (es - f) + mo * 10 ** (eo - f))
+        if (total * 10 ** f == limit if f >= 0 else total == limit * 10 ** -f):
+            return True
+    return False
+
+
+def _bound_pairs(model: dict) -> dict[str, tuple[int | None, int | None]]:
+    """Every bound the text states, by the quantity it limits, as (low, high).
+
+    None marks an end the text leaves to another pair: the register span has
+    only a top, and a bit's bottom is shared by both widths.
+    """
+    low, high, _ = model["fleet"]
+    pairs: dict[str, tuple[int | None, int | None]] = {
+        "fleet identifier length": (low, high),
+        "source length": model["source"][:2],
+        "meaning length": model["meaning"][:2],
+        "poll_interval_ms": model["poll"],
+        "poll_interval_ms with an alarm word": (None, model["alarm_poll"]),
+        "channel count": model["channels"],
+        "start_register": model["start"],
+        "register_count": model["counts"],
+        "register span end": (None, model["span"]),
+        "decimal mantissa": (-model["mantissa"], model["mantissa"]),
+        "decimal exponent": model["exponent"],
+        "alarm count": (1, None),
+        "bit": (0, None),
+        "decode magnitude": (None, model["term_bound"]),
+    }
+    for count in model["counts"]:
+        width = model["bits"] * count
+        pairs[f"bit in a {width}-bit word"] = (None, width - 1)
+        pairs[f"raw unsigned {width}-bit"] = (0, (1 << width) - 1)
+        pairs[f"raw signed {width}-bit"] = (-(1 << (width - 1)), (1 << (width - 1)) - 1)
+    return pairs
+
+
+def _bound_coverage(corpus: dict, model: dict) -> dict[str, bool]:
+    """Each end of each bound accepted, and one past each end refused.
+
+    A refusal breaks exactly one rule, so a value past a bound in a refused
+    document is the value that refuses it.
+    """
+    accepted: dict[str, set[int]] = {}
+    refused: dict[str, set[int]] = {}
+    for case in corpus["cases"]:
+        for k, v in _bound_values(case["document"], model).items():
+            accepted.setdefault(k, set()).update(v)
+    for case in corpus["reject_cases"]:
+        if type(case["document"]) is dict:
+            for k, v in _bound_values(case["document"], model).items():
+                refused.setdefault(k, set()).update(v)
+    wanted: dict[str, bool] = {
+        # The value bound has no next value to refuse at, so only its end is
+        # required, accepted; refusals past it are required by decode coverage.
+        "a decoded value accepted at the value bound": bool(
+            accepted.get("decoded value at the value bound")),
+    }
+    for count in model["counts"]:
+        width = model["bits"] * count
+        top = (1 << width) - 1
+        words = [(r["value"], r["expected"]["interpreted"]) for r in corpus["interpretations"]
+                 if _width_of(corpus, r) == width]
+        for value, interpreted in ((0, True), (top, True), (-1, False), (top + 1, False)):
+            wanted[f"a {width}-bit word value {value} {'' if interpreted else 'not '}"
+                   f"interpreted"] = any(v == value and type(v) is int and i is interpreted
+                                         for v, i in words)
+    for label, (low, high) in _bound_pairs(model).items():
+        for end, past in ((low, -1), (high, 1)):
+            if end is None:
+                continue
+            wanted[f"{label} accepted at {end}"] = end in accepted.get(label, set())
+            wanted[f"{label} refused at {end + past}"] = (
+                end + past in refused.get(label, set()))
+    return wanted
+
+
+def _reading_of(doc: dict, reading: dict, model: dict) -> dict | None:
+    for c in _channels(doc):
+        if c.get("name") == reading["profile_channel"]:
+            return interpret(c, reading["value"], model)
+    return None
+
+
+def _width_of(corpus: dict, reading: dict) -> int | None:
+    for case in corpus["cases"]:
+        if case["name"] == reading["document"]:
+            for c in _channels(case["document"]):
+                if c.get("name") == reading["profile_channel"]:
+                    return 16 * c["register_count"]
+    return None
+
+
+def _field_strings(value: object, field: str) -> list[object]:
+    if type(value) is dict:
+        return [v for k, v in value.items() if k == field] + [
+            s for v in value.values() for s in _field_strings(v, field)]
+    if type(value) is list:
+        return [s for v in value for s in _field_strings(v, field)]
+    return []
+
+
+def _strings(value: object) -> list[str]:
+    if type(value) is str:
+        return [value]
+    if type(value) is dict:
+        return [s for v in value.values() for s in _strings(v)]
+    if type(value) is list:
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+STRING_FIELDS = ("id", "source", "name", "kind", "function", "sensor_type", "unit",
+                 "active", "meaning")
+
+
+def _non_string(value: object) -> bool:
+    if type(value) is dict:
+        return any((k in STRING_FIELDS and type(v) is not str) or _non_string(v)
+                   for k, v in value.items())
+    if type(value) is list:
+        return any(_non_string(v) for v in value)
+    return False
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> None:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
+    check(json.loads(corpus_bytes), model, off)
+
+
+# --- mutations -------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def find(collection: str, name: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c[collection] if x["name"] == name)
+
+    rectifier = find("cases", "rectifier")
+    generator = find("cases", "generator")
+    meter = find("cases", "meter_bounds")
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def text_mutant(old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts["t2"]:
+                raise AssertionError(f"mutant target missing from v2.md: {old!r}")
+            texts["t2"] = texts["t2"].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def channel(case: Callable[[dict], dict], name: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in case(c)["document"]["channels"] if x["name"] == name)
+
+    def edit_accepted(c: dict) -> None:
+        channel(rectifier, "output_current")(c)["raw_max"] = 2001
+
+    def two_rules(c: dict) -> None:
+        case = copy.deepcopy(find("reject_cases", "reject_baud_float")(c))
+        case["name"] = "two_rules"
+        case["document"]["poll_interval_ms"] = 99
+        c["reject_cases"].append(case)
+
+    def fixed(c: dict) -> None:
+        case = find("reject_cases", "reject_poll_too_fast")(c)
+        case["document"]["poll_interval_ms"] = 100
+
+    def drop_rule(rule: str) -> Callable[[dict], None]:
+        return lambda c: c.update(reject_cases=[x for x in c["reject_cases"]
+                                                if x["rule"] != rule])
+
+    def rule_off(rule: str) -> Callable[[], None]:
+        return lambda: run(corpus_bytes, model, frozenset({rule}))
+
+    def stage_while_revoked() -> Callable[[], None]:
+        # A staged anchor spliced in while revoked: the legality check refuses it,
+        # and switching that check off lets the same corpus through.
+        def edit(c: dict) -> None:
+            case = find("states", "revocation_makes_unknown")(c)
+            case["events"].append({"t": 20, "kind": "stage_manifest"})
+        return corpus_mutant(edit)
+
+    def provisioning_mutant(old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts["dp"]:
+                raise AssertionError(f"mutant target missing from device-provisioning: {old!r}")
+            texts["dp"] = texts["dp"].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def run_widened() -> None:
+        # The shape check held to the grammar's maximum instead of the alarm-word
+        # ceiling, the hour cap restored, and a state case past the ceiling: the
+        # cap would then hide the wider bound, which only the shape check refuses.
+        mutated = copy.deepcopy(base)
+        case = next(x for x in mutated["states"] if x["name"] == "past_the_ceiling_bound")
+        case.update(poll_interval_ms=3600000, query_ms=3600001)
+        check(mutated, model, frozenset({"hour_cap"}))
+
+    def range_pinned_without_channel(c: dict) -> None:
+        clone = copy.deepcopy(rectifier(c))
+        clone["name"] = "rectifier_without_current"
+        clone["document"]["channels"] = clone["document"]["channels"][1:]
+        body = canonical(clone["document"])
+        clone.update(canonical_hex=body.hex(),
+                     digest="sha256:" + hashlib.sha256(body).hexdigest())
+        c["cases"].append(clone)
+        find("ranges", "current_zero")(c).update(pinned_document="rectifier_without_current")
+
+    def pinned_without_channel(c: dict) -> None:
+        # Same id as the reading's document, but without its channel.
+        clone = copy.deepcopy(rectifier(c))
+        clone["name"] = "rectifier_without_alarms"
+        clone["document"]["channels"] = clone["document"]["channels"][:1]
+        body = canonical(clone["document"])
+        clone.update(canonical_hex=body.hex(),
+                     digest="sha256:" + hashlib.sha256(body).hexdigest())
+        c["cases"].append(clone)
+        find("interpretations", "rectifier_all_zero")(c).update(
+            pinned_document="rectifier_without_alarms")
+
+    def unescaped(chars: str) -> Callable[[], None]:
+        def go() -> None:
+            saved = dict(_SHORT_ESCAPES)
+            for ch in chars:
+                _SHORT_ESCAPES.pop(ch)
+            try:
+                run(corpus_bytes, model)
+            finally:
+                _SHORT_ESCAPES.clear()
+                _SHORT_ESCAPES.update(saved)
+        return go
+
+    def illegal(name: str, extra: list[dict]) -> Callable[[], None]:
+        def edit(c: dict) -> None:
+            find("states", name)(c)["events"].extend(extra)
+            find("states", name)(c)["query_ms"] = max(
+                find("states", name)(c)["query_ms"], extra[-1]["t"])
+        return corpus_mutant(edit)
+
+    def moved_decode(c: dict) -> None:
+        case = copy.deepcopy(find("reject_cases", "reject_decode_value_past_bound")(c))
+        body = canonical(case["document"])
+        c["cases"].append({"name": "moved_decode", "document": case["document"],
+                           "canonical_hex": body.hex(),
+                           "digest": "sha256:" + hashlib.sha256(body).hexdigest()})
+
+    def same_polarity(c: dict) -> None:
+        case = find("reject_bytes", "reject_bytes_duplicate_key")(c)
+        raw = bytes.fromhex(case["bytes_hex"])
+        case["bytes_hex"] = raw.replace(b'"active":"clear"', b'"active":"set"').hex()
+
+    def drop(collection: str, name: str) -> Callable[[dict], None]:
+        return lambda c: c[collection].remove(find(collection, name)(c))
+
+    def flip_interpretation(c: dict) -> None:
+        find("interpretations", "rectifier_all_zero")(c)["expected"]["alarms"][
+            "fan_stopped"] = "not_asserted"
+
+    def unmapped_all(c: dict) -> None:
+        find("interpretations", "generator_low_first_pair")(c)["expected"][
+            "unmapped_set_bits"] = [2, 16]
+
+    def interpreted_fraction(c: dict) -> None:
+        find("interpretations", "rectifier_fraction")(c)["expected"] = {
+            "interpreted": True, "alarms": {"ac_input_fail": "asserted",
+                                            "over_temperature": "not_asserted",
+                                            "fan_stopped": "asserted",
+                                            "module_fault": "not_asserted"},
+            "unmapped_set_bits": []}
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("accepted document edited, digest kept", corpus_mutant(edit_accepted)),
+        ("accepted digest replaced", corpus_mutant(
+            lambda c: rectifier(c).update(digest=generator(c)["digest"]))),
+        ("canonical bytes replaced", corpus_mutant(
+            lambda c: rectifier(c).update(canonical_hex=generator(c)["canonical_hex"]))),
+        ("accepted keys reordered in canonical bytes", corpus_mutant(
+            lambda c: rectifier(c).update(canonical_hex=json.dumps(
+                rectifier(c)["document"], separators=(",", ":")).encode().hex()))),
+        ("refusal relabelled", corpus_mutant(
+            lambda c: find("reject_cases", "reject_baud_float")(c).update(rule="version"))),
+        ("refusal relabelled to a rule outside the vocabulary", corpus_mutant(
+            lambda c: find("reject_cases", "reject_baud_float")(c).update(rule="number_type"))),
+        ("refusal reason renamed", corpus_mutant(
+            lambda c: find("reject_cases", "reject_no_alarms")(c).update(reason="x"))),
+        ("refusal breaking two rules added", corpus_mutant(two_rules)),
+        ("refusal fixed so it breaks nothing", corpus_mutant(fixed)),
+        ("refusal moved to cases", corpus_mutant(lambda c: c["cases"].append(dict(
+            find("reject_cases", "reject_scale_zero")(c), name="moved_scale_zero",
+            canonical_hex="", digest="")))),
+        ("decode refusal moved to cases", corpus_mutant(moved_decode)),
+        ("byte string made canonical", corpus_mutant(lambda c: find(
+            "reject_bytes", "reject_bytes_whitespace")(c).update(
+                bytes_hex=rectifier(c)["canonical_hex"]))),
+        ("byte string reason renamed", corpus_mutant(lambda c: find(
+            "reject_bytes", "reject_bytes_key_order")(c).update(reason=REASON))),
+        ("duplicate-key byte string dropped", corpus_mutant(
+            drop("reject_bytes", "reject_bytes_duplicate_key"))),
+        ("invalid UTF-8 byte string dropped", corpus_mutant(
+            drop("reject_bytes", "reject_bytes_invalid_utf8"))),
+        ("non-reserializing byte string added", corpus_mutant(lambda c: c["reject_bytes"].append(
+            {"name": "extra", "reason": BYTES_REASON, "bytes_hex": b"[1, 2]".hex()}))),
+        ("duplicate key resolved to the same polarity", corpus_mutant(same_polarity)),
+        ("duplicate keys admitted", rule_off("duplicates")),
+        ("canonical byte comparison skipped", rule_off("canonical_bytes")),
+        ("registers swapped on a high_first pair", corpus_mutant(lambda c: find(
+            "interpretations", "rectifier_high_word_bit")(c).update(registers=[0, 2]))),
+        ("registers swapped on a low_first pair", corpus_mutant(lambda c: find(
+            "interpretations", "generator_low_first_pair")(c).update(registers=[1, 4]))),
+        ("registers given to an uninterpretable value", corpus_mutant(lambda c: find(
+            "interpretations", "rectifier_negative")(c).update(registers=[0, 0]))),
+        ("registers dropped from an interpreted value", corpus_mutant(lambda c: find(
+            "interpretations", "rectifier_all_zero")(c).update(registers=None))),
+        ("register past sixteen bits", corpus_mutant(lambda c: find(
+            "interpretations", "generator_sixteen_bit")(c).update(registers=[32771 + 65536]))),
+        ("word order read reversed", model_mutant(lambda m: m.update(high_first="low_first"))),
+        ("decode bound widened in the model", model_mutant(
+            lambda m: m.update(term_bound=10 ** 30, value_exponent=30))),
+        ("term-alone refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_decode_term_alone_past_bound"))),
+        ("offset-alone refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_decode_offset_alone_past_bound"))),
+        ("scale-alone refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_decode_scale_alone_past_bound"))),
+        ("C0 control refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_source_control"))),
+        ("C1 control refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_source_c1_control"))),
+        ("printable range widened in the model", model_mutant(
+            lambda m: m.update(source=m["source"][:3] + (0x10FFFF,),
+                               meaning=m["meaning"][:3] + (0x10FFFF,)))),
+        ("source range widened to U+00FF in v2.md", text_mutant(
+            "printable ASCII characters, U+0020 to U+007E. Never",
+            "printable ASCII characters, U+0020 to U+00FF. Never")),
+        ("meaning range starts at U+0000 in v2.md", text_mutant(
+            "documentation states it: 1 to 256 printable ASCII characters, U+0020",
+            "documentation states it: 1 to 256 printable ASCII characters, U+0000")),
+        ("meaning loses its reading sentence in v2.md", text_mutant(
+            " An operator and a model read it, and nothing outside that range can hide, "
+            "break or reorder what they read.", "")),
+        ("source non-ASCII refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_source_non_ascii"))),
+        ("meaning non-ASCII refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_alarm_meaning_non_ascii"))),
+        ("tag character refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_alarm_meaning_tag_character"))),
+        ("scale coefficient bound dropped in v2.md", text_mutant(
+            "exponents. Each of `m_scale × 10^(e_scale − f)` and\n`m_offset",
+            "exponents. Each of\n`m_offset")),
+        ("silence multiplier lowered in v2.md", text_mutant(
+            "`3 × poll_interval_ms + 30000`", "`2 × poll_interval_ms + 30000`")),
+        ("silence allowance raised in v2.md", text_mutant(
+            "`3 × poll_interval_ms + 30000`", "`3 × poll_interval_ms + 30001`")),
+        ("silence bound no longer held to an hour in v2.md", text_mutant(
+            "which the profile grammar holds to an hour\n  at most.",
+            "which the profile grammar holds to two hours\n  at most.")),
+        ("silence bound read exclusive", rule_off("bound_exclusive")),
+        ("readings of any epoch accepted", rule_off("epoch_refusal")),
+        ("rotation keeps the latest reading", rule_off("rotate_keeps_latest")),
+        ("rotation keeps the fault", rule_off("rotate_keeps_fault")),
+        ("promotion keeps the latest reading", rule_off("promote_keeps_latest")),
+        ("an equal seq accepted", rule_off("equal_seq")),
+        ("range accepts a value between counts", rule_off("range_fraction")),
+        ("range ignores raw_min and raw_max", rule_off("range_bounds")),
+        ("range reads the double's binary value", rule_off("range_binary")),
+        ("range rule dropped in v2.md", text_mutant(
+            "A device never signs a bridged\nmeasurement whose `value` is not the decode of "
+            "some raw count in\n`[raw_min, raw_max]`; a receiver holding a usable document "
+            "for the reading's\nchannel, the one the manifest it was accepted under names, "
+            "that receives one\nreports the producer defect and does not use the reading. ",
+            "")),
+        ("range sentence reads through the pinned manifest in v2.md", text_mutant(
+            "channel, the one the manifest it was accepted under names,",
+            "channel, the one the pinned manifest names,")),
+        ("range checked through the pinned document", rule_off("range_through_pinned")),
+        ("range verdict flipped", corpus_mutant(lambda c: find(
+            "ranges", "current_at_max")(c).update(expected="out_of_range"))),
+        ("range pinned document of another id", corpus_mutant(lambda c: find(
+            "ranges", "current_zero")(c).update(pinned_document="generator"))),
+        ("range pinned document not accepted", corpus_mutant(lambda c: find(
+            "ranges", "current_zero")(c).update(pinned_document="nothing"))),
+        ("range pinned document lacking the channel", corpus_mutant(
+            range_pinned_without_channel)),
+        ("range case through its own manifest dropped", corpus_mutant(
+            drop("ranges", "range_through_its_own_manifest"))),
+        ("negative raw count case dropped", corpus_mutant(
+            drop("ranges", "temperature_negative_count"))),
+        ("signed raw_min case dropped", corpus_mutant(
+            drop("ranges", "temperature_signed_min"))),
+        ("range case on an alarm word", corpus_mutant(lambda c: find(
+            "ranges", "current_zero")(c).update(profile_channel="alarm_word_1"))),
+        ("range value a boolean", corpus_mutant(lambda c: find(
+            "ranges", "current_zero")(c).update(value=False))),
+        ("range verdict outside its two values", corpus_mutant(lambda c: find(
+            "ranges", "current_zero")(c).update(expected="maybe"))),
+        ("range case named twice", corpus_mutant(lambda c: c["ranges"].append(
+            dict(find("ranges", "current_zero")(c))))),
+        ("agreement case named twice", corpus_mutant(lambda c: c["agreements"].append(
+            dict(find("agreements", "measurement_agrees")(c))))),
+        ("state epoch written false", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["expected"].update(epoch=False))),
+        ("state seq written as a float", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["expected"].update(seq=1.0))),
+        ("unmapped bits written as floats", corpus_mutant(lambda c: find(
+            "interpretations", "generator_low_first_pair")(c)["expected"].update(
+                unmapped_set_bits=[16.0]))),
+        ("corpus names another contract", corpus_mutant(
+            lambda c: c.update(contract="ori-specs/firmware-telemetry/v1.md"))),
+        ("corpus version 1", corpus_mutant(lambda c: c.update(version=1))),
+        ("corpus version a float", corpus_mutant(lambda c: c.update(version=2.0))),
+        ("state case past the alarm-word poll ceiling", corpus_mutant(lambda c: find(
+            "states", "past_the_ceiling_bound")(c).update(poll_interval_ms=1190001))),
+        ("state poll held only to the grammar's maximum, past-the-ceiling case widened",
+         lambda: run_widened()),
+        ("silence bound widened by a poll", text_mutant(
+            "within `3 × poll_interval_ms + 30000` milliseconds",
+            "within `4 × poll_interval_ms + 30000` milliseconds")),
+        ("reinstatement sentence edited in device-provisioning/v1", provisioning_mutant(
+            "It **never activates anything**.", "It **activates the anchor**.")),
+        ("promotion-while-revoked sentence edited in device-provisioning/v1",
+         provisioning_mutant("Promotion MUST refuse if the identity is revoked.",
+                             "Promotion MAY proceed if the identity is revoked.")),
+        ("nothing-accepted sentence edited in device-provisioning/v1", provisioning_mutant(
+            "no pending anchor. Nothing is\naccepted.", "no pending anchor. Telemetry is\naccepted.")),
+        ("pending sentence edited in device-provisioning/v1", provisioning_mutant(
+            "2. moves the retained **revoked** anchor back to **pending**.",
+            "2. moves the retained **revoked** anchor back to **active**.")),
+        ("alarm-word poll ceiling not enforced", rule_off("alarm_poll")),
+        ("alarm-word poll ceiling one higher in the model", model_mutant(
+            lambda m: m.update(alarm_poll=m["alarm_poll"] + 1))),
+        ("alarm-word poll ceiling one lower in the model", model_mutant(
+            lambda m: m.update(alarm_poll=m["alarm_poll"] - 1))),
+        ("alarm-word poll refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_poll_too_slow_for_alarm_word"))),
+        ("alarm-word poll ceiling raised in v2.md", text_mutant(
+            "at most `1190000` in a profile", "at most `1190001` in a profile")),
+        ("alarm-word poll ceiling past the hour in v2.md", text_mutant(
+            "at most `1190000` in a profile", "at most `1200000` in a profile")),
+        ("revocation after a reinstatement forbidden", rule_off("no_revoke_after_reinstate")),
+        ("agreement ignores the digest", rule_off("agree_digest")),
+        ("agreement ignores the id", rule_off("agree_id")),
+        ("agreement ignores a missing profile channel", rule_off("agree_channel")),
+        ("agreement ignores the sensor type", rule_off("agree_sensor_type")),
+        ("agreement ignores the unit", rule_off("agree_unit")),
+        ("agreement lets a measurement be read as an alarm word",
+         rule_off("agree_measurement_tokens")),
+        ("agreement lets an alarm word be read as a measurement", rule_off("agree_alarm")),
+        ("agreement sentence loses the id check in v2.md", text_mutant(
+            "that its `id` is the manifest's,\n", "")),
+        ("agreement verdict flipped", corpus_mutant(lambda c: find(
+            "agreements", "unit_disagrees")(c).update(expected="use"))),
+        ("agreement names an unaccepted document", corpus_mutant(lambda c: find(
+            "agreements", "measurement_agrees")(c).update(document="nothing"))),
+        ("agreement given a stray key", corpus_mutant(lambda c: find(
+            "agreements", "measurement_agrees")(c)["manifest_channel"].update(quality=1))),
+        ("agreement verdict outside its two values", corpus_mutant(lambda c: find(
+            "agreements", "measurement_agrees")(c).update(expected="maybe"))),
+        ("state poll interval a boolean", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c).update(poll_interval_ms=True))),
+        ("state poll interval past the text's ceiling", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c).update(poll_interval_ms=3600001))),
+        ("state poll interval under the text's floor", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c).update(poll_interval_ms=99))),
+        ("negative receiver time", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["events"][0].update(t=-1))),
+        ("negative query time", corpus_mutant(lambda c: find(
+            "states", "nothing_accepted")(c).update(query_ms=-1))),
+        ("query time a float", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c).update(query_ms=1000.0))),
+        ("seq past 2^53 - 1", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["events"][0].update(seq=2**53))),
+        ("negative boot_id", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["events"][0].update(boot_id=-1))),
+        ("negative epoch", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["events"][0].update(epoch=-1))),
+        ("pinned document of another id", corpus_mutant(lambda c: find(
+            "interpretations", "rectifier_all_zero")(c).update(pinned_document="generator"))),
+        ("pinned document not accepted", corpus_mutant(lambda c: find(
+            "interpretations", "rectifier_all_zero")(c).update(pinned_document="nothing"))),
+        ("pinned document lacking the channel", corpus_mutant(pinned_without_channel)),
+        ("interpretation read through the pinned document", rule_off("through_pinned")),
+        ("an uninterpretable reading ignored", rule_off("uninterpretable_ignored")),
+        ("an uninterpretable reading interpreted", rule_off("uninterpretable_interpreted")),
+        ("another message restarts the bound", rule_off("other_restarts_bound")),
+        ("another message leaves freshness alone", rule_off("other_skips_freshness")),
+        ("serializer escapes neither quote nor backslash", unescaped('"\\')),
+        ("serializer escapes no quote", unescaped('"')),
+        ("serializer escapes no backslash", unescaped("\\")),
+        ("promotion while revoked", illegal("revocation_makes_unknown", [
+            {"t": 20, "kind": "promote"}])),
+        ("rotation while revoked", illegal("revocation_makes_unknown", [
+            {"t": 20, "kind": "rotate"}])),
+        ("reinstatement while not revoked", illegal("fresh_reading", [
+            {"t": 20, "kind": "reinstate"}])),
+        ("reinstatement twice", illegal("reinstatement_makes_unknown", [
+            {"t": 25, "kind": "reinstate"}])),
+        ("revocation twice", illegal("revocation_makes_unknown", [
+            {"t": 20, "kind": "revoke"}])),
+        ("readings accepted with no active anchor", rule_off("inactive_refusal")),
+        ("reinstatement activates the anchor", rule_off("reinstate_activates")),
+        ("revocation keeps the latest reading", rule_off("revoke_keeps_latest")),
+        ("latest-reading bullet loses revocation in v2.md", text_mutant(
+            "the promotion of a rotated key or a revocation,",
+            "the promotion of a rotated key,")),
+        ("pending-anchor sentence dropped in v2.md", text_mutant(
+            "Creating or replacing a pending anchor,", "Promoting a pending anchor,")),
+        ("pending-anchor sentence edited in device-provisioning/v1", provisioning_mutant(
+            "A pending anchor MUST NOT affect anything about the active one",
+            "A pending anchor MAY affect the active one")),
+        ("staging clears the latest reading", rule_off("stage_clears_latest")),
+        ("staging clears the fault", rule_off("stage_clears_fault")),
+        ("staging restarts the bound", rule_off("stage_restarts_bound")),
+        ("a pending reading accepted", rule_off("pending_accepted")),
+        ("a pending reading consumes freshness", rule_off("pending_consumes_freshness")),
+        ("staging spliced in while revoked", stage_while_revoked()),
+        ("reinstatement made active without a promotion in v2.md", text_mutant(
+            "a reinstated anchor is active\n  only once a promotion makes it so",
+            "a reinstated anchor is active at once")),
+        ("a boot rollback accepted", rule_off("boot_rollback")),
+        ("faults never hold alarms unknown", rule_off("fault")),
+        ("restart keeps the receiver's memory", rule_off("restart_memory")),
+        ("restart clears the anchor's freshness", rule_off("restart_keeps_freshness")),
+        ("replays accepted", rule_off("freshness")),
+        ("latest-reading bullet loses the manifest in v2.md", text_mutant(
+            "with its active key epoch\n  and active manifest.", "with its active key epoch.")),
+        ("fault bullet loses the epoch and manifest change in v2.md", text_mutant(
+            "for the channel, or\n  until the active anchor changes, which leaves no latest "
+            "reading anyway.", "for the channel.")),
+        ("duplicate sentence dropped in v2.md", text_mutant(
+            "refuse,\n  including a duplicate of one already accepted, is", "refuse, is")),
+        ("silence clock may pause in suspend in v2.md", text_mutant(
+            "that keeps counting while the receiver's host is suspended",
+            "that pauses while the receiver's host is suspended")),
+        ("restart sentence dropped in v2.md", text_mutant(
+            "A receiver that restarts has accepted nothing", "A receiver that restarts keeps")),
+        ("as-of bullet allows the state now in v2.md", text_mutant(
+            "never as the controller's state now.", "or as the controller's state now.")),
+        ("rotate event given an epoch", corpus_mutant(lambda c: find(
+            "states", "rotation_makes_unknown")(c)["events"][1].update(epoch=1))),
+        ("reading event missing its seq", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c)["events"][0].pop("seq"))),
+        ("state verdict given a stray key", corpus_mutant(lambda c: find(
+            "states", "past_the_bound")(c)["expected"].update(seq=1))),
+        ("byte string given a stray key", corpus_mutant(lambda c: find(
+            "reject_bytes", "reject_bytes_whitespace")(c).update(rule="x"))),
+        ("state case given a stray key", corpus_mutant(lambda c: find(
+            "states", "fresh_reading")(c).update(epoch=0))),
+        ("top-level section added", corpus_mutant(lambda c: c.update(extra=[]))),
+        ("events out of time order", corpus_mutant(lambda c: find(
+            "states", "later_reading_clears_fault")(c)["events"].reverse())),
+        ("state verdict flipped", corpus_mutant(lambda c: find(
+            "states", "at_the_bound")(c).update(expected={"state": "unknown"}))),
+        ("sum-bound refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_decode_sum_past_bound"))),
+        ("NUL refusals dropped", corpus_mutant(lambda c: c.update(reject_cases=[
+            x for x in c["reject_cases"] if "\\u0000" not in json.dumps(x["document"])]))),
+        ("interpretation flipped", corpus_mutant(flip_interpretation)),
+        ("unmapped bits include a mapped bit", corpus_mutant(unmapped_all)),
+        ("fractional value interpreted", corpus_mutant(interpreted_fraction)),
+        ("fraction read as an interpreted zero word", corpus_mutant(
+            lambda c: find("interpretations", "rectifier_all_zero")(c).update(value=0.5))),
+        ("interpretation reads a measurement", corpus_mutant(
+            lambda c: find("interpretations", "rectifier_all_zero")(c).update(
+                profile_channel="output_current"))),
+        ("negative offset document dropped", corpus_mutant(drop("cases", "generator"))),
+        ("past-width values dropped", corpus_mutant(lambda c: c.update(interpretations=[
+            x for x in c["interpretations"] if not x["name"].endswith("past_width")]))),
+        ("fraction value dropped", corpus_mutant(drop("interpretations", "rectifier_fraction"))),
+        ("negative value dropped", corpus_mutant(drop("interpretations", "rectifier_negative"))),
+        ("float-encoded value dropped", corpus_mutant(
+            drop("interpretations", "rectifier_float_encoding"))),
+        ("meter bounds mantissa past bound", corpus_mutant(
+            lambda c: meter(c)["document"]["channels"][0]["scale"].update(
+                mantissa=-2147483648))),
+        ("unsigned measurements only", corpus_mutant(lambda c: c.update(cases=[
+            x for x in c["cases"] if x["name"] not in ("generator", "meter_bounds")]))),
+        ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("baud 14400 listed in v2.md", text_mutant("`9600`, `19200`", "`9600`, `14400`, `19200`")),
+        ("poll floor lowered in v2.md", text_mutant(
+            "| `poll_interval_ms` | `100` to", "| `poll_interval_ms` | `99` to")),
+        ("seventeen channels in v2.md", text_mutant("1 to 16 channel objects",
+                                                    "1 to 17 channel objects")),
+        ("mantissa bound narrowed in v2.md", text_mutant(
+            "`-2147483647 <= m <= 2147483647`", "`-2147483646 <= m <= 2147483646`")),
+        ("mantissa bound widened asymmetrically in v2.md", text_mutant(
+            "`-2147483647 <= m", "`-2147483648 <= m")),
+        ("exponent floor lowered in v2.md", text_mutant("`-4 <= e <= 6`", "`-5 <= e <= 6`")),
+        ("exponent ceiling raised in v2.md", text_mutant("`-4 <= e <= 6`", "`-4 <= e <= 7`")),
+        ("source bound raised in v2.md", text_mutant(
+            "taken from: 1 to 256 printable", "taken from: 1 to 257 printable")),
+        ("source range clause dropped in v2.md", text_mutant(
+            " printable ASCII characters, U+0020 to U+007E. Never", " characters. Never")),
+        ("meaning floor raised in v2.md", text_mutant(
+            "states it: 1 to 256 printable", "states it: 0 to 256 printable")),
+        ("source range starts one above U+0020 in v2.md", text_mutant(
+            "characters, U+0020 to U+007E. Never", "characters, U+0021 to U+007E. Never")),
+        ("source range starts one below U+0020 in v2.md", text_mutant(
+            "characters, U+0020 to U+007E. Never", "characters, U+001F to U+007E. Never")),
+        ("source range ends one below U+007E in v2.md", text_mutant(
+            "characters, U+0020 to U+007E. Never", "characters, U+0020 to U+007D. Never")),
+        ("source range ends one above U+007E in v2.md", text_mutant(
+            "characters, U+0020 to U+007E. Never", "characters, U+0020 to U+007F. Never")),
+        ("meaning range starts one below U+0020 in v2.md", text_mutant(
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007E.",
+            "states it: 1 to 256 printable ASCII characters, U+001F to U+007E.")),
+        ("meaning range starts one above U+0020 in v2.md", text_mutant(
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007E.",
+            "states it: 1 to 256 printable ASCII characters, U+0021 to U+007E.")),
+        ("meaning range ends one below U+007E in v2.md", text_mutant(
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007E.",
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007D.")),
+        ("source U+007F refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_source_delete"))),
+        ("meaning U+001F refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_alarm_meaning_unit_separator"))),
+        ("meaning range ends one above U+007E in v2.md", text_mutant(
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007E.",
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007F.")),
+        ("U+001F refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_source_unit_separator"))),
+        ("U+007F refusal dropped", corpus_mutant(
+            drop("reject_cases", "reject_alarm_meaning_delete"))),
+        ("meaning range narrowed at its lower edge in v2.md", text_mutant(
+            "states it: 1 to 256 printable ASCII characters, U+0020 to U+007E.",
+            "states it: 1 to 256 printable ASCII characters, U+0021 to U+007E.")),
+        ("meaning loses the asserted condition in v2.md", text_mutant(
+            "The condition that holds while the alarm is asserted, as",
+            "What the alarm means, as")),
+        ("decode term bound raised in v2.md", text_mutant(
+            "is at most 999999999999999 in", "is at most 9999999999999999999999 in")),
+        ("decode value bound raised in v2.md", text_mutant(
+            "decoded value is at most 10^15 in", "decoded value is at most 10^19 in")),
+        ("decode premise sentence dropped in v2.md", text_mutant(
+            "The decode\nrule is judged only once", "The\nrule is judged only once")),
+        ("canonical-bytes paragraph dropped in v2.md", text_mutant(
+            "and uses them only if they are exactly", "and uses them even if they are not")),
+        ("high_first renamed in the word-value sentence in v2.md", text_mutant(
+            "for `high_first` the first register is", "for `low_first` the first register is")),
+        ("registers clause dropped from Golden Vectors in v2.md", text_mutant(
+            "registers it combines from and the document", "the document")),
+        ("opposite-polarity duplicate dropped from Golden Vectors in v2.md", text_mutant(
+            "among them a duplicate key whose two values\ngive opposite polarities",
+            "among them a duplicate key")),
+        ("register space widened in v2.md", text_mutant("`0` to `65535`.", "`0` to `65536`.")),
+        ("span bound widened in v2.md", text_mutant("register_count <= 65536`",
+                                                    "register_count <= 65537`")),
+        ("word order renamed in v2.md", text_mutant(
+            "`high_first` or `low_first` when", "`big_first` or `low_first` when")),
+        ("polarities swapped in v2.md", text_mutant(
+            "`set` when the alarm is asserted by a 1 in that bit, `clear` when",
+            "`clear` when the alarm is asserted by a 1 in that bit, `set` when")),
+        ("bits per register halved in v2.md", text_mutant(
+            "`0` to `16 × register_count − 1`", "`0` to `8 × register_count − 1`")),
+        ("fleet alphabet lengthened in v2.md", text_mutant(
+            "a string of 1 to 48\ncharacters", "a string of 1 to 49\ncharacters")),
+        ("hyphen dropped from the fleet alphabet in v2.md", text_mutant(
+            "`.`,\n`_` and `-`.", "`.`\nand `_`.")),
+        ("space added to the fleet alphabet in v2.md", text_mutant(
+            "`.`,\n`_` and `-`.", "`.`,\n`_`, `-` and ` `.")),
+        ("dependency paragraph dropped in v2.md", text_mutant(
+            "A document whose\n`register_count` is `3` breaks the `register_count` rule, not also the\n"
+            "`word_order` rule.", "")),
+        ("dependency paragraph inverted for word_order in v2.md", text_mutant(
+            "A document whose\n`register_count` is `3` breaks the `register_count` rule, not also the",
+            "A document whose\n`register_count` is `3` breaks the `register_count` rule, and also the")),
+        ("fleet identifier sized per section in v2.md", text_mutant(
+            "A fleet identifier, wherever Controller Profiles names one,",
+            "A fleet identifier, wherever this subsection names one,")),
+        ("name row loses its fleet identifier in v2.md", text_mutant(
+            "| `name` | A fleet identifier; unique in the profile. |",
+            "| `name` | A string; unique in the profile. |")),
+        ("unmapped-bit bullet allows naming in v2.md", text_mutant(
+            "and MUST NOT name an unmapped bit,", "and may name an unmapped bit,")),
+        ("integer rule dropped in v2.md", text_mutant(
+            " Every number in it is an integer.", "")),
+        ("forbidden token renamed in v2.md", text_mutant(
+            "never `controller_alarm_word` or `bitmask`.",
+            "never `controller_alarm_word` or `bits`.")),
+        ("forbidden tokens dropped in v2.md", text_mutant(
+            "fleet identifiers, never `controller_alarm_word` or `bitmask`.",
+            "fleet identifiers.")),
+        ("sensor_type and unit loosened to strings in v2.md", text_mutant(
+            "declares: fleet identifiers, never", "declares: non-empty strings, never")),
+        ("kind renamed in v2.md", text_mutant(
+            "| `kind` | `measurement` or `alarm_word`. |",
+            "| `kind` | `measurement` or `status_word`. |")),
+        ("function added in v2.md", text_mutant(
+            "`read_holding_registers` or `read_input_registers`.",
+            "`read_holding_registers`, `read_coils` or `read_input_registers`.")),
+        ("measurement may carry other fields in v2.md", text_mutant(
+            "exactly these, and no other field:", "at least these:")),
+        ("row added to the measurement table in v2.md", text_mutant(
+            "| `offset` | The same form;",
+            "| `deadband` | Integer. |\n| `offset` | The same form;")),
+        ("assertion rule inverted in v2.md", text_mutant(
+            "when its bit has the value its\n  `active` names, and not asserted otherwise",
+            "when its bit does not have the value its\n  `active` names")),
+        ("range clause dropped from the uninterpreted-reading bullet in v2.md", text_mutant(
+            " or because its `value` is not an integer in the word's range,", "")),
+        ("float reading clause dropped in v2.md", text_mutant(
+            " whether it is encoded as `5` or `5.0`", "")),
+        ("unmapped bits clause widened in v2.md", text_mutant(
+            "the unmapped bits that are set", "every unmapped bit")),
+        ("bool admitted as an integer", lambda: run(
+            corpus_bytes, model, frozenset({"bool_is_int"}))),
+        ("integral float admitted as an integer", lambda: run(
+            corpus_bytes, model, frozenset({"float_is_int"}))),
+    ]
+    def strings_only(c: dict) -> None:
+        c["reject_cases"] = [x for x in c["reject_cases"] if not _non_string(x["document"])]
+
+    def ints_only(trap: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            c["reject_cases"] = [x for x in c["reject_cases"] if broken_rules(
+                x["document"], model, frozenset({trap})) == {x["rule"]}]
+        return edit
+
+    cases += [
+        ("every non-string refusal dropped", corpus_mutant(strings_only)),
+        ("every boolean-integer refusal dropped", corpus_mutant(ints_only("bool_is_int"))),
+        ("every float-integer refusal dropped", corpus_mutant(ints_only("float_is_int"))),
+        ("dependent rules judged before their premise", rule_off("dependents")),
+    ]
+    for state in base["states"]:
+        cases.append((f"state case {state['name']} dropped",
+                      corpus_mutant(drop("states", state["name"]))))
+    for rule in RULES:
+        cases.append((f"rule off: {rule}", rule_off(rule)))
+        cases.append((f"last refusal under {rule} dropped", corpus_mutant(drop_rule(rule))))
+    # Mutants no corpus case can refuse, because the clause they remove is implied
+    # by others: listed, never counted as survivors. Each holds because the
+    # legality check refuses any other event order:
+    # - a promotion keeps freshness, so the first reading accepted after it is
+    #   later than any fault in the same epoch and ends the hold by itself;
+    # - after a revocation nothing is accepted until a reinstatement and a
+    #   promotion, and the promotion clears the fault, so the revocation's own
+    #   clearing is never observed;
+    # - a reinstatement follows a revocation, which has already left no latest
+    #   reading and no fault, so it has nothing of either to keep;
+    # - capping the bound at an hour changes nothing while every state case's
+    #   poll interval is held to the alarm-word ceiling, where the bound is
+    #   exactly an hour; the shape check is what refuses a case past it.
+    equivalent = {
+        "the bound capped at an hour again": rule_off("hour_cap"),
+        "revocation keeps the fault": rule_off("revoke_keeps_fault"),
+        "promotion keeps the fault": rule_off("promote_keeps_fault"),
+        "reinstatement keeps the latest reading": rule_off("reinstate_keeps_latest"),
+        "reinstatement keeps the fault": rule_off("reinstate_keeps_fault"),
+    }
+    survived = 0
+    for label, mutant in cases + list(equivalent.items()):
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            if label in equivalent:
+                print(f"EQUIVALENT {label} (implied; not counted)")
+            else:
+                print(f"SURVIVED {label}")
+                survived += 1
+    print(f"{len(cases)} mutants, {len(equivalent)} known equivalent")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError, KeyError) as failure:
+        print(f"firmware-telemetry/v2 contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError, StopIteration) as failure:
+        print(f"firmware-telemetry/v2 controller profile corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(
+        f"firmware-telemetry/v2 controller profile corpus: {len(corpus['cases'])} "
+        f"documents accepted, {len(corpus['reject_cases'])} refusals each for exactly "
+        f"its rule, {len(corpus['reject_bytes'])} byte strings refused, "
+        f"{len(corpus['interpretations'])} interpretations, {len(corpus['ranges'])} range "
+        f"cases, "
+        f"{len(corpus['agreements'])} agreement cases and {len(corpus['states'])} "
+        f"state cases reproduced"
+    )
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
