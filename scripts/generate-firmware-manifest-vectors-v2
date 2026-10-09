@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 manifest corpus.
+
+Signatures come from OpenSSL through `cryptography`. Nothing here is shared
+with scripts/check-firmware-manifest-vectors-v2, which verifies them with its
+own curve arithmetic, canonicalises with its own serializer, and reads the
+mode table from the contract rather than from this file.
+
+    python3 scripts/generate-firmware-manifest-vectors-v2          # write
+    python3 scripts/generate-firmware-manifest-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-telemetry" / "manifest-vectors-v2.json"
+
+SEED_HEX = "42" * 32
+DEVICE_ID = "ori-fw-7c9f2b3a"
+
+METERING = {
+    "channel": "ch0",
+    "sensor_type": "current",
+    "unit": "ampere",
+    "protocol": "modbus_rtu",
+    "source": "pzem",
+    "quality_floor": 0.8,
+}
+METERING_I2C = {
+    "channel": "ch2",
+    "sensor_type": "current",
+    "unit": "ampere",
+    "protocol": "i2c",
+    "source": "ads1115",
+    "quality_floor": 0.9,
+}
+BRIDGED = {
+    "channel": "ch1",
+    "sensor_type": "current",
+    "unit": "ampere",
+    "protocol": "modbus_rtu",
+    "source": "foreign_device",
+    "quality_floor": 0.8,
+}
+ACTION = {"action": "relay_open", "channel": "relay0", "authority": "runtime_commanded"}
+INTERLOCK = {
+    "name": "local_overcurrent_interlock",
+    "channel": "ch0",
+    "action": "relay_open",
+}
+
+# (name, device_mode, channels, actions, interlocks, note) for every accepted case.
+ACCEPT = (
+    (
+        "sensor_node",
+        "sensor_node",
+        [METERING],
+        [],
+        [],
+        "one metering channel and no action",
+    ),
+    (
+        "sensor_node_two_sources",
+        "sensor_node",
+        [METERING, METERING_I2C],
+        [],
+        [],
+        "every channel whose source is not foreign_device meters, whatever its "
+        "source or protocol",
+    ),
+    (
+        "bridge_node",
+        "bridge_node",
+        [BRIDGED],
+        [],
+        [],
+        "one bridged channel and no action",
+    ),
+    (
+        "mixed_metering_bridged",
+        "mixed",
+        [METERING, BRIDGED],
+        [],
+        [],
+        "metering and bridged channels, no action",
+    ),
+    (
+        "mixed_metering_action",
+        "mixed",
+        [METERING],
+        [ACTION],
+        [INTERLOCK],
+        "an actuator that declares the channel its interlock reads is mixed",
+    ),
+    (
+        "mixed_bridged_action",
+        "mixed",
+        [BRIDGED],
+        [ACTION],
+        [],
+        "a bridged channel and an action",
+    ),
+    (
+        "mixed_all_three",
+        "mixed",
+        [BRIDGED, METERING],
+        [ACTION],
+        [INTERLOCK],
+        "all three roles; the bridged channel comes first, so no position "
+        "decides the mode",
+    ),
+)
+
+# (name, reason, device_mode, channels, actions, interlocks, note).
+# Every signature is valid.
+REJECT = (
+    (
+        "reject_mode_unknown_string",
+        "invalid_device_mode",
+        "gateway_node",
+        [METERING],
+        [],
+        [],
+        "a string outside the four values, over arrays that make the device a "
+        "sensor_node",
+    ),
+    (
+        "reject_mode_wrong_case",
+        "invalid_device_mode",
+        "Sensor_Node",
+        [METERING],
+        [],
+        [],
+        "values compare exactly; a case variant of sensor_node is no value",
+    ),
+    (
+        "reject_mode_integer",
+        "invalid_device_mode",
+        0,
+        [METERING],
+        [],
+        [],
+        "device_mode is a JSON string; an integer is another type",
+    ),
+    (
+        "reject_mode_null",
+        "invalid_device_mode",
+        None,
+        [METERING],
+        [],
+        [],
+        "null is present but names no mode",
+    ),
+    (
+        "reject_mode_boolean",
+        "invalid_device_mode",
+        True,
+        [METERING],
+        [],
+        [],
+        "device_mode is a JSON string; a boolean is another type",
+    ),
+    (
+        "reject_sensor_node_with_action",
+        "invalid_device_mode",
+        "sensor_node",
+        [METERING],
+        [ACTION],
+        [INTERLOCK],
+        "a metering device that declares an action is mixed",
+    ),
+    (
+        "reject_sensor_node_with_bridged_channel",
+        "invalid_device_mode",
+        "sensor_node",
+        [BRIDGED],
+        [],
+        [],
+        "a channel whose source is foreign_device is bridged, so the arrays "
+        "make this a bridge_node",
+    ),
+    (
+        "reject_bridge_node_with_metering_channel",
+        "invalid_device_mode",
+        "bridge_node",
+        [BRIDGED, METERING],
+        [],
+        [],
+        "a bridge that also meters is mixed",
+    ),
+    (
+        "reject_mixed_single_role",
+        "invalid_device_mode",
+        "mixed",
+        [METERING],
+        [],
+        [],
+        "mixed needs more than one role; metering alone is a sensor_node",
+    ),
+    (
+        "reject_actuator_node_over_mixed",
+        "invalid_device_mode",
+        "actuator_node",
+        [METERING],
+        [ACTION],
+        [INTERLOCK],
+        "an actuator that declares a channel is mixed",
+    ),
+    (
+        "reject_actuator_node_no_channels",
+        "no_channels",
+        "actuator_node",
+        [],
+        [ACTION],
+        [],
+        "the mode agrees with the arrays, so the empty channels alone refuse "
+        "it; actuator_node is never accepted under this version",
+    ),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def build() -> bytes:
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SEED_HEX))
+    public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    public_b64 = base64.b64encode(public).decode("ascii")
+
+    def signed(mode: object, channels: list, actions: list, interlocks: list) -> dict:
+        manifest = {
+            "v": 1,
+            "alg": "ed25519",
+            "device_id": DEVICE_ID,
+            "firmware_version": "0.1.0",
+            "board_profile": "esp32s3-poe-8di8do",
+            "device_mode": mode,
+            "public_key_b64": public_b64,
+            "posture": "sealed_flash",
+            "secure_boot_enabled": True,
+            "flash_encryption_enabled": True,
+            "key_storage": "efuse_derived",
+            "transports": ["mqtt", "rs485"],
+            "channels": [dict(c) for c in channels],
+            "actions": [dict(a) for a in actions],
+            "interlocks": [dict(i) for i in interlocks],
+        }
+        body = canonical(manifest)
+        digest = hashlib.sha256(body).hexdigest()
+        message = {
+            "manifest": manifest,
+            "manifest_hash": "sha256:" + digest,
+            "signature": "ed25519:" + base64.b64encode(key.sign(body)).decode("ascii"),
+        }
+        return {
+            "message": message,
+            "canonical_hex": body.hex(),
+            "canonical_sha256_hex": digest,
+            "message_hex": canonical(message).hex(),
+        }
+
+    cases = []
+    for name, mode, channels, actions, interlocks, note in ACCEPT:
+        cases.append(
+            {"name": name, **signed(mode, channels, actions, interlocks), "note": note}
+        )
+    reject_cases = []
+    for name, reason, mode, channels, actions, interlocks, note in REJECT:
+        reject_cases.append(
+            {
+                "name": name,
+                "reason": reason,
+                "signature_valid": True,
+                **signed(mode, channels, actions, interlocks),
+                "note": note,
+            }
+        )
+
+    corpus = {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for firmware-telemetry/v2 Device Mode. Each case is "
+            "a signed capability manifest message whose manifest is otherwise "
+            "valid under v1. A consumer of this version must accept every case "
+            "in 'cases' and refuse every case in 'reject_cases' with the "
+            "declared reason. Each case is judged on its own against "
+            "verifier_context, as the first manifest registered for that "
+            "provisioning anchor. Signed with a disclosed TEST-ONLY seed, the "
+            "same one the fault corpus discloses: never provision it."
+        ),
+        "test_seed_hex": SEED_HEX,
+        "public_key_hex": public.hex(),
+        "public_key_b64": public_b64,
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "verifier_context": {
+            "device_id": DEVICE_ID,
+            "public_key_b64": public_b64,
+        },
+        "reasons": {
+            "invalid_device_mode": (
+                "device_mode is not one of the four values, including a value "
+                "of another JSON type, or is not the value the manifest's "
+                "channels and actions determine"
+            ),
+            "no_channels": "channels is empty",
+        },
+        "cases": cases,
+        "reject_cases": reject_cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
