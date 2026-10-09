@@ -1,0 +1,1909 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 envelope corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-envelope-vectors-v2. Canonical
+bytes come from this script's own serializer, the key is re-derived from the
+disclosed seed and every signature verified with its own extended-coordinate
+Ed25519 arithmetic, cofactorless with strict decoding. The versions, the nonce
+grammar and the consumers' reasons with their order are read from "Reading
+Envelope at `v` 2" in firmware-telemetry/v2.md; v1's verification steps, error
+names, envelope and reading fields, the canonical number zone and the quality
+bound are read from firmware-telemetry/v1.md. Nothing is read from the
+generator.
+
+Held to:
+
+- each case: canonical bytes, digest, wire message and signature reproduce
+  from its input, and the consumer model accepts it;
+- each refusal: `signature_valid` matches this script's verification, refused
+  for its declared reason by the first failing check in v1's order of steps
+  and, within the sixth, in the order of the table, and breaking exactly that
+  rule and no other;
+- each precedence case: breaking exactly the two checks its bullet in v2.md
+  names, refused for the earlier;
+- coverage: every reason in the consumers' table, every accepted and refused
+  case v2.md lists, every precedence bullet, the version and nonce-length
+  bounds each at the edge and one past it;
+- the seed is the one the signed corpora share, and the digest v2.md pins is
+  the corpus's.
+
+    python3 scripts/check-firmware-envelope-vectors-v2
+    python3 scripts/check-firmware-envelope-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's own
+rule tables and constants in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import math
+import pathlib
+import re
+import sys
+from typing import Callable
+
+import _contract_markdown as markdown
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-telemetry" / "envelope-vectors-v2.json"
+FAULT_CORPUS = ROOT / "firmware-telemetry" / "fault-vectors-v2.json"
+TELEMETRY_V1 = ROOT / "firmware-telemetry" / "v1.md"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+STATUS = ROOT / "status" / "firmware-telemetry" / "v2.json"
+COMMANDS_V2 = ROOT / "firmware-commands" / "v2.md"
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, extended coordinates, verification only -------------------------
+
+FIELD = 2**255 - 19
+GROUP = 2**252 + 27742317777372353535851937790883648493
+EDWARDS_D = -121665 * pow(121666, FIELD - 2, FIELD) % FIELD
+I_ROOT = pow(2, (FIELD - 1) // 4, FIELD)
+
+
+def _xrecover(y: int, sign: int) -> int | None:
+    if y >= FIELD:
+        return None
+    xx = (y * y - 1) * pow(EDWARDS_D * y * y + 1, FIELD - 2, FIELD) % FIELD
+    if xx == 0:
+        return None if sign else 0
+    x = pow(xx, (FIELD + 3) // 8, FIELD)
+    if (x * x - xx) % FIELD:
+        x = x * I_ROOT % FIELD
+    if (x * x - xx) % FIELD:
+        return None
+    return FIELD - x if x & 1 != sign else x
+
+
+def _add(p: tuple, q: tuple) -> tuple:
+    a = (p[1] - p[0]) * (q[1] - q[0]) % FIELD
+    b = (p[1] + p[0]) * (q[1] + q[0]) % FIELD
+    c = 2 * p[3] * q[3] * EDWARDS_D % FIELD
+    d = 2 * p[2] * q[2] % FIELD
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % FIELD, g * h % FIELD, f * g % FIELD, e * h % FIELD)
+
+
+def _times(k: int, p: tuple) -> tuple:
+    out = (0, 1, 1, 0)
+    while k:
+        if k & 1:
+            out = _add(out, p)
+        p = _add(p, p)
+        k >>= 1
+    return out
+
+
+def _compress(p: tuple) -> bytes:
+    zi = pow(p[2], FIELD - 2, FIELD)
+    x, y = p[0] * zi % FIELD, p[1] * zi % FIELD
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _decompress(raw: bytes) -> tuple | None:
+    if len(raw) != 32:
+        return None
+    n = int.from_bytes(raw, "little")
+    y = n & ((1 << 255) - 1)
+    x = _xrecover(y, n >> 255)
+    if x is None:
+        return None
+    p = (x, y, 1, x * y % FIELD)
+    return p if _compress(p) == raw else None
+
+
+_BY = 4 * pow(5, FIELD - 2, FIELD) % FIELD
+_BX = _xrecover(_BY, 0)
+assert _BX is not None
+BASEPOINT = (_BX, _BY, 1, _BX * _BY % FIELD)
+
+
+def public_from_seed(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    scalar = (int.from_bytes(h[:32], "little") & ((1 << 254) - 8)) | (1 << 254)
+    return _compress(_times(scalar, BASEPOINT))
+
+
+_MEMO: dict[tuple[bytes, bytes, bytes], bool] = {}
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    key = (public, message, signature)
+    if key not in _MEMO:
+        _MEMO[key] = _strict_verify(public, message, signature)
+    return _MEMO[key]
+
+
+def _strict_verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if len(signature) != 64:
+        return False
+    a, r = _decompress(public), _decompress(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= GROUP:
+        return False
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little")
+    minus_a = ((FIELD - a[0]) % FIELD, a[1], 1, (FIELD - a[3]) % FIELD)
+    return _compress(_add(_times(s, BASEPOINT), _times(k % GROUP, minus_a))) == signature[:32]
+
+
+# --- canonical JSON (v1 Canonical JSON) ---------------------------------------------
+
+def canonical_number(value: float | int, model: dict) -> str:
+    if type(value) is int:
+        if abs(value) > model["int_max"]:
+            raise Failure(f"integer {value} outside the canonical zone")
+        return str(value)
+    if not math.isfinite(value) or not (value == 0 or model["float_lo"] <= abs(value) < model["float_hi"]):
+        raise Failure(f"number {value!r} outside the canonical zone")
+    text = repr(value)
+    if "e" in text or "E" in text or "." not in text:
+        raise Failure(f"number {value!r} has no fixed-notation shortest form")
+    return text
+
+
+def canonical(value: object, model: dict) -> str:
+    if isinstance(value, dict):
+        return "{" + ",".join(
+            json.dumps(k, ensure_ascii=False) + ":" + canonical(value[k], model)
+            for k in sorted(value)) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(canonical(v, model) for v in value) + "]"
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        return canonical_number(value, model)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    raise Failure(f"no canonical form for {value!r}")
+
+
+# --- contract text -------------------------------------------------------------------
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def section(text: str, heading: str) -> str:
+    """A heading's text and its subsections, by the shared CommonMark recognizer."""
+    return markdown.subtree(text, heading)
+
+
+def need(text: str, sentence: str, where: str) -> None:
+    if sentence not in flat(text):
+        raise Failure(f"{where} no longer says: {sentence!r}")
+
+
+# The consumers' table, by its `When` cells.
+WHEN_CELLS = {
+    "The envelope's `v` is not the integer `1` or `2`.": "version",
+    "`v` is `1` and the envelope has `liveness_nonce`, whatever its value.": "nonce_at_v1",
+    "`v` is `2` and the envelope has no `liveness_nonce`.": "nonce_missing",
+    "`v` is `2` and `liveness_nonce` is neither `null` nor a string of exactly 32 "
+    "characters each one of `0`-`9` or `a`-`f`.": "nonce_invalid",
+    "`v` is `2` and the envelope has a key outside the eleven above.": "unexpected",
+}
+# v1's verification steps, by their words.
+V1_STEPS = {
+    "Load the provisioning anchor for `device_id`.": "anchor",
+    "Verify the latest accepted capability manifest against the anchor.": "manifest",
+    "Reject telemetry whose `alg` is not `ed25519`.": "alg",
+    "Reject telemetry whose `capability_hash` does not match the accepted manifest hash.":
+        "capability",
+    "Canonicalize `envelope` and verify `signature` against the anchored public key.":
+        "signature",
+    "Validate `boot_id`, `seq`, `device_uptime_ms`, posture, channel names, sensor types, "
+    "units, values, and quality bounds.": "fields",
+    "Derive a trust grade.": "grade",
+    "Only after those checks, convert readings into runtime `SensorReading` objects or "
+    "gateway telemetry records.": "convert",
+}
+# v1's error names, by their condition cells.
+V1_ERRORS = {
+    "unknown device id": "anchor",
+    "malformed signature": "signature_format",
+    "signature failed": "signature",
+    "manifest hash mismatch": "capability",
+    "unsupported channel": "channel",
+    "unsupported posture claim": "posture",
+    "invalid reading value": "reading",
+}
+V2_SENTENCES = (
+    "Every other field, canonical JSON, the signature and its encoding, heartbeats, "
+    "and sequence and freshness are v1's. The signature covers the canonical bytes of "
+    "the envelope, `liveness_nonce` included.",
+    "A consumer that implements this section accepts an envelope at `v` `1` or `v` `2` "
+    "and refuses any other `v`, including a `v` of another JSON type. At `v` `2` it "
+    "requires `liveness_nonce`, and at `v` `1` it refuses it. Each refusal names one "
+    "reason:",
+    "These checks belong to v1's sixth verification step, the validation of the "
+    "envelope's fields, after the signature verifies. They are made first in that "
+    "step, in the order of the table, before v1's validation of `boot_id`, `seq`, "
+    "`device_uptime_ms`, posture, channels and readings. An envelope that fails more "
+    "than one check is refused for the first that fails in v1's order of steps, and "
+    "within the sixth step in that order. That orders only the checks in the table, "
+    "which come first in the sixth step. v1's own checks in that step keep v1's order, "
+    "and this version orders them no further. So an envelope whose `capability_hash` "
+    "does not match is refused as `capability_hash_mismatch`, and one whose signature "
+    "fails as `signature_verification_failed`, whatever its `liveness_nonce`. The nonce "
+    "checks apply only at `v` `1` and `v` `2`, and the field-set check only at `v` `2`, "
+    "so an envelope refused as `unsupported_version` is never judged on its "
+    "`liveness_nonce` or its other keys. v1's checks keep their order and their meaning "
+    "for an envelope at either `v`. An envelope refused for any reason is never "
+    "converted into a reading.",
+    "This version leaves extra keys in an envelope at `v` `1` to v1's own rules. v1 does "
+    "not decide them, so a consumer of this version treats them as its v1 conformance "
+    "already does.",
+    "A consumer that is not the signing runtime of [How Old A Reading "
+    "Is](#how-old-a-reading-is) checks the nonce's grammar and nothing else about it.",
+)
+# The producer's capture rules and the consumer's limits on the nonce, each with
+# the polarities a mutant reverses. Pinned word for word under "Reading
+# Envelope at `v` 2"; no case can exercise a producer rule.
+GUARDS = (
+    ("`null` when it held none: the device had no usable freshness reference, which does "
+     "not mean that no runtime was watching.", [("which does not mean", "which means")]),
+    ("The producer captures the held nonce before the first bus or sensor operation of the "
+     "first transaction the envelope represents, and carries that value unchanged through "
+     "validation, sequence reservation, signing and buffering. A liveness message accepted "
+     "after that point is not the envelope's nonce.",
+     [("captures the held nonce before the first", "captures the held nonce after the first"),
+      ("carries that value unchanged", "may update that value"),
+      ("is not the envelope's nonce", "may be the envelope's nonce")]),
+    ("A producer MUST NOT sign a nonce beside a reading whose transaction began before that "
+     "nonce was accepted. An envelope that includes a cached reading, or readings collected "
+     "independently, carries a nonce accepted before every one of their transactions began, "
+     "and otherwise `null`.",
+     [("MUST NOT", "MAY"), ("accepted before every one", "accepted before any one")]),
+    ("**A heartbeat carries the nonce held when it is signed.** A heartbeat measures nothing.",
+     [("measures nothing", "measures")]),
+    ("**A fault carries none.**", [("carries none", "carries one")]),
+    ("**The signed bytes survive buffering.** A reading retransmitted after a reboot carries "
+     "the `v` and `liveness_nonce` it was signed with, whatever the device holds when it "
+     "retransmits.", [("it was signed with, whatever",
+                       "the device holds then, not those it was signed with, whatever")]),
+    ("An envelope refused for any reason is never converted into a reading.",
+     [("is never converted", "may be converted")]),
+    ("A consumer that is not the signing runtime of [How Old A Reading "
+     "Is](#how-old-a-reading-is) checks the nonce's grammar and nothing else about it. To "
+     "that consumer the nonce identifies nothing, and it never presents it, or anything "
+     "derived from it, as an age or a freshness.",
+     [("and nothing else about it", "and may match it"),
+      ("the nonce identifies nothing", "the nonce identifies a liveness message"),
+      ("never presents it", "may present it")]),
+)
+GOLDEN_SENTENCES = (
+    "Each case is a signed telemetry message judged on its own against the corpus's "
+    "`verifier_context`, with no prior message accepted from the device. Its readings "
+    "name channels the context accepts and are otherwise valid under v1.",
+    "It holds envelopes at `v` `2` with a nonce and with `null`, among them one carrying "
+    "two readings, heartbeats with a nonce and with `null`, and one whose nonce is all "
+    "zeros. It also holds a reading and a heartbeat at `v` `1`, which a consumer of this "
+    "version still accepts. Its refusals have valid signatures:",
+    "Each refusal names its reason from the consumers' table in [Reading Envelope at `v` "
+    "2](#reading-envelope-at-v-2), and breaks exactly that rule and no other. The corpus "
+    "also holds precedence cases, each breaking two checks and refused for the first in "
+    "the order that section states:",
+    "The disclosed test seed, shared by the signed corpora, is a fixture only and MUST "
+    "NOT be provisioned on any device.",
+)
+ACCEPTED_ITEMS = ("v2_reading_nonce", "v2_reading_null", "v2_two_readings",
+                  "v2_heartbeat_nonce", "v2_heartbeat_null", "v2_zero_nonce",
+                  "v1_reading", "v1_heartbeat")
+REFUSAL_BULLETS = {
+    "`v` `2` without `liveness_nonce`;": ("missing",),
+    "`v` `1` with one, populated and `null`;": ("at_v1_populated", "at_v1_null"),
+    "a nonce with an uppercase letter, with a character outside the hexadecimal digits, "
+    "of 31 and of 33 characters, the empty string, an integer, and a boolean;": (
+        "upper", "non_hex", "short", "long", "empty", "integer", "boolean"),
+    "the versions `0` and `3`, the string `\"2\"`, and `true`;": ("v=0", "v=3", 'v="2"', "v=true"),
+    "an extra key at `v` `2`.": ("extra_key",),
+}
+# Each precedence bullet's second broken rule, by the words that name it.
+SECOND_RULES = {
+    "a manifest mismatch with a malformed nonce": "nonce_invalid",
+    "a failing signature with a malformed nonce": "nonce_invalid",
+    "a `v` `1` envelope carrying `liveness_nonce` with a channel the context does not "
+    "accept": "channel",
+    "a missing nonce with a channel the context does not accept": "channel",
+    "an extra key with a malformed nonce": "unexpected",
+    "an extra key with a channel the context does not accept": "channel",
+}
+
+
+def _table(region: str, first: str) -> list[tuple[str, str]]:
+    return re.findall(rf"^\| `({first})` \| (.+?) \|\s*$", region, re.M)
+
+
+def _words(text: str) -> str:
+    return r"\s+".join(re.escape(word) for word in text.split())
+
+
+def guard_text(raw: str, clause: str, flip: tuple[str, str] | None) -> str:
+    """The text with a pinned clause deleted, or with one polarity in it reversed."""
+    span = re.search(_words(clause), raw)
+    if span is None:
+        raise AssertionError(f"guard clause missing: {clause!r}")
+    if flip is None:
+        return raw[: span.start()] + raw[span.end():]
+    segment = span.group(0)
+    hit = re.search(_words(flip[0]), segment)
+    if hit is None:
+        raise AssertionError(f"polarity {flip[0]!r} missing from its clause")
+    return (raw[: span.start()] + segment[: hit.start()] + flip[1] + segment[hit.end():]
+            + raw[span.end():])
+
+
+# --- normative sentences ---------------------------------------------------------
+#
+# Every section of firmware-commands/v2.md and firmware-telemetry/v2.md, by its
+# heading path, with the checker that owns its normative sentences. The section
+# list itself is held: a section added, removed or renamed fails every checker
+# until it is assigned here. None marks a section this amendment did not add or
+# change.
+SECTION_OWNERS = {
+    "commands": (
+        ("# Firmware Commands Contract v2", "liveness"),
+        ("## What changed from v1", "liveness"),
+        ("## Error Semantics", None),
+        ("## Rate-Limited Refusal", None),
+        ("## Unresolved Commands", None),
+        ("## Runtime Liveness at `v` 2", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Wire format", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Acceptance", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The held nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### The runtime's nonce", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Publication during rollout", "liveness"),
+        ("## Runtime Liveness at `v` 2 > ### Golden vectors", "liveness"),
+        ("## Runtime Obligations", "liveness"),
+        ("## Required Implementation Artifacts", "liveness"),
+    ),
+    "telemetry": (
+        ("# Firmware Telemetry Contract v2", "envelope"),
+        ("## What changed from v1", "envelope"),
+        ("## Signed Fault Events", "envelope"),
+        ("## Signed Fault Events > ### Closed `detail` sets at `v` 2", None),
+        ("## Signed Fault Events > ### Producers", None),
+        ("## Signed Fault Events > ### Consumers", None),
+        ("## Late Faults", None),
+        ("## Reading Envelope at `v` 2", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Producers", "envelope"),
+        ("## Reading Envelope at `v` 2 > ### Consumers", "envelope"),
+        ("## How Old A Reading Is", "reading-age"),
+        ("## How Old A Reading Is > ### What the signed fields do not establish", "reading-age"),
+        ("## How Old A Reading Is > ### The bound", "reading-age"),
+        ("## How Old A Reading Is > ### What a receiver may present", "reading-age"),
+        ("## How Old A Reading Is > ### What it is not", "reading-age"),
+        ("## Device Mode", None),
+        ("## Controller Profiles", None),
+        ("## Controller Profiles > ### The `controller_profile` field", None),
+        ("## Controller Profiles > ### The profile document", None),
+        ("## Controller Profiles > ### Receivers", "reading-age"),
+        ("## Adoption Order", "envelope"),
+        ("## Golden Vectors", "envelope"),
+        ("## Required Implementation Artifacts", "envelope"),
+    ),
+}
+# Every sentence of an owned section is held, not only those carrying MUST,
+# SHOULD, MAY, never, only or exactly: restrictions in these sections are also
+# stated declaratively ("An envelope with no bound is still accepted"), and a
+# keyword filter leaves those reversible. Any added, removed or changed sentence
+# in an owned section fails until this table is updated in review.
+
+
+def split_sections(text: str) -> list[tuple[str, str]]:
+    """(heading path, own body) for every heading at any depth, by the shared
+    CommonMark recognizer; fenced code is left out of each body."""
+    return markdown.section_bodies(text)
+
+
+def split_sentences(body: str) -> list[str]:
+    blocks: list[list[str]] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(">"):
+            stripped = stripped.lstrip(">").strip()
+        if not stripped:
+            blocks.append([])
+            continue
+        if stripped.startswith("|"):
+            if not re.fullmatch(r"\|[\s|:-]+\|", stripped):
+                blocks.append([stripped])
+            blocks.append([])
+            continue
+        if re.match(r"(?:- |\d+\. )", stripped):
+            blocks.append([re.sub(r"^(?:- |\d+\. )", "", stripped)])
+            continue
+        if not blocks:
+            blocks.append([])
+        blocks[-1].append(stripped)
+    sentences = []
+    for block in blocks:
+        text = " ".join(block).strip()
+        if text:
+            sentences += [s for s in re.split(r"(?<=[.!?:;])\s+(?=[A-Z`*\[\"(])", text) if s]
+    return sentences
+
+
+def normative_sentences(text: str, owned: list[str]) -> dict[str, list[str]]:
+    return {path: split_sentences(body) for path, body in split_sections(text) if path in owned}
+
+
+def check_normative(texts: dict[str, str], owner: str, held: dict) -> None:
+    """Fail on any section unassigned, or any owned normative sentence changed."""
+    for doc, table in SECTION_OWNERS.items():
+        crooked = markdown.non_canonical(texts[doc])
+        if crooked:
+            raise Failure(f"non-canonical heading in {doc}: {crooked}")
+        paths = [path for path, _ in split_sections(texts[doc])]
+        if paths != [path for path, _ in table]:
+            extra = [p for p in paths if p not in dict(table)]
+            gone = [p for p, _ in table if p not in paths]
+            raise Failure(f"normative sections of {doc} changed: unassigned {extra}, "
+                          f"gone {gone}, or reordered")
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        for path in owned:
+            want, got = list(held[doc][path]), found[path]
+            if got != want:
+                added = [s for s in got if s not in want]
+                removed = [s for s in want if s not in got]
+                raise Failure(f"normative sentence changed in {doc} {path}: added {added}, "
+                              f"removed {removed}" + ("" if added or removed else ", reordered"))
+
+
+def section_region(raw: str, path: str) -> tuple[int, int]:
+    """Where a section's own body lies in the raw text."""
+    return markdown.section_offsets(raw, path)
+
+
+def sentence_span(raw: str, path: str, sentence: str) -> tuple[int, int] | None:
+    start, end = section_region(raw, path)
+    hit = re.search(r"(?:\s|>)+".join(re.escape(w) for w in sentence.split()), raw[start:end])
+    return None if hit is None else (start + hit.start(), start + hit.end())
+
+
+POLARITY = (("MUST NOT", "MAY"), ("MUST", "MAY"), ("SHOULD", "MAY"), ("MAY", "MUST NOT"),
+            ("is not decided", "is decided"), ("does not decide", "decides"),
+            ("no other", "any other"), ("cannot", "can"), ("does not", "does"),
+            ("never", "may"), ("Never", "Sometimes"), ("only", "also"), ("exactly", "about"),
+            ("not", "also"), ("no", "some"))
+
+
+def normative_text_mutants(texts: dict[str, str], owner: str, must: tuple[str, ...]
+                           ) -> list[tuple[str, str, str]]:
+    """(label, doc, mutated text): sampled deletions and reversals, the listed
+    sentences among them, and one new MUST sentence per owned section."""
+    out = []
+    for doc, table in SECTION_OWNERS.items():
+        owned = [path for path, who in table if who == owner]
+        found = normative_sentences(texts[doc], owned)
+        flat_list = [(p, s) for p in owned for s in found[p]]
+        for index, (path, sentence) in enumerate(flat_list):
+            if index % 5 and not any(m in sentence for m in must):
+                continue
+            span = sentence_span(texts[doc], path, sentence)
+            if span is None:
+                raise AssertionError(f"held sentence not found in {doc}: {sentence!r}")
+            raw = texts[doc]
+            out.append((f"normative deleted: {sentence[:60]}", doc,
+                        raw[: span[0]] + raw[span[1]:]))
+            segment = raw[span[0]:span[1]]
+            for old, new in POLARITY:
+                hit = re.search(rf"\b{re.escape(old)}\b", segment)
+                if hit:
+                    flipped = segment[: hit.start()] + new + segment[hit.end():]
+                    break
+            else:
+                last = segment.rstrip(".;:").split()[-1]
+                flipped = segment[: segment.rindex(last)] + "otherwise" + segment[
+                    segment.rindex(last) + len(last):]
+            out.append((f"normative reversed: {sentence[:60]}", doc,
+                        raw[: span[0]] + flipped + raw[span[1]:]))
+        for path in owned:
+            raw = texts[doc]
+            at = section_region(raw, path)[0]
+            out.append((f"normative added to {doc} {path}", doc,
+                        raw[:at] + "\nEvery consumer MUST accept this added sentence.\n" + raw[at:]))
+    return out
+
+
+OWNER = 'envelope'
+# The sentences held for each owned section, extracted by normative_sentences and
+# reviewed: a change to any of them is a change to this table.
+HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
+    'commands': {},
+    'telemetry': {
+        '# Firmware Telemetry Contract v2': (
+            ('Status: maturity `draft`; compatibility `amendable`; adoption: verifier (runtime) '
+             '`implemented-unreleased`, `unassessed`, producer (edge-firmware) '
+             '`implemented-unreleased`, `unassessed`; proof: end-to-end `none`, HIL `none`, '
+             'production `none`.'),
+            ('Record:'),
+            ('[status/firmware-telemetry/v2.json](../status/firmware-telemetry/v2.json).'),
+            ('This version exists so a device can sign a refusal it makes under '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md): a `command_rejected` fault '
+             'whose `detail` is `rate_limited`.'),
+            ("It also settles what a manifest's `device_mode` means, makes every bridged channel "
+             'name the controller profile that decoded it, and lets the runtime that supervises a '
+             'device bound how long ago the device began the transaction behind a reading.'),
+        ),
+        '## What changed from v1': (
+            ('Five things change what a consumer accepts, and one meaning v1 left open is settled.'),
+            ('A consumer of this version admits a device key under '
+             '[ed25519-key-admission/v1](../ed25519-key-admission/v1.md) and verifies every '
+             'signature it accepts under this version, on the manifest, the telemetry envelope, '
+             'the fault and the maintenance lifecycle event alike, under '
+             '[ed25519-verification/v1](../ed25519-verification/v1.md). v1 named neither rule, '
+             'and a v1 consumer whose verifier takes the cofactored equation or decodes R loosely '
+             'accepts signatures this version refuses, none of which a device makes by signing '
+             'under RFC 8032.'),
+            ('A signature that contract refuses, under any of its clauses, is '
+             '`signature_verification_failed`, and a device key admission refuses is never '
+             'registered.'),
+            ('No signed bytes change.'),
+            ('The second change is to the signed fault event.'),
+            ('A fault object may carry `"v":2`, and under `v` `2` the closed `detail` sets are '
+             'the ones this document lists.'),
+            ('Against v1 as it was frozen, they differ in two tokens:'),
+            ('`rate_limited` is added to `command_rejected`, for '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md);'),
+            ("`liveness_authority_failed` is listed under `ingress_degraded`. v1's text gained it "
+             "in place after its freeze, its classification there is still owed by v1's baseline "
+             'audit, and consumers of v1 differ on it.'),
+            ('At `v` `2` it is a member, whatever that audit decides for v1.'),
+            ("[v1](v1.md)'s closed `command_rejected` set cannot take the token in place. v1 "
+             'calls extending a closed set an additive change, but its consumers refuse a token '
+             'outside the set, so every existing consumer would stop conforming the moment the '
+             'token became valid.'),
+            ('Under [VERSIONING](../VERSIONING.md#compatibility) that is not additive.'),
+            ('A device has no way to tell whether the consumer reading its evidence is one of '
+             'them.'),
+            ('The version therefore travels inside the signed fault, where the device that chose '
+             'it is the only party that could have.'),
+            ('The third change is to manifest validation. v1 lists `device_mode` values without '
+             "defining them, and accepts any string there, any disagreement with the manifest's "
+             'arrays, and a manifest that declares no channel.'),
+            ('A consumer of this version refuses all three: see [Device Mode](#device-mode).'),
+            ("These rules deliberately tighten v1's acceptance, and a manifest a v1 producer may "
+             'sign is refused under them.'),
+            ('Producers and consumers are updated together.'),
+            ("[Late Faults](#late-faults) settles what a fault's freshness fields describe when "
+             'it is signed after the condition it reports, which v1 said only of '
+             '`storage_degraded`.'),
+            ('It changes no grammar and refuses nothing.'),
+            ('The fourth change is to bridged channels. v1 signs that a channel is bridged and '
+             'nothing about what decoded it.'),
+            ('Under this version every bridged channel names, in the signed manifest, the '
+             "controller profile that decoded it, by a digest over the profile's full "
+             'interpretation, and the qualification the device attests for it; a foreign '
+             "controller's alarm registers are read as bridged channels interpreted through that "
+             'profile.'),
+            ('See [Controller Profiles](#controller-profiles).'),
+            ("This too tightens v1's acceptance, in three ways: a bridged channel that names no "
+             'profile is refused, a bridged channel on a protocol other than `modbus_rtu` is '
+             'refused, and the sensor type `controller_alarm_word` and the unit `bitmask` are '
+             'refused on any channel that is not a bridged alarm word, which can refuse a device '
+             'that declares no bridged channel at all.'),
+            ('The fifth change is to the reading envelope.'),
+            ('An envelope may carry `"v":2`, and at `v` `2` it carries `liveness_nonce`: the '
+             'nonce of the last runtime liveness message the device accepted before the '
+             'measurement began, or `null`.'),
+            ('See [Reading Envelope at `v` 2](#reading-envelope-at-v-2).'),
+            ('With it, and only there, the runtime that signed that liveness message can bound '
+             'from above how long ago the device began the transaction behind the reading: see '
+             '[How Old A Reading Is](#how-old-a-reading-is).'),
+            ('A consumer that implements only v1, or this version before that section, refuses '
+             "every `v` `2` envelope, because v1 requires the envelope's `v` to be `1`."),
+            ("Everything else is v1's, as its text stands at ori-specs `d979402`, incorporated "
+             'unchanged: the trust model except for the key admission and signature verification '
+             'above, the signature encoding, canonical JSON, the capability manifest and its '
+             'validation, the telemetry envelope and heartbeats, sequence and freshness, the MQTT '
+             'transport, the fault code vocabulary and every non-closed `detail` category, signed '
+             'maintenance lifecycle events, error semantics and the required artifacts, except as '
+             '[Late Faults](#late-faults), [Device Mode](#device-mode), [Controller '
+             'Profiles](#controller-profiles), [Reading Envelope at `v` '
+             '2](#reading-envelope-at-v-2) and [How Old A Reading Is](#how-old-a-reading-is) '
+             'state.'),
+            ('**The manifest and the maintenance lifecycle event do not change version.** They '
+             'keep `"v":1` and their v1 grammar.'),
+            ('The manifest gains the validation rules of [Device Mode](#device-mode), and one '
+             'field, on bridged channels only:'),
+            ('`controller_profile`.'),
+            ('A device that declares no bridged channel signs the same bytes as before, so '
+             'adopting this version changes its `capability_hash` only if it declares a bridged '
+             'channel, and for such a device adoption is a capability transition.'),
+            ('The telemetry envelope gains one field, and only at `"v":2`; an envelope at `"v":1` '
+             "keeps v1's grammar exactly."),
+        ),
+        '## Signed Fault Events': (
+            ("A fault object is v1's, field for field, except for `v`:"),
+            ('| Field | Type | Notes |'),
+            ("| `v` | `int` | The fault object's version:"),
+            ('`1` or `2`.'),
+            ("Unlike v1, it is not the telemetry envelope's `v`, which is `1` or `2` "
+             'independently of it. |'),
+        ),
+        '## Reading Envelope at `v` 2': (
+            ('| Field | Type | Notes |'),
+            ("| `v` | `int` | The envelope's version:"),
+            ('`1` or `2`. |'),
+            ('| `liveness_nonce` | `string \\| null` | Required at `v` `2` and forbidden at `v` '
+             '`1`.'),
+            ('Exactly 32 characters, each one of `0`-`9` or `a`-`f`: the `nonce` of the runtime '
+             'liveness message the device held when the measurement began '
+             '([firmware-commands/v2.md](../firmware-commands/v2.md#runtime-liveness-at-v-2)).'),
+            ('`null` when it held none: the device had no usable freshness reference, which does '
+             'not mean that no runtime was watching. |'),
+            ('Every other field, canonical JSON, the signature and its encoding, heartbeats, and '
+             "sequence and freshness are v1's."),
+            ('The signature covers the canonical bytes of the envelope, `liveness_nonce` included.'),
+            ('**The field set is closed at `v` `2`.** An envelope at `v` `2` has exactly these '
+             'eleven keys and no other:'),
+            ('`v`, `alg`, `device_id`, `boot_id`, `seq`, `capability_hash`, `posture`, '
+             '`device_uptime_ms`, `emitted_at_ms`, `liveness_nonce` and `readings`.'),
+            ("This version leaves extra keys in an envelope at `v` `1` to v1's own rules. v1 does "
+             'not decide them, so a consumer of this version treats them as its v1 conformance '
+             'already does.'),
+        ),
+        '## Reading Envelope at `v` 2 > ### Producers': (
+            ('A producer that implements this section signs every envelope at `v` `2`, readings '
+             'and heartbeats alike, and always includes `liveness_nonce`, `null` when it holds no '
+             'nonce.'),
+            ('Envelopes it signed before it implemented this section and still holds in its '
+             'offline buffer are retransmitted unchanged, at `v` `1`: retransmission is not '
+             'signing.'),
+            ('**A reading carries the nonce held when its measurement began.** The producer '
+             'captures the held nonce before the first bus or sensor operation of the first '
+             'transaction the envelope represents, and carries that value unchanged through '
+             'validation, sequence reservation, signing and buffering.'),
+            ("A liveness message accepted after that point is not the envelope's nonce."),
+            ('That includes one accepted while a fault owed from an earlier condition is '
+             'published, or while the buffer is flushed, between the read and the signing.'),
+            ('**Every reading in an envelope comes from a transaction begun after its nonce was '
+             'accepted.** A producer MUST NOT sign a nonce beside a reading whose transaction '
+             'began before that nonce was accepted.'),
+            ('An envelope that includes a cached reading, or readings collected independently, '
+             'carries a nonce accepted before every one of their transactions began, and '
+             'otherwise `null`.'),
+            ('An alarm-word reading is still signed alone in its envelope, as [Controller '
+             'Profiles](#controller-profiles) requires.'),
+            ('**A heartbeat carries the nonce held when it is signed.** A heartbeat measures '
+             'nothing.'),
+            ('**A fault carries none.** The fault object is unchanged, and under [Late '
+             'Faults](#late-faults) its fields date its report, never its condition.'),
+            ('**The signed bytes survive buffering.** A reading retransmitted after a reboot '
+             'carries the `v` and `liveness_nonce` it was signed with, whatever the device holds '
+             'when it retransmits.'),
+            ('The field costs buffer depth, in steps rather than in proportion, because a ring '
+             'buffer of whole records per flash sector loses a record per sector once a record no '
+             'longer fits.'),
+            ("In the reference firmware's buffer the single-reading message of v1's example, with "
+             'a full capability hash, is 465 bytes, and is stored as a 484-byte record, eight to '
+             'a 4 KiB sector, up to 512 records in its 256 KiB ring.'),
+            ('A populated `liveness_nonce` adds 52 bytes and leaves seven to a sector, up to 448 '
+             'records.'),
+            ('`null` adds 22 bytes and keeps eight, up to 512.'),
+        ),
+        '## Reading Envelope at `v` 2 > ### Consumers': (
+            ('A consumer that implements this section accepts an envelope at `v` `1` or `v` `2` '
+             'and refuses any other `v`, including a `v` of another JSON type.'),
+            ('At `v` `2` it requires `liveness_nonce`, and at `v` `1` it refuses it.'),
+            ('Each refusal names one reason:'),
+            ('| Reason | When |'),
+            ("| `unsupported_version` | The envelope's `v` is not the integer `1` or `2`. |"),
+            ('| `liveness_nonce_at_v1` | `v` is `1` and the envelope has `liveness_nonce`, '
+             'whatever its value. |'),
+            ('| `liveness_nonce_missing` | `v` is `2` and the envelope has no `liveness_nonce`. |'),
+            ('| `invalid_liveness_nonce` | `v` is `2` and `liveness_nonce` is neither `null` nor '
+             'a string of exactly 32 characters each one of `0`-`9` or `a`-`f`. |'),
+            ('| `unexpected_field` | `v` is `2` and the envelope has a key outside the eleven '
+             'above. |'),
+            ("These checks belong to v1's sixth verification step, the validation of the "
+             "envelope's fields, after the signature verifies."),
+            ("They are made first in that step, in the order of the table, before v1's validation "
+             'of `boot_id`, `seq`, `device_uptime_ms`, posture, channels and readings.'),
+            ('An envelope that fails more than one check is refused for the first that fails in '
+             "v1's order of steps, and within the sixth step in that order."),
+            ("That orders only the checks in the table, which come first in the sixth step. v1's "
+             "own checks in that step keep v1's order, and this version orders them no further."),
+            ('So an envelope whose `capability_hash` does not match is refused as '
+             '`capability_hash_mismatch`, and one whose signature fails as '
+             '`signature_verification_failed`, whatever its `liveness_nonce`.'),
+            ('The nonce checks apply only at `v` `1` and `v` `2`, and the field-set check only at '
+             '`v` `2`, so an envelope refused as `unsupported_version` is never judged on its '
+             "`liveness_nonce` or its other keys. v1's checks keep their order and their meaning "
+             'for an envelope at either `v`.'),
+            ('An envelope refused for any reason is never converted into a reading.'),
+            ('The consumer holds no record of which version a device last used.'),
+            ('`v` is inside the signed bytes, so only the device chooses it, and a `v` `1` '
+             'envelope from a device that has also signed `v` `2` envelopes is judged under v1 '
+             'like any other.'),
+            ('A consumer that is not the signing runtime of [How Old A Reading '
+             "Is](#how-old-a-reading-is) checks the nonce's grammar and nothing else about it."),
+            ('To that consumer the nonce identifies nothing, and it never presents it, or '
+             'anything derived from it, as an age or a freshness.'),
+        ),
+        '## Adoption Order': (
+            ('The runtime adopts this version and '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md) before any device signs a `v` '
+             '`2` fault.'),
+            ('A runtime on v1 refuses every `v` `2` fault, and under firmware-commands/v1 a '
+             'command whose fault it refused is a command it must treat as lost and retry, which '
+             'is the late actuation the successor exists to prevent.'),
+            ('Every other verifier adopts this version before the devices whose evidence it reads.'),
+            ('A producer on this version signs every new fault at `v` `2`, so a verifier on v1 '
+             "alone refuses all of that device's faults, `interlock_tripped` included, from the "
+             'moment the device adopts.'),
+            ('A device signs a bridged channel only once the consumers that read its evidence '
+             'implement [Controller Profiles](#controller-profiles).'),
+            ("A consumer on v1, or on this version before that section, refuses the manifest's "
+             'unknown `controller_profile` key, so a device that adopts first loses its '
+             'registration rather than having its bridged readings misread.'),
+            ('A device whose release ships controller profiles before its manifest can name them '
+             'ships none: a reading decoded through a profile the signed evidence cannot name has '
+             'no provenance a receiver can check.'),
+            ('In the other direction, a consumer that adopts this section refuses every device '
+             'that still signs a bridged channel without a profile, or declares '
+             '`controller_alarm_word` or `bitmask` outside a bridged alarm word, until that '
+             'device adopts it too.'),
+            ('[Reading Envelope at `v` 2](#reading-envelope-at-v-2) and the liveness nonce of '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md#runtime-liveness-at-v-2) are '
+             'adopted consumers first, in both directions:'),
+            ('Every consumer that verifies reading envelopes accepts `v` `2`: the runtime, the '
+             "Python SDK, and the verifier the reference firmware's test rig uses."),
+            ('A consumer whose v1 verifier validates readings before the signature moves that '
+             "validation after it, so that a failing signature and the envelope's nonce are "
+             "judged before its channels and readings, as the envelope corpus's precedence cases "
+             'require.'),
+            ("A party that holds this version's envelope corpus without verifying envelope "
+             'grammar, as the evidence authority does, takes the new corpus.'),
+            ('Devices accept liveness at `v` `2`.'),
+            ('The runtime publishes liveness as '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md#publication-during-rollout) '
+             'requires during rollout, and keeps the liveness table.'),
+            ('Devices sign envelopes at `v` `2`.'),
+            ('A device that signs a `v` `2` envelope before a consumer adopts loses every reading '
+             'and heartbeat at that consumer.'),
+            ('A runtime that publishes only `v` `2` liveness to a device that accepts only `v` '
+             '`1` leaves that device without supervision, silently, because a refused liveness '
+             'message carries no verdict back.'),
+        ),
+        '## Golden Vectors': (
+            ("The authoritative corpus for this version's fault events is "
+             '[fault-vectors-v2.json](fault-vectors-v2.json), held here beside this document.'),
+            ('Its SHA-256 is `7c54e32f65e02e9b58f7eb28a669977277863c81f2349b78970a69354b30bff0`.'),
+            ('Implementing repositories copy it byte for byte, pin that digest, and never '
+             'generate its expectations from their own behaviour.'),
+            ('It holds signed fault events at `v` `2` for every fault code and every token of '
+             'every closed set above, a `v` `1` fault a consumer of this version still accepts, '
+             'and refusals whose signatures verify:'),
+            ("`rate_limited` at `v` `1`, a token outside its code's set at `v` `2`, an empty "
+             'closed-set `detail`, and unsupported versions.'),
+            ('Each refusal names its reason, and its signature is valid, so a consumer that '
+             'refuses it has refused it for that reason rather than at the signature.'),
+            ('`scripts/generate-firmware-fault-vectors-v2` reproduces the file byte for byte.'),
+            ('`scripts/check-firmware-fault-vectors-v2` shares no code with it: it recomputes '
+             'canonical bytes, re-derives the key from the disclosed seed and verifies every '
+             'signature with its own curve arithmetic, reads the closed sets from this document '
+             'and [firmware-commands/v2.md](../firmware-commands/v2.md), and confirms that each '
+             'refusal is refused for its declared reason and for no other.'),
+            ('The authoritative corpus for [Device Mode](#device-mode) is '
+             '[manifest-vectors-v2.json](manifest-vectors-v2.json), held beside it.'),
+            ('Its SHA-256 is `fc1c630891422f52d1dc26aa7e9cda7a59534314130d6e6137018cff6c847eea`.'),
+            ('Implementing repositories copy and pin it the same way.'),
+            ('Each case is a signed manifest message whose manifest is otherwise valid under v1, '
+             'judged as the first manifest registered against the provisioning anchor in its '
+             '`verifier_context`.'),
+            ('It holds `sensor_node`, `bridge_node`, and `mixed` over each combination of '
+             'metering channels, bridged channels and actions, and refusals whose signatures '
+             'verify: a `device_mode` outside the four values, as an unknown string, a variant in '
+             'letter case and values of other JSON types; each mode over arrays that determine '
+             'another; and `actuator_node` with an action and no channel, refused only as '
+             '`no_channels`.'),
+            ("It covers these rules and none of v1's other manifest validation."),
+            ('`scripts/generate-firmware-manifest-vectors-v2` reproduces the file byte for byte.'),
+            ('`scripts/check-firmware-manifest-vectors-v2` shares no code with it: it recomputes '
+             'canonical bytes and the manifest hash with its own serializer, verifies every '
+             'signature with its own curve arithmetic, reads the mode table and the bridged '
+             "source from this document, derives each manifest's mode from its arrays, and "
+             'confirms that each case is accepted and each refusal is refused for its declared '
+             'reason and for no other.'),
+            ('The manifest corpus also covers [Controller Profiles](#controller-profiles): '
+             'bridged channels naming a profile qualified and unqualified, an alarm-word channel, '
+             'two channels reading one profile, and refusals whose signatures verify for a '
+             'bridged channel with no profile, a profile on a metering channel, each way a '
+             '`controller_profile` breaks its grammar, one profile `id` under two digests, two '
+             'qualifications or two records, one digest under two ids, a bridged channel on '
+             'another protocol, and each misuse of `controller_alarm_word` and `bitmask`.'),
+            ('Each `digest` an accepted case names is the digest of a document in the profile '
+             'corpus, whose `id`, `profile_channel` and channel kind, `sensor_type` and `unit` '
+             'agree with the case.'),
+            ('The authoritative corpus for the profile document is '
+             '[controller-profile-vectors-v2.json](controller-profile-vectors-v2.json), held '
+             'beside them.'),
+            ('Its SHA-256 is `3504e144432b3c8f05f66850c60d974ed44588f175702a0a2f2162dbaa6ea6d3`.'),
+            ('Implementing repositories copy and pin it the same way.'),
+            ('It holds valid documents with their canonical bytes and digests, covering both '
+             'kinds, both widths, both word orders, signed and unsigned ranges, negative offsets '
+             'and both polarities; documents each breaking exactly one rule of the grammar, '
+             'including numbers of the wrong JSON type and each way a decode leaves fifteen '
+             'digits or 10^15; byte strings refused as not canonical, each but one of which '
+             're-serializes to a pinned digest, among them a duplicate key whose two values give '
+             'opposite polarities; and interpretation cases, each an alarm-word `value` read '
+             'through the document of the manifest it was accepted under, with the registers it '
+             'combines from and the document pinned when it is read again, which in some cases is '
+             'another document of the same `id`, giving every mapped alarm as asserted or not '
+             'asserted and the unmapped bits that are set, or the value as not interpreted; range '
+             'cases, each a measurement `value` read through a document, giving whether it lies '
+             "within the decode of the channel's range; agreement cases, each a manifest channel "
+             'and a document, giving whether the receiver may use the document for that channel; '
+             'and state cases, each a sequence of readings, uninterpretable readings, other '
+             'messages, faults, pending anchors for a new manifest or a re-provisioned key and '
+             'readings signed under them, promotions of rotated keys, manifest promotions, '
+             'revocations, reinstatements and receiver restarts on one channel, each sequence '
+             'legal under [device-provisioning/v1](../device-provisioning/v1.md), with the '
+             "receiver time each was accepted, giving the channel's alarms at a query time as "
+             'unknown or as of a named reading, covering the silence bound at the alarm-word poll '
+             'ceiling, faults, key rotation with restarted counters, a superseded epoch, manifest '
+             'promotion, receiver restart, a drained backlog, a reboot, and refused replays, '
+             'duplicates and boot rollbacks.'),
+            ('`scripts/generate-firmware-controller-profile-vectors-v2` reproduces it byte for '
+             'byte.'),
+            ('`scripts/check-firmware-controller-profile-vectors-v2` shares no code with it: it '
+             "reads the grammar's bounds and closed sets from this document, recomputes canonical "
+             'bytes and digests with its own serializer, confirms that each refused document '
+             'breaks exactly the rule it declares, refuses each byte string on its bytes, '
+             "combines each case's registers in its word order, recomputes every interpretation, "
+             'range case and agreement case, and recomputes every state case from the rules in '
+             '[Receivers](#receivers).'),
+            ('The authoritative corpus for [Reading Envelope at `v` 2](#reading-envelope-at-v-2) '
+             'is [envelope-vectors-v2.json](envelope-vectors-v2.json), held beside them.'),
+            ('Its SHA-256 is `dff9e940de06bdb1dda12ec19c3f66679b39b4a1f4d7565d9a985e9282558d7f`.'),
+            ('Implementing repositories copy and pin it the same way.'),
+            ("Each case is a signed telemetry message judged on its own against the corpus's "
+             '`verifier_context`, with no prior message accepted from the device.'),
+            ('Its readings name channels the context accepts and are otherwise valid under v1.'),
+            ('It holds envelopes at `v` `2` with a nonce and with `null`, among them one carrying '
+             'two readings, heartbeats with a nonce and with `null`, and one whose nonce is all '
+             'zeros.'),
+            ('It also holds a reading and a heartbeat at `v` `1`, which a consumer of this '
+             'version still accepts.'),
+            ('Its refusals have valid signatures:'),
+            ('`v` `2` without `liveness_nonce`;'),
+            ('`v` `1` with one, populated and `null`;'),
+            ('a nonce with an uppercase letter, with a character outside the hexadecimal digits, '
+             'of 31 and of 33 characters, the empty string, an integer, and a boolean;'),
+            ('the versions `0` and `3`, the string `"2"`, and `true`;'),
+            ('an extra key at `v` `2`.'),
+            ("Each refusal names its reason from the consumers' table in [Reading Envelope at `v` "
+             '2](#reading-envelope-at-v-2), and breaks exactly that rule and no other.'),
+            ('The corpus also holds precedence cases, each breaking two checks and refused for '
+             'the first in the order that section states:'),
+            ('a manifest mismatch with a malformed nonce, refused as `capability_hash_mismatch`;'),
+            ('a failing signature with a malformed nonce, refused as '
+             '`signature_verification_failed`;'),
+            ('a `v` `1` envelope carrying `liveness_nonce` with a channel the context does not '
+             'accept, refused as `liveness_nonce_at_v1`;'),
+            ('a missing nonce with a channel the context does not accept, refused as '
+             '`liveness_nonce_missing`;'),
+            ('an extra key with a malformed nonce, refused as `invalid_liveness_nonce`;'),
+            ('an extra key with a channel the context does not accept, refused as '
+             '`unexpected_field`.'),
+            ('`scripts/generate-firmware-envelope-vectors-v2` reproduces the file byte for byte.'),
+            ('It signs with OpenSSL through `cryptography`.'),
+            ('`scripts/check-firmware-envelope-vectors-v2` shares no code with it: it recomputes '
+             'canonical bytes, re-derives the key from the disclosed seed, verifies every '
+             'signature with its own curve arithmetic, reads the reasons and the nonce grammar '
+             'from this document, and confirms that each case is accepted and each refusal is '
+             'refused for its declared reason and for no other.'),
+            ('The authoritative corpus for [How Old A Reading Is](#how-old-a-reading-is) is '
+             '[reading-age-vectors-v2.json](reading-age-vectors-v2.json), held beside them.'),
+            ('Its SHA-256 is `909ef412cec0da86683aea72c2fdd430ce4797089166750f97c3c72db3696d83`.'),
+            ('Implementing repositories copy and pin it the same way.'),
+            ("Each case runs at the signing runtime, on that section's clock, in nanoseconds, "
+             'under the per-device and total table bounds the case declares.'),
+            ('Its events are in clock order, and are of eight kinds:'),
+            ('`v` `2` liveness messages the runtime signs, each with its nonce and its signing '
+             'start, or with none when the clock could not be read;'),
+            ('`v` `1` liveness messages the runtime signs, which carry no nonce and record '
+             'nothing in the table;'),
+            ('`v` `2` signings that fail, each with the nonce and signing start it was given, '
+             'whose entry is recorded and then discarded, and whose message is never published;'),
+            ('envelopes the runtime accepts, each with its `v`, `device_id`, `boot_id`, '
+             '`capability_hash`, `seq`, the channels of its readings, none for a heartbeat, and '
+             'its `liveness_nonce`;'),
+            ('restarts;'),
+            ("restores of the runtime's state store while it runs;"),
+            ("intervals during which the runtime's host was suspended, which the clock counts, so "
+             'they change nothing the runtime records;'),
+            ('queries.'),
+            ('Every envelope event is a message the runtime has already accepted under every '
+             'check of v1 and of this version; the corpus does not exercise verification.'),
+            ('Each query is made at a time, of a message by its `(boot_id, seq)` or of a '
+             "channel's latest reading."),
+            ("A channel's latest reading is the last envelope accepted since the last restart "
+             'carrying a reading of that channel; a heartbeat never is one.'),
+            ('Each query gives the bound in nanoseconds and rounded up to whole milliseconds, or '
+             'no bound.'),
+            ('The cases cover:'),
+            ('a matched reading, and its bound growing after receipt;'),
+            ('rounding up;'),
+            ('an unknown nonce, a `null` nonce and a `v` `1` envelope;'),
+            ('a nonce signed for another device, another boot or another manifest;'),
+            ('acceptance exactly one hour after the signing start, and one nanosecond later;'),
+            ('an entry exactly an hour old when another is recorded, which survives when there is '
+             'room and, when there is not, still counts and is evicted although it is usable;'),
+            ('the per-device bound applied before the total bound, and a per-device bound '
+             "counting a device's entries under two `boot_id`s;"),
+            ('two entries with the same signing start, where the one whose nonce sorts first in '
+             'byte order is evicted;'),
+            ('a matched reading queried more than an hour after its signing start;'),
+            ('eviction by the per-device bound and by the total bound;'),
+            ('a restart before acceptance and one after;'),
+            ('a store restore while the runtime runs that reissues a `runtime_seq`;'),
+            ('a restart followed by a restore that reissues a `runtime_seq` under a fresh nonce, '
+             'with an old reading still carrying the first nonce;'),
+            ('a heartbeat that does not refresh a channel;'),
+            ('a signing whose start could not be read;'),
+            ('time during which the host was suspended;'),
+            ('a drained backlog;'),
+            ('a failed signing whose recording evicted another entry, which stays evicted;'),
+            ("rollout: a `v` `2` signing that fails after its interval's `v` `1` message, leaving "
+             'no entry, and readings measured after the pair, bounded by the `v` `2` nonce, and '
+             'between its messages, with no bound.'),
+            ('`scripts/generate-firmware-reading-age-vectors-v2` reproduces the file byte for '
+             'byte.'),
+            ('`scripts/check-firmware-reading-age-vectors-v2` shares no code with it: it reads '
+             'the retention and the matching and eviction rules from this document, and '
+             'recomputes every query from [How Old A Reading Is](#how-old-a-reading-is).'),
+            ('The disclosed test seed, shared by the signed corpora, is a fixture only and MUST '
+             'NOT be provisioned on any device.'),
+            ('The nonces in the envelope and age corpora are fixed fixture values; a runtime '
+             'generates its own as '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md#runtime-liveness-at-v-2) '
+             'requires.'),
+        ),
+        '## Required Implementation Artifacts': (
+            ("In addition to v1's:"),
+            ("consumer tests driving the corpus through the consumer's real verification entry "
+             'point, accepting every case and refusing every refusal for its declared reason;'),
+            ('consumer tests driving the corpora of '
+             '[ed25519-key-admission/v1](../ed25519-key-admission/v1.md) and '
+             '[ed25519-verification/v1](../ed25519-verification/v1.md) through the verifier the '
+             "consumer uses for this version's signatures, accepting every accepted case and "
+             'refusing every refused one;'),
+            ('a producer test that the device signs the `rate_limited` refusal of '
+             '[firmware-commands/v2.md](../firmware-commands/v2.md) at `v` `2`, and that no fault '
+             'is signed at `v` `1` once the producer implements this version;'),
+            ('a producer test that each retry of a late fault carries the freshness fields of its '
+             'own signing, not those of the condition or of an earlier attempt;'),
+            ('a producer test, at each public boundary that builds a manifest, that it signs the '
+             '`device_mode` its `channels` and `actions` determine for every combination it can '
+             'declare, reproducing the mode of each accepted case of the manifest corpus from '
+             "that case's arrays, and refuses to build a manifest with no channel or with any "
+             'other mode;'),
+            ("a producer test that, for every profile in the device's release, the bytes it "
+             "hashes for `digest` are the canonical bytes of the profile's document under the "
+             'grammar above, reproducing the canonical bytes and digest of each accepted document '
+             'of the profile corpus from an equivalent profile;'),
+            ("a producer test that the device combines an alarm word's registers in its declared "
+             "word order, reproducing each interpretation case's `value` from its `registers`;"),
+            ("consumer tests driving the profile corpus's range cases through the receiver's "
+             "check of a bridged measurement against its channel's range;"),
+            ("consumer tests driving the profile corpus's agreement cases through the receiver's "
+             'check of a document against a manifest channel, using each agreeing document and '
+             'refusing each disagreeing one;'),
+            ('consumer tests that an alarm-word reading sharing its envelope with any other '
+             "reading is accepted, is not interpreted and becomes the channel's latest reading, "
+             "and that one below its channel's `quality_floor` is not refused;"),
+            ('a producer test that the device signs each alarm-word reading alone in its envelope;'),
+            ("consumer tests that a receiver refuses each byte string of the profile corpus's "
+             '`reject_bytes`, and hashes the bytes it holds rather than a re-serialization;'),
+            ('a producer test that the device signs `controller_profile` on every bridged channel '
+             'and on no other, with `qualification` and `record` as its release states them;'),
+            ("consumer tests driving the profile corpus through the consumer's document "
+             'validation, alarm interpretation and alarm state, accepting and refusing every '
+             'document as the corpus declares and reproducing every interpretation and every '
+             'state case; the state cases are stated at the longest bound, and a consumer using a '
+             'shorter one expects unknown in every case whose query falls later than its bound '
+             'after the last accepted reading;'),
+            ("consumer tests driving the manifest corpus through the consumer's real registration "
+             'path, accepting every case and refusing every refusal for its declared reason.'),
+            ("consumer tests driving the envelope corpus through the consumer's real verification "
+             'entry point, accepting every case and refusing every refusal for its declared '
+             'reason, and converting no refused envelope into a reading;'),
+            ('a producer test that a liveness message accepted after a measurement transaction '
+             "begins, and before its reading is signed, is not the reading's nonce: the reading "
+             'carries the nonce held when the transaction began, including when a fault owed from '
+             'an earlier condition is published, or the buffer flushed, in between, and including '
+             'when the liveness expiry window lapses in between;'),
+            ('a producer test that an envelope including a reading whose transaction began before '
+             'the held nonce was accepted, a cached reading among them, carries a nonce accepted '
+             'before every one of its transactions began, or `null`;'),
+            ('a producer test that a reading signed and buffered, then retransmitted after a '
+             'reboot, is retransmitted with the bytes it was signed with, its `v` and '
+             '`liveness_nonce` included;'),
+            ('a producer test that every envelope is signed at `v` `2` with `liveness_nonce`, '
+             '`null` when no nonce is held, that a heartbeat carries the nonce held when it is '
+             'signed, and that no fault carries one;'),
+            ('tests at the signing runtime driving the reading-age corpus through the liveness '
+             'table and the age computation it uses, reproducing every query;'),
+            ('tests at the signing runtime that its clock counts suspended time, that a restart '
+             'empties the table, that a store restore while it runs does not, and that a reading '
+             'read back from storage after a restart has no bound;'),
+            ('tests at every receiver that presents firmware readings that none is presented as '
+             'fresh, current or live, that only the signing runtime presents a bound, that an '
+             'alarm state with a bound is presented as a snapshot polled no more than its bound '
+             'ago, anchored to the instant the bound was computed, and that health and any '
+             'exported snapshot or other delivered record that carries a bound names the instant '
+             'it was computed, and none carries an unanchored A;'),
+            ('consumer tests of the operator message, the Tier C approval request among them, '
+             'driven through the path that composes it: for a firmware reading its "Measured" '
+             'line reads "not reported by device", followed, when the reading has a bound, by '
+             '"polled no more than A ago, as of T" with T the runtime\'s wall-clock time when A '
+             'was computed, and no message carries an A without its T; and a health report or '
+             'exported snapshot carries no A without its T.'),
+        ),
+    },
+}
+# Sentences every mutation run reverses and deletes, whatever the sample.
+MUTATE_ALWAYS = (
+    'signs every envelope at `v` `2`',
+    'retransmitted unchanged',
+    'while a fault owed from an earlier condition',
+    'holds no record of which',
+    'Devices accept liveness at',
+    'Devices sign envelopes at',
+    'independently of it',
+    'do not change version',
+    'copy and pin it the same way',
+    'MUST NOT be provisioned',
+)
+
+
+# --- status-record notes ---------------------------------------------------------
+#
+# Every note in status/firmware-telemetry/v2.json, the top-level one and each adoption
+# entry's, held verbatim: a note states what implements this contract and what
+# proof exists, and the status checker reads neither. A note added, removed or
+# changed fails here until this table is updated in review.
+STATUS_NOTES: tuple[tuple[str, str], ...] = (
+    ('notes',
+     'Exists so a device can sign a command_rejected fault whose detail is rate_limited: '
+     'the fault object carries v 2, under which the closed detail sets are the ones this '
+     'version lists. Manifest and maintenance events keep v 1; the manifest gains Device '
+     'Mode validation and, on bridged channels, a controller_profile naming the digest of '
+     'the profile that decoded it. The reading envelope may carry v 2 with '
+     'liveness_nonce, the nonce of the runtime liveness message the device held when the '
+     'measurement began, from which only the runtime that signed that message can bound, '
+     'from above, how long ago the device began the transaction behind the reading; the '
+     'bound dates that transaction, not the measured quantity. No verifier or producer '
+     'implements envelope v 2 or the reading-age bound yet. The runtime verifies v 2 '
+     'faults and the edge firmware signs them; the evidence authority and sdk-python have '
+     'not adopted it. Every verifier, the runtime first, adopts it before the devices '
+     'whose faults it reads: a v1-only verifier refuses every v 2 fault. Envelope v 2 is '
+     'adopted consumers first: verifiers accept it, devices accept liveness v 2, the '
+     'runtime publishes it, and devices sign envelope v 2 last.'),
+    ('adoption[0] verifier runtime notes',
+     "The runtime verifies each firmware fault under its own v: v 1 under v1's closed "
+     "sets, v 2 under this version's, any other v refused, and drives this version's "
+     'corpus through its ingest gate. Its module docstring and capability matrix describe '
+     "the v 2 sets as this draft's and make no conformance claim, so the version is not "
+     'frozen by this merge. It verifies signatures with OpenSSL behind its '
+     'ed25519-key-admission/v1 admission. That combination reaches every verdict of the '
+     'ed25519-verification/v1 corpus when the corpus is run on the host, OpenSSL alone '
+     'differing only on the keys admission refuses, but the runtime does not yet drive '
+     'that corpus through its ingest gate. From 1ddc3e9 it also enforces Device Mode at '
+     'registration, at promotion of a pending candidate, and on every message against a '
+     "stored anchor, and drives this version's manifest corpus through its registration "
+     'path: every accepted case registers and every refusal is refused for its reason and '
+     'stores nothing. It reads no authority or trust grade from the mode. From 72eb2b4 it '
+     'implements Controller Profiles: registration applies the four refusals and the '
+     'one-profile rule, profile documents are held by digest only when canonical and '
+     "valid, a bridged measurement outside its document's range is refused, and health "
+     'shows each alarm channel as unknown or as of the reading it came from, with the '
+     "silence bound on a clock that counts suspend; it vendors this version's profile "
+     'corpus at f3e980d. That is implementation, not end-to-end or HIL proof. It '
+     'implements neither the reading envelope at v 2 nor the reading-age bound: it '
+     'refuses every envelope whose v is not 1, and reads no liveness_nonce.'),
+    ('adoption[1] producer edge-firmware notes',
+     'The device signs every fault at v 2 and has no path to v 1; faults it buffered '
+     "before adopting are retransmitted at v 1 as stored. It mirrors this version's fault "
+     'corpus byte for byte, copied from ori-specs 3159506 and pinned by digest in its '
+     'golden-vector README; it carries no vector manifest, so no vendored revision is '
+     'recorded. Its DECISIONS.md says core/fault_event.c implements the fault object this '
+     'version defines; that sentence was written while the firmware was built alongside '
+     'this draft, and the maintainer ruled on 2026-10-09 that it is provenance, not a '
+     'conformance claim, so the version is not frozen by this merge and stays amendable. '
+     'It signs no controller_profile yet, and its release ships no controller profile '
+     'until it does. It signs every envelope at v 1, holds no liveness nonce, and signs '
+     'no liveness_nonce.'),
+)
+
+
+def status_notes(record: dict) -> list[tuple[str, str]]:
+    out = [("notes", record["notes"])] if "notes" in record else []
+    for index, entry in enumerate(record.get("adoption", [])):
+        if "notes" in entry:
+            where = f"adoption[{index}] {entry['role']} {entry['repository']} notes"
+            out.append((where, entry["notes"]))
+    return out
+
+
+def check_status_notes(raw: str) -> None:
+    found = status_notes(json.loads(raw))
+    if found != list(STATUS_NOTES):
+        added = [n for n in found if n not in STATUS_NOTES]
+        removed = [n for n in STATUS_NOTES if n not in found]
+        raise Failure(f"status notes changed in status/firmware-telemetry/v2.json: added {added}, removed {removed}"
+                      + ("" if added or removed else ", reordered"))
+
+
+def contract_texts() -> dict[str, str]:
+    return {"t1": TELEMETRY_V1.read_text(), "t2": TELEMETRY_V2.read_text()}
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    check_status_notes(texts.get("status") or STATUS.read_text())
+    docs = {"commands": texts.get("c2") or COMMANDS_V2.read_text(), "telemetry": texts["t2"]}
+    check_normative(docs, OWNER, HELD_SENTENCES)
+    t1, t2 = texts["t1"], texts["t2"]
+    env2 = section(t2, "## Reading Envelope at `v` 2")
+    consumers = section(env2, "### Consumers")
+    golden = section(t2, "## Golden Vectors")
+    for sentence in V2_SENTENCES:
+        need(env2, sentence, "firmware-telemetry/v2.md Reading Envelope at v 2")
+    for clause, _ in GUARDS:
+        need(env2, clause, "firmware-telemetry/v2.md Reading Envelope at v 2")
+    for sentence in GOLDEN_SENTENCES:
+        need(golden, sentence, "firmware-telemetry/v2.md Golden Vectors")
+
+    rows = dict(_table(env2, "[a-z0-9_]+"))
+    v_row = re.fullmatch(r"`int` \| The envelope's version: `(\d)` or `(\d)`\.", rows.get("v", ""))
+    nonce_row = re.fullmatch(
+        r"`string \\\| null` \| Required at `v` `(\d)` and forbidden at `v` `(\d)`\. Exactly "
+        r"(\d+) characters, each one of `(.)`-`(.)` or `(.)`-`(.)`: .*", rows.get("liveness_nonce", ""))
+    if v_row is None or nonce_row is None:
+        raise Failure("the v and liveness_nonce rows of the envelope table changed")
+    versions = (int(v_row.group(1)), int(v_row.group(2)))
+    alphabet = "".join(chr(c) for lo, hi in ((nonce_row.group(4), nonce_row.group(5)),
+                                             (nonce_row.group(6), nonce_row.group(7)))
+                       for c in range(ord(lo), ord(hi) + 1))
+    reasons = []
+    for reason, cell in _table(consumers, "[a-z0-9_]+"):
+        if cell not in WHEN_CELLS:
+            raise Failure(f"consumers' table row {reason}: {cell!r} has no predicate here")
+        reasons.append((reason, WHEN_CELLS[cell]))
+    if sorted(r[1] for r in reasons) != sorted(WHEN_CELLS.values()):
+        raise Failure("the consumers' table does not name every check exactly once")
+
+    flow = section(t1, "## Consumer Verification Flow")
+    steps = re.findall(r"^(\d)\. (.+?)(?=\n\d\. |\n\n)", flow, re.M | re.S)
+    roles = []
+    for number, words in steps:
+        words = flat(words)
+        if words not in V1_STEPS:
+            raise Failure(f"v1 verification step {number} reads {words!r}")
+        roles.append(V1_STEPS[words])
+    if roles != list(V1_STEPS.values()):
+        raise Failure(f"v1's verification steps are now {roles}")
+    errors = {}
+    for condition, name in re.findall(r"^\| (.+?) \| `([a-z0-9_]+)` \|\s*$",
+                                      section(t1, "## Error Semantics"), re.M):
+        if condition in V1_ERRORS:
+            errors[V1_ERRORS[condition]] = name
+    if sorted(errors) != sorted(V1_ERRORS.values()):
+        raise Failure("v1's error table lost a condition this checker names")
+
+    env_fields = [f for f, _ in _table(section(t1, "### Envelope Fields"), "[a-z0-9_]+")]
+    reading_fields = [f for f, _ in _table(section(t1, "### Reading Fields"), "[a-z0-9_]+")]
+    need(t1, "Additional reading fields are forbidden in v1.", "firmware-telemetry/v1.md")
+    closed_sentence = re.search(r"\*\*The field set is closed at `v` `2`\.\*\* An envelope at "
+                                r"`v` `2` has exactly these (\w+) keys and no other: (.+?)\. ",
+                                flat(env2))
+    if closed_sentence is None:
+        raise Failure("v2.md no longer closes the field set at v 2 as this checker reads it")
+    closed = re.findall(r"`([a-z0-9_]+)`", closed_sentence.group(2))
+    words = {"eleven": 11, "twelve": 12, "ten": 10}
+    if words.get(closed_sentence.group(1)) != len(closed) or len(set(closed)) != len(closed):
+        raise Failure(f"the closed field set names {len(closed)} keys, not {closed_sentence.group(1)}")
+    if sorted(closed) != sorted(env_fields + ["liveness_nonce"]):
+        raise Failure("the eleven keys are not v1's envelope fields and liveness_nonce")
+    quality = re.search(r"`(\d\.\d) <= quality <= (\d\.\d)`", section(t1, "### Reading Fields"))
+    zone = flat(section(t1, "## Canonical JSON"))
+    int_max = re.search(r"integers must satisfy `\|n\| <= (\d+)`", zone)
+    float_zone = re.search(r"magnitude in `\[(\S+), (\S+)\)`", zone)
+    if quality is None or int_max is None or float_zone is None:
+        raise Failure("v1's quality bound or canonical number zone changed")
+    need(zone, "object keys sorted lexicographically at every nesting level,", "v1 Canonical JSON")
+    need(section(t1, "## Signature Encoding"), "Decoded signature length must be 64 bytes.",
+         "v1 Signature Encoding")
+
+    # The global order: v1's steps, the sixth expanded as the text states.
+    order = [(errors["anchor"], "anchor"), ("alg (unnamed in v1)", "alg"),
+             (errors["capability"], "capability"),
+             (errors["signature_format"], "signature_format"), (errors["signature"], "signature")]
+    order += reasons
+    order += [("envelope field (unnamed in v1)", "envelope"), (errors["posture"], "posture"),
+              (errors["channel"], "channel"), (errors["reading"], "reading")]
+
+    golden_env = flat(golden[golden.index("[envelope-vectors-v2.json]"):
+                             golden.index("[reading-age-vectors-v2.json]")])
+    pin = re.search(r"Its SHA-256 is `([0-9a-f]{64})`", golden_env)
+    if pin is None:
+        raise Failure("v2.md pins no envelope corpus digest")
+    bullets = [flat(b) for b in re.findall(r"^- (.+?)(?=\n- |\n\n)", golden[
+        golden.index("[envelope-vectors-v2.json]"):golden.index("[reading-age-vectors-v2.json]")],
+        re.M | re.S)]
+    refusal_bullets = [b for b in bullets if not b.startswith(tuple(SECOND_RULES))]
+    if refusal_bullets != list(REFUSAL_BULLETS):
+        raise Failure(f"the envelope corpus's refusal list changed: {refusal_bullets}")
+    precedence = []
+    for bullet in bullets:
+        match = re.fullmatch(r"(.+?), refused as `([a-z0-9_]+)`[;.]", bullet)
+        if match and match.group(1) in SECOND_RULES:
+            precedence.append((match.group(2), SECOND_RULES[match.group(1)]))
+    if len(precedence) != len(SECOND_RULES):
+        raise Failure("the envelope corpus's precedence list changed")
+    return {
+        "versions": versions,
+        "nonce_required_at": int(nonce_row.group(1)),
+        "nonce_forbidden_at": int(nonce_row.group(2)),
+        "nonce_length": int(nonce_row.group(3)),
+        "nonce_alphabet": alphabet,
+        "order": order,
+        "order_stated": list(order),
+        "env_fields": env_fields,
+        "closed_v2": closed,
+        "reading_fields": reading_fields,
+        "quality": (float(quality.group(1)), float(quality.group(2))),
+        "int_max": int(int_max.group(1)),
+        "float_lo": float(float_zone.group(1)),
+        "float_hi": float(float_zone.group(2)),
+        "sig_prefix": "ed25519:",
+        "sig_length": 64,
+        "precedence": precedence,
+        "pin": pin.group(1),
+    }
+
+
+# --- consumer model ---------------------------------------------------------------------
+
+def nonce_grammar(value: object, model: dict) -> bool:
+    return value is None or (
+        isinstance(value, str) and len(value) == model["nonce_length"]
+        and all(ch in model["nonce_alphabet"] for ch in value))
+
+
+def _number(value: object) -> bool:
+    return type(value) in (int, float)
+
+
+def broken(env: dict, wire: str, ctx: dict, public: bytes, model: dict) -> set[str]:
+    """Every check this envelope fails, each judged on its own."""
+    out = set()
+    v = env.get("v")
+    known_v = type(v) is int and v in model["versions"]
+    if env.get("device_id") != ctx["device_id"]:
+        out.add("anchor")
+    if env.get("alg") != "ed25519":
+        out.add("alg")
+    if env.get("capability_hash") != ctx["capability_hash"]:
+        out.add("capability")
+    sig = None
+    if wire.startswith(model["sig_prefix"]):
+        body = wire[len(model["sig_prefix"]):]
+        try:
+            sig = base64.b64decode(body, validate=True)
+        except ValueError:
+            sig = None
+        if sig is not None and (base64.b64encode(sig).decode() != body
+                                or len(sig) != model["sig_length"]):
+            sig = None
+    if sig is None:
+        out.add("signature_format")
+    else:
+        try:
+            body_bytes = canonical(env, model).encode()
+        except Failure:
+            body_bytes = b""
+        if not verify(public, body_bytes, sig):
+            out.add("signature")
+    if not known_v:
+        out.add("version")
+    has = "liveness_nonce" in env
+    if v == model["nonce_forbidden_at"] and type(v) is int and has:
+        out.add("nonce_at_v1")
+    if v == model["nonce_required_at"] and type(v) is int and not has:
+        out.add("nonce_missing")
+    judged_at_v2 = v == model["nonce_required_at"] and type(v) is int
+    if judged_at_v2 and has and not nonce_grammar(env["liveness_nonce"], model):
+        out.add("nonce_invalid")
+    # The field set is closed at v 2 only; v1 names no rule for an extra
+    # envelope key, so only a missing or mistyped field is v1's refusal here.
+    if judged_at_v2 and set(env) - set(model["closed_v2"]):
+        out.add("unexpected")
+    keys = set(env)
+    types = {"alg": str, "device_id": str, "capability_hash": str, "posture": str,
+             "readings": list}
+    if set(model["env_fields"]) - keys or any(
+            not isinstance(env[k], t) for k, t in types.items() if k in env) or any(
+            type(env.get(k)) is not int or not 0 <= env[k] <= model["int_max"]
+            for k in ("boot_id", "seq", "device_uptime_ms")) or not (
+            env.get("emitted_at_ms") is None or type(env.get("emitted_at_ms")) is int):
+        out.add("envelope")
+    if env.get("posture") != ctx["posture"]:
+        out.add("posture")
+    channels = {c["channel"]: c for c in ctx["accepted_channels"]}
+    for reading in env.get("readings") or []:
+        if not isinstance(reading, dict) or set(reading) != set(model["reading_fields"]):
+            out.add("reading")
+            continue
+        declared = channels.get(reading["channel"])
+        if declared is None or (declared["sensor_type"], declared["unit"]) != (
+                reading["sensor_type"], reading["unit"]):
+            out.add("channel")
+        value, quality = reading["value"], reading["quality"]
+        if not _number(value) or not _number(quality):
+            out.add("reading")
+            continue
+        try:
+            canonical_number(value, model)
+        except Failure:
+            out.add("reading")
+        if not model["quality"][0] <= quality <= model["quality"][1]:
+            out.add("reading")
+    return out
+
+
+def judge(failed: set[str], model: dict, off: frozenset[str] = frozenset()) -> str | None:
+    for reason, check in model["order"]:
+        if check in failed and check not in off:
+            return reason
+    return None
+
+
+# --- the corpus -------------------------------------------------------------------------
+
+def check(corpus: dict, model: dict, off: frozenset[str] = frozenset(),
+          fault_seed: str | None = None) -> dict:
+    if fault_seed is None:
+        fault_seed = json.loads(FAULT_CORPUS.read_bytes())["test_seed_hex"]
+    if corpus["test_seed_hex"] != fault_seed:
+        raise Failure("the seed is not the one the signed corpora share")
+    public = public_from_seed(bytes.fromhex(corpus["test_seed_hex"]))
+    ctx = corpus["verifier_context"]
+    if corpus["public_key_hex"] != public.hex() or base64.b64decode(
+            corpus["public_key_b64"], validate=True) != public or base64.b64decode(
+            ctx["public_key_b64"], validate=True) != public:
+        raise Failure("the public key does not derive from the seed")
+    reason_of = {check: reason for reason, check in model["order"]}
+    table = [r for r, c in model["order"] if c in WHEN_CELLS.values()]
+    if sorted(corpus["reasons"]) != sorted(table + [reason_of["capability"], reason_of["signature"]]):
+        raise Failure("the corpus's reasons are not the table's and v1's two it cites")
+    if corpus["check_order"] != [r for r, c in model["order_stated"]
+                                 if r in corpus["reasons"]]:
+        raise Failure("the corpus's check_order differs from the text's")
+    position = {reason: i for i, (reason, _) in enumerate(model["order"])}
+
+    names: set[str] = set()
+    for key in ("cases", "reject_cases", "precedence_cases"):
+        for case in corpus[key]:
+            if case["name"] in names:
+                raise Failure(f"duplicate case {case['name']}")
+            names.add(case["name"])
+
+    def common(case: dict) -> tuple[set[str], bool]:
+        label, env = case["name"], case["input"]
+        body = canonical(env, model).encode()
+        if bytes.fromhex(case["canonical_hex"]) != body:
+            raise Failure(f"{label}: canonical bytes")
+        if case["canonical_sha256_hex"] != hashlib.sha256(body).hexdigest():
+            raise Failure(f"{label}: digest")
+        wire = canonical({"envelope": env, "signature": case["signature"]}, model).encode()
+        if bytes.fromhex(case["message_hex"]) != wire:
+            raise Failure(f"{label}: wire message")
+        parsed = json.loads(wire)
+        if parsed["envelope"] != env:
+            raise Failure(f"{label}: the wire message does not carry the input")
+        failed = broken(env, case["signature"], ctx, public, model)
+        return failed, "signature" not in failed and "signature_format" not in failed
+
+    facts: dict[str, list[str]] = {}
+
+    def note(item: str, name: str) -> None:
+        facts.setdefault(item, []).append(name)
+
+    for case in corpus["cases"]:
+        failed, _ = common(case)
+        verdict = judge(failed, model, off)
+        if verdict is not None:
+            raise Failure(f"{case['name']}: refused ({verdict})")
+        env = case["input"]
+        # A JSON boolean is not an integer; Python's True == 1 must not say otherwise.
+        readings, v = env["readings"], env["v"] if type(env["v"]) is int else None
+        nonce = env.get("liveness_nonce")
+        if v == 2:
+            if readings and nonce is not None:
+                note("v2_reading_nonce", case["name"])
+            if readings and nonce is None:
+                note("v2_reading_null", case["name"])
+            if len(readings) >= 2:
+                note("v2_two_readings", case["name"])
+            if not readings and nonce is not None:
+                note("v2_heartbeat_nonce", case["name"])
+            if not readings and nonce is None:
+                note("v2_heartbeat_null", case["name"])
+            if nonce == "0" * model["nonce_length"]:
+                note("v2_zero_nonce", case["name"])
+        if v == 1:
+            note("v1_reading" if readings else "v1_heartbeat", case["name"])
+        if type(v) is int:
+            note(f"accepted v={v}", case["name"])
+        if isinstance(nonce, str):
+            note(f"accepted nonce length {len(nonce)}", case["name"])
+
+    for case in corpus["reject_cases"]:
+        failed, valid = common(case)
+        if case["signature_valid"] is not valid or not valid:
+            raise Failure(f"{case['name']}: a refusal here carries a valid signature")
+        verdict = judge(failed, model, off)
+        if verdict != case["reason"]:
+            raise Failure(f"{case['name']}: refused for {verdict}, not {case['reason']}")
+        if {reason_of[c] for c in failed} != {case["reason"]}:
+            raise Failure(f"{case['name']}: breaks {sorted(failed)}, not exactly {case['reason']}")
+        env = case["input"]
+        nonce = env.get("liveness_nonce", ...)
+        raw_v = env["v"]
+        v = raw_v if type(raw_v) is int else None
+        if v == 2 and nonce is ...:
+            note("missing", case["name"])
+        if v == 1 and isinstance(nonce, str):
+            note("at_v1_populated", case["name"])
+        if v == 1 and nonce is None:
+            note("at_v1_null", case["name"])
+        if v == 2 and isinstance(nonce, str):
+            n = model["nonce_length"]
+            if nonce == "":
+                note("empty", case["name"])
+            elif len(nonce) == n - 1:
+                note("short", case["name"])
+            elif len(nonce) == n + 1:
+                note("long", case["name"])
+            elif len(nonce) == n and nonce != nonce.lower() and nonce_grammar(nonce.lower(), model):
+                note("upper", case["name"])
+            elif len(nonce) == n and nonce == nonce.lower() and not nonce_grammar(nonce, model):
+                note("non_hex", case["name"])
+        if v == 2 and type(nonce) is int:
+            note("integer", case["name"])
+        if v == 2 and type(nonce) is bool:
+            note("boolean", case["name"])
+        if v == 2 and set(env) - set(model["closed_v2"]):
+            note("extra_key", case["name"])
+        if case["reason"] == reason_of["version"]:
+            note(f"v={json.dumps(raw_v)}", case["name"])
+        note(f"reason {case['reason']}", case["name"])
+
+    for case in corpus["precedence_cases"]:
+        failed, valid = common(case)
+        if case["signature_valid"] is not valid:
+            raise Failure(f"{case['name']}: signature_valid says {case['signature_valid']}")
+        verdict = judge(failed, model, off)
+        if verdict != case["reason"]:
+            raise Failure(f"{case['name']}: refused for {verdict}, not {case['reason']}")
+        pair = next(((r, s) for r, s in model["precedence"] if r == case["reason"]
+                     and {reason_of[c] for c in failed} == {r, reason_of[s]}), None)
+        if pair is None:
+            raise Failure(f"{case['name']}: breaks {sorted(failed)}, which no precedence bullet names")
+        if position[pair[0]] >= position[reason_of[pair[1]]]:
+            raise Failure(f"{case['name']}: {pair[0]} is not before {reason_of[pair[1]]}")
+        note(f"precedence {pair[0]} {pair[1]}", case["name"])
+        note(f"reason {case['reason']}", case["name"])
+
+    for reason in table:
+        if f"reason {reason}" not in facts:
+            raise Failure(f"coverage: no refusal for {reason}")
+    for reason, second in model["precedence"]:
+        if f"precedence {reason} {second}" not in facts:
+            raise Failure(f"coverage: no precedence case {reason} before {second}")
+    for item in ACCEPTED_ITEMS:
+        if item not in facts:
+            raise Failure(f"coverage: no accepted case for {item}")
+    for group in REFUSAL_BULLETS.values():
+        for item in group:
+            if item not in facts:
+                raise Failure(f"coverage: no refusal for {item}")
+    lo, hi = model["versions"]
+    n = model["nonce_length"]
+    for edge in (f"accepted v={lo}", f"accepted v={hi}", f"v={lo - 1}", f"v={hi + 1}",
+                 f"accepted nonce length {n}", "short", "long"):
+        if edge not in facts:
+            raise Failure(f"coverage: bound edge {edge} has no case")
+    return facts
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> dict:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
+    return check(json.loads(corpus_bytes), model, off)
+
+
+# --- mutations ------------------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts[key]:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = texts[key].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def find(name: str) -> Callable[[dict], dict]:
+        def get(c: dict) -> dict:
+            return next(x for k in ("cases", "reject_cases", "precedence_cases")
+                        for x in c[k] if x["name"] == name)
+        return get
+
+    def drop(name: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            for key in ("cases", "reject_cases", "precedence_cases"):
+                c[key] = [x for x in c[key] if x["name"] != name]
+        return edit
+
+    def flip(name: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = find(name)(c)
+            raw = bytearray(base64.b64decode(case["signature"][8:]))
+            raw[3] ^= 0x10
+            case["signature"] = "ed25519:" + base64.b64encode(bytes(raw)).decode()
+            case["message_hex"] = canonical(
+                {"envelope": case["input"], "signature": case["signature"]}, model).encode().hex()
+        return edit
+
+    def check_off(name: str) -> Callable[[], None]:
+        def go() -> None:
+            run(corpus_bytes, model, frozenset({name}))
+        return go
+
+    def relocate(check: str, beside: str, after: bool) -> Callable[[dict], None]:
+        """Move one check to just after (or before) another in the order."""
+        def edit(m: dict) -> None:
+            entry = next(e for e in m["order"] if e[1] == check)
+            m["order"].remove(entry)
+            at = next(i for i, e in enumerate(m["order"]) if e[1] == beside)
+            m["order"].insert(at + 1 if after else at, entry)
+        return edit
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("accepted signature bit flipped", corpus_mutant(flip("v2_reading_with_nonce"))),
+        ("refusal signature bit flipped", corpus_mutant(flip("reject_v2_nonce_boolean"))),
+        ("nonce edited after signing", corpus_mutant(
+            lambda c: find("v2_reading_with_nonce")(c)["input"].update(liveness_nonce="1" * 32))),
+        ("refusal relabelled", corpus_mutant(
+            lambda c: find("reject_v2_nonce_integer")(c).update(reason="liveness_nonce_missing"))),
+        ("precedence relabelled to the later check", corpus_mutant(
+            lambda c: find("reject_capability_hash_before_nonce")(c).update(
+                reason="invalid_liveness_nonce"))),
+        ("signature_valid misstated", corpus_mutant(
+            lambda c: find("reject_signature_before_nonce")(c).update(signature_valid=True))),
+        ("refusal moved to cases", corpus_mutant(
+            lambda c: c["cases"].append(dict(find("reject_v1_with_nonce")(c), name="moved")))),
+        ("seed swapped", corpus_mutant(lambda c: c.update(test_seed_hex="43" * 32))),
+        ("context names another channel unit", corpus_mutant(
+            lambda c: c["verifier_context"]["accepted_channels"][1].update(unit="ampere"))),
+        ("context posture changed", corpus_mutant(
+            lambda c: c["verifier_context"].update(posture="development"))),
+        ("check_order rewritten", corpus_mutant(lambda c: c["check_order"].reverse())),
+        ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("nonce one character shorter", model_mutant(
+            lambda m: m.update(nonce_length=m["nonce_length"] - 1))),
+        ("nonce one character longer", model_mutant(
+            lambda m: m.update(nonce_length=m["nonce_length"] + 1))),
+        ("nonce alphabet admits uppercase", model_mutant(
+            lambda m: m.update(nonce_alphabet=m["nonce_alphabet"] + "ABCDEF"))),
+        ("nonce alphabet admits g", model_mutant(
+            lambda m: m.update(nonce_alphabet=m["nonce_alphabet"] + "g"))),
+        ("v 3 admitted", model_mutant(lambda m: m.update(versions=(1, 2, 3)))),
+        ("v 0 admitted", model_mutant(lambda m: m.update(versions=(0, 1, 2)))),
+        ("nonce required at v 1", model_mutant(lambda m: m.update(nonce_required_at=1))),
+        ("nonce forbidden at v 2", model_mutant(lambda m: m.update(nonce_forbidden_at=2))),
+        ("quality ceiling lowered", model_mutant(lambda m: m.update(quality=(0.0, 0.99)))),
+        ("canonical zone narrowed", model_mutant(lambda m: m.update(float_hi=100.0))),
+        ("reading fields widened", model_mutant(
+            lambda m: m["reading_fields"].append("unit_scale"))),
+        ("signature length", model_mutant(lambda m: m.update(sig_length=32))),
+        ("precedence bullet retargeted", model_mutant(
+            lambda m: m["precedence"].__setitem__(3, (m["precedence"][3][0], "posture")))),
+        ("text: nonce length", text_mutant(
+            "t2", "Exactly 32 characters, each one of `0`-`9` or `a`-`f`: the `nonce`",
+            "Exactly 33 characters, each one of `0`-`9` or `a`-`f`: the `nonce`")),
+        ("text: versions", text_mutant("t2", "The envelope's version: `1` or `2`.",
+                                       "The envelope's version: `1` or `3`.")),
+        ("text: reason renamed", text_mutant("t2", "| `liveness_nonce_missing` |",
+                                             "| `nonce_missing` |")),
+        ("text: version row dropped", text_mutant(
+            "t2", "| `unsupported_version` | The envelope's `v` is not the integer `1` or `2`. |\n",
+            "")),
+        ("text: checks after the signature moved before it", text_mutant(
+            "t2", "after the signature verifies. They are made first in that",
+            "before the signature verifies. They are made first in that")),
+        ("text: v1 step order changed", text_mutant(
+            "t1", "4. Reject telemetry whose `capability_hash` does not match the accepted\n"
+                  "   manifest hash.\n5. Canonicalize `envelope` and verify `signature` against "
+                  "the anchored public\n   key.",
+            "4. Canonicalize `envelope` and verify `signature` against the anchored public\n   key.\n"
+            "5. Reject telemetry whose `capability_hash` does not match the accepted\n   manifest hash.")),
+        ("text: v1 error renamed", text_mutant(
+            "t1", "| manifest hash mismatch | `capability_hash_mismatch` |",
+            "| manifest hash mismatch | `manifest_mismatch` |")),
+        ("text: canonical zone", text_mutant("t1", "magnitude in `[1e-4, 1e16)`",
+                                             "magnitude in `[1e-4, 1e2)`")),
+        ("text: refusal bullet dropped", text_mutant(
+            "t2", "- the versions `0` and `3`, the string `\"2\"`, and `true`;\n", "")),
+        ("text: precedence bullet reworded", text_mutant(
+            "t2", "- a missing nonce with a channel the context does not accept, refused "
+                  "as\n  `liveness_nonce_missing`;",
+            "- a missing nonce with a wrong posture, refused as\n  `liveness_nonce_missing`;")),
+        ("text: corpus digest", text_mutant(
+            "t2", "`dff9e940de06bdb1dda12ec19c3f66679b39b4a1f4d7565d9a985e9282558d7f`",
+            "`" + "0" * 64 + "`")),
+        ("capability check after the nonce checks", model_mutant(
+            relocate("capability", "nonce_invalid", after=True))),
+        ("signature check after the nonce checks", model_mutant(
+            relocate("signature", "nonce_invalid", after=True))),
+        ("version check after the nonce checks", model_mutant(
+            relocate("version", "nonce_invalid", after=True))),
+        ("channel check before the nonce checks", model_mutant(
+            relocate("channel", "nonce_at_v1", after=False))),
+        ("v 1 nonce check after the channel check", model_mutant(
+            relocate("nonce_at_v1", "channel", after=True))),
+        ("field-set check before the nonce checks", model_mutant(
+            relocate("unexpected", "nonce_at_v1", after=False))),
+        ("field-set check after the channel check", model_mutant(
+            relocate("unexpected", "channel", after=True))),
+        ("closed set loses emitted_at_ms", model_mutant(
+            lambda m: m["closed_v2"].remove("emitted_at_ms"))),
+        ("closed set admits the corpus's extra key", model_mutant(
+            lambda m: m["closed_v2"].append("emitted_at_source"))),
+        ("text: closed set count", text_mutant("t2", "exactly\nthese eleven keys", "exactly\nthese ten keys")),
+        ("text: field-set row dropped", text_mutant(
+            "t2", "| `unexpected_field` | `v` is `2` and the envelope has a key outside the eleven above. |\n",
+            "")),
+    ]
+    def normative_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts[{'telemetry': 't2'}[doc]] = mutated
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def status_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            record = json.loads(STATUS.read_text())
+            edit(record)
+            texts = contract_texts()
+            texts["status"] = json.dumps(record, indent=2)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def reword(old: str, new: str) -> Callable[[dict], None]:
+        def edit(record: dict) -> None:
+            for entry in [record, *record.get("adoption", [])]:
+                if old in entry.get("notes", ""):
+                    entry["notes"] = entry["notes"].replace(old, new, 1)
+                    return
+            raise AssertionError(f"status note phrase missing: {old!r}")
+        return edit
+
+    for label, old, new in (
+        ('status: implementation claimed',
+         'No verifier or producer implements envelope v 2 or the reading-age bound yet.',
+         'The runtime and the edge firmware implement envelope v 2 and the reading-age bound.'),
+        ('status: proof claimed',
+         'That is implementation, not end-to-end or HIL proof.',
+         'That is end-to-end and HIL proof.'),
+        ('status: runtime adoption claimed',
+         'It implements neither the reading envelope at v 2 nor the reading-age bound',
+         'It implements the reading envelope at v 2 and the reading-age bound'),
+        ('status: producer adoption claimed',
+         'It signs every envelope at v 1, holds no liveness nonce, and signs no liveness_nonce.',
+         'It signs every envelope at v 2 with its liveness_nonce.'),
+    ):
+        cases.append((label, status_mutant(reword(old, new))))
+    cases.append(("status: top-level note deleted", status_mutant(lambda r: r.pop("notes"))))
+    for index in range(len(json.loads(STATUS.read_text())["adoption"])):
+        cases.append((f"status: adoption[{index}] note deleted", status_mutant(
+            lambda r, i=index: r["adoption"][i].pop("notes"))))
+    cases.append(("status: a note added", status_mutant(lambda r: r["adoption"].append(
+        dict(r["adoption"][0], notes="The edge firmware implements this version.")))))
+
+    def heading_mutant(doc: str, mutated: str) -> Callable[[], None]:
+        return normative_mutant(doc, mutated)
+
+    docs_now = {"commands": contract_texts().get("c2") or COMMANDS_V2.read_text(),
+                "telemetry": contract_texts().get("t2") or TELEMETRY_V2.read_text()}
+    own_doc = next(doc for doc, table in SECTION_OWNERS.items()
+                   if any(who == OWNER for _, who in table))
+    places = {
+        "owned": next(path for path, who in SECTION_OWNERS[own_doc] if who == OWNER),
+        "unowned": next(path for path, who in SECTION_OWNERS[own_doc] if who is None),
+    }
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        for form_name, form in markdown.HEADING_FORMS:
+            mutated = (docs_now[own_doc][:at] + markdown.form_insertion(form)
+                       + docs_now[own_doc][at:])
+            cases.append((f"heading form in an {where} section: {form_name}",
+                          heading_mutant(own_doc, mutated)))
+
+    current = contract_texts()
+    for label, doc, mutated in normative_text_mutants(
+            {"commands": current.get("c2") or COMMANDS_V2.read_text(),
+              "telemetry": current.get("t2") or TELEMETRY_V2.read_text()}, OWNER, MUTATE_ALWAYS):
+        cases.append((label, normative_mutant(doc, mutated)))
+
+    def guard_mutant(clause: str, flip: tuple[str, str] | None) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            texts["t2"] = guard_text(texts["t2"], clause, flip)
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    for clause, flips in GUARDS:
+        short = clause[:48]
+        cases.append((f"guard deleted: {short}", guard_mutant(clause, None)))
+        for polarity in flips:
+            cases.append((f"guard reversed ({polarity[0]} -> {polarity[1]}): {short}",
+                          guard_mutant(clause, polarity)))
+    for _, check_name in model["order"]:
+        cases.append((f"check off: {check_name}", check_off(check_name)))
+    for key in ("cases", "reject_cases", "precedence_cases"):
+        for case in base[key]:
+            cases.append((f"case {case['name']} dropped", corpus_mutant(drop(case["name"]))))
+    # Checks no case of this corpus can reach: each case is otherwise valid
+    # under v1, and v2.md lists no refusal for these.
+    equivalent_reasons = {
+        "check off: anchor": "every case names the context's device",
+        "check off: alg": "every case carries alg ed25519",
+        "check off: signature_format": "every case's signature field is well formed",
+        "check off: envelope": "every case carries v1's envelope fields with their types",
+        "check off: posture": "every case claims the context's posture",
+        "check off: reading": "every reading is valid under v1",
+        "check off: channel": "v2.md lists no refusal for an unaccepted channel alone; it "
+                              "appears only as the later check of three precedence cases",
+        "version check after the nonce checks":
+            "every nonce check applies only at v 1 or v 2, and the field-set check only at "
+            "v 2, where the version check passes, so the version check never fails beside "
+            "them and their order decides no envelope",
+        "case v2_reading_with_nonce dropped": "v2_two_readings and v2_all_zero_nonce are v 2 "
+                                              "readings carrying a nonce too",
+    }
+    equivalent = [(label, m) for label, m in cases if label in equivalent_reasons]
+    cases = [(label, m) for label, m in cases if label not in equivalent_reasons]
+    survived = 0
+    for label, mutant in cases + equivalent:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError, IndexError) as refused:
+            if label in equivalent_reasons:
+                print(f"REFUSED (listed as equivalent) {label}: {refused}")
+                survived += 1
+            else:
+                print(f"refused  {label}: {refused}")
+        else:
+            if label in equivalent_reasons:
+                print(f"EQUIVALENT {label}: {equivalent_reasons[label]}")
+            else:
+                print(f"SURVIVED {label}")
+                survived += 1
+    # Heading-shaped lines that are not headings must change nothing.
+    for where, path in places.items():
+        at = markdown.section_offsets(docs_now[own_doc], path)[0]
+        before = markdown.sections(docs_now[own_doc])
+        for form_name, inserted in markdown.NOT_HEADINGS:
+            mutated = docs_now[own_doc][:at] + "\n" + inserted + docs_now[own_doc][at:]
+            shifted = [p for p, _, _ in markdown.sections(mutated)]
+            wrong = shifted != [p for p, _, _ in before] or markdown.non_canonical(mutated)
+            if not wrong and "fence" in form_name:
+                try:
+                    normative_mutant(own_doc, mutated)()
+                except Failure as refused:
+                    wrong = str(refused)
+            if wrong:
+                print(f"WRONGLY REFUSED not a heading, in an {where} section: {form_name}: {wrong}")
+                survived += 1
+            else:
+                print(f"accepted not a heading, in an {where} section: {form_name}")
+    print(f"{len(cases)} mutants, {len(equivalent)} known equivalent")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError) as failure:
+        print(f"firmware-telemetry/v2 envelope contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-telemetry/v2 envelope corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(
+        f"firmware-telemetry/v2 envelope corpus: {len(corpus['cases'])} cases accepted, "
+        f"{len(corpus['reject_cases'])} refusals each for exactly its reason, "
+        f"{len(corpus['precedence_cases'])} precedence cases refused for the earlier check"
+    )
+    print(f"{len(STATUS_NOTES)} status notes held, unchanged, in {STATUS.relative_to(ROOT)}")
+    held = [s for doc in HELD_SENTENCES.values() for body in doc.values() for s in body]
+    owned = sum(len(doc) for doc in HELD_SENTENCES.values())
+    print(f"{len(held)} sentences held, unchanged, in the {owned} sections this checker owns")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

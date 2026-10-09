@@ -1,0 +1,267 @@
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Headings and sections of a contract document, for the corpus checkers.
+
+Imported by the firmware-commands/v2 liveness checker and the firmware-telemetry/v2
+envelope, reading-age and controller-profile checkers. No generator imports it, so
+a checker that reads a contract's sections through it still shares no code with
+any generator.
+
+Contract documents use a deliberately restricted heading syntax, total by
+construction rather than a model of CommonMark's paragraphs and containers:
+
+- Outside fenced code (``` or ~~~, 0-3 spaces of indentation, closed by the
+  same character at least as long), every line has any run of container
+  prefixes stripped, repeatedly: up to 3 spaces, `>` with an optional space,
+  and a list marker (`-`, `*`, `+`, `1.` or `1)`) followed by a space or tab.
+  Repetition strips any run of leading spaces, so indented code holding a
+  heading-shaped line is refused too: put it in a fence.
+- A remainder that starts with 1-6 `#` followed by a space, a tab or the end of
+  the line is heading-shaped.
+- A remainder made only of `=` or only of `-`, with optional trailing spaces or
+  tabs, is underline-shaped, unless the line contains `|` (a table row).
+- A remainder that starts with `<` followed by a letter, `/`, `!` or `?` starts
+  an HTML block, which can render as a heading or hide text, and is refused.
+  A `<` later in a line is not at its start and is allowed.
+- The one permitted heading-shaped line is a canonical heading: no prefix,
+  `#` x depth, one space and the title, with no closing `#`s and no trailing
+  space. Every other heading-shaped line, and every underline-shaped line,
+  whatever precedes or follows it, is refused by `non_canonical`.
+
+- A line outside fenced code that contains a tab is refused, whatever else it
+  holds: a tab can stand where a prefix's space would.
+
+So a setext heading, in a container or not, is refused at its underline, a
+thematic break written as `---` is refused with it, and so is raw HTML. Sections come only from
+canonical headings.
+
+Scope: this is a restriction the contract text is held to, not a Markdown
+parser. It refuses the heading, underline, HTML and tab forms above; a
+rendering construct it does not name is outside what it proves, and a contract
+that needs one widens the restriction first.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_PREFIX = re.compile(r"^(?: {1,3}|>[ ]?|(?:[-*+]|\d{1,9}[.)])[ \t]+)")
+_HEADING_SHAPED = re.compile(r"#{1,6}(?:[ \t]|$)")
+_UNDERLINE_SHAPED = re.compile(r"(?:=+|-+)[ \t]*")
+_HTML_BLOCK = re.compile(r"<[A-Za-z/!?]")
+
+
+@dataclass(frozen=True)
+class Heading:
+    first: int   # index of the heading's line
+    last: int    # the same line: only canonical ATX headings make sections
+    depth: int
+    title: str
+    canonical: bool
+
+    @property
+    def path_name(self) -> str:
+        return "#" * self.depth + " " + self.title
+
+
+def fenced_lines(lines: list[str]) -> set[int]:
+    """Indexes of fence lines and of every line inside a fenced block."""
+    inside: set[int] = set()
+    opener: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        match = _FENCE.match(line)
+        if opener is None:
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                opener = (match.group(1)[0], len(match.group(1)))
+                inside.add(index)
+            continue
+        inside.add(index)
+        if match and match.group(1)[0] == opener[0] and len(match.group(1)) >= opener[1] \
+                and not match.group(2).strip():
+            opener = None
+    return inside
+
+
+def strip_prefixes(line: str) -> str:
+    while True:
+        match = _PREFIX.match(line)
+        if match is None or match.end() == 0:
+            return line
+        line = line[match.end():]
+
+
+def _canonical(line: str) -> tuple[int, str] | None:
+    match = re.fullmatch(r"(#{1,6}) (\S(?:.*\S)?)", line)
+    if match is None or re.search(r"(?:^|[ \t])#+$", match.group(2)):
+        return None
+    return len(match.group(1)), match.group(2)
+
+
+def _scan(text: str) -> tuple[list[Heading], list[str]]:
+    lines = text.split("\n")
+    fenced = fenced_lines(lines)
+    found: list[Heading] = []
+    refused: list[str] = []
+    for index, line in enumerate(lines):
+        if index in fenced:
+            continue
+        if "\t" in line:
+            # A tab can stand where a prefix's space would, and makes the forms
+            # below depend on tab stops; contract text outside fences has none.
+            refused.append(f"line {index + 1}: contains a tab {line!r}")
+            continue
+        rest = strip_prefixes(line)
+        if _HEADING_SHAPED.match(rest):
+            canonical = _canonical(line) if rest == line else None
+            if canonical is None:
+                refused.append(f"line {index + 1}: heading-shaped {line!r}")
+            else:
+                found.append(Heading(index, index, canonical[0], canonical[1], True))
+        elif _UNDERLINE_SHAPED.fullmatch(rest) and "|" not in line:
+            refused.append(f"line {index + 1}: underline-shaped {line!r}")
+        elif _HTML_BLOCK.match(rest):
+            refused.append(f"line {index + 1}: starts an HTML block {line!r}")
+    return found, refused
+
+
+def headings(text: str) -> list[Heading]:
+    """The canonical headings, the only lines that make sections."""
+    return _scan(text)[0]
+
+
+def non_canonical(text: str) -> list[str]:
+    """Every heading-shaped line but a canonical heading, and every
+    underline-shaped line, each named by its line number."""
+    return _scan(text)[1]
+
+
+def sections(text: str) -> list[tuple[str, int, int]]:
+    """(heading path, first body line, end line) for every heading, at any depth.
+
+    The path joins every enclosing heading below depth 1 with " > "; a depth-1
+    heading's path is itself. A body ends at the next heading of any depth.
+    """
+    found = headings(text)
+    total = len(text.split("\n"))
+    parents: dict[int, str] = {}
+    out = []
+    for position, heading in enumerate(found):
+        parents = {depth: name for depth, name in parents.items() if depth < heading.depth}
+        parents[heading.depth] = heading.path_name
+        path = " > ".join(parents[d] for d in sorted(parents) if d > 1) or heading.path_name
+        end = found[position + 1].first if position + 1 < len(found) else total
+        out.append((path, heading.last + 1, end))
+    return out
+
+
+def own_body(text: str, heading: str) -> str:
+    """The text under the first heading named `heading` (canonical form), down
+    to the next heading of any depth, fences included."""
+    lines = text.split("\n")
+    found = headings(text)
+    for position, head in enumerate(found):
+        if head.path_name == heading:
+            end = found[position + 1].first if position + 1 < len(found) else len(lines)
+            return "\n".join(lines[head.last + 1:end])
+    raise ValueError(f"no heading {heading!r}")
+
+
+def subtree(text: str, heading: str) -> str:
+    """The text under the first heading named `heading` (canonical form), down
+    to the next heading at its depth or above, subsections and fences included."""
+    lines = text.split("\n")
+    found = headings(text)
+    for position, head in enumerate(found):
+        if head.path_name == heading:
+            end = next((h.first for h in found[position + 1:] if h.depth <= head.depth),
+                       len(lines))
+            return "\n".join(lines[head.last + 1:end])
+    raise ValueError(f"no heading {heading!r}")
+
+
+def section_bodies(text: str) -> list[tuple[str, str]]:
+    """(heading path, own body with fenced code removed) for every heading."""
+    lines = text.split("\n")
+    fenced = fenced_lines(lines)
+    return [(path, "\n".join(lines[i] for i in range(start, end) if i not in fenced))
+            for path, start, end in sections(text)]
+
+
+def section_offsets(text: str, path: str) -> tuple[int, int]:
+    """Character offsets of a section's own body in the text."""
+    starts = [0]
+    for line in text.split("\n"):
+        starts.append(starts[-1] + len(line) + 1)
+    for name, start, end in sections(text):
+        if name == path:
+            return starts[start], min(starts[end], len(text))
+    raise KeyError(path)
+
+
+# Every heading form a contract must not use, as a text to insert after a blank
+# line: each makes or implies a new section carrying a new MUST sentence.
+_RULE = "Every consumer MUST treat the nonce as physical authority."
+HEADING_FORMS: tuple[tuple[str, str], ...] = (
+    ("ATX depth 1", "# Unassigned Authority"),
+    ("ATX depth 2", "## Unassigned Authority"),
+    ("ATX depth 3", "### Unassigned Authority"),
+    ("ATX depth 4", "#### Unassigned Authority"),
+    ("ATX depth 5", "##### Unassigned Authority"),
+    ("ATX depth 6", "###### Unassigned Authority"),
+    ("one space of indentation", " ## Unassigned Authority"),
+    ("two spaces of indentation", "  ### Unassigned Authority"),
+    ("three spaces of indentation", "   #### Unassigned Authority"),
+    ("tab separator", "##\tUnassigned Authority"),
+    ("two-space separator", "##  Unassigned Authority"),
+    ("closing sequence", "## Unassigned Authority ##"),
+    ("unbalanced closing sequence", "### Unassigned Authority #######"),
+    ("closing sequence and trailing space", "#### Unassigned Authority #   "),
+    ("trailing space", "## Unassigned Authority "),
+    ("indented with a tab separator", "  ##\tUnassigned Authority"),
+    ("indented with a closing sequence", " ##### Unassigned Authority ##"),
+    ("empty ATX heading", "##"),
+    ("empty ATX heading with a closing sequence", "### ###"),
+    ("setext depth 1", "Unassigned Authority\n===================="),
+    ("setext depth 2", "Unassigned Authority\n--------------------"),
+    ("setext with a one-character underline", "Unassigned Authority\n-"),
+    ("setext with an indented underline", "Unassigned Authority\n   ==="),
+    ("setext with a trailing space on the underline", "Unassigned Authority\n---   "),
+    ("setext over two lines", "Unassigned\nAuthority\n==="),
+    ("ATX in a block quote", "> ## Unassigned Authority"),
+    ("ATX in a list item", "- ### Unassigned Authority"),
+    ("setext = in a block quote", "> Unassigned Authority\n> ==="),
+    ("setext - in a block quote", "> Unassigned Authority\n> ---"),
+    ("setext = in a nested block quote", "> > Unassigned Authority\n> > ==="),
+    ("setext - in a nested block quote", "> > Unassigned Authority\n> > ---"),
+    ("setext = in an unordered list item", "- Unassigned Authority\n  ==="),
+    ("setext - in an unordered list item", "* Unassigned Authority\n  ---"),
+    ("setext = in an ordered list item", "1. Unassigned Authority\n   ==="),
+    ("setext - in an ordered list item", "1) Unassigned Authority\n   ---"),
+    ("nested quote, list and setext", "> - > Unassigned Authority\n> - > ==="),
+    ("list and ATX", "+ ## Unassigned Authority"),
+    ("indented underline under a quoted line", "> Unassigned Authority\n   ==="),
+    ("HTML heading", "<h2>Unassigned Authority</h2>"),
+    ("HTML heading in a block quote", "> <h2>Unassigned Authority</h2>"),
+    ("HTML details", "<details><summary>x</summary>"),
+    ("HTML comment", "<!-- Unassigned Authority -->"),
+)
+
+
+def form_insertion(form: str) -> str:
+    return "\n" + form + "\n\n" + _RULE + "\n\n"
+
+
+# Lines that look like headings and are not: each must leave the headings unchanged.
+NOT_HEADINGS: tuple[tuple[str, str], ...] = (
+    ("heading inside a ``` fence", "```text\n## Not A Heading\nNot A Heading\n===\n```\n\n"),
+    ("heading inside a ~~~ fence", "~~~\n#### Not A Heading\n---\n~~~\n\n"),
+    ("table separator after a header row", "| a | b |\n| --- | --- |\n| c | d |\n\n"),
+    ("table separator after a paragraph line", "Not a heading\n| --- |\n\n"),
+    ("hash without a separator", "#hashtag is not a heading\n\n"),
+    ("seven hashes", "####### is not a heading\n\n"),
+    ("a bullet with text", "- a bullet - with text\n- another\n\n"),
+    ("a numbered item", "1. a numbered item\n\n"),
+    ("an inline less-than sign", "A sequence number is valid when A < B holds.\n\n"),
+)
