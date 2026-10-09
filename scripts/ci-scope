@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Print which checks a change reaches, read from the hooks' own `files:` scoping.
+
+Every corpus and status checker is a local hook in .pre-commit-config.yaml, and
+its `files:` pattern names the paths it reads. That pattern is the one place a
+check's scope is written; CI gates each explicit step on the answer printed
+here rather than on a copy of it. A check that is not a hook (the agent-skills
+installer proof) is scoped in EXTRA below.
+
+The answer fails open. With no comparable base, an unreachable one, or no
+changed paths, every check is reached; a change to CI's own wiring reaches
+every check too.
+
+    scripts/ci-scope --base <rev> [--head <rev>]   # paths changed between the two
+    scripts/ci-scope --paths <path>...             # paths given directly
+    scripts/ci-scope --all                         # every check
+    scripts/ci-scope --list                        # every check id, reached or not
+
+Reached check ids go to stdout, one per line; the reason goes to stderr. When
+GITHUB_OUTPUT is set, `reach` (space-padded ids, for contains() with spaces
+on both sides of an id) and `skip` (every local hook id, for pre-commit's SKIP:
+CI runs each of them as its own gated step) are appended to it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+import yaml
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONFIG = ROOT / ".pre-commit-config.yaml"
+
+# Paths whose change reaches every check: the scoping itself, the workflow that
+# consumes it, its self-test, and the dependencies every checker imports.
+EVERYTHING = re.compile(
+    r"^(\.pre-commit-config\.yaml|\.github/workflows/validate\.yml|scripts/ci-scope|scripts/test-ci-scope"
+    r"|scripts/vector-check-requirements\.(txt|in))$"
+)
+
+# Checks CI runs that are not pre-commit hooks, with the paths they read.
+EXTRA = {
+    "agent-skills": r"^(agent-skills/|scripts/install-agent-skills|scripts/test-install-agent-skills)",
+}
+
+
+def hook_scopes() -> dict[str, tuple[re.Pattern[str], re.Pattern[str]]]:
+    """{hook id: (files, exclude)} for every local hook that runs at the pre-commit stage."""
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    top_files = config.get("files", "")
+    top_exclude = config.get("exclude", "^$")
+    if top_files or top_exclude != "^$":
+        raise SystemExit("ci-scope: a top-level files/exclude in .pre-commit-config.yaml is not supported")
+    out: dict[str, tuple[re.Pattern[str], re.Pattern[str]]] = {}
+    for repo in config["repos"]:
+        if repo["repo"] != "local":
+            continue
+        for hook in repo["hooks"]:
+            stages = hook.get("stages")
+            if stages and not {"pre-commit", "commit"} & set(stages):
+                continue
+            if hook["id"] in out or hook["id"] in EXTRA:
+                raise SystemExit(f"ci-scope: hook id {hook['id']} is declared twice")
+            # pre-commit matches with re.search; `types` and friends only narrow,
+            # so ignoring them over-reaches and never under-reaches.
+            out[hook["id"]] = (re.compile(hook.get("files", "")), re.compile(hook.get("exclude", "^$")))
+    return out
+
+
+def scopes() -> dict[str, tuple[re.Pattern[str], re.Pattern[str]]]:
+    out = hook_scopes()
+    for name, pattern in EXTRA.items():
+        out[name] = (re.compile(pattern), re.compile("^$"))
+    return out
+
+
+def changed_paths(base: str, head: str) -> list[str] | None:
+    """Paths changed between base and head, both sides of a rename, deletions included; None when unknown."""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--no-renames", "-z", base, head],
+            cwd=ROOT, capture_output=True, check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    return [p for p in result.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
+
+
+def reached(paths: list[str] | None, table: dict[str, tuple[re.Pattern[str], re.Pattern[str]]]) -> tuple[list[str], str]:
+    if paths is None:
+        return sorted(table), "no comparable base: every check runs"
+    if not paths:
+        return sorted(table), "no changed paths reported: every check runs"
+    wiring = [p for p in paths if EVERYTHING.search(p)]
+    if wiring:
+        return sorted(table), f"CI's own wiring changed ({', '.join(wiring)}): every check runs"
+    ids = [
+        name for name, (files, exclude) in table.items()
+        if any(files.search(p) and not exclude.search(p) for p in paths)
+    ]
+    return sorted(ids), f"{len(paths)} changed path(s) reach {len(ids)} of {len(table)} checks"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--base", help="comparison base revision")
+    mode.add_argument("--paths", nargs="*", help="changed paths, given directly")
+    mode.add_argument("--all", action="store_true", help="reach every check")
+    mode.add_argument("--list", action="store_true", help="print every check id")
+    ap.add_argument("--head", default="HEAD", help="head revision (default HEAD)")
+    args = ap.parse_args()
+
+    table = scopes()
+    if args.list:
+        print("\n".join(sorted(table)))
+        return 0
+    if args.all:
+        ids, why = sorted(table), "every check requested"
+    else:
+        paths = changed_paths(args.base, args.head) if args.base is not None else list(args.paths)
+        ids, why = reached(paths, table)
+    print(f"ci-scope: {why}", file=sys.stderr)
+    for name in sorted(table):
+        print(f"  {'run ' if name in ids else 'skip'}  {name}", file=sys.stderr)
+    print("\n".join(ids))
+
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        with open(output, "a", encoding="utf-8") as fh:
+            fh.write(f"reach= {' '.join(ids)} \n")
+            fh.write(f"skip={','.join(sorted(hook_scopes()))}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Which checks a change reaches, held as a test rather than a belief.
+
+Every check in validate.yml is gated on scripts/ci-scope, which reads each
+hook's `files:` pattern. A wrong pattern costs a check that silently skips the
+change it should have refused, so this pins the paths that must reach each
+check, that a change outside every check reaches none of the corpus checkers,
+that CI's own wiring and an unknown base reach everything, and that every
+check step in the workflow is gated on the hook it runs and on nothing else.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import yaml
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCOPE = ROOT / "scripts" / "ci-scope"
+WORKFLOW = ROOT / ".github" / "workflows" / "validate.yml"
+CONFIG = ROOT / ".pre-commit-config.yaml"
+GATE = re.compile(r"^contains\(steps\.scope\.outputs\.reach, ' ([a-z0-9-]+) '\)$")
+
+#: Checks that read the status model and the Markdown as a whole rather than one
+#: corpus; every other check is a corpus checker.
+WHOLE_TREE = {"contract-status", "contract-status-mutations", "contract-yaml-blocks"}
+
+#: Steps that run on every change: what the gated steps need, and checks cheap
+#: enough, or about the whole tree, to run regardless.
+ALWAYS = {
+    "Ensure workflow actions are pinned",
+    "Install the vector checkers' verifier, hash-locked",
+    "Decide which checks this change reaches",
+    "Prove the scope decision reaches what it must",
+    "Hygiene (pre-commit)",
+    "Check contract status records",
+    "Check required files exist",
+    "Ensure repo remains docs-only",
+    "Validate markdown links",
+}
+
+#: One changed path, and checks it must reach. Each line is a file the check
+#: reads; the ones outside the check's own directory are the easy ones to miss.
+MUST_REACH: list[tuple[str, set[str]]] = [
+    ("skills-package/vectors/tier-b.json", {"skills-package-vectors"}),
+    ("schema-descriptor/v1.md", {"skills-package-vectors"}),
+    ("evidence/vectors/chain-row-v3.json", {"evidence-vectors", "evidence-vectors-mutations",
+                                            "tier-c-approval-vectors"}),
+    ("safety-profile/vectors/legacy-actions.json", {"safety-profile-vectors", "tier-c-approval-vectors"}),
+    ("runtime-config/vectors/schema.json", {"runtime-config-vectors", "tier-c-approval-vectors"}),
+    ("runtime-config/v2.md", {"runtime-config-vectors", "tier-c-approval-vectors", "evidence-patf-clauses"}),
+    ("runtime-config-orchestration/v1.md", {"runtime-config-orchestration-vectors", "evidence-patf-clauses"}),
+    ("skills-package/v3.md", {"skills-package-vectors", "tier-c-approval-vectors", "evidence-patf-clauses"}),
+    ("ed25519-key-admission/vectors-v1.json", {"ed25519-key-admission-vectors",
+                                               "ed25519-key-admission-vectors-reproduce"}),
+    ("evidence-exchange/vectors/authority-key-registry-v2.json", {
+        "ed25519-key-admission-vectors", "ed25519-key-admission-vectors-reproduce",
+        "evidence-authority-key-registry-vectors", "evidence-authority-artifact-vectors"}),
+    ("ed25519-verification/vectors-v1.json", {"ed25519-verification-vectors",
+                                              "ed25519-verification-vectors-reproduce"}),
+    ("firmware-telemetry/fault-vectors-v2.json", {"firmware-fault-vectors-v2",
+                                                  "firmware-fault-vectors-v2-reproduce"}),
+    ("firmware-commands/v2.md", {"firmware-fault-vectors-v2"}),
+    ("evidence-exchange/vectors/commissioning-authorization.json", {"evidence-commissioning-vectors",
+                                                                   "evidence-commissioning-ingest-vectors"}),
+    ("evidence-commissioning-ingest/v1.md", {"evidence-commissioning-vectors",
+                                             "evidence-commissioning-ingest-vectors", "evidence-patf-clauses"}),
+    ("evidence-transport/vectors/retention-v2.json", {"evidence-transport-retention-vectors"}),
+    ("evidence-transport/vectors/handoff-order-v2.json", {"evidence-handoff-vectors"}),
+    ("evidence-transport/vectors/refusal-policy-v2.json", {"evidence-transport-refusal-policy-vectors"}),
+    ("evidence-transport/vectors/carriage-capability-v2.json", {"evidence-transport-capability-vectors"}),
+    ("evidence-transport/v2.md", {"gateway-site-health-evidence-vectors", "evidence-patf-clauses",
+                                  "evidence-commissioning-vectors"}),
+    ("evidence-exchange/v2.md", {"evidence-transport-retention-vectors", "evidence-handoff-vectors",
+                                 "runtime-evidence-anchor-vectors", "evidence-disposition-vectors",
+                                 "evidence-routing-projection-vectors", "evidence-patf-clauses"}),
+    ("runtime-evidence-anchor/vectors/runtime-anchor-v2.json", {"runtime-evidence-anchor-vectors"}),
+    ("runtime-health/v3.md", {"evidence-disposition-vectors", "tier-c-approval-vectors",
+                              "evidence-patf-clauses"}),
+    ("tier-c-approval/vectors/admission.json", {"tier-c-approval-vectors"}),
+    ("offline-tokens/vectors/tier-c-binding-v2.json", {"tier-c-approval-vectors"}),
+    ("operator-socket/vectors/tier-c-reconcile-v2.json", {"tier-c-approval-vectors"}),
+    ("signing/v2.md", {"tier-c-approval-vectors"}),
+    ("events/v2.md", {"tier-c-approval-vectors", "evidence-patf-clauses"}),
+    ("gateway-api/v1.md", {"tier-c-approval-vectors", "evidence-patf-clauses", "gateway-return-path-vectors",
+                           "gateway-site-health-evidence-vectors"}),
+    ("gateway-evidence-carriage/vectors/return-path.json", {"gateway-return-path-vectors"}),
+    ("gateway-evidence-carriage/vectors/site-health-evidence-delivery.json", {
+        "gateway-site-health-evidence-vectors"}),
+    ("gateway-config/v2.md", {"gateway-return-path-vectors", "gateway-config-evidence-vectors"}),
+    ("evidence-exchange/vectors/routing-projection-v2.json", {"evidence-routing-projection-vectors"}),
+    ("evidence-exchange/vectors/evidence-disposition-v2.json", {"evidence-disposition-vectors",
+                                                               "evidence-authority-artifact-vectors"}),
+    ("scripts/check-evidence-transport-refusal-policy-vectors", {
+        "evidence-transport-refusal-policy-vectors", "evidence-commissioning-vectors",
+        "gateway-site-health-evidence-vectors"}),
+    ("scripts/check-evidence-authority-key-registry-vectors", {"evidence-authority-key-registry-vectors",
+                                                               "evidence-authority-artifact-vectors"}),
+    ("commissioned-safety-binding/binding-vectors-v2.json", {"commissioned-binding-vectors",
+                                                             "commissioned-binding-vectors-mutations"}),
+    ("safety-qualification-fixture/vectors/fixture-vectors-v1.json", {"safety-qualification-fixture-vectors"}),
+    ("capability-grant/grant-vectors-v1.json", {"capability-grant-vectors", "capability-grant-issuance-vectors"}),
+    ("capability-grant-issuance/denial-vectors-v1.json", {"capability-grant-issuance-vectors"}),
+    ("runtime-mobile/payload-vectors-v2.json", {"runtime-mobile-payload-vectors",
+                                                "runtime-mobile-payload-vectors-mutations"}),
+    ("agent-skills/ori-rigorous-review/SKILL.md", {"agent-skills"}),
+    ("scripts/install-agent-skills", {"agent-skills"}),
+    # The status checker reads every file in a contract directory, the root
+    # summaries and CONTRIBUTING.md, and its mutations edit them.
+    ("status/events/v1.json", {"contract-status", "contract-status-mutations"}),
+    ("README.md", {"contract-status", "contract-status-mutations"}),
+    ("VERSIONING.md", {"contract-status", "contract-status-mutations"}),
+    ("CONTRIBUTING.md", {"contract-status", "contract-status-mutations"}),
+    ("safety-profile/ratification.md", {"contract-status", "contract-status-mutations"}),
+    ("decisions/evidence-transport-v1-freeze-event.md", {"contract-status", "contract-status-mutations"}),
+]
+
+#: Paths that reach no corpus checker.
+NO_CORPUS_CHECKER = [
+    "AGENTS.md", "SECURITY.md", "LICENSE", "README.md", "CONTRIBUTING.md", "VERSIONING.md",
+    "gaps/open.md", "gaps/resolved.md", ".github/CODEOWNERS", ".github/workflows/pr-title.yml",
+    "scripts/check-signed-commits", "scripts/run-corpus-checks",
+]
+
+#: Paths that reach every check.
+EVERYTHING = [
+    ".pre-commit-config.yaml", ".github/workflows/validate.yml", "scripts/ci-scope", "scripts/test-ci-scope",
+    "scripts/vector-check-requirements.txt", "scripts/vector-check-requirements.in",
+]
+
+
+def scope(*args: str, env: dict[str, str] | None = None) -> set[str]:
+    result = subprocess.run([sys.executable, str(SCOPE), *args], cwd=ROOT, capture_output=True, text=True,
+                            env=env if env is not None else {k: v for k, v in os.environ.items()
+                                                             if k != "GITHUB_OUTPUT"}, check=False)
+    if result.returncode != 0:
+        raise AssertionError(f"ci-scope {' '.join(args)} exited {result.returncode}: {result.stderr}")
+    return set(result.stdout.split())
+
+
+def local_hooks() -> list[dict]:
+    config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
+    return [h for r in config["repos"] if r["repo"] == "local" for h in r["hooks"]
+            if not h.get("stages") or "pre-commit" in h["stages"]]
+
+
+def steps() -> list[dict]:
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["validate"]["steps"]
+
+
+def script_of(command: str) -> str:
+    """The scripts/ path a command runs, dropping a leading interpreter."""
+    words = command.split()
+    if words and words[0].startswith("python"):
+        words = words[1:]
+    return words[0] if words else ""
+
+
+def arguments_of(command: str) -> list[str]:
+    """The arguments a command passes its script."""
+    words = command.split()
+    if words and words[0].startswith("python"):
+        words = words[1:]
+    return words[1:]
+
+
+class Reach(unittest.TestCase):
+    def setUp(self) -> None:
+        self.all = scope("--list")
+
+    def test_every_check_is_listed(self) -> None:
+        self.assertEqual(self.all, {h["id"] for h in local_hooks()} | {"agent-skills"})
+
+    def test_paths_reach_the_checks_that_read_them(self) -> None:
+        for path, ids in MUST_REACH:
+            with self.subTest(path=path):
+                missing = ids - scope("--paths", path)
+                self.assertFalse(missing, f"{path} does not reach {sorted(missing)}")
+
+    def test_every_hook_is_reached_by_its_own_script(self) -> None:
+        for hook in local_hooks():
+            with self.subTest(hook=hook["id"]):
+                self.assertIn(hook["id"], scope("--paths", script_of(hook["entry"])))
+
+    def test_a_change_outside_every_corpus_reaches_no_corpus_checker(self) -> None:
+        for path in NO_CORPUS_CHECKER:
+            with self.subTest(path=path):
+                self.assertFalse(scope("--paths", path) - WHOLE_TREE, path)
+        self.assertEqual(scope("--paths", "AGENTS.md"), {"contract-yaml-blocks"})
+        self.assertEqual(scope("--paths", "LICENSE"), set())
+        self.assertEqual(scope("--paths", "AGENTS.md", "gaps/open.md", "SECURITY.md"), {"contract-yaml-blocks"})
+
+    def test_a_contract_change_reaches_only_its_own_corpus_checkers(self) -> None:
+        self.assertEqual(scope("--paths", "capability-grant-issuance/denial-vectors-v1.json"),
+                         {"capability-grant-issuance-vectors", "contract-status", "contract-status-mutations"})
+
+    def test_every_contract_directory_reaches_the_status_checks(self) -> None:
+        source = (ROOT / "scripts" / "check-contract-status").read_text(encoding="utf-8")
+        excluded = set(re.findall(r'"([^"]+)"', re.search(r"^NOT_CONTRACT_DIRS = \{(.*)\}$", source, re.M)[1]))
+        dirs = [p.name for p in ROOT.iterdir() if p.is_dir() and p.name not in excluded and not p.name.startswith(".")]
+        self.assertGreater(len(dirs), 20)
+        for name in dirs:
+            with self.subTest(dir=name):
+                self.assertTrue({"contract-status", "contract-status-mutations"} <= scope("--paths", f"{name}/x.txt"))
+        for name in excluded - {".git", ".github", "status"}:
+            with self.subTest(dir=name):
+                self.assertNotIn("contract-status-mutations", scope("--paths", f"{name}/x.txt"))
+
+    def test_ci_wiring_reaches_everything(self) -> None:
+        for path in EVERYTHING:
+            with self.subTest(path=path):
+                self.assertEqual(scope("--paths", "AGENTS.md", path), self.all)
+
+    def test_no_base_reaches_everything(self) -> None:
+        self.assertEqual(scope("--all"), self.all)
+        self.assertEqual(scope("--paths"), self.all)
+        self.assertEqual(scope("--base", "0" * 40), self.all)
+        self.assertEqual(scope("--base", ""), self.all)
+        self.assertEqual(scope("--base", "HEAD", "--head", "HEAD"), self.all)
+
+    def test_github_output_carries_padded_reach_and_the_skip_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "out"
+            scope("--paths", "capability-grant/grant-vectors-v1.json", env={**os.environ, "GITHUB_OUTPUT": str(out)})
+            fields = dict(line.split("=", 1) for line in out.read_text().splitlines())
+        self.assertEqual(fields["reach"], " capability-grant-issuance-vectors capability-grant-vectors "
+                                          "contract-status contract-status-mutations ")
+        self.assertEqual(set(fields["skip"].split(",")), {h["id"] for h in local_hooks()})
+
+
+class Wiring(unittest.TestCase):
+    def test_concurrency_cancels_pull_requests_only(self) -> None:
+        group = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["concurrency"]
+        self.assertTrue(group["cancel-in-progress"])
+        self.assertIn("github.event_name == 'pull_request' && github.ref || github.run_id", group["group"])
+
+    def test_the_decision_runs_everything_unless_a_pull_request_names_its_base(self) -> None:
+        step = next(s for s in steps() if s.get("id") == "scope")
+        self.assertIn('if [ "$EVENT_NAME" = pull_request ] && [ -n "$PR_BASE_SHA" ]', step["run"])
+        self.assertIn("ci-scope --all", step["run"].split("else", 1)[1])
+        self.assertNotIn("if", step)
+
+    def test_hygiene_skips_exactly_the_hooks_run_as_steps(self) -> None:
+        step = next(s for s in steps() if s.get("name") == "Hygiene (pre-commit)")
+        self.assertEqual(step["env"]["SKIP"], "no-commit-to-branch,${{ steps.scope.outputs.skip }}")
+        self.assertIn("--all-files", step["run"])
+
+    def test_every_step_is_gated_on_the_hook_it_runs_or_declared_always_on(self) -> None:
+        hooks = {h["id"]: h for h in local_hooks()}
+        all_steps = steps()
+        decision = next(i for i, s in enumerate(all_steps) if s.get("id") == "scope")
+        gated: set[str] = set()
+        for index, step in enumerate(all_steps):
+            name = step.get("name", step.get("uses", ""))
+            with self.subTest(step=name):
+                if "if" not in step:
+                    self.assertTrue(name in ALWAYS or "uses" in step and "name" not in step,
+                                    f"{name} is neither gated nor declared always-on")
+                    continue
+                self.assertNotIn(name, ALWAYS)
+                self.assertGreater(index, decision, f"{name} is gated before the decision")
+                match = GATE.match(step["if"])
+                self.assertIsNotNone(match, f"{name} has a gate other than the scope decision: {step['if']}")
+                assert match
+                gate = match[1]
+                gated.add(gate)
+                if gate == "agent-skills":
+                    self.assertIn("install-agent-skills", step["run"])
+                    continue
+                self.assertIn(gate, hooks, f"{name} is gated on {gate}, which is no hook")
+                commands = [line.strip() for line in step["run"].splitlines() if line.strip()]
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(script_of(commands[0]), script_of(hooks[gate]["entry"]),
+                                 f"{name} runs a different script from hook {gate}")
+                # A step may run a stronger command than its hook, never a weaker one.
+                missing = set(arguments_of(hooks[gate]["entry"])) - set(arguments_of(commands[0]))
+                self.assertFalse(missing, f"{name} drops {sorted(missing)} that hook {gate} runs with")
+        self.assertEqual(set(hooks) - gated - {"contract-status"}, set(),
+                         "a local hook is skipped in the hygiene step and run by no gated step")
+        self.assertIn("python3 scripts/check-contract-status",
+                      [s.get("run") for s in all_steps if s.get("name") == "Check contract status records"])
+
+    def test_every_action_is_pinned(self) -> None:
+        for step in steps():
+            if "uses" in step:
+                self.assertRegex(step["uses"], r"@[0-9a-f]{40}$")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
