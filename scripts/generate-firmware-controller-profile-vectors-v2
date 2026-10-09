@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 controller profile corpus.
+
+Nothing here is shared with scripts/check-firmware-controller-profile-vectors-v2,
+which reads the grammar from the contract, canonicalises with its own
+serializer and recomputes every interpretation.
+
+    python3 scripts/generate-firmware-controller-profile-vectors-v2          # write
+    python3 scripts/generate-firmware-controller-profile-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import sys
+from collections.abc import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
+
+
+def measurement(name: str, **over: object) -> dict:
+    channel = {
+        "name": name,
+        "kind": "measurement",
+        "function": "read_input_registers",
+        "start_register": 40,
+        "register_count": 1,
+        "word_order": None,
+        "raw_signed": False,
+        "raw_min": 0,
+        "raw_max": 2000,
+        "scale": {"mantissa": 1, "exponent": -1},
+        "offset": {"mantissa": 0, "exponent": 0},
+        "sensor_type": "current",
+        "unit": "ampere",
+    }
+    channel.update(over)
+    return channel
+
+
+def alarm_word(name: str, alarms: list, **over: object) -> dict:
+    channel = {
+        "name": name,
+        "kind": "alarm_word",
+        "function": "read_holding_registers",
+        "start_register": 100,
+        "register_count": 1,
+        "word_order": None,
+        "alarms": alarms,
+    }
+    channel.update(over)
+    return channel
+
+
+def alarm(bit: int, active: str, ident: str, meaning: str) -> dict:
+    return {"bit": bit, "active": active, "id": ident, "meaning": meaning}
+
+
+def profile(ident: str, channels: list, **over: object) -> dict:
+    document = {
+        "v": 1,
+        "id": ident,
+        "source": "Synthetic register map for the ori-specs corpus; describes no product",
+        "baud_rate": 9600,
+        "poll_interval_ms": 5000,
+        "channels": channels,
+    }
+    document.update(over)
+    return document
+
+
+RECTIFIER = profile(
+    "example-rectifier",
+    [
+        measurement("output_current"),
+        measurement(
+            "output_voltage",
+            start_register=41,
+            raw_max=6000,
+            scale={"mantissa": 1, "exponent": -2},
+            sensor_type="voltage",
+            unit="volt",
+        ),
+        alarm_word(
+            "alarm_word_1",
+            [
+                alarm(0, "set", "ac_input_fail", "AC input failure"),
+                alarm(3, "set", "over_temperature", "Rectifier over temperature"),
+                alarm(4, "set", "long_meaning", "M" * 256),
+                alarm(17, "clear", "fan_stopped", "Fan stopped"),
+                alarm(31, "set", "module_fault", "Rectifier module fault"),
+            ],
+            register_count=2,
+            word_order="high_first",
+        ),
+    ],
+)
+
+RECTIFIER_REVISED = profile(
+    "example-rectifier",
+    [
+        dict(RECTIFIER["channels"][0], raw_max=1000),
+        RECTIFIER["channels"][1],
+        dict(RECTIFIER["channels"][2], alarms=[
+            dict(a, bit=5) if a["id"] == "over_temperature" else a
+            for a in RECTIFIER["channels"][2]["alarms"]
+        ]),
+    ],
+)
+
+GENERATOR = profile(
+    "example.genset_ctl-2",
+    [
+        measurement(
+            "coolant_temperature",
+            function="read_holding_registers",
+            start_register=65534,
+            register_count=2,
+            word_order="low_first",
+            raw_signed=True,
+            raw_min=-2147483648,
+            raw_max=2147483647,
+            scale={"mantissa": 1, "exponent": -4},
+            offset={"mantissa": -27315, "exponent": -2},
+            sensor_type="temperature",
+            unit="celsius",
+        ),
+        alarm_word(
+            "shutdown_alarms",
+            [
+                alarm(0, "set", "low_oil_pressure", 'Low oil pressure "LOP" shutdown, path A\\B'),
+                alarm(1, "set", "high_coolant_temp", "High coolant temperature shutdown"),
+                alarm(15, "clear", "estop_circuit_open", "Emergency stop circuit open"),
+            ],
+            start_register=0,
+        ),
+        alarm_word(
+            "warning_alarms",
+            [alarm(2, "set", "battery_low", "Battery voltage low (~11.5 V)")],
+            start_register=1,
+            register_count=2,
+            word_order="low_first",
+            function="read_input_registers",
+        ),
+    ],
+    baud_rate=115200,
+    poll_interval_ms=100,
+    source='Synthetic "G-2" map, section A\\B',
+)
+
+METER = profile(
+    "M",
+    [
+        measurement(
+            "frequency",
+            raw_signed=True,
+            raw_min=-32768,
+            raw_max=32767,
+            scale={"mantissa": -2147483647, "exponent": -4},
+            offset={"mantissa": 2147483647, "exponent": -4},
+            sensor_type="frequency",
+            unit="hertz",
+        ),
+        measurement(
+            "energy",
+            start_register=41,
+            raw_max=999,
+            scale={"mantissa": 1, "exponent": 6},
+            offset={"mantissa": 1, "exponent": 6},
+            sensor_type="energy",
+            unit="watt_hour",
+        ),
+    ],
+    baud_rate=1200,
+    poll_interval_ms=3600000,
+    source=" " + "x" * 254 + "~",
+)
+
+SIXTEEN = profile(
+    "sixteen-channels",
+    [measurement(f"c{i:02d}", start_register=i) for i in range(15)]
+    + [alarm_word("alarms", [alarm(b, "set", f"a{b:02d}", f"Alarm {b}") for b in range(16)])],
+)
+
+DECODE_BOUNDS = profile(
+    "decode-bounds",
+    [
+        measurement("last_register", start_register=65535, raw_max=65535,
+                    scale={"mantissa": 1, "exponent": 0}),
+        measurement("full_unsigned_32", start_register=0, register_count=2,
+                    word_order="low_first", raw_min=0, raw_max=4294967295,
+                    scale={"mantissa": 1, "exponent": 0}),
+        measurement("fifteen_nines", start_register=2, register_count=2,
+                    word_order="high_first", raw_min=0, raw_max=999999999,
+                    scale={"mantissa": 1, "exponent": 6},
+                    offset={"mantissa": 999999, "exponent": 0},
+                    sensor_type="energy", unit="watt_hour"),
+        measurement("value_at_limit", start_register=4, register_count=2,
+                    word_order="high_first", raw_min=0, raw_max=100000,
+                    scale={"mantissa": 1000000000, "exponent": 1},
+                    offset={"mantissa": 0, "exponent": 1},
+                    sensor_type="energy", unit="watt_hour"),
+    ],
+    source="S",
+)
+
+THIRTY_TWO = profile(
+    "thirty-two-alarms",
+    [
+        alarm_word(
+            "alarms",
+            [alarm(b, "clear" if b % 2 else "set", f"bit{b}", "A" if b == 0 else f"Alarm bit {b}")
+             for b in range(32)],
+            register_count=2,
+            word_order="low_first",
+            start_register=65534,
+        )
+    ],
+    id="a" * 48,
+    poll_interval_ms=1190000,
+)
+
+ACCEPT = (
+    ("rectifier", RECTIFIER,
+     "measurements and a 32-bit high_first alarm word with both polarities; the "
+     "manifest corpus names this document"),
+    ("rectifier_revised", RECTIFIER_REVISED,
+     "the rectifier's id under another digest: output_current's range halved and "
+     "over_temperature moved from bit 3 to bit 5, so a reading read through the "
+     "wrong one is misread"),
+    ("generator", GENERATOR,
+     "a signed 32-bit low_first measurement at the full signed range with a "
+     "negative offset, the last register pair of the space, and alarm words of "
+     "both widths"),
+    ("meter_bounds", METER,
+     "the one-character id, the longest source with both ends of the printable "
+     "range, the slowest rate and interval, "
+     "mantissas at both bounds and exponents at both bounds, every decode within "
+     "fifteen digits"),
+    ("sixteen_channels", SIXTEEN, "the most channels a profile may carry"),
+    ("decode_bounds", DECODE_BOUNDS,
+     "the one-character source, the last register, the full unsigned 32-bit "
+     "range, a decode of exactly fifteen nines and a value of exactly 10^15"),
+    ("thirty_two_alarms", THIRTY_TWO,
+     "the longest id, a one-character meaning, the slowest poll a profile with an "
+     "alarm word may declare, and the most alarms a channel may carry, one on "
+     "every bit of a two-register word"),
+)
+
+
+def at(path: tuple) -> Callable[[dict], tuple[dict | list, object]]:
+    def locate(document: dict) -> tuple[dict | list, object]:
+        node: object = document
+        for key in path[:-1]:
+            node = node[key]  # type: ignore[index]
+        return node, path[-1]  # type: ignore[return-value]
+    return locate
+
+
+def set_(path: tuple, value: object) -> Callable[[dict], None]:
+    def edit(document: dict) -> None:
+        node, key = at(path)(document)
+        node[key] = value  # type: ignore[index]
+    return edit
+
+
+def drop(path: tuple) -> Callable[[dict], None]:
+    def edit(document: dict) -> None:
+        node, key = at(path)(document)
+        del node[key]  # type: ignore[arg-type]
+    return edit
+
+
+def add(path: tuple, value: object) -> Callable[[dict], None]:
+    return set_(path, value)
+
+
+def edits(*steps: Callable[[dict], None]) -> Callable[[dict], None]:
+    def edit(document: dict) -> None:
+        for step in steps:
+            step(document)
+    return edit
+
+
+CH0 = ("channels", 0)
+WORD = ("channels", 2)  # RECTIFIER's alarm word
+ALARM0 = WORD + ("alarms", 0)
+
+# (name, rule, edit, note). Each edit to RECTIFIER breaks exactly one rule.
+REJECT = (
+    ("reject_extra_top_field", "top_fields", add(("vendor",), "x"),
+     "the top-level keys are exactly six"),
+    ("reject_missing_top_field", "top_fields", drop(("poll_interval_ms",)),
+     "every top-level key is required"),
+    ("reject_version_2", "version", set_(("v",), 2), "v is 1"),
+    ("reject_version_boolean", "version", set_(("v",), True),
+     "true is not the integer 1"),
+    ("reject_id_bad_character", "id", set_(("id",), "example rectifier"),
+     "a space is outside the fleet alphabet"),
+    ("reject_id_too_long", "id", set_(("id",), "a" * 49), "an id is at most 48 characters"),
+    ("reject_id_empty", "id", set_(("id",), ""), "an id is at least one character"),
+    ("reject_source_empty", "source", set_(("source",), ""), "source is at least one byte"),
+    ("reject_source_nul", "source", set_(("source",), "register map\u0000v2"),
+     "U+0000 is valid JSON and no C string can hold it"),
+    ("reject_source_control", "source", set_(("source",), "register map\u0007v2"),
+     "a C0 control in a string an operator reads"),
+    ("reject_source_c1_control", "source", set_(("source",), "register map\u0085v2"),
+     "a C1 control in a string an operator reads"),
+    ("reject_source_too_long", "source", set_(("source",), "x" * 257),
+     "257 characters exceed 256"),
+    ("reject_source_unit_separator", "source", set_(("source",), "register\u001fmap"),
+     "U+001F is just below the printable range"),
+    ("reject_alarm_meaning_delete", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input failure\u007f"),
+     "U+007F is just above the printable range"),
+    ("reject_source_delete", "source", set_(("source",), "register map\u007f"),
+     "U+007F is just above the printable range"),
+    ("reject_alarm_meaning_unit_separator", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u001ffailure"),
+     "U+001F is just below the printable range"),
+    ("reject_source_non_ascii", "source", set_(("source",), "R\u00e9gulateur map"),
+     "a letter outside printable ASCII"),
+    ("reject_alarm_meaning_tag_character", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input failure\U000e0041"),
+     "an invisible tag character a model would read and an operator would not see"),
+    ("reject_alarm_meaning_non_ascii", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "D\u00e9faut secteur"), "a letter outside printable ASCII"),
+    ("reject_baud_unlisted", "baud_rate", set_(("baud_rate",), 14400),
+     "14400 is not one of the eight rates"),
+    ("reject_baud_float", "baud_rate", set_(("baud_rate",), 9600.0),
+     "every number in a document is an integer"),
+    ("reject_poll_too_fast", "poll_interval_ms", set_(("poll_interval_ms",), 99),
+     "below the 100 ms floor"),
+    ("reject_poll_too_slow_for_alarm_word", "poll_interval_ms",
+     set_(("poll_interval_ms",), 1190001),
+     "a profile with an alarm word polls at most every 1190000 ms"),
+    ("reject_poll_too_slow", "poll_interval_ms", set_(("poll_interval_ms",), 3600001),
+     "above the one-hour ceiling"),
+    ("reject_no_channels", "channels", set_(("channels",), []), "at least one channel"),
+    ("reject_seventeen_channels", "channels",
+     lambda d: d["channels"].extend(
+         measurement(f"extra{i}", start_register=200 + i) for i in range(14)),
+     "seventeen channels exceed sixteen"),
+    ("reject_duplicate_channel_name", "channel_name",
+     set_(("channels", 1, "name"), "output_current"), "channel names are unique"),
+    ("reject_channel_name_too_long", "channel_name",
+     set_(CH0 + ("name",), "c" * 49), "a channel name is a fleet identifier, at most 48"),
+    ("reject_channel_name_bad_character", "channel_name",
+     set_(CH0 + ("name",), "output/current"), "a slash is outside the fleet alphabet"),
+    ("reject_unknown_kind", "kind", set_(CH0 + ("kind",), "status_word"),
+     "kind is measurement or alarm_word"),
+    ("reject_unknown_function", "function",
+     set_(CH0 + ("function",), "read_coils"), "only the two register reads"),
+    ("reject_start_register_past_space", "start_register",
+     set_(CH0 + ("start_register",), 65536), "a register address is 0 to 65535"),
+    ("reject_start_register_boolean", "start_register",
+     set_(CH0 + ("start_register",), False), "false is not the integer 0"),
+    ("reject_start_register_negative", "start_register",
+     set_(CH0 + ("start_register",), -1), "a register address is at least 0"),
+    ("reject_register_count_zero", "register_count",
+     set_(CH0 + ("register_count",), 0), "at least one register"),
+    ("reject_register_count_three", "register_count",
+     set_(CH0 + ("register_count",), 3), "one or two registers"),
+    ("reject_register_pair_past_space", "register_span",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("start_register",), 65535)),
+     "a pair starting at 65535 runs past the register space"),
+    ("reject_word_order_on_one_register", "word_order",
+     set_(CH0 + ("word_order",), "high_first"), "one register has no word order"),
+    ("reject_word_order_missing_on_pair", "word_order",
+     set_(WORD + ("word_order",), None), "a pair declares its word order"),
+    ("reject_word_order_unknown", "word_order",
+     set_(WORD + ("word_order",), "little_endian"), "high_first or low_first"),
+    ("reject_measurement_missing_field", "channel_fields", drop(CH0 + ("raw_signed",)),
+     "a measurement carries every one of its fields"),
+    ("reject_measurement_with_alarms", "channel_fields",
+     add(CH0 + ("alarms",), [alarm(0, "set", "x", "x")]),
+     "a measurement carries no alarms"),
+    ("reject_alarm_word_with_scale", "channel_fields",
+     add(WORD + ("scale",), {"mantissa": 1, "exponent": 0}),
+     "an alarm word carries nothing but alarms beyond the common fields"),
+    ("reject_raw_signed_not_boolean", "raw_signed", set_(CH0 + ("raw_signed",), 0),
+     "raw_signed is a boolean"),
+    ("reject_range_inverted", "raw_range",
+     edits(set_(CH0 + ("raw_min",), 10), set_(CH0 + ("raw_max",), 9)),
+     "raw_min is at most raw_max"),
+    ("reject_unsigned_min_negative", "raw_range", set_(CH0 + ("raw_min",), -1),
+     "an unsigned register holds no negative count"),
+    ("reject_unsigned_16_max_past_width", "raw_range", set_(CH0 + ("raw_max",), 65536),
+     "65536 does not fit sixteen bits"),
+    ("reject_signed_16_min_past_width", "raw_range",
+     edits(set_(CH0 + ("raw_signed",), True), set_(CH0 + ("raw_min",), -32769)),
+     "-32769 does not fit a signed sixteen-bit register"),
+    ("reject_signed_16_max_past_width", "raw_range",
+     edits(set_(CH0 + ("raw_signed",), True), set_(CH0 + ("raw_max",), 32768)),
+     "32768 does not fit a signed sixteen-bit register"),
+    ("reject_scale_mantissa_past_bound", "scale",
+     set_(CH0 + ("scale",), {"mantissa": 2147483648, "exponent": -4}),
+     "a mantissa is within plus or minus 2147483647"),
+    ("reject_unsigned_32_min_negative", "raw_range",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("raw_min",), -1)),
+     "an unsigned register pair holds no negative count"),
+    ("reject_unsigned_32_max_past_width", "raw_range",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("scale",), {"mantissa": 1, "exponent": 0}),
+           set_(CH0 + ("raw_max",), 4294967296)),
+     "4294967296 does not fit thirty-two bits"),
+    ("reject_signed_32_min_past_width", "raw_range",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("raw_signed",), True), set_(CH0 + ("raw_min",), -2147483649)),
+     "-2147483649 does not fit a signed register pair"),
+    ("reject_signed_32_max_past_width", "raw_range",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("raw_signed",), True),
+           set_(CH0 + ("scale",), {"mantissa": 1, "exponent": 0}),
+           set_(CH0 + ("raw_max",), 2147483648)),
+     "2147483648 does not fit a signed register pair"),
+    ("reject_scale_zero", "scale", set_(CH0 + ("scale",), {"mantissa": 0, "exponent": 0}),
+     "a scale mantissa is nonzero"),
+    ("reject_scale_exponent_low", "scale",
+     set_(CH0 + ("scale",), {"mantissa": 1, "exponent": -5}), "exponents are -4 to 6"),
+    ("reject_offset_exponent_high", "offset",
+     set_(CH0 + ("offset",), {"mantissa": 1, "exponent": 7}), "exponents are -4 to 6"),
+    ("reject_offset_mantissa_past_bound", "offset",
+     set_(CH0 + ("offset",), {"mantissa": -2147483648, "exponent": 0}),
+     "a mantissa is within plus or minus 2147483647"),
+    ("reject_scale_extra_field", "scale",
+     set_(CH0 + ("scale",), {"mantissa": 1, "exponent": -1, "digits": 1}),
+     "a decimal is exactly mantissa and exponent"),
+    ("reject_scale_mantissa_float", "scale",
+     set_(CH0 + ("scale",), {"mantissa": 1.0, "exponent": -1}),
+     "every number in a document is an integer"),
+    ("reject_sensor_type_not_fleet", "sensor_type", set_(CH0 + ("sensor_type",), "deg C"),
+     "a sensor type is a fleet identifier"),
+    ("reject_unit_not_fleet", "unit", set_(CH0 + ("unit",), "\u00b0C"),
+     "a unit is a fleet identifier; the degree sign is outside the alphabet"),
+    ("reject_decode_term_past_bound", "decode",
+     edits(set_(CH0 + ("scale",), {"mantissa": 2147483647, "exponent": 6}),
+           set_(CH0 + ("offset",), {"mantissa": 0, "exponent": -4})),
+     "at raw_max the scale term at the finer exponent has twenty digits"),
+    ("reject_decode_scale_alone_past_bound", "decode",
+     edits(set_(CH0 + ("raw_max",), 0),
+           set_(CH0 + ("scale",), {"mantissa": 2147483647, "exponent": 6}),
+           set_(CH0 + ("offset",), {"mantissa": 0, "exponent": -4})),
+     "the range is zero alone, so every raw term is zero, and the scale at the "
+     "finer exponent has twenty digits"),
+    ("reject_decode_offset_alone_past_bound", "decode",
+     edits(set_(CH0 + ("raw_signed",), True), set_(CH0 + ("raw_min",), -1),
+           set_(CH0 + ("raw_max",), -1),
+           set_(CH0 + ("scale",), {"mantissa": 1, "exponent": -4}),
+           set_(CH0 + ("offset",), {"mantissa": 100000, "exponent": 6})),
+     "the offset at the finer exponent is 10^15 while the raw term of -1 brings "
+     "the sum to fifteen nines and the value to about 1e11"),
+    ("reject_decode_term_alone_past_bound", "decode",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("raw_max",), 100000),
+           set_(CH0 + ("scale",), {"mantissa": 1000000, "exponent": 0}),
+           set_(CH0 + ("offset",), {"mantissa": -1, "exponent": -4})),
+     "at raw_max the scale term is exactly 10^15 while the sum is fifteen nines "
+     "and the value about 1e11, so only the term bound refuses it"),
+    ("reject_decode_sum_past_bound", "decode",
+     edits(set_(CH0 + ("scale",), {"mantissa": 2147483647, "exponent": -4}),
+           set_(CH0 + ("offset",), {"mantissa": 99999, "exponent": 6}),
+           set_(CH0 + ("raw_max",), 65535)),
+     "each term is within fifteen digits and their sum at raw_max is not"),
+    ("reject_decode_value_past_bound", "decode",
+     edits(set_(CH0 + ("register_count",), 2), set_(CH0 + ("word_order",), "high_first"),
+           set_(CH0 + ("scale",), {"mantissa": 1, "exponent": 6}),
+           set_(CH0 + ("offset",), {"mantissa": 0, "exponent": 6}),
+           set_(CH0 + ("raw_max",), 2000000000)),
+     "the numerator is ten digits and the value is 2e15, past 10^15"),
+    ("reject_sensor_type_empty", "sensor_type", set_(CH0 + ("sensor_type",), ""),
+     "a measurement names its sensor type"),
+    ("reject_measurement_as_alarm_word_type", "sensor_type",
+     set_(CH0 + ("sensor_type",), "controller_alarm_word"),
+     "controller_alarm_word belongs to alarm words only"),
+    ("reject_measurement_alarm_word_unit", "unit",
+     set_(CH0 + ("unit",), "controller_alarm_word"),
+     "either alarm token is refused in either field"),
+    ("reject_measurement_bitmask_unit", "unit", set_(CH0 + ("unit",), "bitmask"),
+     "bitmask belongs to alarm words only"),
+    ("reject_sensor_type_bitmask", "sensor_type",
+     set_(CH0 + ("sensor_type",), "bitmask"),
+     "either alarm token is refused in either field"),
+    ("reject_unit_empty", "unit", set_(CH0 + ("unit",), ""),
+     "a measurement names its unit"),
+    ("reject_no_alarms", "alarms", set_(WORD + ("alarms",), []), "at least one alarm"),
+    ("reject_alarm_bit_past_width", "alarm_bit",
+     edits(set_(WORD + ("register_count",), 1), set_(WORD + ("word_order",), None),
+           set_(WORD + ("alarms",), [alarm(16, "set", "ac_input_fail", "x")])),
+     "bit 16 is past a one-register word"),
+    ("reject_alarm_bit_past_32", "alarm_bit", set_(ALARM0 + ("bit",), 32),
+     "bit 32 is past a two-register word"),
+    ("reject_alarm_bit_negative", "alarm_bit", set_(ALARM0 + ("bit",), -1),
+     "bits count from zero"),
+    ("reject_duplicate_alarm_bit", "alarm_bit", set_(ALARM0 + ("bit",), 3),
+     "two alarms on one bit"),
+    ("reject_duplicate_alarm_id_in_channel", "alarm_id",
+     set_(ALARM0 + ("id",), "fan_stopped"), "alarm ids are unique in a channel"),
+    ("reject_duplicate_alarm_id_across_channels", "alarm_id",
+     lambda d: d["channels"].append(alarm_word(
+         "alarm_word_2", [alarm(0, "set", "ac_input_fail", "AC input failure")],
+         start_register=102)),
+     "alarm ids are unique in the profile, not only in their channel"),
+    ("reject_alarm_id_too_long", "alarm_id",
+     set_(ALARM0 + ("id",), "a" * 49), "an alarm id is a fleet identifier, at most 48"),
+    ("reject_alarm_id_not_string", "alarm_id",
+     set_(ALARM0 + ("id",), 7), "an alarm id is a string"),
+    ("reject_alarm_id_bad_character", "alarm_id",
+     set_(ALARM0 + ("id",), "ac input"), "a space is outside the fleet alphabet"),
+    ("reject_alarm_active_unknown", "alarm_active",
+     set_(ALARM0 + ("active",), "high"), "active is set or clear"),
+    ("reject_alarm_meaning_too_long", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "M" * 257), "257 characters exceed 256"),
+    ("reject_alarm_meaning_empty", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), ""), "a meaning is at least one byte"),
+    ("reject_alarm_meaning_nul", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u0000failure"), "no U+0000 in a meaning"),
+    ("reject_alarm_meaning_bidi", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input \u202efailure"),
+     "a bidirectional override can reorder what an operator reads"),
+    ("reject_alarm_meaning_isolate", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input \u2066failure\u2069"),
+     "a bidirectional isolate"),
+    ("reject_alarm_meaning_arabic_letter_mark", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u061cfailure"), "U+061C is a bidi control"),
+    ("reject_alarm_meaning_zero_width", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u200bfailure"), "a zero-width space hides a break"),
+    ("reject_alarm_meaning_line_separator", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u2028failure"), "a line separator breaks a line"),
+    ("reject_alarm_meaning_soft_hyphen", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC in\u00adput failure"), "a soft hyphen is invisible"),
+    ("reject_alarm_meaning_word_joiner", "alarm_meaning",
+     set_(ALARM0 + ("meaning",), "AC input\u2060failure"), "a word joiner is invisible"),
+    ("reject_source_byte_order_mark", "source",
+     set_(("source",), "\ufeffregister map"), "U+FEFF is invisible"),
+    ("reject_alarm_extra_field", "alarm_fields",
+     add(ALARM0 + ("severity",), "critical"),
+     "an alarm carries no severity; its fields are exactly four"),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def _rectifier_bytes() -> str:
+    return canonical(RECTIFIER).decode("utf-8")
+
+
+def _swap_first(text: str, old: str, new: str) -> bytes:
+    assert text.count(old) == 1, old
+    return text.replace(old, new, 1).encode("utf-8")
+
+
+# (name, bytes, note). Each is RECTIFIER's document in bytes that are not canonical.
+REJECT_BYTES = (
+    ("reject_bytes_duplicate_key",
+     lambda: _swap_first(_rectifier_bytes(), '{"active":"clear","bit":17,',
+                         '{"active":"set","active":"clear","bit":17,'),
+     "a duplicate active key: a last-wins parse re-serializes to the pinned "
+     "digest, and a first-wins parse reads the opposite polarity"),
+    ("reject_bytes_whitespace",
+     lambda: json.dumps(RECTIFIER, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8"),
+     "the same object, indented"),
+    ("reject_bytes_key_order",
+     lambda: _swap_first(_rectifier_bytes(), '"baud_rate":9600,"channels":',
+                         '"channels":').replace(b',"id":"example-rectifier"',
+                                                b',"baud_rate":9600,"id":"example-rectifier"', 1),
+     "baud_rate moved after channels; keys are sorted"),
+    ("reject_bytes_escaped_ascii",
+     lambda: _swap_first(_rectifier_bytes(), '"source":"Synthetic', '"source":"\\u0053ynthetic'),
+     "a letter written as a \\u escape; canonical bytes escape only what RFC 8259 requires"),
+    ("reject_bytes_trailing_newline",
+     lambda: _rectifier_bytes().encode("utf-8") + b"\n",
+     "a byte after the object"),
+    ("reject_bytes_invalid_utf8",
+     lambda: _swap_first(_rectifier_bytes(), "Synthetic", "Synthet\x00ic").replace(b"\x00", b"\xff"),
+     "a byte that is not UTF-8"),
+)
+
+
+def registers_for(document: dict, channel: str, value: object) -> list | None:
+    ch = next(c for c in document["channels"] if c["name"] == channel)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+        return None
+    word = int(value)
+    if not 0 <= word < 2 ** (16 * ch["register_count"]):
+        return None
+    if ch["register_count"] == 1:
+        return [word]
+    high, low = word >> 16, word & 0xFFFF
+    return [high, low] if ch["word_order"] == "high_first" else [low, high]
+
+
+def unsigned_word(document: dict, channel: str) -> tuple[int, list]:
+    ch = next(c for c in document["channels"] if c["name"] == channel)
+    return 16 * ch["register_count"], ch["alarms"]
+
+
+def interpret(document: dict, channel: str, value: object) -> dict:
+    width, alarms = unsigned_word(document, channel)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return {"interpreted": False}
+    if value != int(value) or not 0 <= value < 2**width:
+        return {"interpreted": False}
+    word = int(value)
+    mapped = 0
+    states = {}
+    for a in alarms:
+        mapped |= 1 << a["bit"]
+        on = (word >> a["bit"]) & 1
+        states[a["id"]] = "asserted" if on == (1 if a["active"] == "set" else 0) else "not_asserted"
+    unmapped = [b for b in range(width) if (word >> b) & 1 and not (mapped >> b) & 1]
+    return {"interpreted": True, "alarms": states, "unmapped_set_bits": unmapped}
+
+
+# (name, document, profile_channel, value, note); every case is read with the
+# document pinned equal to the one it was accepted under, except PINNED_ELSEWHERE.
+INTERPRET = (
+    ("rectifier_all_zero", "rectifier", "alarm_word_1", 0,
+     "a zero word asserts the clear-polarity alarm only"),
+    ("rectifier_high_word_bit", "rectifier", "alarm_word_1", 131072,
+     "bit 17 sits in the high register of a high_first pair; set, fan_stopped is not asserted"),
+    ("rectifier_mapped_and_unmapped", "rectifier", "alarm_word_1", 2147680521,
+     "bits 0, 3, 17 and 31 mapped and bits 8 and 16 unmapped, all set"),
+    ("rectifier_all_ones", "rectifier", "alarm_word_1", 4294967295,
+     "every bit set: every set-polarity alarm asserted, every unmapped bit listed"),
+    ("rectifier_float_encoding", "rectifier", "alarm_word_1", 9.0,
+     "an integral value encoded with a fractional part is read by value"),
+    ("rectifier_past_width", "rectifier", "alarm_word_1", 4294967296,
+     "one past the 32-bit range is not interpreted"),
+    ("rectifier_negative", "rectifier", "alarm_word_1", -1,
+     "a negative value is not interpreted"),
+    ("rectifier_fraction", "rectifier", "alarm_word_1", 1.5,
+     "a non-integral value is not interpreted"),
+    ("generator_sixteen_bit", "generator", "shutdown_alarms", 32771,
+     "bits 0, 1 and 15 of a one-register word; estop_circuit_open is clear-polarity"),
+    ("generator_sixteen_bit_zero", "generator", "shutdown_alarms", 0,
+     "the lowest one-register word"),
+    ("generator_sixteen_bit_all_ones", "generator", "shutdown_alarms", 65535,
+     "the highest one-register word"),
+    ("generator_sixteen_bit_negative", "generator", "shutdown_alarms", -1,
+     "below a one-register word"),
+    ("generator_sixteen_bit_past_width", "generator", "shutdown_alarms", 65536,
+     "65536 is past a one-register word"),
+    ("generator_low_first_pair", "generator", "warning_alarms", 65540,
+     "bit 2 and bit 16 set; only bit 2 is mapped"),
+    ("thirty_two_low_word_set", "thirty_two_alarms", "alarms", 65535,
+     "the low sixteen bits set: below bit 16 the set-polarity alarms are asserted "
+     "and the clear-polarity ones are not; above it, the reverse"),
+)
+
+
+def bound_ms(poll_interval_ms: int) -> int:
+    return 3 * poll_interval_ms + 30000
+
+
+def channel_state(poll_interval_ms: int, events: list, query_ms: int) -> dict:
+    epoch = 0
+    active = True  # an anchor is active
+    revoked = False
+    last = None  # greatest (boot_id, seq) accepted in the active epoch, any kind
+    latest = None
+    accepted_at = None
+    fault = None
+    interpretable = False
+    for e in events:
+        if e["kind"] == "restart":
+            # The anchor's freshness state is durable; what a receiver holds in
+            # memory about the channel is not.
+            latest = accepted_at = fault = None
+            continue
+        if e["kind"] == "revoke":
+            # Revoking a reinstated identity discards its pending anchor.
+            assert not revoked, "device-provisioning: the identity is already revoked"
+            active, revoked = False, True
+            latest = accepted_at = fault = None
+            continue
+        if e["kind"] == "reinstate":
+            # The retained anchor returns to pending; nothing is active yet.
+            assert revoked, "device-provisioning: only a revoked identity is reinstated"
+            revoked = False
+            latest = accepted_at = fault = None
+            continue
+        if e["kind"] in ("stage_manifest", "stage_key"):
+            # A pending anchor, created or replaced, affects nothing about the
+            # active one.
+            assert not revoked, "device-provisioning: no re-provisioning while revoked"
+            continue
+        if e["kind"] == "pending_reading":
+            continue  # signed under the pending anchor: refused, freshness untouched
+        if e["kind"] == "promote":
+            assert not revoked, "device-provisioning: nothing activates while revoked"
+            active = True
+            # A new manifest in the same key epoch: freshness runs on.
+            latest = accepted_at = fault = None
+            continue
+        if e["kind"] == "rotate":
+            # The promotion of a re-provisioned key.
+            assert not revoked, "device-provisioning: no re-provisioning while revoked"
+            active = True
+            epoch += 1
+            last = latest = accepted_at = fault = None
+            continue
+        key = (e["boot_id"], e["seq"])
+        # v1 freshness: one seq high-water mark per key epoch, across boots.
+        if not active or e["epoch"] != epoch or (last is not None and (e["seq"] <= last[1] or e["boot_id"] < last[0])):
+            continue
+        last = key
+        if e["kind"] == "fault":
+            fault = key
+        elif e["kind"] == "other":
+            pass  # a heartbeat or another channel's reading: freshness only
+        else:
+            # A reading of the channel, interpretable or not, is its latest.
+            latest, accepted_at = key, e["t"]
+            interpretable = e["kind"] == "reading"
+            if fault is not None and key > fault:
+                fault = None
+    if (latest is None or fault is not None or not interpretable
+            or query_ms - accepted_at > bound_ms(poll_interval_ms)):
+        return {"state": "unknown"}
+    return {"state": "as_of", "epoch": epoch, "boot_id": latest[0], "seq": latest[1]}
+
+
+def ev(t: int, kind: str, epoch: int = 0, boot: int = 1, seq: int = 1) -> dict:
+    if kind in ("restart", "rotate", "promote", "revoke", "reinstate", "stage_manifest",
+                "stage_key"):
+        return {"t": t, "kind": kind}
+    return {"t": t, "kind": kind, "epoch": epoch, "boot_id": boot, "seq": seq}
+
+
+# (name, poll_interval_ms, events, query_ms, note)
+STATES = (
+    ("fresh_reading", 5000, [ev(0, "reading")], 1000, "one reading inside the bound"),
+    ("at_the_bound", 5000, [ev(0, "reading")], 45000,
+     "3 x 5000 + 30000 is 45000; a reading exactly that long ago still stands"),
+    ("past_the_bound", 5000, [ev(0, "reading")], 45001, "one millisecond past it, unknown"),
+    ("at_the_ceiling", 1190000, [ev(0, "reading")], 3600000,
+     "at the alarm-word poll ceiling the bound is exactly an hour, and a reading "
+     "that long ago still stands"),
+    ("past_the_ceiling_bound", 1190000, [ev(0, "reading")], 3600001,
+     "one millisecond past an hour at the ceiling, unknown"),
+    ("nothing_accepted", 5000, [], 0, "no reading at all is unknown, not clear"),
+    ("backlog_is_as_of_its_reading", 5000,
+     [ev(100000, "reading", seq=1), ev(100001, "reading", seq=2), ev(100002, "reading", seq=3)],
+     100010,
+     "a drained backlog accepted just now stands as of its latest reading; the "
+     "text forbids presenting it as the state now"),
+    ("fault_makes_unknown", 5000, [ev(0, "reading", seq=1), ev(10, "fault", seq=2)], 20,
+     "a sensor_fault inside the bound still makes every alarm unknown"),
+    ("later_reading_clears_fault", 5000,
+     [ev(0, "reading", seq=1), ev(10, "fault", seq=2), ev(20, "reading", seq=3)], 30,
+     "a reading after the fault stands"),
+    ("rotation_makes_unknown", 5000,
+     [ev(0, "reading", boot=41, seq=900), ev(10, "rotate")], 20,
+     "a new key epoch has no latest reading yet"),
+    ("rotation_then_lower_counters", 5000,
+     [ev(0, "reading", boot=41, seq=900), ev(10, "rotate"),
+      ev(20, "reading", epoch=1, boot=1, seq=1)], 30,
+     "counters restart under the new epoch; boot 1 is latest there, not older "
+     "than boot 41"),
+    ("superseded_epoch_reading_ignored", 5000,
+     [ev(0, "reading", boot=41, seq=900), ev(10, "rotate"),
+      ev(20, "reading", epoch=0, boot=41, seq=901)], 30,
+     "a reading signed under the superseded epoch is never the latest"),
+    ("old_epoch_fault_does_not_wedge", 5000,
+     [ev(0, "fault", boot=41, seq=900), ev(10, "rotate"),
+      ev(20, "reading", epoch=1, boot=1, seq=1)], 30,
+     "a fault from the superseded epoch does not hold the new epoch unknown"),
+    ("receiver_restart_makes_unknown", 5000,
+     [ev(0, "reading"), ev(10, "restart")], 20,
+     "a restarted receiver has accepted nothing"),
+    ("reading_after_restart", 5000,
+     [ev(0, "reading", seq=1), ev(10, "restart"), ev(20, "reading", seq=2)], 30,
+     "a reading after the restart stands"),
+    ("replay_not_accepted", 5000,
+     [ev(0, "reading", seq=5), ev(40000, "reading", seq=4)], 46000,
+     "a lower seq is refused, so it neither becomes latest nor restarts the bound"),
+    ("replay_after_restart_not_accepted", 5000,
+     [ev(0, "reading", seq=5), ev(10, "restart"), ev(20, "reading", seq=4)], 30,
+     "a restart clears what the receiver holds in memory, not the anchor's "
+     "freshness, so a replay after it is still refused"),
+    ("promotion_makes_unknown", 5000,
+     [ev(0, "reading", seq=1), ev(10, "promote")], 20,
+     "a promoted manifest may name another profile, so the reading read under "
+     "the old one is not interpreted under the new one"),
+    ("reading_after_promotion", 5000,
+     [ev(0, "reading", seq=1), ev(10, "promote"), ev(20, "reading", seq=2)], 30,
+     "freshness runs on across a promotion; the next reading stands"),
+    ("promotion_ends_fault_hold", 5000,
+     [ev(0, "fault", seq=1), ev(10, "promote"), ev(20, "reading", seq=2)], 30,
+     "the first reading after a promotion stands; it is later than the fault, so "
+     "the fault's hold would end here with or without the promotion"),
+    ("replay_after_promotion_not_accepted", 5000,
+     [ev(0, "reading", seq=5), ev(10, "promote"), ev(20, "reading", seq=5)], 30,
+     "a promotion does not reset freshness"),
+    ("duplicate_does_not_restart_bound", 5000,
+     [ev(0, "reading", seq=5), ev(40000, "reading", seq=5)], 46000,
+     "a duplicate of the accepted reading is not accepted, so it cannot hold a "
+     "silent channel known"),
+    ("boot_rollback_not_accepted", 5000,
+     [ev(0, "reading", boot=3, seq=5), ev(40000, "reading", boot=2, seq=6)], 46000,
+     "a lower boot_id is refused even with a higher seq"),
+    ("revocation_makes_unknown", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke")], 20,
+     "no anchor is active, so the channel has no latest reading"),
+    ("reading_while_revoked_not_accepted", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke"), ev(20, "reading", seq=2)], 30,
+     "nothing is accepted while no anchor is active"),
+    ("reinstatement_promotion_then_reading", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke"), ev(20, "reinstate"),
+      ev(25, "promote"), ev(30, "reading", seq=2)], 40,
+     "a reinstated anchor is promoted, and the reading after it stands"),
+    ("reading_after_reinstatement_before_promotion", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke"), ev(20, "reinstate"),
+      ev(30, "reading", seq=2)], 40,
+     "reinstatement returns the anchor to pending; nothing is accepted until a "
+     "promotion activates it"),
+    ("reinstatement_makes_unknown", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke"), ev(20, "reinstate")], 30,
+     "a reinstated anchor is pending, not active"),
+    ("uninterpretable_reading_is_latest", 5000,
+     [ev(0, "reading", seq=1), ev(10, "uninterpretable", seq=2)], 20,
+     "a reading accepted and not interpreted replaces the earlier one, so its "
+     "alarms are unknown rather than the earlier reading's"),
+    ("reading_after_uninterpretable", 5000,
+     [ev(0, "uninterpretable", seq=1), ev(10, "reading", seq=2)], 20,
+     "the next interpretable reading stands"),
+    ("other_message_does_not_restart_bound", 5000,
+     [ev(0, "reading", seq=1), ev(40000, "other", seq=2)], 46000,
+     "a heartbeat or another channel's reading keeps no channel known"),
+    ("other_message_advances_freshness", 5000,
+     [ev(0, "reading", seq=1), ev(10, "other", seq=5), ev(20, "reading", seq=3)], 30,
+     "a reading at a seq already passed by another message is refused, so the "
+     "first reading stays the latest"),
+    ("revocation_after_reinstatement", 5000,
+     [ev(0, "reading", seq=1), ev(10, "revoke"), ev(20, "reinstate"), ev(30, "revoke"),
+      ev(40, "reading", seq=2)], 50,
+     "revoking a reinstated identity is legal and discards its pending anchor; "
+     "nothing is accepted"),
+    ("pending_manifest_changes_nothing", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_manifest")], 20,
+     "a new manifest awaiting promotion leaves the active channel's reading standing"),
+    ("pending_key_changes_nothing", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_key")], 20,
+     "a re-provisioned key awaiting promotion leaves the active channel's reading standing"),
+    ("replaced_pending_changes_nothing", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_manifest"), ev(20, "stage_manifest")], 30,
+     "replacing a pending candidate changes nothing either"),
+    ("pending_keeps_fault_hold", 5000,
+     [ev(0, "reading", seq=1), ev(10, "fault", seq=2), ev(20, "stage_key")], 30,
+     "a pending anchor does not end a fault hold"),
+    ("pending_does_not_restart_bound", 5000,
+     [ev(0, "reading", seq=1), ev(40000, "stage_manifest")], 46000,
+     "a pending anchor does not restart the silence bound"),
+    ("pending_reading_refused", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_manifest"), ev(40000, "pending_reading", seq=2)],
+     46000,
+     "a reading signed under the pending manifest is refused, so it neither stands "
+     "nor restarts the bound"),
+    ("pending_reading_leaves_freshness", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_manifest"), ev(20, "pending_reading", seq=2),
+      ev(30, "reading", seq=2)], 40,
+     "a refused reading does not consume its seq, so the active reading at that "
+     "seq is accepted"),
+    ("promotion_of_rotated_key_after_pending", 5000,
+     [ev(0, "reading", seq=1), ev(10, "stage_key"), ev(20, "rotate")], 30,
+     "the rotated key takes effect at its promotion, which leaves no latest reading"),
+    ("reboot_counts_as_later", 5000,
+     [ev(0, "reading", boot=1, seq=50), ev(10, "reading", boot=2, seq=51)], 20,
+     "seq runs on across a reboot within one key epoch; the later boot's first "
+     "reading is the latest"),
+)
+
+
+# (name, accepted-under document, profile_channel, value, note, pinned document)
+PINNED_ELSEWHERE = (
+    ("read_through_its_own_manifest", "rectifier", "alarm_word_1", 8,
+     "bit 3 set, accepted under the rectifier and read again after the revised "
+     "document is pinned: over_temperature is asserted, through the document "
+     "the reading was accepted under", "rectifier_revised"),
+    ("read_through_its_own_manifest_revised", "rectifier_revised", "alarm_word_1", 8,
+     "the same word accepted under the revised document, read again while the "
+     "original is pinned: bit 3 is unmapped there", "rectifier"),
+)
+
+
+def agreement(binding_id: str, binding_digest: str, digest_of: str, profile_channel: str,
+              sensor_type: str, unit: str, documents: dict, digests: dict) -> str:
+    doc = documents[digest_of]
+    if digests[digest_of] != binding_digest or doc["id"] != binding_id:
+        return "disagree"
+    ch = next((c for c in doc["channels"] if c["name"] == profile_channel), None)
+    if ch is None:
+        return "disagree"
+    if ch["kind"] == "alarm_word":
+        ok = (sensor_type, unit) == ("controller_alarm_word", "bitmask")
+    else:
+        ok = (sensor_type, unit) == (ch["sensor_type"], ch["unit"])
+    return "use" if ok else "disagree"
+
+
+# (name, binding id, document, profile_channel, manifest sensor_type, unit, note)
+AGREE = (
+    ("measurement_agrees", "example-rectifier", "rectifier", "output_current",
+     "current", "ampere", "the manifest channel declares what the profile channel decodes"),
+    ("alarm_word_agrees", "example-rectifier", "rectifier", "alarm_word_1",
+     "controller_alarm_word", "bitmask", "an alarm word read as one"),
+    ("id_disagrees", "other-rectifier", "rectifier", "output_current",
+     "current", "ampere", "the document's id is not the binding's"),
+    ("profile_channel_missing", "example-rectifier", "rectifier", "input_voltage",
+     "voltage", "volt", "the document has no channel by that name"),
+    ("measurement_read_as_alarm_word", "example-rectifier", "rectifier", "output_current",
+     "controller_alarm_word", "bitmask", "a measurement channel cannot be read as an alarm word"),
+    ("alarm_word_read_as_measurement", "example-rectifier", "rectifier", "alarm_word_1",
+     "current", "ampere", "an alarm word is never a measurement"),
+    ("sensor_type_disagrees", "example-rectifier", "rectifier", "output_current",
+     "voltage", "ampere", "the sensor type differs"),
+    ("digest_disagrees", "example-rectifier", "rectifier", "output_current",
+     "current", "ampere", "everything agrees but the digest: the document is "
+     "not the one the manifest names"),
+    ("unit_disagrees", "example-rectifier", "rectifier", "output_voltage",
+     "voltage", "millivolt", "the unit differs"),
+)
+
+# Cases whose binding names another digest than the document's own.
+OTHER_DIGEST = {"digest_disagrees": "sha256:" + "ab" * 32}
+
+
+def in_range(document: dict, channel: str, value: float) -> bool:
+    from decimal import Decimal
+    ch = next(c for c in document["channels"] if c["name"] == channel)
+    scale = Decimal(ch["scale"]["mantissa"]).scaleb(ch["scale"]["exponent"])
+    offset = Decimal(ch["offset"]["mantissa"]).scaleb(ch["offset"]["exponent"])
+    raw = (Decimal(repr(value)) - offset) / scale
+    return raw == raw.to_integral_value() and ch["raw_min"] <= raw <= ch["raw_max"]
+
+
+# (name, document, profile_channel, value, note); pinned equals document except
+# in RANGES_PINNED_ELSEWHERE.
+RANGES = (
+    ("current_zero", "rectifier", "output_current", 0.0, "raw 0"),
+    ("current_at_max", "rectifier", "output_current", 200.0, "raw 2000, the top of the range"),
+    ("current_past_max", "rectifier", "output_current", 200.1, "raw 2001, past the range"),
+    ("current_below_min", "rectifier", "output_current", -0.1, "raw -1, below the range"),
+    ("current_between_counts", "rectifier", "output_current", 12.35,
+     "no raw count decodes to it at 0.1 per count"),
+    ("temperature_at_min_count", "generator", "coolant_temperature", -273.15,
+     "raw 0 with a negative offset"),
+    ("temperature_zero", "generator", "coolant_temperature", 0.0,
+     "raw 2731500 decodes exactly to zero"),
+    ("temperature_fine_step", "generator", "coolant_temperature", 21.0001,
+     "one count of 0.0001 above 21"),
+    ("temperature_negative_count", "generator", "coolant_temperature", -273.1501,
+     "raw -1 on a signed register"),
+    ("temperature_signed_min", "generator", "coolant_temperature", -215021.5148,
+     "raw -2147483648, the signed minimum"),
+)
+
+# (name, accepted-under document, profile_channel, value, note, pinned document)
+RANGES_PINNED_ELSEWHERE = (
+    ("range_through_its_own_manifest", "rectifier", "output_current", 150.0,
+     "raw 1500 is in the range of the document the reading was accepted under, "
+     "though not in the revised document pinned now", "rectifier_revised"),
+)
+
+
+def build() -> bytes:
+    documents = {name: doc for name, doc, _ in ACCEPT}
+    cases = []
+    for name, document, note in ACCEPT:
+        body = canonical(document)
+        cases.append({
+            "name": name,
+            "document": document,
+            "canonical_hex": body.hex(),
+            "digest": "sha256:" + hashlib.sha256(body).hexdigest(),
+            "note": note,
+        })
+    reject_cases = []
+    for name, rule, edit, note in REJECT:
+        document = copy.deepcopy(RECTIFIER)
+        edit(document)
+        reject_cases.append({
+            "name": name,
+            "reason": "invalid_profile_document",
+            "rule": rule,
+            "document": document,
+            "note": note,
+        })
+    reject_bytes = []
+    for name, make, note in REJECT_BYTES:
+        reject_bytes.append({
+            "name": name,
+            "reason": "non_canonical_document",
+            "bytes_hex": make().hex(),
+            "note": note,
+        })
+    interpretations = []
+    for name, doc_name, channel, value, note, pinned in (
+        [i + (i[1],) for i in INTERPRET] + list(PINNED_ELSEWHERE)
+    ):
+        interpretations.append({
+            "name": name,
+            "document": doc_name,
+            "pinned_document": pinned,
+            "profile_channel": channel,
+            "registers": registers_for(documents[doc_name], channel, value),
+            "value": value,
+            "expected": interpret(documents[doc_name], channel, value),
+            "note": note,
+        })
+    ranges = []
+    for name, doc_name, channel, value, note, pinned in (
+        [r + (r[1],) for r in RANGES] + list(RANGES_PINNED_ELSEWHERE)
+    ):
+        ranges.append({
+            "name": name,
+            "document": doc_name,
+            "pinned_document": pinned,
+            "profile_channel": channel,
+            "value": value,
+            "expected": "in_range" if in_range(documents[doc_name], channel, value) else "out_of_range",
+            "note": note,
+        })
+    agreements = []
+    digest_by_name = {c["name"]: c["digest"] for c in cases}
+    for name, bid, doc_name, channel, stype, unit, note in AGREE:
+        digest = OTHER_DIGEST.get(name, digest_by_name[doc_name])
+        agreements.append({
+            "name": name,
+            "manifest_channel": {
+                "sensor_type": stype,
+                "unit": unit,
+                "controller_profile_id": bid,
+                "digest": digest,
+                "profile_channel": channel,
+            },
+            "document": doc_name,
+            "expected": agreement(bid, digest, doc_name, channel, stype, unit, documents,
+                                  digest_by_name),
+            "note": note,
+        })
+    states = []
+    for name, poll, events, query, note in STATES:
+        states.append({
+            "name": name,
+            "poll_interval_ms": poll,
+            "events": events,
+            "query_ms": query,
+            "expected": channel_state(poll, events, query),
+            "note": note,
+        })
+    corpus = {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "version": 2,
+        "comment": (
+            "Golden vectors for firmware-telemetry/v2 Controller Profiles. A "
+            "consumer must accept every document in 'cases', reproducing its "
+            "canonical bytes and digest; refuse every document in "
+            "'reject_cases', each of which breaks exactly the one rule its "
+            "'rule' names; refuse every byte string in 'reject_bytes'; "
+            "reproduce every interpretation in 'interpretations' and every "
+            "verdict in 'ranges' and 'agreements'; and reproduce "
+            "every state case in 'states', stated at the longest bound. No "
+            "profile here describes a real product."
+        ),
+        "reasons": {
+            "invalid_profile_document": "the document breaks the grammar of "
+                                        "firmware-telemetry/v2 The profile document",
+            "non_canonical_document": "the document's bytes are not exactly the "
+                                      "canonical bytes of the object they parse to",
+        },
+        "cases": cases,
+        "reject_cases": reject_cases,
+        "reject_bytes": reject_bytes,
+        "interpretations": interpretations,
+        "ranges": ranges,
+        "agreements": agreements,
+        "states": states,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

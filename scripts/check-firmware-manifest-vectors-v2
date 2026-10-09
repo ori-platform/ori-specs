@@ -6,10 +6,19 @@
 Shares no code with scripts/generate-firmware-manifest-vectors-v2. Canonical
 bytes come from this script's own serializer, the key is re-derived from the
 disclosed seed and every signature verified with this script's own affine
-curve arithmetic. The mode table, the bridged source, the refusal reasons and
-the corpus digest are read from firmware-telemetry/v2.md; the manifest's
-fields and enumerated values from v1's example manifest. Nothing is read from
-the generator.
+curve arithmetic. The mode table, the bridged source, the refusal reasons,
+the `controller_profile` grammar and the corpus digests are read from
+firmware-telemetry/v2.md; the manifest's fields and enumerated values from
+v1's example manifest. Nothing is read from either generator.
+
+v1 names no closed `sensor_type` or `unit` vocabulary. The values held
+supported here are v1's example's (`current`, `ampere`), the two tokens v2's
+alarm-channel rule names (`controller_alarm_word`, `bitmask`), and the values
+the measurement channels of the profile corpus's accepted documents declare,
+because v2 says a profile channel's `sensor_type` and `unit` are what a
+manifest channel reading it declares. The channel field set is v1's, or v1's
+plus the one field v2's example channel adds; which channels may carry it is
+v2's rule, not v1's.
 
 Held to:
 
@@ -19,10 +28,22 @@ Held to:
 - each case: its device_mode is the mode this script derives from its arrays;
 - each refusal: signature valid, and the set of v2 rules it breaks names
   exactly its declared reason, so no other rule refuses it;
+- each accepted bridged channel: its `controller_profile.digest` is this
+  script's digest of a document in the profile corpus's `cases`, whose `id`
+  is the binding's, which has the named `profile_channel`, and whose kind,
+  `sensor_type` and `unit` agree with the channel;
 - coverage: every single-role mode and every multi-role combination accepted,
   no actuator_node accepted, each defined mode refused over arrays that
-  determine another, integer and null modes, and no_channels alone;
-- the digest firmware-telemetry/v2.md pins is the corpus's.
+  determine another, integer and null modes, and no_channels alone; profiles
+  qualified and unqualified, an alarm word and two channels reading one
+  profile accepted; a refusal for every reason, every `controller_profile`
+  grammar clause (a wrong JSON type for each field among them), the bridged
+  protocol, one profile `id` under two digests, two qualifications and two
+  records, and one digest under two ids, each alone; and
+  each misuse of the alarm tokens; and for each bound pair the grammar reads
+  (fleet identifier length, record length, digest hex length), each end
+  accepted and one past each end refused;
+- the digests firmware-telemetry/v2.md pins are the two corpora's.
 
     python3 scripts/check-firmware-manifest-vectors-v2
     python3 scripts/check-firmware-manifest-vectors-v2 --mutations
@@ -44,10 +65,11 @@ import math
 import pathlib
 import re
 import sys
-from typing import Callable
+from collections.abc import Callable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "firmware-telemetry" / "manifest-vectors-v2.json"
+PROFILES = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
 TELEMETRY_V1 = ROOT / "firmware-telemetry" / "v1.md"
 TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
 
@@ -61,7 +83,10 @@ ROLE_WORDS = {
     "bridged channels": "bridged",
     "actions": "actions",
 }
-RULES = ("mode_undefined", "mode_disagrees", "channels_empty")
+MODE_RULES = ("mode_undefined", "mode_disagrees", "channels_empty")
+PROFILE_RULES = ("profile_missing", "profile_unexpected", "profile_invalid",
+                 "alarm_channel")
+RULES = MODE_RULES + PROFILE_RULES
 # What each rule refuses, as v2.md words it. The checker evaluates each rule by
 # its own predicate below, so the clause it is held to must say exactly that: a
 # clause whose meaning changes, its polarity included, fails here rather than
@@ -72,7 +97,53 @@ RULE_CLAUSES = {
     "mode_disagrees": "`device_mode` is not the value its `channels` and "
                       "`actions` determine",
     "channels_empty": "`channels` is empty",
+    "profile_missing": "a bridged channel carries no `controller_profile`",
+    "profile_unexpected": "a channel that is not bridged carries `controller_profile`",
+    "profile_invalid": "a `controller_profile` breaks the grammar above, or a "
+                       "bridged channel's `protocol` is not `modbus_rtu`",
+    "alarm_channel": "a channel declares `sensor_type` `controller_alarm_word` or "
+                     "`unit` `bitmask`, unless it is a bridged channel that declares both",
 }
+# The `controller_profile` grammar, cell by cell, as v2.md's field table states
+# it. Each pattern matches its Notes cell whole; the groups are the bounds and
+# closed sets this script reads.
+PROFILE_ROWS = {
+    "id": ("string", r"The profile's `id`, a fleet identifier\."),
+    "digest": ("string", (r"`([a-z0-9]+:)` and (\d+) (lowercase )?hex: SHA-256 over the "
+                          r"canonical bytes of the profile document\.")),
+    "profile_channel": ("string", (r"The `name` of the profile channel this channel "
+                                   r"reads, a fleet identifier\.")),
+    "qualification": ("string", r"`([a-z]+)` or `([a-z]+)`\."),
+    "record": ("string or null", (r"The repository path of the qualification record, "
+                                  r"relative to the root of the repository that ships the "
+                                  r"profile; `null` exactly when `qualification` is "
+                                  r"`([a-z]+)`\.")),
+}
+FLEET_SENTENCE = (r"A fleet identifier, wherever Controller Profiles names one, is a string of "
+                  r"(\d+) to (\d+) characters, each from the fleet alphabet: (.*)\.")
+RECORD_SENTENCE = (r"A `record` is (\d+) to (\d+) characters, each from the fleet alphabet "
+                   r"or `(.)`\. It does not begin or end with `(.)`, never has two `(.)` in a "
+                   r"row, and never contains `([^`]+)` anywhere, even inside a segment\.")
+KEYS_SENTENCE = "The object's keys are exactly these five."
+SAME_PROFILE = (r"Channels that name the same profile `([a-z_]+)` carry the same `([a-z_]+)`, "
+                r"`([a-z_]+)` and `([a-z_]+)`, and channels that name the same `([a-z_]+)` "
+                r"name the same `([a-z_]+)`: a device holds one document and one "
+                r"qualification per profile\. A consumer MUST reject a manifest in which they "
+                r"differ \(`([a-z_]+)`\)\.")
+# Every grammar clause a refusal of the corpus must break alone at least once.
+# A value of the wrong JSON type breaks its type clause and nothing else.
+PROFILE_CLAUSES = (
+    "not_object", "keys_extra", "keys_missing", "id_type", "id_length", "id_chars",
+    "digest_prefix", "digest_length", "digest_digits", "profile_channel_length",
+    "profile_channel_chars", "qualification_type", "qualification", "record_type",
+    "record_missing", "record_unexpected", "record_length", "record_chars",
+    "record_leading", "record_trailing", "record_double_separator", "record_dotdot",
+    "protocol", "one_id_two_digest", "one_id_two_qualification", "one_id_two_record",
+    "digest_type", "profile_channel_type", "one_digest_two_id",
+)
+# Channels that differ in qualification differ in record too, under the
+# pairing rule, so a second qualification brings a second record with it.
+IMPLIED = {"one_id_two_qualification": "one_id_two_record"}
 OPTIONAL_MANIFEST_FIELD = "deployment_maintenance_limit_ms"
 
 
@@ -190,7 +261,7 @@ def _string(s: str) -> str:
     return "".join(out)
 
 
-def _number(n: int | float) -> str:
+def _number(n: float) -> str:
     if type(n) is int:
         if abs(n) > 2**53 - 1:
             raise Failure(f"integer {n} outside the canonical range")
@@ -244,7 +315,7 @@ def contract_texts() -> dict[str, str]:
 
 def _v1_manifest(t1: str) -> dict:
     block = re.search(r"```json\n(\{\n  \"manifest\".*?)\n```",
-                      _section(t1, "## Capability Manifest"), re.S)
+                      _section(t1, "## Capability Manifest"), re.DOTALL)
     if block is None:
         raise Failure("v1 carries no example manifest message")
     example = json.loads(block.group(1))["manifest"]
@@ -282,7 +353,7 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     if bridged is None:
         raise Failure("v2 Device Mode does not say which source is bridged")
     modes: dict[str, object] = {}
-    for value, cell in re.findall(r"^\| `([a-z_]+)` \| (.*?) \|\s*$", section, re.M):
+    for value, cell in re.findall(r"^\| `([a-z_]+)` \| (.*?) \|\s*$", section, re.MULTILINE):
         single = re.fullmatch(r"(Metering channels|Bridged channels|Actions) only"
                               r"(?:, and no (?:actions|channels))?\.", cell)
         several = re.fullmatch(r"More than one of the three: (.*)\.", cell)
@@ -300,31 +371,137 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     ) or list(modes.values()).count("several") != 1:
         raise Failure("the mode table does not give each role one mode and "
                       "one mode to several roles")
-    rules_text = section[section.index("MUST reject a manifest when:"):]
-    bullets = re.findall(r"^- (.*?)(?=^- |^\S|\Z)", rules_text, re.M | re.S)
+    reasons = _rules(section, "Device Mode", MODE_RULES)
+    field = _section(t2, "### The `controller_profile` field")
+    reasons |= _rules(field, "Controller Profiles", PROFILE_RULES)
+    v1 = _v1_manifest(t1)
+    profile = _profile_grammar(field, _section(t2, "## Controller Profiles"), v1)
+    if profile["shared_reason"] != reasons["profile_invalid"]:
+        raise Failure("the one-profile rule names another reason than the grammar's")
+    reading = re.search(r"A manifest channel reading an `([a-z_]+)` channel declares "
+                        r"`sensor_type` `([a-z_]+)` and `unit` `([a-z_]+)`",
+                        " ".join(_section(t2, "### The profile document").split()))
+    if reading is None or reading.groups()[1:] != (profile["alarm_sensor_type"],
+                                                   profile["alarm_unit"]):
+        raise Failure("v2 does not say what a manifest channel reading an alarm word declares")
+    profile["alarm_kind"] = reading.group(1)
+    golden = _section(t2, "## Golden Vectors")
+    pins = {}
+    for name in ("manifest", "controller-profile"):
+        pin = re.search(rf"\[{name}-vectors-v2\.json\]\({name}-vectors-v2\.json\)"
+                        r"[^`]*?Its\s+SHA-256\s+is\s+`([0-9a-f]{64})`", golden)
+        if pin is None:
+            raise Failure(f"firmware-telemetry/v2.md pins no {name} corpus digest")
+        pins[name] = pin.group(1)
+    return {
+        "v1": v1,
+        "bridged_source": bridged.group(1),
+        "modes": modes,
+        "reasons": reasons,
+        "profile": profile,
+        "pin": pins["manifest"],
+        "profile_pin": pins["controller-profile"],
+    }
+
+
+def _rules(section: str, where: str, rules: tuple[str, ...]) -> dict[str, str]:
+    """The reason each rule of a "MUST reject a manifest when:" list names."""
+    start = re.search(r"MUST\s+reject\s+a\s+manifest\s+when:", section)
+    if start is None:
+        raise Failure(f"v2 {where} lists no manifest refusals")
+    bullets = re.findall(r"^- (.*?)(?=^- |^\S|\Z)", section[start.end():], re.MULTILINE | re.DOTALL)
     codes = [re.findall(r"`([a-z_]+)`\)", " ".join(b.split())) for b in bullets]
-    if len(codes) != len(RULES) or any(len(c) != 1 for c in codes):
-        raise Failure("v2 Device Mode does not list three rules, each with one error")
-    for rule, bullet in zip(RULES, bullets):
+    if len(codes) != len(rules) or any(len(c) != 1 for c in codes):
+        raise Failure(f"v2 {where} does not list {len(rules)} rules, each with one error")
+    for rule, bullet in zip(rules, bullets):
         # Only the trailing error annotation is removed; every other word of
         # the bullet, a parenthesis included, is part of the clause.
         annotated = re.fullmatch(r"(.*) \((?:recommended error )?`[a-z_]+`\)[;.]",
                                  " ".join(bullet.split()))
         clause = annotated.group(1) if annotated else " ".join(bullet.split())
         if clause != RULE_CLAUSES[rule]:
-            raise Failure(f"v2 Device Mode's {rule} clause reads {clause!r}, "
+            raise Failure(f"v2 {where}'s {rule} clause reads {clause!r}, "
                           f"not {RULE_CLAUSES[rule]!r}")
-    golden = _section(t2, "## Golden Vectors")
-    pin = re.search(r"\[manifest-vectors-v2\.json\]\(manifest-vectors-v2\.json\)"
-                    r"[^`]*?Its\s+SHA-256\s+is\s+`([0-9a-f]{64})`", golden)
-    if pin is None:
-        raise Failure("firmware-telemetry/v2.md pins no manifest corpus digest")
+    return {rule: c[0] for rule, c in zip(rules, codes)}
+
+
+def _alphabet(spec: str) -> frozenset[str]:
+    chars: set[str] = set()
+    for item in re.split(r", (?:and )?| and ", spec):
+        pair = re.fullmatch(r"`(.)`–`(.)`", item)
+        single = re.fullmatch(r"`(.)`", item)
+        if pair is not None:
+            chars.update(chr(c) for c in range(ord(pair.group(1)), ord(pair.group(2)) + 1))
+        elif single is not None:
+            chars.add(single.group(1))
+        else:
+            raise Failure(f"cannot read the fleet alphabet item {item!r}")
+    return frozenset(chars)
+
+
+def _profile_grammar(field: str, intro_text: str, v1: dict) -> dict:
+    """The `controller_profile` grammar and the two rule tokens, from v2.md."""
+    block = re.search(r"```json\n(\{.*?)\n```", field, re.DOTALL)
+    if block is None:
+        raise Failure("v2 carries no example channel with a controller_profile")
+    example = json.loads(block.group(1))
+    added = set(example) - v1["channel_fields"]
+    if len(added) != 1 or not v1["channel_fields"] <= set(example):
+        raise Failure("v2's example channel does not add exactly one field to v1's")
+    name = added.pop()
+    rows = re.findall(r"^\| `([a-z_]+)` \| ([a-z ]+) \| (.*) \|$", field, re.MULTILINE)
+    if [r[0] for r in rows] != list(PROFILE_ROWS) or set(example[name]) != set(PROFILE_ROWS):
+        raise Failure(f"v2's {name} rows {[r[0] for r in rows]} are not {list(PROFILE_ROWS)}")
+    cells = {}
+    for key, kind, notes in rows:
+        wanted_kind, pattern = PROFILE_ROWS[key]
+        match = re.fullmatch(pattern, notes)
+        if kind != wanted_kind or match is None:
+            raise Failure(f"v2's {key} row reads {kind!r}, {notes!r}")
+        cells[key] = match.groups()
+    flat = " ".join(field.split())
+    if KEYS_SENTENCE not in flat:
+        raise Failure(f"v2 no longer says {KEYS_SENTENCE!r}")
+    same = re.search(SAME_PROFILE, flat)
+    if (same is None or same.group(1) != "id" or not set(same.groups()[1:4]) <= set(PROFILE_ROWS)
+            or (same.group(5), same.group(6)) != ("digest", same.group(1))):
+        raise Failure("v2 does not say which fields channels naming one profile share")
+    intro = intro_text.strip().split("\n\n")
+    fleet_paragraph = next((p for p in intro if p.startswith("A fleet identifier")), "")
+    fleet = re.fullmatch(FLEET_SENTENCE, " ".join(fleet_paragraph.split()))
+    if fleet is None:
+        raise Failure("v2 does not define the fleet identifier where this script reads it")
+    record = re.search(RECORD_SENTENCE, flat)
+    if record is None or len({record.group(3), record.group(4), record.group(5)}) != 1:
+        raise Failure("v2's record sentence does not read as this script holds it")
+    clause = RULE_CLAUSES["profile_invalid"]
+    protocol = re.search(r"`protocol` is not `([a-z_]+)`", clause)
+    tokens = re.search(r"declares `sensor_type` `([a-z_]+)` or `unit` `([a-z_]+)`",
+                       RULE_CLAUSES["alarm_channel"])
+    assert protocol is not None and tokens is not None
+    if protocol.group(1) not in v1["protocols"]:
+        raise Failure("the bridged protocol is not one of v1's")
+    qualifications = frozenset(cells["qualification"])
+    if cells["record"][0] not in qualifications:
+        raise Failure("the record row names no qualification")
+    prefix, hex_len, lower = cells["digest"]
     return {
-        "v1": _v1_manifest(t1),
-        "bridged_source": bridged.group(1),
-        "modes": modes,
-        "reasons": {rule: c[0] for rule, c in zip(RULES, codes)},
-        "pin": pin.group(1),
+        "field": name,
+        "keys": frozenset(PROFILE_ROWS),
+        "types": {k: (str, type(None)) if kind == "string or null" else (str,)
+                  for k, kind, _ in rows},
+        "fleet": (int(fleet.group(1)), int(fleet.group(2)), _alphabet(fleet.group(3))),
+        "digest": (prefix, int(hex_len),
+                   frozenset("0123456789abcdef" if lower else "0123456789abcdefABCDEF")),
+        "qualifications": qualifications,
+        "unrecorded": cells["record"][0],
+        "record": (int(record.group(1)), int(record.group(2)), record.group(3),
+                   record.group(6)),
+        "protocol": protocol.group(1),
+        "shared": same.groups()[1:4],
+        "shared_reason": same.group(7),
+        "alarm_sensor_type": tokens.group(1),
+        "alarm_unit": tokens.group(2),
     }
 
 
@@ -345,9 +522,12 @@ def derive_mode(manifest: dict, model: dict) -> str | None:
     return None
 
 
-def v1_fault(message: dict, context: dict, public: bytes, model: dict) -> str | None:
+def v1_fault(message: dict, context: dict, public: bytes, model: dict,
+             vocabulary: tuple[set[str], set[str]]) -> str | None:
     """Return why the v1 checks modelled here refuse the message, or None."""
     v1 = model["v1"]
+    sensor_types, units = vocabulary
+    shapes = (v1["channel_fields"], v1["channel_fields"] | {model["profile"]["field"]})
     if type(message) is not dict or set(message) != {"manifest", "manifest_hash", "signature"}:
         return "message fields"
     m = message["manifest"]
@@ -391,12 +571,14 @@ def v1_fault(message: dict, context: dict, public: bytes, model: dict) -> str | 
             return name
     seen = set()
     for c in m["channels"]:
-        if type(c) is not dict or set(c) != v1["channel_fields"]:
+        if type(c) is not dict or set(c) not in shapes:
             return "channel fields"
         if c["channel"] in seen:
             return "duplicate channel"
         seen.add(c["channel"])
-        if (c["sensor_type"] not in v1["sensor_types"] or c["unit"] not in v1["units"]
+        if any(type(c[k]) is not str for k in ("sensor_type", "unit", "protocol", "source")):
+            return "channel strings"
+        if (c["sensor_type"] not in sensor_types or c["unit"] not in units
                 or c["protocol"] not in v1["protocols"] or c["source"] not in v1["sources"]):
             return "unsupported channel"
         q = c["quality_floor"]
@@ -415,8 +597,74 @@ def v1_fault(message: dict, context: dict, public: bytes, model: dict) -> str | 
     return None
 
 
+def profile_faults(binding: object, channel: dict, model: dict,
+                   off: frozenset[str] = frozenset()) -> set[str]:
+    """Every `controller_profile` grammar clause a bridged channel breaks."""
+    g = model["profile"]
+    faults = set()
+    if channel["source"] == model["bridged_source"] and channel["protocol"] != g["protocol"]:
+        faults.add("protocol")
+    if g["field"] not in channel:
+        return faults
+    if type(binding) is not dict:
+        return faults | {"not_object"}
+    if set(binding) - g["keys"]:
+        faults.add("keys_extra")
+    if g["keys"] - set(binding):
+        faults.add("keys_missing")
+    for key, kinds in g["types"].items():
+        if key in binding and type(binding[key]) not in kinds:
+            faults.add(f"{key}_type")
+    low, high, chars = g["fleet"]
+    for key in ("id", "profile_channel"):
+        value = binding.get(key)
+        if type(value) is str:
+            if not low <= len(value) <= high:
+                faults.add(f"{key}_length")
+            if not set(value) <= chars:
+                faults.add(f"{key}_chars")
+    prefix, size, digits = g["digest"]
+    digest = binding.get("digest")
+    if type(digest) is str:
+        if not digest.startswith(prefix):
+            faults.add("digest_prefix")
+        else:
+            if len(digest) != len(prefix) + size:
+                faults.add("digest_length")
+            if not set(digest[len(prefix):]) <= digits:
+                faults.add("digest_digits")
+    qualification = binding.get("qualification")
+    known = type(qualification) is str and qualification in g["qualifications"]
+    content = "type_also_content" in off
+    if (type(qualification) is str or (content and "qualification" in binding)) and not known:
+        faults.add("qualification")
+    elif known and "record" in binding and (
+            content or type(binding["record"]) in (str, type(None))):
+        unrecorded = qualification == g["unrecorded"]
+        if binding["record"] is None and not unrecorded:
+            faults.add("record_missing")
+        if binding["record"] is not None and unrecorded:
+            faults.add("record_unexpected")
+    record = binding.get("record")
+    if type(record) is str:
+        low, high, separator, parent = g["record"]
+        if not low <= len(record) <= high:
+            faults.add("record_length")
+        if not set(record) <= chars | {separator}:
+            faults.add("record_chars")
+        if record.startswith(separator):
+            faults.add("record_leading")
+        if record.endswith(separator):
+            faults.add("record_trailing")
+        if separator * 2 in record:
+            faults.add("record_double_separator")
+        if parent in record:
+            faults.add("record_dotdot")
+    return faults
+
+
 def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
-    """Every v2 Device Mode rule the manifest breaks, not only the first."""
+    """Every v2 manifest rule the manifest breaks, not only the first."""
     mode = manifest["device_mode"]
     broken = set()
     defined = type(mode) is str and mode in model["modes"]
@@ -426,10 +674,122 @@ def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
         broken.add("mode_disagrees")
     if not manifest["channels"]:
         broken.add("channels_empty")
+    g = model["profile"]
+    for c in manifest["channels"]:
+        bridged = c["source"] == model["bridged_source"]
+        if bridged and g["field"] not in c:
+            broken.add("profile_missing")
+        if not bridged and g["field"] in c:
+            broken.add("profile_unexpected")
+        if profile_faults(c.get(g["field"]), c, model, off):
+            broken.add("profile_invalid")
+        alarm_type = c["sensor_type"] == g["alarm_sensor_type"]
+        alarm_unit = c["unit"] == g["alarm_unit"]
+        if (alarm_type or alarm_unit) and not (bridged and alarm_type and alarm_unit):
+            broken.add("alarm_channel")
+    if consistency_faults(manifest, model) and "profile_consistency" not in off:
+        broken.add("profile_invalid")
     return broken - off
 
 
-def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+def consistency_faults(manifest: dict, model: dict) -> set[str]:
+    """Which shared fields differ between channels that name one profile id."""
+    g = model["profile"]
+    groups: dict[str, list[dict]] = {}
+    for c in manifest["channels"]:
+        b = c.get(g["field"])
+        if type(b) is dict and type(b.get("id")) is str:
+            groups.setdefault(b["id"], []).append(b)
+    faults = set()
+    for bindings in groups.values():
+        for key in g["shared"]:
+            if len({json.dumps(b.get(key), sort_keys=True) for b in bindings}) > 1:
+                faults.add(f"one_id_two_{key}")
+    ids: dict[str, set[str]] = {}
+    for c in manifest["channels"]:
+        b = c.get(g["field"])
+        if type(b) is dict and type(b.get("digest")) is str and type(b.get("id")) is str:
+            ids.setdefault(b["digest"], set()).add(b["id"])
+    if any(len(v) > 1 for v in ids.values()):
+        faults.add("one_digest_two_id")
+    return faults
+
+
+def profile_documents(profiles: dict, model: dict) -> dict[str, dict]:
+    """The profile corpus's accepted documents, by this script's digest of each."""
+    documents = {}
+    for case in profiles["cases"]:
+        digest = "sha256:" + hashlib.sha256(canonical(case["document"])).hexdigest()
+        if case["digest"] != digest:
+            raise Failure(f"profile {case['name']}: digest is not its document's")
+        documents[digest] = case["document"]
+    return documents
+
+
+def vocabulary(documents: dict[str, dict], model: dict) -> tuple[set[str], set[str]]:
+    v1, g = model["v1"], model["profile"]
+    sensor_types = v1["sensor_types"] | {g["alarm_sensor_type"]}
+    units = v1["units"] | {g["alarm_unit"]}
+    for doc in documents.values():
+        for c in doc["channels"]:
+            if "sensor_type" in c:
+                sensor_types.add(c["sensor_type"])
+                units.add(c["unit"])
+    return sensor_types, units
+
+
+def binding_fault(channel: dict, documents: dict[str, dict], model: dict) -> str | None:
+    """Why the profile corpus does not hold what an accepted channel names."""
+    g = model["profile"]
+    binding = channel[g["field"]]
+    doc = documents.get(binding["digest"])
+    if doc is None:
+        return "names no document of the profile corpus"
+    if doc["id"] != binding["id"]:
+        return f"names {binding['id']}, the document is {doc['id']}"
+    named = [c for c in doc["channels"] if c["name"] == binding["profile_channel"]]
+    if len(named) != 1:
+        return f"the document has no channel {binding['profile_channel']}"
+    if named[0]["kind"] == g["alarm_kind"]:
+        wanted = (g["alarm_sensor_type"], g["alarm_unit"])
+    else:
+        wanted = (named[0]["sensor_type"], named[0]["unit"])
+    if (channel["sensor_type"], channel["unit"]) != wanted:
+        return f"declares {channel['sensor_type']}/{channel['unit']}, the profile {wanted}"
+    return None
+
+
+CONTRACT = "ori-specs/firmware-telemetry/v2.md"
+CORPUS_VERSION = 2
+TOP_KEYS = {"contract", "version", "comment", "test_seed_hex", "public_key_hex",
+            "public_key_b64", "signature_encoding", "verifier_context", "reasons", "cases",
+            "reject_cases"}
+CASE_KEYS = {"name", "message", "canonical_hex", "canonical_sha256_hex", "message_hex", "note"}
+REJECT_KEYS = CASE_KEYS | {"reason", "signature_valid"}
+
+
+def _shapes(corpus: dict) -> None:
+    """The corpus and each of its entries carry exactly their keys."""
+    if type(corpus) is not dict or set(corpus) != TOP_KEYS:
+        raise Failure(f"corpus keys {sorted(corpus)} are not {sorted(TOP_KEYS)}")
+    if (type(corpus["contract"]) is not str or corpus["contract"] != CONTRACT
+            or type(corpus["version"]) is not int or corpus["version"] != CORPUS_VERSION):
+        raise Failure(f"corpus names {corpus['contract']!r} v{corpus['version']!r}, not "
+                      f"{CONTRACT} v{CORPUS_VERSION}")
+    for section, keys in (("cases", CASE_KEYS), ("reject_cases", REJECT_KEYS)):
+        for entry in corpus[section]:
+            if type(entry) is not dict or set(entry) != keys:
+                raise Failure(f"{section} entry {entry.get('name')!r} has keys "
+                              f"{sorted(entry)}, not {sorted(keys)}")
+            if type(entry["note"]) is not str or type(entry["name"]) is not str:
+                raise Failure(f"{section} entry {entry['name']!r}: name or note not a string")
+
+
+def check(corpus: dict, model: dict, profiles: dict,
+          off: frozenset[str] = frozenset()) -> None:
+    _shapes(corpus)
+    documents = profile_documents(profiles, model)
+    words = vocabulary(documents, model)
     seed = bytes.fromhex(corpus["test_seed_hex"])
     public = public_key(seed)
     if corpus["public_key_hex"] != public.hex():
@@ -455,7 +815,7 @@ def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
             raise Failure(f"{case['name']}: digest")
         if bytes.fromhex(case["message_hex"]) != canonical(message):
             raise Failure(f"{case['name']}: wire message")
-        why = v1_fault(message, context, public, model)
+        why = v1_fault(message, context, public, model, words)
         if why is not None:
             raise Failure(f"{case['name']}: not otherwise valid under v1 ({why})")
         return manifest
@@ -473,6 +833,11 @@ def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
             raise Failure(f"{case['name']}: refused ({sorted(broken)})")
         if "mode_disagrees" not in off and manifest["device_mode"] != derive_mode(manifest, model):
             raise Failure(f"{case['name']}: mode is not the one its arrays determine")
+        for c in manifest["channels"]:
+            if model["profile"]["field"] in c:
+                why = binding_fault(c, documents, model)
+                if why is not None:
+                    raise Failure(f"{case['name']}: {c['channel']} {why}")
 
     for case in corpus["reject_cases"]:
         manifest = common(case)
@@ -510,6 +875,97 @@ def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
     if not any(r == model["reasons"]["channels_empty"] and m["actions"]
                and derive_mode(m, model) == m["device_mode"] for r, m in refused):
         raise Failure("coverage: no refusal for empty channels alone")
+    _profile_coverage(accepted, refused, model, off)
+
+
+def _bound_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
+                    model: dict) -> dict[str, bool]:
+    """Each end of each bound the grammar reads accepted, one past each refused."""
+    g = model["profile"]
+    prefix, size, _ = g["digest"]
+    low, high, _ = g["fleet"]
+    pairs = {
+        "fleet identifier length": ((low, high), ("id", "profile_channel"), 0),
+        "record length": (g["record"][:2], ("record",), 0),
+        "digest hex length": ((size, size), ("digest",), len(prefix)),
+    }
+
+    def lengths(manifests: list[dict], fields: tuple[str, ...], skip: int) -> set[int]:
+        out = set()
+        for m in manifests:
+            for c in m["channels"]:
+                b = c.get(g["field"])
+                if type(b) is not dict:
+                    continue
+                for f in fields:
+                    v = b.get(f)
+                    if type(v) is str and (not skip or v.startswith(prefix)):
+                        out.add(len(v) - skip)
+        return out
+
+    invalid = model["reasons"]["profile_invalid"]
+    wanted = {}
+    for label, ((first, last), fields, skip) in pairs.items():
+        good = lengths(accepted, fields, skip)
+        bad = lengths([m for r, m in refused if r == invalid], fields, skip)
+        for end, past in ((first, first - 1), (last, last + 1)):
+            wanted[f"{label} accepted at {end}"] = end in good
+            wanted[f"{label} refused at {past}"] = past in bad
+    return wanted
+
+
+def _profile_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
+                      model: dict, off: frozenset[str]) -> None:
+    g = model["profile"]
+    bindings = [[c[g["field"]] for c in m["channels"] if g["field"] in c] for m in accepted]
+    wanted: dict[str, bool] = {}
+    for q in sorted(g["qualifications"]):
+        wanted[f"{q} profile accepted"] = any(b["qualification"] == q
+                                              for bs in bindings for b in bs)
+    wanted["alarm-word channel accepted"] = any(
+        c["sensor_type"] == g["alarm_sensor_type"] for m in accepted for c in m["channels"])
+    wanted["two channels reading one profile accepted"] = any(
+        len(bs) > len({b["digest"] for b in bs}) for bs in bindings)
+    wanted.update(_bound_coverage(accepted, refused, model))
+    for reason in set(model["reasons"].values()):
+        wanted[f"a refusal for {reason}"] = any(r == reason for r, _ in refused)
+    invalid = model["reasons"]["profile_invalid"]
+    alone = set()
+    for r, m in refused:
+        if r == invalid:
+            faults: set[str] = set()
+            for c in m["channels"]:
+                faults |= profile_faults(c.get(g["field"]), c, model, off)
+            faults |= consistency_faults(m, model)
+            faults -= {IMPLIED[f] for f in faults if f in IMPLIED}
+            if len(faults) == 1:
+                alone |= faults
+    for clause in PROFILE_CLAUSES:
+        wanted[f"a refusal breaking {clause} alone"] = clause in alone
+    # "even inside a segment": the parent token within a segment, not as one.
+    _, _, separator, parent = g["record"]
+    wanted[f"a refusal with {parent} inside a record segment"] = any(
+        r == invalid and any(
+            type(b := c.get(g["field"])) is dict and type(b.get("record")) is str
+            and any(parent in seg and seg != parent for seg in b["record"].split(separator))
+            for c in m["channels"]) for r, m in refused)
+    misuse = model["reasons"]["alarm_channel"]
+    for bridged, tokens in itertools.product((True, False), ((1, 0), (0, 1), (1, 1))):
+        if bridged and tokens == (1, 1):
+            continue
+        label = (f"{'a bridged' if bridged else 'an unbridged'} channel declaring "
+                 f"{['', 'the alarm sensor_type'][tokens[0]]}"
+                 f"{' and ' if tokens == (1, 1) else ''}"
+                 f"{['', 'the alarm unit'][tokens[1]]}"
+                 f"{' alone' if tokens != (1, 1) else ''}")
+        wanted[label] = any(r == misuse and any(
+            (c["source"] == model["bridged_source"]) == bridged
+            and (int(c["sensor_type"] == g["alarm_sensor_type"]),
+                 int(c["unit"] == g["alarm_unit"])) == tokens
+            for c in m["channels"]) for r, m in refused)
+    missing = sorted(k for k, ok in wanted.items() if not ok)
+    if missing:
+        raise Failure(f"coverage: {missing}")
 
 
 def _roles(manifest: dict, model: dict) -> set[str]:
@@ -520,16 +976,21 @@ def _roles(manifest: dict, model: dict) -> set[str]:
     return roles | ({"actions"} if manifest["actions"] else set())
 
 
-def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> None:
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset(),
+        profile_bytes: bytes | None = None) -> None:
+    profile_bytes = PROFILES.read_bytes() if profile_bytes is None else profile_bytes
     if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
         raise Failure("corpus digest differs from the one firmware-telemetry/v2.md pins")
-    check(json.loads(corpus_bytes), model, off)
+    if hashlib.sha256(profile_bytes).hexdigest() != model["profile_pin"]:
+        raise Failure("profile corpus digest differs from the one v2.md pins")
+    check(json.loads(corpus_bytes), model, json.loads(profile_bytes), off)
 
 
 # --- mutations -------------------------------------------------------------
 
 def mutations(corpus_bytes: bytes, model: dict) -> int:
     base = json.loads(corpus_bytes)
+    profiles = json.loads(PROFILES.read_bytes())
     seed = bytes.fromhex(base["test_seed_hex"])
 
     def resign(case: dict) -> None:
@@ -554,7 +1015,7 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         def go() -> None:
             mutated = copy.deepcopy(base)
             edit(mutated)
-            check(mutated, model)
+            check(mutated, model, profiles)
         return go
 
     def edited(pick: Callable[[dict], dict], **fields: object) -> Callable[[dict], None]:
@@ -577,6 +1038,52 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         case["message"]["manifest"].update(actions=[])
         resign(case)
         c["reject_cases"].append(case)
+
+    def profile_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(profiles)
+            edit(mutated)
+            check(copy.deepcopy(base), model, mutated)
+        return go
+
+    def rename_voltage(p: dict) -> None:
+        doc = p["cases"][0]["document"]
+        next(c for c in doc["channels"] if c["name"] == "output_voltage")["name"] = "volts"
+        p["cases"][0]["digest"] = "sha256:" + hashlib.sha256(canonical(doc)).hexdigest()
+
+    qualified = find("cases", "bridge_node_qualified")
+    alarm_case = find("cases", "bridge_node_alarm_word")
+    generator_digest = next(x["digest"] for x in profiles["cases"] if x["name"] == "generator")
+
+    def without_profile(case: dict) -> dict:
+        channel = dict(case["message"]["manifest"]["channels"][0])
+        del channel["controller_profile"]
+        return channel
+
+    def rechannel(pick: Callable[[dict], dict], name: str,
+                  **fields: object) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = pick(c)
+            channel = next(x for x in case["message"]["manifest"]["channels"]
+                           if x["channel"] == name)
+            channel.update(copy.deepcopy(fields))
+            resign(case)
+        return edit
+
+    def rebind(pick: Callable[[dict], dict], name: str,
+               **fields: object) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = pick(c)
+            channel = next(x for x in case["message"]["manifest"]["channels"]
+                           if x["channel"] == name)
+            channel["controller_profile"].update(fields)
+            resign(case)
+        return edit
+
+    def two_profile_reasons(c: dict) -> None:
+        case = find("reject_cases", "reject_bridged_without_profile")(c)
+        case["message"]["manifest"]["channels"][0]["protocol"] = "i2c"
+        resign(case)
 
     def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
         def go() -> None:
@@ -617,8 +1124,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                                           protocol="can")]))),
         ("null mode refusal dropped", corpus_mutant(
             lambda c: c["reject_cases"].remove(null_mode(c)))),
-        ("bridge_node case dropped", corpus_mutant(
-            lambda c: c["cases"].remove(bridge(c)))),
+        ("bridge_node cases dropped", corpus_mutant(lambda c: c.update(cases=[
+            x for x in c["cases"] if x["message"]["manifest"]["device_mode"] != "bridge_node"]))),
         ("refusal moved to cases", corpus_mutant(
             lambda c: c["cases"].append(dict(no_channels(c), name="moved")))),
         ("seed swapped", corpus_mutant(lambda c: c.update(test_seed_hex="43" * 32))),
@@ -667,6 +1174,242 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("fourth rule added in v2.md", text_mutant(
             "t2", "- `channels` is empty (`no_channels`).",
             "- `channels` is empty (`no_channels`).\n- placeholder (`x`).")),
+        ("rule off: profile missing", lambda: run(
+            corpus_bytes, model, frozenset({"profile_missing"}))),
+        ("rule off: profile unexpected", lambda: run(
+            corpus_bytes, model, frozenset({"profile_unexpected"}))),
+        ("rule off: profile invalid", lambda: run(
+            corpus_bytes, model, frozenset({"profile_invalid"}))),
+        ("rule off: alarm channel", lambda: run(
+            corpus_bytes, model, frozenset({"alarm_channel"}))),
+        ("profile-missing clause inverted in v2.md", text_mutant(
+            "t2", "- a bridged channel carries no `controller_profile`",
+            "- a bridged channel carries `controller_profile`")),
+        ("profile-unexpected clause inverted in v2.md", text_mutant(
+            "t2", "- a channel that is not bridged carries `controller_profile`",
+            "- a channel that is bridged carries `controller_profile`")),
+        ("bridged protocol clause inverted in v2.md", text_mutant(
+            "t2", "`protocol` is not `modbus_rtu`", "`protocol` is `modbus_rtu`")),
+        ("bridged protocol renamed in v2.md", text_mutant(
+            "t2", "`protocol` is not `modbus_rtu`", "`protocol` is not `uart`")),
+        ("alarm clause's exception dropped in v2.md", text_mutant(
+            "t2", "`bitmask`, unless it is a bridged channel that declares both\n  ",
+            "`bitmask`\n  ")),
+        ("alarm clause's exception widened in v2.md", text_mutant(
+            "t2", "unless it is a bridged channel that declares both",
+            "unless it is a bridged channel that declares either")),
+        ("profile reason renamed in v2.md", text_mutant(
+            "t2", "(`controller_profile_missing`)", "(`profile_missing`)")),
+        ("fifth profile rule added in v2.md", text_mutant(
+            "t2", "  (`invalid_alarm_channel`).",
+            "  (`invalid_alarm_channel`).\n- placeholder (`x`).")),
+        ("profile rules reordered in v2.md", text_mutant(
+            "t2",
+            "- a bridged channel carries no `controller_profile` (`controller_profile_missing`);\n"
+            "- a channel that is not bridged carries `controller_profile` "
+            "(`controller_profile_unexpected`);\n",
+            "- a channel that is not bridged carries `controller_profile` "
+            "(`controller_profile_unexpected`);\n"
+            "- a bridged channel carries no `controller_profile` (`controller_profile_missing`);\n")),
+        ("fleet alphabet lengthened in v2.md", text_mutant(
+            "t2", "a string of 1 to 48\ncharacters", "a string of 1 to 64\ncharacters")),
+        ("fleet alphabet emptied of length in v2.md", text_mutant(
+            "t2", "a string of 1 to 48\ncharacters", "a string of 0 to 48\ncharacters")),
+        ("hyphen dropped from the fleet alphabet in v2.md", text_mutant(
+            "t2", "`.`,\n`_` and `-`.", "`.`\nand `_`.")),
+        ("slash added to the fleet alphabet in v2.md", text_mutant(
+            "t2", "`.`,\n`_` and `-`.", "`.`,\n`_`, `-` and `/`.")),
+        ("digest case rule dropped in v2.md", text_mutant(
+            "t2", "and 64 lowercase hex:", "and 64 hex:")),
+        ("digest length changed in v2.md", text_mutant(
+            "t2", "and 64 lowercase hex:", "and 63 lowercase hex:")),
+        ("digest prefix renamed in v2.md", text_mutant(
+            "t2", "| `digest` | string | `sha256:`", "| `digest` | string | `sha512:`")),
+        ("qualification renamed in v2.md", text_mutant(
+            "t2", "| `qualified` or `unqualified`. |", "| `qualified` or `pending`. |")),
+        ("record pairing inverted in v2.md", text_mutant(
+            "t2", "`null` exactly when `qualification` is `unqualified`",
+            "`null` exactly when `qualification` is `qualified`")),
+        ("record may be absent in v2.md", text_mutant(
+            "t2", "| `record` | string or null |", "| `record` | string |")),
+        ("record bound raised in v2.md", text_mutant(
+            "t2", "A `record` is 1 to 127", "A `record` is 1 to 200")),
+        ("record parent token lengthened in v2.md", text_mutant(
+            "t2", "never contains\n`..` anywhere", "never contains\n`...` anywhere")),
+        ("record leading-slash rule dropped in v2.md", text_mutant(
+            "t2", "does not begin or end with `/`", "does not end with `/`")),
+        ("record double-separator rule dropped in v2.md", text_mutant(
+            "t2", " never has two `/` in a row,", "")),
+        ("record dots allowed inside a segment in v2.md", text_mutant(
+            "t2", "anywhere, even inside a segment.", "as a segment.")),
+        ("fleet identifier definition moved in v2.md", text_mutant(
+            "t2", "A fleet identifier, wherever Controller Profiles names one,",
+            "A fleet identifier, wherever this subsection names one,")),
+        ("profile_channel row loses its fleet identifier in v2.md", text_mutant(
+            "t2", "channel this channel reads, a fleet identifier.",
+            "channel this channel reads, a string.")),
+        ("wrong-type values judged by content", lambda: run(
+            corpus_bytes, model, frozenset({"type_also_content"}))),
+        ("five-keys sentence loosened in v2.md", text_mutant(
+            "t2", "The object's keys are exactly these five.",
+            "The object's keys include these five.")),
+        ("field table row added in v2.md", text_mutant(
+            "t2", "| `qualification` | string |",
+            "| `bus_address` | string | Any. |\n| `qualification` | string |")),
+        ("example channel adds a second field in v2.md", text_mutant(
+            "t2", '  "quality_floor": 0.8,\n  "controller_profile"',
+            '  "quality_floor": 0.8,\n  "bus": 1,\n  "controller_profile"')),
+        ("alarm reading sentence renamed in v2.md", text_mutant(
+            "t2", "declares\n`sensor_type` `controller_alarm_word` and `unit` `bitmask`",
+            "declares\n`sensor_type` `controller_alarm_word` and `unit` `bits`")),
+        ("profile corpus pin wrong", model_mutant(lambda m: m.update(profile_pin="0" * 64))),
+        ("profile corpus edited", lambda: run(
+            corpus_bytes, model, profile_bytes=PROFILES.read_bytes().replace(
+                b'"poll_interval_ms": 5000', b'"poll_interval_ms": 5001', 1))),
+        ("rectifier dropped from the profile corpus", profile_mutant(
+            lambda p: p["cases"].pop(0))),
+        ("profile corpus digest misstated", profile_mutant(
+            lambda p: p["cases"][0].update(digest=p["cases"][1]["digest"]))),
+        ("rectifier's voltage channel renamed in the profile corpus", profile_mutant(
+            rename_voltage)),
+        ("accepted bridged channel's profile removed and re-signed", corpus_mutant(
+            edited(bridge, channels=[without_profile(bridge(base))]))),
+        ("accepted binding names another profile and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", digest=generator_digest))),
+        ("accepted binding names an unknown digest and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", digest="sha256:" + "0" * 64))),
+        ("accepted binding names another id and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", id="example-rectifier2"))),
+        ("accepted binding reads a channel of another type and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", profile_channel="output_voltage"))),
+        ("accepted alarm word reads a measurement and re-signed", corpus_mutant(
+            rebind(alarm_case, "ch3", profile_channel="output_current"))),
+        ("accepted binding reads no channel and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", profile_channel="input_current"))),
+        ("accepted unqualified binding given a record and re-signed", corpus_mutant(
+            rebind(bridge, "ch1", record="controllers/records/example-rectifier.md"))),
+        ("accepted qualified binding loses its record and re-signed", corpus_mutant(
+            rebind(qualified, "ch1", record=None))),
+        ("accepted bridged channel moved to uart and re-signed", corpus_mutant(
+            rechannel(bridge, "ch1", protocol="uart"))),
+        ("accepted metering channel given a profile and re-signed", corpus_mutant(
+            rechannel(find("cases", "sensor_node"), "ch0",
+                      controller_profile=bridge(base)["message"]["manifest"]["channels"][0][
+                          "controller_profile"]))),
+        ("accepted alarm word made metering and re-signed", corpus_mutant(
+            rechannel(alarm_case, "ch3", source="pzem"))),
+        ("profile refusal fixed and re-signed", corpus_mutant(
+            rebind(find("reject_cases", "reject_profile_id_empty"), "ch1",
+                   id="example-rectifier"))),
+        ("profile refusal also missing a profile and re-signed", corpus_mutant(
+            two_profile_reasons)),
+        ("alarm refusal also on another protocol and re-signed", corpus_mutant(
+            rechannel(find("reject_cases", "reject_alarm_word_type_wrong_unit"), "ch1",
+                      protocol="uart"))),
+        ("profile refusal relabelled missing", corpus_mutant(
+            lambda c: find("reject_cases", "reject_profile_id_empty")(c).update(
+                reason="controller_profile_missing"))),
+        ("alarm refusal relabelled unexpected", corpus_mutant(
+            lambda c: find("reject_cases", "reject_alarm_word_type_on_metering")(c).update(
+                reason="controller_profile_unexpected"))),
+        ("protocol refusal relabelled alarm", corpus_mutant(
+            lambda c: find("reject_cases", "reject_bridged_other_protocol")(c).update(
+                reason="invalid_alarm_channel"))),
+        ("qualified cases dropped", corpus_mutant(lambda c: c.update(cases=[
+            x for x in c["cases"] if not any(
+                ch.get("controller_profile", {}).get("qualification") == "qualified"
+                for ch in x["message"]["manifest"]["channels"])]))),
+        ("shortest record case dropped", corpus_mutant(
+            lambda c: c["cases"].remove(find("cases", "bridge_node_shortest_record")(c)))),
+        ("longest record case dropped", corpus_mutant(
+            lambda c: c["cases"].remove(find("cases", "bridge_node_longest_record")(c)))),
+        ("empty record refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(find("reject_cases", "reject_record_empty")(c)))),
+        ("record length raised in v2.md", text_mutant(
+            "t2", "A `record` is 1 to 127 characters", "A `record` is 1 to 128 characters")),
+        ("record length floor lowered in v2.md", text_mutant(
+            "t2", "A `record` is 1 to 127 characters", "A `record` is 0 to 127 characters")),
+        ("alarm-word cases dropped", corpus_mutant(lambda c: c.update(cases=[
+            x for x in c["cases"] if not any(
+                ch["unit"] == "bitmask" for ch in x["message"]["manifest"]["channels"])]))),
+        ("unexpected-profile refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_profile_on_metering_channel")(c)))),
+        ("rule off: one profile, one digest and qualification", lambda: run(
+            corpus_bytes, model, frozenset({"profile_consistency"}))),
+        ("one-profile paragraph drops digest in v2.md", text_mutant(
+            "t2", "carry the same `digest`,\n`qualification` and `record`",
+            "carry the same `id`,\n`qualification` and `record`")),
+        ("one-profile paragraph names another reason in v2.md", text_mutant(
+            "t2", "in which they differ\n(`invalid_controller_profile`)",
+            "in which they differ\n(`controller_profile_conflict`)")),
+        ("accepted alarm word given a second digest and re-signed", corpus_mutant(
+            rebind(alarm_case, "ch3", digest=generator_digest))),
+        ("accepted alarm word given a second qualification and re-signed", corpus_mutant(
+            rebind(alarm_case, "ch3", qualification="qualified",
+                   record="controllers/records/example-rectifier.md"))),
+        ("two-digest refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_one_profile_two_digests")(c)))),
+        ("one-digest-two-ids refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_one_digest_two_ids")(c)))),
+        ("digest-to-id clause dropped in v2.md", text_mutant(
+            "t2", ", and channels that name the same `digest` name the\nsame `id`", "")),
+        ("accepted alarm word given another id and re-signed", corpus_mutant(
+            rebind(alarm_case, "ch3", id="example-rectifier-2"))),
+        ("two-record refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_one_profile_two_records")(c)))),
+        ("non-string digest refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_digest_not_string")(c)))),
+        ("non-string profile_channel refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_profile_channel_not_string")(c)))),
+        ("two-qualification refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_one_profile_two_qualifications")(c)))),
+        ("top-level key added", corpus_mutant(lambda c: c.update(extra=1))),
+        ("corpus names another contract", corpus_mutant(
+            lambda c: c.update(contract="ori-specs/firmware-telemetry/v1.md"))),
+        ("corpus version 1", corpus_mutant(lambda c: c.update(version=1))),
+        ("corpus version a boolean", corpus_mutant(lambda c: c.update(version=True))),
+        ("top-level key removed", corpus_mutant(lambda c: c.pop("comment"))),
+        ("case given a stray key", corpus_mutant(lambda c: bridge(c).update(reason="x"))),
+        ("case loses its note", corpus_mutant(lambda c: bridge(c).pop("note"))),
+        ("refusal given a stray key", corpus_mutant(lambda c: null_mode(c).update(rule="x"))),
+        ("refusal loses signature_valid", corpus_mutant(
+            lambda c: null_mode(c).pop("signature_valid"))),
+        ("case note not a string", corpus_mutant(lambda c: bridge(c).update(note=1))),
+        ("refusal note not a string", corpus_mutant(lambda c: null_mode(c).update(note=None))),
+        ("double-separator refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_record_empty_segment")(c)))),
+        ("dots-inside-segment refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_record_dots_inside_segment")(c)))),
+        ("record-type refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_record_not_string")(c)))),
+        ("qualification-type refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_qualification_boolean")(c)))),
+        ("unbridged bitmask-alone refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_bitmask_unit_on_metering")(c)))),
+        ("unbridged alarm-type-alone refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_alarm_word_type_on_metering_alone")(c)))),
+        ("profile_channel length refusals dropped", corpus_mutant(lambda c: c.update(
+            reject_cases=[x for x in c["reject_cases"] if x["name"] not in (
+                "reject_profile_channel_empty", "reject_profile_channel_too_long")]))),
+        ("other-protocol refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_bridged_other_protocol")(c)))),
+        ("bitmask-alone refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(
+                find("reject_cases", "reject_bitmask_unit_on_measurement")(c)))),
         ("first two rules swapped in v2.md", text_mutant(
             "t2",
             "- `device_mode` is not one of the four values above, including a value of\n"
@@ -687,6 +1430,7 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         else:
             print(f"SURVIVED {label}")
             survived += 1
+    print(f"{len(cases)} mutants")
     return survived
 
 
@@ -705,7 +1449,8 @@ def main(argv: list[str]) -> int:
     corpus = json.loads(corpus_bytes)
     print(
         f"firmware-telemetry/v2 manifest corpus: {len(corpus['cases'])} cases "
-        f"accepted, {len(corpus['reject_cases'])} refusals each for its declared reason"
+        f"accepted, {len(corpus['reject_cases'])} refusals each for its declared reason; "
+        f"it holds no states or reject_bytes"
     )
     if argv == ["--mutations"]:
         survived = mutations(corpus_bytes, model)

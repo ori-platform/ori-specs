@@ -25,6 +25,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "firmware-telemetry" / "manifest-vectors-v2.json"
+PROFILES = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
 
 SEED_HEX = "42" * 32
 DEVICE_ID = "ori-fw-7c9f2b3a"
@@ -45,14 +46,62 @@ METERING_I2C = {
     "source": "ads1115",
     "quality_floor": 0.9,
 }
-BRIDGED = {
-    "channel": "ch1",
-    "sensor_type": "current",
-    "unit": "ampere",
-    "protocol": "modbus_rtu",
-    "source": "foreign_device",
-    "quality_floor": 0.8,
-}
+
+def _profile_digest(name: str) -> str:
+    corpus = json.loads(PROFILES.read_bytes())
+    return next(c["digest"] for c in corpus["cases"] if c["name"] == name)
+
+
+RECTIFIER_DIGEST = _profile_digest("rectifier")
+
+
+def controller_profile(channel: str, **over: object) -> dict:
+    binding = {
+        "id": "example-rectifier",
+        "digest": RECTIFIER_DIGEST,
+        "profile_channel": channel,
+        "qualification": "unqualified",
+        "record": None,
+    }
+    binding.update(over)
+    return binding
+
+
+def bridged(**over: object) -> dict:
+    channel = {
+        "channel": "ch1",
+        "sensor_type": "current",
+        "unit": "ampere",
+        "protocol": "modbus_rtu",
+        "source": "foreign_device",
+        "quality_floor": 0.8,
+        "controller_profile": controller_profile("output_current"),
+    }
+    channel.update(over)
+    return channel
+
+
+def with_profile(**over: object) -> dict:
+    return bridged(controller_profile=controller_profile("output_current", **over))
+
+
+BRIDGED = bridged()
+QUALIFIED = with_profile(
+    qualification="qualified", record="controllers/records/example-rectifier.md")
+ALARM_WORD = bridged(
+    channel="ch3",
+    sensor_type="controller_alarm_word",
+    unit="bitmask",
+    quality_floor=1.0,
+    controller_profile=controller_profile("alarm_word_1"),
+)
+BRIDGED_VOLTAGE = bridged(
+    channel="ch4",
+    sensor_type="voltage",
+    unit="volt",
+    controller_profile=controller_profile("output_voltage"),
+)
+NO_PROFILE = {k: v for k, v in BRIDGED.items() if k != "controller_profile"}
 ACTION = {"action": "relay_open", "channel": "relay0", "authority": "runtime_commanded"}
 INTERLOCK = {
     "name": "local_overcurrent_interlock",
@@ -119,6 +168,76 @@ ACCEPT = (
         [INTERLOCK],
         "all three roles; the bridged channel comes first, so no position "
         "decides the mode",
+    ),
+    (
+        "bridge_node_qualified",
+        "bridge_node",
+        [QUALIFIED],
+        [],
+        [],
+        "a bridged channel whose profile the device attests qualified, naming "
+        "its record",
+    ),
+    (
+        "bridge_node_alarm_word",
+        "bridge_node",
+        [BRIDGED, ALARM_WORD],
+        [],
+        [],
+        "an alarm-word channel reads the profile's alarm word as a bitmask",
+    ),
+    (
+        "bridge_node_one_profile_three_channels",
+        "bridge_node",
+        [BRIDGED, BRIDGED_VOLTAGE, ALARM_WORD],
+        [],
+        [],
+        "three channels read three channels of one profile, under one digest",
+    ),
+    (
+        "bridge_node_shortest_record",
+        "bridge_node",
+        [with_profile(qualification="qualified", record="r")],
+        [],
+        [],
+        "a one-character record",
+    ),
+    (
+        "bridge_node_longest_record",
+        "bridge_node",
+        [with_profile(qualification="qualified", record="c/" + "r" * 125)],
+        [],
+        [],
+        "a 127-character record",
+    ),
+    (
+        "bridge_node_shortest_profile_id",
+        "bridge_node",
+        [bridged(sensor_type="frequency", unit="hertz",
+                 controller_profile=controller_profile(
+                     "frequency", id="M", digest=_profile_digest("meter_bounds")))],
+        [],
+        [],
+        "a one-character profile id",
+    ),
+    (
+        "bridge_node_longest_profile_id",
+        "bridge_node",
+        [bridged(sensor_type="controller_alarm_word", unit="bitmask", quality_floor=1.0,
+                 controller_profile=controller_profile(
+                     "alarms", id="a" * 48, digest=_profile_digest("thirty_two_alarms")))],
+        [],
+        [],
+        "a 48-character profile id",
+    ),
+    (
+        "mixed_metering_and_alarm_word",
+        "mixed",
+        [METERING, ALARM_WORD],
+        [],
+        [],
+        "an alarm-word channel is bridged, so with a metering channel the "
+        "device is mixed",
     ),
 )
 
@@ -230,6 +349,130 @@ REJECT = (
 )
 
 
+def bad_profile(name: str, note: str, **over: object) -> tuple:
+    return (name, "invalid_controller_profile", "bridge_node",
+            [with_profile(**over)], [], [], note)
+
+
+def bad_profile_value(name: str, value: object, note: str) -> tuple:
+    return (name, "invalid_controller_profile", "bridge_node",
+            [bridged(controller_profile=value)], [], [], note)
+
+
+_PROFILE_NO_RECORD = {k: v for k, v in controller_profile("output_current").items()
+                      if k != "record"}
+
+REJECT_PROFILES = (
+    ("reject_bridged_without_profile", "controller_profile_missing", "bridge_node",
+     [NO_PROFILE], [], [],
+     "a bridged channel that names no profile; this was a valid v1 bridged "
+     "channel"),
+    ("reject_alarm_word_without_profile", "controller_profile_missing", "bridge_node",
+     [BRIDGED, {k: v for k, v in ALARM_WORD.items() if k != "controller_profile"}], [], [],
+     "an alarm word with no profile could not be interpreted at all"),
+    ("reject_profile_on_metering_channel", "controller_profile_unexpected", "sensor_node",
+     [dict(METERING, controller_profile=controller_profile("output_current"))], [], [],
+     "a metering channel decodes through no controller profile"),
+    bad_profile("reject_profile_id_bad_character", "a space is outside the fleet alphabet",
+                id="example rectifier"),
+    bad_profile("reject_profile_id_too_long", "an id is at most 48 characters", id="a" * 49),
+    bad_profile("reject_profile_id_empty", "an id is at least one character", id=""),
+    bad_profile("reject_digest_uppercase", "the digest is lowercase hex",
+                digest=RECTIFIER_DIGEST.upper().replace("SHA256:", "sha256:")),
+    bad_profile("reject_digest_no_prefix", "the digest carries its sha256: prefix",
+                digest=RECTIFIER_DIGEST[len("sha256:"):]),
+    bad_profile("reject_digest_long", "sixty-five hex digits are not a SHA-256",
+                digest=RECTIFIER_DIGEST + "0"),
+    bad_profile("reject_digest_short", "sixty-three hex digits are not a SHA-256",
+                digest=RECTIFIER_DIGEST[:-1]),
+    bad_profile("reject_profile_channel_bad_character",
+                "a slash is outside the fleet alphabet", profile_channel="output/current"),
+    bad_profile("reject_profile_id_not_string", "an id is a string", id=7),
+    bad_profile("reject_profile_channel_empty", "a fleet identifier is at least one character",
+                profile_channel=""),
+    bad_profile("reject_profile_channel_too_long", "a fleet identifier is at most 48 characters",
+                profile_channel="p" * 49),
+    bad_profile("reject_digest_not_string", "a digest is a string", digest=7),
+    bad_profile("reject_profile_channel_not_string", "a profile channel is a string",
+                profile_channel=["output_current"]),
+    bad_profile("reject_qualification_boolean", "qualification is a string",
+                qualification=True),
+    bad_profile("reject_record_not_string", "a record is a string or null",
+                qualification="qualified", record=5),
+    bad_profile("reject_record_dots_inside_segment", "a record never contains ..",
+                qualification="qualified", record="controllers/records/r..md"),
+    bad_profile("reject_qualification_unknown", "qualified or unqualified only",
+                qualification="pending"),
+    bad_profile("reject_qualified_without_record", "a qualified profile names its record",
+                qualification="qualified"),
+    bad_profile("reject_unqualified_with_record",
+                "a record on an unqualified profile would read as a qualification",
+                record="controllers/records/example-rectifier.md"),
+    bad_profile("reject_record_absolute", "a record does not begin with a slash",
+                qualification="qualified", record="/controllers/records/r.md"),
+    bad_profile("reject_record_parent", "a record contains no ..",
+                qualification="qualified", record="controllers/../records/r.md"),
+    bad_profile("reject_record_empty_segment", "a record has no empty segment",
+                qualification="qualified", record="controllers//r.md"),
+    bad_profile("reject_record_trailing_slash", "a record has no trailing slash",
+                qualification="qualified", record="controllers/records/"),
+    bad_profile("reject_record_empty", "a record is at least one character",
+                qualification="qualified", record=""),
+    bad_profile("reject_record_too_long", "a record is at most 127 characters",
+                qualification="qualified", record="r" * 128),
+    bad_profile("reject_record_bad_character", "a space is outside the record alphabet",
+                qualification="qualified", record="controllers/records/r 1.md"),
+    bad_profile_value("reject_profile_extra_key",
+                      dict(controller_profile("output_current"), bus_address=7),
+                      "the object's keys are exactly five; a site's bus address is not one"),
+    bad_profile_value("reject_profile_missing_record_key", _PROFILE_NO_RECORD,
+                      "record is present, as null, on an unqualified profile"),
+    bad_profile_value("reject_profile_not_object", RECTIFIER_DIGEST,
+                      "controller_profile is an object, not a bare digest"),
+    ("reject_one_profile_two_qualifications", "invalid_controller_profile", "bridge_node",
+     [QUALIFIED, BRIDGED_VOLTAGE], [], [],
+     "two channels name one profile id, one qualified and one not; a device "
+     "holds one qualification per profile"),
+    ("reject_one_profile_two_digests", "invalid_controller_profile", "bridge_node",
+     [BRIDGED, bridged(channel="ch4", sensor_type="voltage", unit="volt",
+                       controller_profile=controller_profile(
+                           "output_voltage", digest="sha256:" + "0" * 64))], [], [],
+     "two channels name one profile id under two digests"),
+    ("reject_one_profile_two_records", "invalid_controller_profile", "bridge_node",
+     [QUALIFIED, bridged(channel="ch4", sensor_type="voltage", unit="volt",
+                         controller_profile=controller_profile(
+                             "output_voltage", qualification="qualified",
+                             record="controllers/records/other.md"))], [], [],
+     "two channels name one qualified profile under one digest with two records"),
+    ("reject_one_digest_two_ids", "invalid_controller_profile", "bridge_node",
+     [BRIDGED, bridged(channel="ch4", sensor_type="voltage", unit="volt",
+                       controller_profile=controller_profile(
+                           "output_voltage", id="other-rectifier"))], [], [],
+     "one digest named under two profile ids"),
+    ("reject_bridged_other_protocol", "invalid_controller_profile", "bridge_node",
+     [bridged(protocol="i2c")], [], [],
+     "a controller profile describes Modbus RTU registers; a bridged channel "
+     "on another protocol has no profile that could decode it"),
+    ("reject_alarm_word_type_on_metering", "invalid_alarm_channel", "sensor_node",
+     [dict(METERING, sensor_type="controller_alarm_word", unit="bitmask")], [], [],
+     "an alarm word is read from a foreign controller, so only a bridged channel "
+     "may be one"),
+    ("reject_bitmask_unit_on_metering", "invalid_alarm_channel", "sensor_node",
+     [dict(METERING, unit="bitmask")], [], [],
+     "the unit alone, on a metering channel"),
+    ("reject_alarm_word_type_on_metering_alone", "invalid_alarm_channel", "sensor_node",
+     [dict(METERING, sensor_type="controller_alarm_word")], [], [],
+     "the sensor type alone, on a metering channel"),
+    ("reject_alarm_word_type_wrong_unit", "invalid_alarm_channel", "bridge_node",
+     [bridged(sensor_type="controller_alarm_word", unit="ampere",
+              controller_profile=controller_profile("alarm_word_1"))], [], [],
+     "an alarm word's unit is bitmask"),
+    ("reject_bitmask_unit_on_measurement", "invalid_alarm_channel", "bridge_node",
+     [bridged(unit="bitmask")], [], [],
+     "bitmask is the unit of an alarm word only"),
+)
+
+
 def canonical(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -279,7 +522,7 @@ def build() -> bytes:
             {"name": name, **signed(mode, channels, actions, interlocks), "note": note}
         )
     reject_cases = []
-    for name, reason, mode, channels, actions, interlocks, note in REJECT:
+    for name, reason, mode, channels, actions, interlocks, note in REJECT + REJECT_PROFILES:
         reject_cases.append(
             {
                 "name": name,
@@ -294,7 +537,8 @@ def build() -> bytes:
         "contract": "ori-specs/firmware-telemetry/v2.md",
         "version": 2,
         "comment": (
-            "Golden vectors for firmware-telemetry/v2 Device Mode. Each case is "
+            "Golden vectors for firmware-telemetry/v2 Device Mode and "
+            "Controller Profiles. Each case is "
             "a signed capability manifest message whose manifest is otherwise "
             "valid under v1. A consumer of this version must accept every case "
             "in 'cases' and refuse every case in 'reject_cases' with the "
@@ -318,6 +562,15 @@ def build() -> bytes:
                 "channels and actions determine"
             ),
             "no_channels": "channels is empty",
+            "controller_profile_missing": "a bridged channel carries no "
+                                          "controller_profile",
+            "controller_profile_unexpected": "a channel that is not bridged "
+                                             "carries controller_profile",
+            "invalid_controller_profile": "a controller_profile breaks its "
+                                          "grammar, or a bridged channel's "
+                                          "protocol is not modbus_rtu",
+            "invalid_alarm_channel": "controller_alarm_word or bitmask on a "
+                                     "channel that is not a bridged alarm word",
         },
         "cases": cases,
         "reject_cases": reject_cases,
