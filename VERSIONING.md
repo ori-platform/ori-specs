@@ -439,7 +439,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-evidence-anchor | v2 | `draft` | `frozen` | claiming-merge, runtime `01d614a`, 2026-09-26; audit complete |
 | runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
-| runtime-health | v3 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
+| runtime-health | v3 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
 | runtime-mobile | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit pending |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
