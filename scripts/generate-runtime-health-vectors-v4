@@ -1,0 +1,1791 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the runtime-health/v4 corpus: severity, reasons, heartbeat mapping, framing.
+
+Every expected value is computed here by a small model of runtime-health/v4
+Severity, Heartbeat Mapping, Request and Representation, and of the
+gateway-api/v2 degradation_reasons validation order. Nothing here is shared
+with a checker, which recomputes every expected value from the contracts'
+text.
+
+    python3 scripts/generate-runtime-health-vectors-v4          # write
+    python3 scripts/generate-runtime-health-vectors-v4 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import hashlib
+import itertools
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "runtime-health" / "health-vectors-v4.json"
+
+C, D = "critical", "degraded"
+UMBRELLA = "firmware_liveness_degraded"
+SEVERITY = {
+    "action_log_records_lost": D,
+    "action_log_records_stalled": D,
+    "commissioning_problem": D,
+    "community_skills_refused": D,
+    "config_unsigned_value_source": D,
+    "decision_record_lost": C,
+    "evidence_contributor_link_unresolved": D,
+    "evidence_courier_answer_unrecognised": D,
+    "evidence_posture_problem": D,
+    "firmware_liveness_device_expired": C,
+    "firmware_liveness_over_capacity": D,
+    "firmware_liveness_stopped": C,
+    "firmware_liveness_tick_failures": D,
+    "firmware_liveness_tick_stale": C,
+    "safety_zone_active_unprotected": D,
+    "sensor_measurement_degraded": D,
+    "sensor_unconnected": D,
+    "subsystem_starting": D,
+    "subsystem_state_unknown": D,
+    "safety_zone_activation_refused": D,
+    "safety_zone_trip_unresolved": C,
+    "sensor_stale": D,
+    "tier_d_alert_delivery_unconfirmed": C,
+    "alert_delivery_overdue": D,
+    "skill_required_hooks_unavailable": C,
+    "skill_optional_hooks_unavailable": D,
+    "tier_c_records_degraded": D,
+    "tier_c_recovery_failed": D,
+    "subsystem_state_unknown_critical": C,
+}
+CRITICAL_CAPABLE = ("safety_registry", "alert_outbox", "action_log_records", "skill_hooks",
+                    "firmware_liveness")
+INVALID = "health_snapshot_invalid"  # the heartbeat's alone; never in a snapshot
+VOCAB = sorted([*SEVERITY, UMBRELLA, INVALID])
+SNAPSHOT_VOCAB = [x for x in VOCAB if x != INVALID]
+RANK = {"ok": 0, D: 1, C: 2}
+MAX_REASONS = 32
+INT_MAX = 2**53 - 1
+
+
+def is_liveness(token: str) -> bool:
+    return token.startswith("firmware_liveness_") and token != UMBRELLA
+
+
+def fold(holding: list[str]) -> dict:
+    """The status the conditions give, taking the maximum, never the last."""
+    status = "ok"
+    for token in holding:
+        if RANK[SEVERITY[token]] > RANK[status]:
+            status = SEVERITY[token]
+    reasons = set(holding)
+    if any(is_liveness(t) for t in holding):
+        reasons.add(UMBRELLA)
+    return {"status": status, "critical": status == C,
+            "degradation_reasons": sorted(reasons)}
+
+
+# ── condition model over a snapshot's members ────────────────────────────────
+
+def avail(block: dict) -> bool:
+    return isinstance(block, dict) and block.get("state") == "available"
+
+
+REFUSAL_VERDICTS = ("unit_mismatch", "direction_unsupported", "parameter_mismatch",
+                    "trip_point_unobservable", "undemonstrated_binding")
+
+
+def holding(v: dict) -> list[str]:
+    out = []
+    fl = v["firmware_liveness"]
+    if avail(fl) and fl["loop"] != "stopped_cleanly":
+        loop = fl["loop"]
+        if loop == "stopped_unexpectedly":
+            out.append("firmware_liveness_stopped")
+        age, window = fl["last_successful_tick_age_ms"], fl["expiry_window_ms"]
+        if (age is not None and age >= window) or (
+                age is None and fl["started_age_ms"] >= window):
+            out.append("firmware_liveness_tick_stale")
+        if fl["expiring_device_ids"]:
+            out.append("firmware_liveness_device_expired")
+        if fl["supervised_devices"] > fl["supported_device_capacity"]:
+            out.append("firmware_liveness_over_capacity")
+        if fl["consecutive_tick_failures"] > 0:
+            out.append("firmware_liveness_tick_failures")
+    al = v["action_log_records"]
+    if avail(al):
+        open_kinds = {i["kind"] for i in al["loss_incidents"] if not i["acknowledged"]}
+        if "decision_record_lost" in open_kinds:
+            out.append("decision_record_lost")
+        if "action_record_lost" in open_kinds:
+            out.append("action_log_records_lost")
+        if al["oldest_pending_age_ms"] is not None and \
+                al["oldest_pending_age_ms"] > al["stall_bound_ms"]:
+            out.append("action_log_records_stalled")
+    ev = v["evidence"]
+    ar = ev["action_records"]
+    if avail(ar):
+        if ar["lost"] > 0 or ar["unknown_live"] > 0 or ar["pending"] >= ar["ceiling"]:
+            out.append("tier_c_records_degraded")
+        if ar["recovery_failed"]:
+            out.append("tier_c_recovery_failed")
+    sensors = {s["id"]: s for s in v["sensors"]}
+    if any(s["connection"] == "failed" for s in v["sensors"]):
+        out.append("sensor_unconnected")
+    if any(s["measurement_degraded"] is True for s in v["sensors"]):
+        out.append("sensor_measurement_degraded")
+    if any(s["stale"] is True for s in v["sensors"]):
+        out.append("sensor_stale")
+    ao = v["alert_outbox"]
+    if avail(ao):
+        if ao["tier_d_unresolved_count"] > 0 and (
+                ao["tier_d_max_attempts"] >= ao["tier_d_critical_warning_threshold"]
+                or ao["tier_d_oldest_age_ms"] >= ao["tier_d_age_bound_ms"]):
+            out.append("tier_d_alert_delivery_unconfirmed")
+        if ao["oldest_non_tier_d_age_ms"] is not None and \
+                ao["oldest_non_tier_d_age_ms"] >= ao["overdue_bound_ms"]:
+            out.append("alert_delivery_overdue")
+    sh = v["skill_hooks"]
+    if avail(sh):
+        if sh["required_unavailable"] > 0:
+            out.append("skill_required_hooks_unavailable")
+        if sh["optional_unavailable"] > 0:
+            out.append("skill_optional_hooks_unavailable")
+    if avail(v["community_skills"]) and v["community_skills"]["refused_skills"] > 0:
+        out.append("community_skills_refused")
+    if avail(v["config_authority"]) and v["config_authority"]["unsigned_value_source"]:
+        out.append("config_unsigned_value_source")
+    if ev["posture_problems"]:
+        out.append("evidence_posture_problem")
+    if ev.get("delivery_ledger_available") and ev["courier_answer_faults"] > 0:
+        out.append("evidence_courier_answer_unrecognised")
+    if ev.get("attestation_summary_available") and ev["contributor_links_unresolved"] > 0:
+        out.append("evidence_contributor_link_unresolved")
+    cm = v["commissioning"]
+    if avail(cm) and cm["problems"]:
+        out.append("commissioning_problem")
+    zone_sensor = {z["zone_id"]: z["sensor_id"] for z in cm["zones"]} if avail(cm) else {}
+    sr = v["safety_registry"]
+    if avail(sr):
+        def unreported(zone: dict) -> bool:
+            s = sensors.get(zone_sensor.get(zone["zone_id"], ""))
+            return s is not None and (s["stale"] or s["connection"] != "connected")
+        if any(z["activation"] == "active" and (
+                z["protection_claim"] == "unprotected" or unreported(z))
+               for z in v["safety_zones"]):
+            out.append("safety_zone_active_unprotected")
+        if any(z["activation"] in REFUSAL_VERDICTS for z in v["safety_zones"]):
+            out.append("safety_zone_activation_refused")
+        if any(z["activation"] == "active" and z["trip_state"] == "tripped" and (
+                z["command_status"] == "driver_refused"
+                or z["effect_verified"] == "mismatched"
+                or (z["effect_verified"] == "unknown"
+                    and z["trip_age_ms"] >= sr["trip_verification_deadline_ms"]))
+               for z in v["safety_zones"]):
+            out.append("safety_zone_trip_unresolved")
+    deciding = (ao, cm, sr, v["community_skills"], v["config_authority"], al, fl, sh, ev, ar)
+    if any(b["state"] == "starting" for b in deciding) or any(
+            s["connection"] == "pending" for s in v["sensors"]):
+        out.append("subsystem_starting")
+    if any(v[name]["state"] == "unavailable" for name in CRITICAL_CAPABLE):
+        out.append("subsystem_state_unknown_critical")
+    unknown = any(b["state"] == "unavailable" for b in (
+        cm, v["community_skills"], v["config_authority"], ev, ar)) or any(
+        s["connection"] == "unavailable" for s in v["sensors"])
+    if ev["state"] == "available" and not (
+            ev["attestation_summary_available"] and ev["registration_available"]
+            and ev["delivery_ledger_available"]):
+        unknown = True
+    if unknown:
+        out.append("subsystem_state_unknown")
+    return out
+
+
+def sensor(sid: str) -> dict:
+    return {"id": sid, "connection": "connected", "connected": True, "stale": False,
+            "measurement_degraded": False}
+
+
+def baseline() -> dict:
+    return {
+        "firmware_liveness": {
+            "state": "available", "loop": "running", "started_age_ms": 600000,
+            "expiry_window_ms": 60000, "supervised_devices": 2,
+            "supported_device_capacity": 16, "consecutive_tick_failures": 0,
+            "last_successful_tick_age_ms": 1000, "expiring_device_ids": [],
+            "degraded": False},
+        "action_log_records": {
+            "state": "available", "pending": 0, "oldest_pending_age_ms": None,
+            "ceiling": 1000, "lost": 0, "stall_bound_ms": 30000,
+            "decision_records_lost": 0, "loss_incidents": []},
+        "evidence": {
+            "state": "available", "posture_problems": [],
+            "action_records": {
+                "state": "available", "pending": 0, "outcome_unknown": 0,
+                "dispatch_unproven": 0, "lost": 0, "ceiling": 64, "unknown_live": 0,
+                "oldest_pending_age_ms": None, "recovery_failed": False},
+            "attestation_summary_available": True, "registration_available": True,
+            "delivery_ledger_available": True, "contributor_links_unresolved": 0,
+            "courier_answer_faults": 0},
+        "sensors": [sensor("load-current"), sensor("grid-voltage"),
+                    sensor("tank-temperature"), sensor("zone-a-current")],
+        "alert_outbox": {
+            "state": "available", "tier_d_unresolved_count": 0, "tier_d_max_attempts": None,
+            "tier_d_oldest_age_ms": None, "tier_d_age_bound_ms": 300000,
+            "tier_d_critical_warning_threshold": 3, "oldest_non_tier_d_age_ms": None,
+            "overdue_bound_ms": 3600000},
+        "skill_hooks": {"state": "available", "required_unavailable": 0,
+                        "optional_unavailable": 0},
+        "community_skills": {"state": "available", "refused_skills": 0},
+        "config_authority": {"state": "available", "unsigned_value_source": False},
+        "commissioning": {"state": "available", "problems": [], "zones": [
+            {"zone_id": "zone-a", "sensor_id": "zone-a-current", "state": "in_force",
+             "availability": "available"}]},
+        "safety_registry": {"state": "available", "trip_verification_deadline_ms": 10000},
+        "safety_zones": [
+            {"zone_id": "zone-a", "profile_id": "profile-a", "activation": "active",
+             "trip_state": "armed", "command_status": "none", "effect_verified": "unknown",
+             "trip_age_ms": None, "protection_claim": "protected"}],
+    }
+
+
+def view(*edits) -> dict:
+    v = baseline()
+    for path, value in edits:
+        node = v
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    for sensor in v["sensors"]:
+        sensor["connected"] = sensor["connection"] == "connected"
+    # A member its section flag withholds is absent, never a default.
+    if not v["evidence"]["attestation_summary_available"]:
+        v["evidence"].pop("contributor_links_unresolved", None)
+    if not v["evidence"]["delivery_ledger_available"]:
+        v["evidence"].pop("courier_answer_faults", None)
+    if avail(v["firmware_liveness"]):
+        v["firmware_liveness"]["degraded"] = any(is_liveness(t) for t in holding(v))
+    return v
+
+
+FL = "firmware_liveness"
+AL = "action_log_records"
+EV = "evidence"
+AR = (EV, "action_records")
+
+def incident(kind: str, acknowledged: bool = False, iid: str = "inc-0001",
+             count: int = 1) -> dict:
+    return {"incident_id": iid, "kind": kind, "count": count,
+            "first_observed_at_ms": 1716990000000, "acknowledged": acknowledged,
+            "acknowledged_at_ms": 1716995000000 if acknowledged else None}
+
+
+def losses(*incidents: dict) -> list:
+    """The incidents with the two counters they imply."""
+    action = sum(i["count"] for i in incidents if i["kind"] == "action_record_lost")
+    decision = sum(i["count"] for i in incidents if i["kind"] == "decision_record_lost")
+    return [((AL, "loss_incidents"), sorted(incidents, key=lambda i: i["incident_id"])),
+            ((AL, "lost"), action), ((AL, "decision_records_lost"), decision)]
+
+
+TRIPPED = [(("safety_zones", 0, "trip_state"), "tripped"),
+           (("safety_zones", 0, "trip_age_ms"), 1000)]
+
+SINGLE = {
+    "firmware_liveness_stopped": [((FL, "loop"), "stopped_unexpectedly")],
+    "firmware_liveness_tick_stale": [((FL, "last_successful_tick_age_ms"), 60000)],
+    "firmware_liveness_device_expired": [((FL, "expiring_device_ids"), ["ori-fw-7c9f2b3a"])],
+    "firmware_liveness_over_capacity": [((FL, "supervised_devices"), 17)],
+    "firmware_liveness_tick_failures": [((FL, "consecutive_tick_failures"), 1)],
+    "decision_record_lost": losses(incident("decision_record_lost")),
+    "action_log_records_lost": losses(incident("action_record_lost", iid="inc-0002")),
+    "action_log_records_stalled": [((AL, "pending"), 1), ((AL, "oldest_pending_age_ms"), 30001)],
+    "tier_c_records_degraded": [((*AR, "unknown_live"), 1)],
+    "tier_c_recovery_failed": [((*AR, "recovery_failed"), True)],
+    "sensor_unconnected": [(("sensors", 1, "connection"), "failed")],
+    "sensor_measurement_degraded": [(("sensors", 0, "measurement_degraded"), True)],
+    "community_skills_refused": [(("community_skills", "refused_skills"), 2)],
+    "config_unsigned_value_source": [(("config_authority", "unsigned_value_source"), True)],
+    "evidence_posture_problem": [((EV, "posture_problems"), ["custody_unconfigured"])],
+    "evidence_courier_answer_unrecognised": [((EV, "courier_answer_faults"), 1)],
+    "evidence_contributor_link_unresolved": [((EV, "contributor_links_unresolved"), 1)],
+    "commissioning_problem": [(("commissioning", "problems"), ["binding_missing"])],
+    "safety_zone_active_unprotected": [(("safety_zones", 0, "protection_claim"), "unprotected")],
+    "subsystem_starting": [(("sensors", 2, "connection"), "pending")],
+    "subsystem_state_unknown": [(("community_skills",), {"state": "unavailable"})],
+    "safety_zone_activation_refused": [(("safety_zones", 0, "activation"), "unit_mismatch"),
+                                       (("safety_zones", 0, "protection_claim"),
+                                        "unprotected")],
+    "safety_zone_trip_unresolved": TRIPPED + [
+        (("safety_zones", 0, "command_status"), "driver_refused"),
+        (("safety_zones", 0, "protection_claim"), "unprotected")],
+    "sensor_stale": [(("sensors", 0, "stale"), True)],
+    "tier_d_alert_delivery_unconfirmed": [
+        (("alert_outbox", "tier_d_unresolved_count"), 1),
+        (("alert_outbox", "tier_d_max_attempts"), 3),
+        (("alert_outbox", "tier_d_oldest_age_ms"), 1000)],
+    "alert_delivery_overdue": [(("alert_outbox", "oldest_non_tier_d_age_ms"), 3600000)],
+    "skill_required_hooks_unavailable": [(("skill_hooks", "required_unavailable"), 1)],
+    "skill_optional_hooks_unavailable": [(("skill_hooks", "optional_unavailable"), 1)],
+    "subsystem_state_unknown_critical": [(("skill_hooks",), {"state": "unavailable"})],
+}
+
+
+def snapshot_specs() -> list[tuple[str, list, str]]:
+    s = [("nothing_wrong", [], "every block available and nothing holds")]
+    for token in SEVERITY:
+        note = f"{token} alone"
+        if token == "safety_zone_trip_unresolved":
+            note += ", with the unprotected claim a refused trip implies"
+        s.append((f"alone_{token}", SINGLE[token], note))
+    s += [
+        ("tick_age_at_window", [((FL, "last_successful_tick_age_ms"), 60000)],
+         "an age equal to the expiry window is expired"),
+        ("tick_age_under_window", [((FL, "last_successful_tick_age_ms"), 59999)],
+         "one millisecond under the window is not stale"),
+        ("no_tick_started_at_window", [((FL, "last_successful_tick_age_ms"), None),
+                                       ((FL, "started_age_ms"), 60000)],
+         "no tick has succeeded since a start one window ago"),
+        ("no_tick_started_under_window", [((FL, "last_successful_tick_age_ms"), None),
+                                          ((FL, "started_age_ms"), 59999)],
+         "no tick yet, inside the first window"),
+        ("stale_tick_after_clean_stop", [((FL, "loop"), "stopped_cleanly"),
+                                         ((FL, "last_successful_tick_age_ms"), 900000)],
+         "an orderly shutdown owes no tick"),
+        ("liveness_starting", [((FL,), {"state": "starting"})],
+         "a configured scheduler whose loop has not started is starting"),
+        ("config_starting", [(("config_authority",), {"state": "starting"})],
+         "the configuration not yet read"),
+        ("commissioning_starting", [(("commissioning",), {"state": "starting"})],
+         "commissioning not yet loaded"),
+        ("skills_starting", [(("community_skills",), {"state": "starting"})],
+         "skills not yet loaded"),
+        ("registry_starting", [(("safety_registry",), {"state": "starting"}),
+                               (("safety_zones",), [])],
+         "a required registry not yet built"),
+        ("action_log_starting", [((AL,), {"state": "starting"})], "no record writer yet"),
+        ("action_records_starting", [(AR, {"state": "starting"})], "no dispatcher yet"),
+        ("evidence_starting", [((EV, "state"), "starting"),
+                               ((EV, "attestation_summary_available"), False),
+                               ((EV, "registration_available"), False),
+                               ((EV, "delivery_ledger_available"), False)],
+         "enabled evidence not yet opened is starting, and its unread sections are not unknown"),
+        ("every_sensor_pending", [(("sensors", i, "connection"), "pending") for i in range(3)],
+         "no adapter connected yet"),
+        ("starting_beside_critical", [(("config_authority",), {"state": "starting"})] +
+         losses(incident("decision_record_lost")),
+         "a known critical wins over starting"),
+        ("starting_beside_unknown", [(("config_authority",), {"state": "starting"}),
+                                     (("commissioning",), {"state": "unavailable"})],
+         "initialisation and a failure to read are named apart"),
+        ("pending_and_failed_sensors", [(("sensors", 0, "connection"), "pending"),
+                                        (("sensors", 1, "connection"), "failed")],
+         "one sensor still connecting, another failed"),
+        ("stopped_with_stale_tick", [((FL, "loop"), "stopped_unexpectedly"),
+                                     ((FL, "last_successful_tick_age_ms"), 120000)],
+         "a dead loop past the window is both stopped and stale"),
+        ("capacity_equal", [((FL, "supervised_devices"), 16)],
+         "supervised equal to capacity is not over it"),
+        ("over_capacity_and_tick_failures", [((FL, "supervised_devices"), 17),
+                                             ((FL, "consecutive_tick_failures"), 3)],
+         "both degraded liveness conditions stay degraded"),
+        ("tick_failures_and_device_expired", [((FL, "consecutive_tick_failures"), 3),
+                                              ((FL, "expiring_device_ids"), ["ori-fw-00000000"])],
+         "a degraded liveness condition beside a critical one is critical"),
+        ("all_liveness", [((FL, "loop"), "stopped_unexpectedly"),
+                          ((FL, "last_successful_tick_age_ms"), 120000),
+                          ((FL, "expiring_device_ids"), ["ori-fw-00000000", "ori-fw-7c9f2b3a"]),
+                          ((FL, "supervised_devices"), 17),
+                          ((FL, "consecutive_tick_failures"), 5)],
+         "every liveness condition at once"),
+        ("liveness_disabled", [((FL,), {"state": "disabled"})],
+         "a disabled scheduler contributes nothing"),
+        ("stall_at_bound", [((AL, "pending"), 1), ((AL, "oldest_pending_age_ms"), 30000)],
+         "an age equal to the stall bound is not stalled"),
+        ("trip_mismatched", TRIPPED + [
+            (("safety_zones", 0, "command_status"), "command_issued"),
+            (("safety_zones", 0, "effect_verified"), "mismatched"),
+            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "an observed effect that contradicts the trip"),
+        ("trip_unverified_at_deadline", TRIPPED + [
+            (("safety_zones", 0, "command_status"), "command_issued"),
+            (("safety_zones", 0, "trip_age_ms"), 10000),
+            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "unverified at the deadline: unresolved"),
+        ("trip_unverified_under_deadline", TRIPPED + [
+            (("safety_zones", 0, "command_status"), "command_issued"),
+            (("safety_zones", 0, "trip_age_ms"), 9999),
+            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "pending verification inside the deadline"),
+        ("trip_verified", TRIPPED + [
+            (("safety_zones", 0, "command_status"), "command_issued"),
+            (("safety_zones", 0, "effect_verified"), "matched")],
+         "a verified trip is resolved and protected"),
+        ("trip_refused_while_pending_ratification", TRIPPED + [
+            (("safety_zones", 0, "activation"), "pending_ratification"),
+            (("safety_zones", 0, "command_status"), "driver_refused"),
+            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "only an active pair can hold an unresolved trip"),
+        ("activation_pending_ratification", [
+            (("safety_zones", 0, "activation"), "pending_ratification"),
+            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "pending ratification is not a refusal"),
+        ("zone_sensor_stale", [(("sensors", 3, "stale"), True)],
+         "a stale sensor feeding an active pair also names the protection finding"),
+        ("zone_sensor_failed", [(("sensors", 3, "connection"), "failed")],
+         "an unconnected sensor feeding an active pair"),
+        ("tier_d_alert_at_age_bound", [
+            (("alert_outbox", "tier_d_unresolved_count"), 1),
+            (("alert_outbox", "tier_d_max_attempts"), 1),
+            (("alert_outbox", "tier_d_oldest_age_ms"), 300000)],
+         "one attempt, at the age bound"),
+        ("tier_d_alert_under_thresholds", [
+            (("alert_outbox", "tier_d_unresolved_count"), 1),
+            (("alert_outbox", "tier_d_max_attempts"), 2),
+            (("alert_outbox", "tier_d_oldest_age_ms"), 299999)],
+         "under both thresholds: not yet critical"),
+        ("alert_under_overdue_bound", [(("alert_outbox", "oldest_non_tier_d_age_ms"), 3599999)],
+         "a young alert, whatever the backlog"),
+        ("alert_outbox_unavailable", [(("alert_outbox",), {"state": "unavailable"})],
+         "alert delivery decides severity, so an unreadable outbox is unknown"),
+        ("alert_outbox_starting", [(("alert_outbox",), {"state": "starting"})],
+         "the store not yet opened"),
+        ("skill_hooks_disabled", [(("skill_hooks",), {"state": "disabled"})],
+         "no isolated hook worker"),
+        ("decision_loss_acknowledged", losses(incident("decision_record_lost", True)),
+         "acknowledged: still listed and counted, no longer named"),
+        ("decision_loss_after_restart", losses(incident("decision_record_lost")),
+         "the persisted incident, reported again after a restart with its severity"),
+        ("acknowledged_loss_beside_unacknowledged", losses(
+            incident("decision_record_lost", True),
+            incident("decision_record_lost", iid="inc-0003", count=2)),
+         "an acknowledgement resolves only its own incident"),
+        ("acknowledged_loss_beside_trip", losses(incident("decision_record_lost", True)) +
+         SINGLE["safety_zone_trip_unresolved"],
+         "an acknowledgement clears no other condition"),
+        ("loss_incidents_unreadable", [((AL,), {"state": "unavailable"})],
+         "persisted incidents that cannot be read: unknown, never clean counters"),
+        ("liveness_clean_stop", [((FL, "loop"), "stopped_cleanly"),
+                                 ((FL, "expiring_device_ids"), ["ori-fw-7c9f2b3a"]),
+                                 ((FL, "supervised_devices"), 17),
+                                 ((FL, "consecutive_tick_failures"), 2)],
+         "an orderly shutdown owes no liveness"),
+        ("skill_hooks_unavailable", [(("skill_hooks",), {"state": "unavailable"})],
+         "a critical-capable block unreadable: critical visibility unavailable"),
+        ("skill_hooks_starting", [(("skill_hooks",), {"state": "starting"})],
+         "before the deadline a critical-capable block is only starting"),
+        ("liveness_unavailable", [((FL,), {"state": "unavailable"})],
+         "the liveness scheduler unreadable"),
+        ("known_critical_beside_unknown_critical",
+         losses(incident("decision_record_lost")) +
+         [(("skill_hooks",), {"state": "unavailable"})],
+         "unknown never overwrites or clears a known critical"),
+        ("unknown_critical_beside_degraded_unknown",
+         [(("skill_hooks",), {"state": "unavailable"}),
+          (("config_authority",), {"state": "unavailable"})],
+         "the two unknown tokens are named apart"),
+        ("refused_direction_unsupported",
+         [(("safety_zones", 0, "activation"), "direction_unsupported"),
+          (("safety_zones", 0, "protection_claim"), "unprotected")], "a refusal verdict"),
+        ("refused_parameter_mismatch",
+         [(("safety_zones", 0, "activation"), "parameter_mismatch"),
+          (("safety_zones", 0, "protection_claim"), "unprotected")], "a refusal verdict"),
+        ("refused_trip_point_unobservable",
+         [(("safety_zones", 0, "activation"), "trip_point_unobservable"),
+          (("safety_zones", 0, "protection_claim"), "unprotected")], "a refusal verdict"),
+        ("refused_undemonstrated_binding",
+         [(("safety_zones", 0, "activation"), "undemonstrated_binding"),
+          (("safety_zones", 0, "protection_claim"), "unprotected")], "a refusal verdict"),
+        ("overdue_at_lowered_bound",
+         [(("alert_outbox", "overdue_bound_ms"), 600000),
+          (("alert_outbox", "oldest_non_tier_d_age_ms"), 600000)],
+         "a bound lowered below its default decides at the lowered value"),
+        ("tier_d_at_lowered_threshold",
+         [(("alert_outbox", "tier_d_critical_warning_threshold"), 1),
+          (("alert_outbox", "tier_d_unresolved_count"), 1),
+          (("alert_outbox", "tier_d_max_attempts"), 1),
+          (("alert_outbox", "tier_d_oldest_age_ms"), 1000)],
+         "one attempt is critical once the threshold is lowered to one"),
+        ("action_loss_acknowledged", losses(incident("action_record_lost", True,
+                                                     iid="inc-0002")),
+         "an acknowledged action-record loss: listed and counted, no longer named"),
+        ("records_at_ceiling", [((*AR, "pending"), 64), ((*AR, "oldest_pending_age_ms"), 5000)],
+         "pending equal to ceiling"),
+        ("records_under_ceiling", [((*AR, "pending"), 63),
+                                   ((*AR, "oldest_pending_age_ms"), 5000)],
+         "pending one under ceiling"),
+        ("tier_c_lost", [((*AR, "outcome_unknown"), 1), ((*AR, "lost"), 1)],
+         "an unreconciled dispatch_outcome_unknown"),
+        ("action_records_unavailable", [(AR, {"state": "unavailable"})],
+         "the Tier C records could not be read"),
+        ("action_log_unavailable", [((AL,), {"state": "unavailable"})],
+         "the record writer's state could not be read"),
+        ("commissioning_unavailable", [(("commissioning",), {"state": "unavailable"})],
+         "commissioning state could not be read"),
+        ("config_unavailable", [(("config_authority",), {"state": "unavailable"})],
+         "the configuration's authority could not be determined"),
+        ("safety_registry_unavailable", [(("safety_registry",), {"state": "unavailable"}),
+                                         (("safety_zones",), [])],
+         "the registry's state could not be read: critical visibility unavailable"),
+        ("safety_registry_disabled", [(("safety_registry",), {"state": "disabled"}),
+                                      (("safety_zones",), [])],
+         "no registry: nothing to protect, nothing unknown"),
+        ("pending_ratification_unprotected",
+         [(("safety_zones", 0, "activation"), "pending_ratification"),
+          (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "a pair the device never undertook to protect"),
+        ("qualification_unavailable", [(("safety_zones", 0, "protection_claim"), "unavailable")],
+         "a pair under qualification is not unprotected"),
+        ("ledger_unread", [((EV, "delivery_ledger_available"), False)],
+         "evidence open and its ledger not read"),
+        ("registration_unread", [((EV, "registration_available"), False)],
+         "evidence open and registration not read"),
+        ("attestations_unread", [((EV, "attestation_summary_available"), False)],
+         "evidence open and the attestation summary not read"),
+        ("evidence_disabled", [((EV, "state"), "disabled"),
+                               ((EV, "attestation_summary_available"), False),
+                               ((EV, "delivery_ledger_available"), False)],
+         "disabled evidence reads no ledger and is not unknown"),
+        ("evidence_unavailable", [((EV, "state"), "unavailable"),
+                                  ((EV, "posture_problems"), ["signing_unavailable"]),
+                                  ((EV, "attestation_summary_available"), False),
+                                  ((EV, "registration_available"), False),
+                                  ((EV, "delivery_ledger_available"), False)],
+         "enabled evidence that did not open is unknown, and a posture problem"),
+        ("evidence_starting_with_posture_problem",
+         [((EV, "state"), "starting"), ((EV, "attestation_summary_available"), False),
+          ((EV, "registration_available"), False), ((EV, "delivery_ledger_available"), False),
+          ((EV, "posture_problems"), ["custody_unconfigured"])],
+         ("signing_unavailable is not listed while starting; a posture problem that holds "
+          "in every state still names its token")),
+        ("tier_c_records_while_evidence_disabled",
+         [((EV, "state"), "disabled"), ((EV, "attestation_summary_available"), False),
+          ((EV, "delivery_ledger_available"), False), ((*AR, "unknown_live"), 1)],
+         "action_records is its own block: its condition holds whatever the evidence state"),
+        ("tier_c_recovery_while_evidence_unavailable",
+         [((EV, "state"), "unavailable"), ((EV, "posture_problems"), ["signing_unavailable"]),
+          ((EV, "attestation_summary_available"), False),
+          ((EV, "registration_available"), False), ((EV, "delivery_ledger_available"), False),
+          ((*AR, "recovery_failed"), True)],
+         "action_records is its own block: its condition holds whatever the evidence state"),
+        ("contributor_link_while_evidence_unavailable",
+         [((EV, "state"), "unavailable"), ((EV, "posture_problems"), ["signing_unavailable"]),
+          ((EV, "attestation_summary_available"), True),
+          ((EV, "registration_available"), False), ((EV, "delivery_ledger_available"), False),
+          ((EV, "contributor_links_unresolved"), 1)],
+         "the predicate reads its section flag, not the evidence state"),
+        ("lockout_unavailable", [(("remote_command_lockout",), {"state": "unavailable"})],
+         "an unreadable block that decides no severity contributes no condition"),
+        ("reading_age_unavailable", [(("firmware_reading_age",), {"state": "unavailable"})],
+         "an unreadable block that decides no severity contributes no condition"),
+        ("telemetry_export_unavailable", [(("telemetry_export",), {"state": "unavailable"})],
+         "an unreadable block that decides no severity contributes no condition"),
+        ("posture_problem_while_disabled", [((EV, "state"), "disabled"),
+                                            ((EV, "attestation_summary_available"), False),
+                                            ((EV, "delivery_ledger_available"), False),
+                                            ((EV, "posture_problems"), ["custody_unconfigured"])],
+         "the posture condition holds in every evidence state"),
+        ("two_sensors_two_conditions", [(("sensors", 0, "measurement_degraded"), True),
+                                        (("sensors", 1, "connection"), "failed")],
+         "one sensor unmeasured, another unconnected"),
+        ("decision_lost_commissioning_unprotected",
+         losses(incident("decision_record_lost")) + [
+          (("commissioning", "problems"), ["binding_missing"]),
+          (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "a critical condition raised beside two degraded ones stays critical"),
+    ]
+    every = []
+    for token in SEVERITY:
+        if token == "subsystem_state_unknown":
+            every.append(((EV, "registration_available"), False))
+        elif token not in ("decision_record_lost", "action_log_records_lost",
+                           "subsystem_state_unknown_critical",
+                           "safety_zone_activation_refused", "safety_zone_trip_unresolved",
+                           "safety_zone_active_unprotected"):
+            every += SINGLE[token]
+    every += losses(incident("decision_record_lost"),
+                    incident("action_record_lost", iid="inc-0002"))
+    every.append((("safety_zones",), [
+        {"zone_id": "zone-a", "profile_id": "profile-a", "activation": "active",
+         "trip_state": "tripped", "command_status": "driver_refused",
+         "effect_verified": "unknown", "trip_age_ms": 1000, "protection_claim": "unprotected"},
+        {"zone_id": "zone-b", "profile_id": "profile-a", "activation": "unit_mismatch",
+         "trip_state": "inactive", "command_status": "none", "effect_verified": "unknown",
+         "trip_age_ms": None, "protection_claim": "unprotected"}]))
+    s.append(("every_condition", every, "every condition at once: twenty-nine tokens"))
+    return s
+
+
+BLOCK_PATH = {"config_authority": ("config_authority",), "commissioning": ("commissioning",),
+              "firmware_liveness": (FL,), "evidence.action_records": AR,
+              "alert_outbox": ("alert_outbox",), "safety_registry": ("safety_registry",)}
+
+
+def startup(not_ready: list[str], elapsed_ms: int, deadline_ms: int, extra: list) -> tuple:
+    """A producer not yet ready on these blocks, resolved by the startup deadline."""
+    state = "starting" if elapsed_ms < deadline_ms else "unavailable"
+    edits = []
+    for block in not_ready:
+        if block.startswith("sensor:"):
+            edits.append((("sensors", int(block[7:]), "connection"),
+                          "pending" if state == "starting" else "unavailable"))
+        elif block == "evidence":
+            edits += [((EV, "state"), state), ((EV, "attestation_summary_available"), False),
+                      ((EV, "registration_available"), False),
+                      ((EV, "delivery_ledger_available"), False)]
+            if state == "unavailable":
+                edits.append(((EV, "posture_problems"), ["signing_unavailable"]))
+        else:
+            edits.append((BLOCK_PATH[block], {"state": state}))
+            if block == "safety_registry":
+                edits.append((("safety_zones",), []))
+    return edits + extra, {"not_ready": not_ready, "elapsed_ms": elapsed_ms,
+                           "deadline_ms": deadline_ms}
+
+
+def startup_specs() -> list[tuple[str, list, dict, str]]:
+    lost = losses(incident("decision_record_lost"))
+    out = []
+    for name, nr, el, dl, extra, note in [
+        ("startup_config_within", ["config_authority"], 4000, 120000, [],
+         "inside the deadline: initialising"),
+        ("startup_config_under_deadline", ["config_authority"], 119999, 120000, [],
+         "one millisecond before the deadline: still starting"),
+        ("startup_config_at_deadline", ["config_authority"], 120000, 120000, [],
+         "at the deadline: unavailable, a failure to read"),
+        ("startup_config_past", ["config_authority"], 300000, 120000, [],
+         "a hung initialisation never reads as benign"),
+        ("startup_within_beside_critical", ["config_authority"], 4000, 120000, lost,
+         "a known critical wins over starting"),
+        ("startup_past_beside_critical", ["config_authority"], 300000, 120000, lost,
+         "a known critical wins over unknown"),
+        ("startup_sensor_within", ["sensor:2"], 4000, 120000, [], "an adapter still connecting"),
+        ("startup_sensor_past", ["sensor:2"], 300000, 120000, [],
+         "an adapter never connected, never attempted to a verdict"),
+        ("startup_liveness_within", ["firmware_liveness"], 4000, 120000, [],
+         "the liveness loop not yet started"),
+        ("startup_liveness_past", ["firmware_liveness"], 300000, 120000, [],
+         "the liveness loop never started"),
+        ("startup_evidence_within", ["evidence"], 4000, 120000, [], "evidence not yet opened"),
+        ("startup_evidence_past", ["evidence"], 300000, 120000, [],
+         "evidence never opened: unknown, and a posture problem"),
+        ("startup_alert_outbox_within", ["alert_outbox"], 4000, 120000, [],
+         "a critical-capable block initialising"),
+        ("startup_alert_outbox_past", ["alert_outbox"], 300000, 120000, [],
+         "a critical-capable block hung past the deadline: critical visibility unavailable"),
+        ("startup_registry_past", ["safety_registry"], 120000, 120000, [],
+         "at the deadline, a required safety registry still not built"),
+        ("startup_records_past", ["evidence.action_records", "commissioning"], 300000, 120000,
+         [], "two blocks hung: one token"),
+    ]:
+        edits, inputs = startup(nr, el, dl, extra)
+        out.append((name, edits, inputs, note))
+    return out
+
+
+def snapshot_cases() -> list[dict]:
+    out = []
+    for name, edits, note in snapshot_specs():
+        v = view(*edits)
+        f = fold(holding(v))
+        out.append({"name": name, "snapshot": v, "expected": f, "note": note})
+    for name, edits, inputs, note in startup_specs():
+        v = view(*edits)
+        out.append({"name": name, "startup": inputs, "snapshot": v,
+                    "expected": fold(holding(v)), "note": note})
+    return out
+
+
+# ── served triples: snapshot checks 6 to 10 ──────────────────────────────────
+
+ABSENT = object()
+
+
+def check_served(v: dict, served: dict) -> str:
+    st = served.get("status", ABSENT)
+    if not isinstance(st, str) or st not in RANK:
+        return "status_invalid"
+    cr = served.get("critical", ABSENT)
+    if not isinstance(cr, bool) or cr != (st == C):
+        return "critical_mismatch"
+    rs = served.get("degradation_reasons", ABSENT)
+    if (not isinstance(rs, list) or len(rs) > MAX_REASONS
+            or not all(isinstance(x, str) for x in rs)
+            or rs != sorted(set(rs)) or any(x not in SNAPSHOT_VOCAB for x in rs)):
+        return "reasons_malformed"
+    want = fold(holding(v))
+    if rs != want["degradation_reasons"]:
+        return "reasons_mismatch"
+    if st != want["status"]:
+        return "status_mismatch"
+    return "accept"
+
+
+def served_cases() -> list[dict]:
+    crit = view(*losses(incident("decision_record_lost")),
+                (("commissioning", "problems"), ["binding_missing"]))
+    deg = view(*SINGLE["sensor_unconnected"])
+    ok = view()
+    good_c = fold(holding(crit))
+    good_d = fold(holding(deg))
+    many = [VOCAB[i % len(VOCAB)] for i in range(33)]
+    specs = [
+        ("consistent_critical", crit, good_c, "the served triple is the fold"),
+        ("consistent_degraded", deg, good_d, "one degraded condition"),
+        ("consistent_ok", ok, {"status": "ok", "critical": False, "degradation_reasons": []},
+         "nothing holds"),
+        ("degraded_over_critical", crit, {**good_c, "status": D, "critical": False},
+         "a later degraded assigned over a critical"),
+        ("status_absent", crit, {k: good_c[k] for k in ("critical", "degradation_reasons")},
+         "no status member"),
+        ("status_healthy", ok, {"status": "healthy", "critical": False, "degradation_reasons": []},
+         "the heartbeat's word is not a local status"),
+        ("status_not_string", ok, {"status": 0, "critical": False, "degradation_reasons": []},
+         "status must be a string"),
+        ("critical_true_beside_degraded", crit, {**good_c, "status": D},
+         "critical true beside degraded is checked before reasons"),
+        ("critical_absent", crit, {k: good_c[k] for k in ("status", "degradation_reasons")},
+         "no critical member"),
+        ("critical_false_on_critical", crit, {**good_c, "critical": False},
+         "critical must follow status"),
+        ("critical_string", ok, {"status": "ok", "critical": "false", "degradation_reasons": []},
+         "critical must be a boolean"),
+        ("reasons_absent", ok, {"status": "ok", "critical": False}, "no reasons member"),
+        ("reasons_null", ok, {"status": "ok", "critical": False, "degradation_reasons": None},
+         "null is not the empty set"),
+        ("reasons_unsorted", crit, {**good_c, "degradation_reasons":
+                                    list(reversed(good_c["degradation_reasons"]))},
+         "reasons out of byte order"),
+        ("reasons_duplicate", deg, {**good_d, "degradation_reasons":
+                                    ["sensor_unconnected", "sensor_unconnected"]},
+         "a token twice"),
+        ("reasons_unknown_token", deg, {**good_d, "degradation_reasons":
+                                        ["sensor_disconnected"]},
+         "a token outside the vocabulary"),
+        ("reasons_over_bound", deg, {**good_d, "degradation_reasons": many},
+         "thirty-three entries"),
+        ("reasons_heartbeat_token", deg, {"status": C, "critical": True,
+                                          "degradation_reasons": [INVALID]},
+         "the heartbeat's token is never a snapshot's"),
+        ("reason_missing", crit, {**good_c, "degradation_reasons": ["decision_record_lost"]},
+         "a condition holds and its token is not served"),
+        ("reason_extra", deg, {**good_d, "degradation_reasons":
+                               ["community_skills_refused", "sensor_unconnected"]},
+         "a token whose condition does not hold"),
+        ("umbrella_missing", view(*SINGLE["firmware_liveness_tick_failures"]),
+         {"status": D, "critical": False,
+          "degradation_reasons": ["firmware_liveness_tick_failures"]},
+         "a liveness condition holds without the umbrella"),
+        ("ok_with_reasons", deg, {**good_d, "status": "ok"},
+         "correct reasons and status ok"),
+        ("critical_on_degraded", deg, {**good_d, "status": C, "critical": True},
+         "critical served where only degraded conditions hold"),
+    ]
+    return [{"name": n, "snapshot": v, "served": s, "expected": check_served(v, s), "note": note}
+            for n, v, s, note in specs]
+
+
+# ── heartbeat mapping ────────────────────────────────────────────────────────
+
+def self_consistent(st: str, cr: bool, rs: list[str]) -> bool:
+    if (len(rs) == 0) != (st == "ok"):
+        return False
+    if (UMBRELLA in rs) != any(is_liveness(t) for t in rs):
+        return False
+    if st != "ok":
+        top = max((SEVERITY[t] for t in rs if t != UMBRELLA), key=RANK.__getitem__,
+                  default="ok")
+        if top != st:
+            return False
+    return cr == (st == C)
+
+
+def triple_check(snapshot) -> str | None:
+    """The first failing step, T1 to T4, or None when the triple passes."""
+    if not isinstance(snapshot, dict):
+        return "status_invalid"
+    st = snapshot.get("status", ABSENT)
+    cr = snapshot.get("critical", ABSENT)
+    rs = snapshot.get("degradation_reasons", ABSENT)
+    if not isinstance(st, str) or st not in RANK:
+        return "status_invalid"
+    if not isinstance(cr, bool) or cr != (st == C):
+        return "critical_mismatch"
+    if (not isinstance(rs, list) or len(rs) > MAX_REASONS
+            or not all(isinstance(x, str) for x in rs)
+            or rs != sorted(set(rs)) or any(x not in SNAPSHOT_VOCAB for x in rs)):
+        return "reasons_malformed"
+    if not self_consistent(st, cr, rs):
+        return "reasons_inconsistent"
+    return None
+
+
+def heartbeat(snapshot) -> dict:
+    if triple_check(snapshot) is not None:
+        return {"status": C, "degradation_reasons": [INVALID]}
+    if snapshot["status"] == "ok":
+        return {"status": "healthy", "degradation_reasons": None}
+    return {"status": snapshot["status"], "degradation_reasons": list(snapshot["degradation_reasons"])}
+
+
+def fallback_heartbeat_case() -> dict:
+    snapshot = {
+        "status": "warning", "critical": False, "degradation_reasons": [],
+        "device_id": "spoofed-device", "active_triggers": ["dangerous_overcurrent"],
+        "evidence": {"enabled": True, "available": True, "chain_head_hash": "ab" * 32,
+                     "attestation_gap_count": 0, "action_event_type": "SAFETY_ACTION_EXECUTED"},
+    }
+    runtime = {"device_id": "site-a-edge-01", "now_ms": 1717000000000, "auth_enabled": False}
+    assert triple_check(snapshot) is not None
+    return {
+        "snapshot": snapshot, "runtime": runtime, "failed_step": triple_check(snapshot),
+        "expected": {"device_id": runtime["device_id"], "status": C,
+                     "last_seen_ms": runtime["now_ms"], "gateway_seen_ms": 0,
+                     "active_triggers": [], "degradation_reasons": [INVALID]},
+        "note": "nothing from the failed snapshot: not its device_id, triggers or evidence; "
+                "no auth member, because heartbeat authentication is disabled",
+    }
+
+
+def heartbeat_cases() -> list[dict]:
+    def t(st, cr, rs):
+        return {"status": st, "critical": cr, "degradation_reasons": rs}
+    specs = [
+        ("ok", t("ok", False, []), "healthy, no reasons"),
+        ("degraded", t(D, False, ["sensor_unconnected"]), "degraded carries its reasons"),
+        ("critical", t(C, True, ["decision_record_lost", "sensor_unconnected"]),
+         "critical carries its reasons"),
+        ("critical_liveness", t(C, True, ["firmware_liveness_degraded",
+                                          "firmware_liveness_stopped",
+                                          "firmware_liveness_tick_failures"]),
+         "the umbrella travels with the precise tokens"),
+        ("status_absent", {"critical": False, "degradation_reasons": []},
+         "no status never maps to healthy"),
+        ("status_unknown_word", t("warning", False, []), "an unknown status"),
+        ("status_healthy_word", t("healthy", False, []), "the heartbeat's word used locally"),
+        ("status_case", t("OK", False, []), "case is not folded"),
+        ("status_padded", t(" ok", False, []), "whitespace is not trimmed"),
+        ("status_number", t(0, False, []), "a number"),
+        ("status_null", t(None, False, []), "null"),
+        ("critical_absent", {"status": "ok", "degradation_reasons": []}, "no critical"),
+        ("critical_mismatch", t("ok", True, []), "critical true on ok"),
+        ("critical_beside_degraded", t(D, True, ["firmware_liveness_degraded",
+                                                 "firmware_liveness_stopped"]),
+         "the v3 runtime's stalled-loop shape: critical true beside degraded"),
+        ("reasons_absent", {"status": "ok", "critical": False}, "no reasons member"),
+        ("ok_with_reason", t("ok", False, ["sensor_unconnected"]), "reasons on ok"),
+        ("degraded_without_reason", t(D, False, []), "degraded with an empty set"),
+        ("liveness_without_umbrella", t(D, False, ["firmware_liveness_tick_failures"]),
+         "a liveness token without the umbrella"),
+        ("umbrella_alone", t(D, False, ["firmware_liveness_degraded"]),
+         "the umbrella decides no severity, so it cannot stand alone"),
+        ("severity_understated", t(D, False, ["decision_record_lost"]),
+         "a critical token under a degraded status"),
+        ("severity_overstated", t(C, True, ["sensor_unconnected"]),
+         "a critical status with only degraded tokens"),
+        ("reasons_unsorted", t(D, False, ["sensor_unconnected", "community_skills_refused"]),
+         "out of order"),
+        ("reasons_unknown", t(D, False, ["sensor_disconnected"]), "unknown token"),
+        ("reasons_not_array", t(D, False, "sensor_unconnected"), "a string, not an array"),
+        ("starting", t(D, False, ["subsystem_starting"]), "startup reads degraded"),
+        ("unknown_critical", t(C, True, ["subsystem_state_unknown_critical"]),
+         "passes through as critical"),
+        ("unknown_critical_under_degraded", t(D, False, ["subsystem_state_unknown_critical"]),
+         "a critical token under degraded"),
+        ("starting_beside_critical", t(C, True, ["decision_record_lost", "subsystem_starting"]),
+         "a known critical wins over starting"),
+        ("snapshot_carries_invalid_token", t(C, True, [INVALID]),
+         "a snapshot never carries the heartbeat's token"),
+        ("reasons_over_bound", t(C, True, [f"t{i:02d}" for i in range(33)]),
+         "thirty-three entries"),
+        ("reasons_duplicate", t(D, False, ["sensor_unconnected", "sensor_unconnected"]),
+         "a token twice"),
+        ("reasons_null", t("ok", False, None), "null is not the empty set"),
+        ("snapshot_not_object", ["ok", False, []], "the snapshot is not an object"),
+        ("snapshot_null", None, "no snapshot"),
+    ]
+    out = []
+    for name, snap, note in specs:
+        hb = heartbeat(snap)
+        expected = {"failed_step": triple_check(snap), "status": hb["status"]}
+        if hb["degradation_reasons"] is not None:
+            expected["degradation_reasons"] = hb["degradation_reasons"]
+        out.append({"name": name, "snapshot": snap, "expected": expected, "note": note})
+    return out
+
+
+# ── gateway-api/v2 degradation_reasons validation ────────────────────────────
+
+def gateway_verdict(hb: dict) -> str:
+    if hb.get("status") not in ("healthy", D, C):
+        return "runtime_status_invalid"
+    if "degradation_reasons" not in hb:
+        return "accept"
+    rs = hb["degradation_reasons"]
+    if not isinstance(rs, list):
+        return "degradation_reasons_not_array"
+    if not 1 <= len(rs) <= MAX_REASONS:
+        return "degradation_reasons_length_invalid"
+    if not all(isinstance(x, str) for x in rs):
+        return "degradation_reason_not_string"
+    if len(set(rs)) != len(rs):
+        return "degradation_reasons_not_unique"
+    if rs != sorted(rs):
+        return "degradation_reasons_not_ordered"
+    if any(x not in VOCAB for x in rs):
+        return "degradation_reason_unknown"
+    if INVALID in rs and (len(rs) != 1 or hb["status"] != C):
+        return "degradation_reason_not_alone"
+    if hb.get("status") not in (D, C):
+        return "degradation_reasons_status_mismatch"
+    worst = max((RANK[C if x == INVALID else SEVERITY[x]] for x in rs if x != UMBRELLA),
+                default=0)
+    if RANK[hb["status"]] < worst:
+        return "degradation_reasons_severity_understated"
+    return "accept"
+
+
+def gateway_cases() -> list[dict]:
+    specs = [
+        ("healthy_absent", {"status": "healthy"}, "nothing to report"),
+        ("degraded_absent", {"status": D}, "an older runtime naming no reason"),
+        ("critical_absent", {"status": C}, "a runtime that cannot name its reason"),
+        ("critical_with_reason", {"status": C, "degradation_reasons": ["decision_record_lost"]},
+         "row 8 admits critical"),
+        ("degraded_with_reasons", {"status": D, "degradation_reasons":
+                                   ["firmware_liveness_degraded",
+                                    "firmware_liveness_over_capacity"]}, "two tokens"),
+        ("every_token", {"status": C, "degradation_reasons": list(SNAPSHOT_VOCAB)},
+         f"all {len(SNAPSHOT_VOCAB)} snapshot tokens, within the bound of thirty-two"),
+        ("snapshot_invalid", {"status": C, "degradation_reasons": [INVALID]},
+         "a runtime whose snapshot was malformed"),
+        ("snapshot_invalid_degraded", {"status": D, "degradation_reasons": [INVALID]},
+         "the token only ever accompanies critical"),
+        ("snapshot_invalid_beside_token", {"status": C, "degradation_reasons":
+                                           [INVALID, "sensor_unconnected"]},
+         "the token is always alone"),
+        ("snapshot_invalid_healthy", {"status": "healthy", "degradation_reasons": [INVALID]},
+         "refused by the alone step before the status step"),
+        ("status_absent", {"degradation_reasons": ["sensor_unconnected"]},
+         "status is validated before any reason"),
+        ("status_starting_alone", {"status": "starting"},
+         "starting is not a runtime node status"),
+        ("status_unknown", {"status": "ok"}, "the local word is not a heartbeat status"),
+        ("starting", {"status": D, "degradation_reasons": ["subsystem_starting"]},
+         "a runtime still starting"),
+        ("critical_with_degraded_tokens", {"status": C,
+                                           "degradation_reasons": ["sensor_unconnected"]},
+         "the gateway checks presence against status, not severity"),
+        ("healthy_with_reason", {"status": "healthy",
+                                 "degradation_reasons": ["sensor_unconnected"]},
+         "reasons need degraded or critical"),
+        ("starting_with_reason", {"status": "starting",
+                                  "degradation_reasons": ["sensor_unconnected"]},
+         "starting is not a runtime node status"),
+        ("empty", {"status": D, "degradation_reasons": []}, "present-empty is malformed"),
+        ("over_bound", {"status": C, "degradation_reasons":
+                        [f"t{i:02d}" for i in range(33)]},
+         "thirty-three entries fail length before anything else"),
+        ("at_bound_duplicates", {"status": C, "degradation_reasons":
+                                 ["sensor_unconnected"] * 32},
+         "thirty-two entries pass length and fail uniqueness"),
+        ("seventeen_duplicates", {"status": C, "degradation_reasons":
+                                  ["sensor_unconnected"] * 17},
+         "past the old bound of sixteen, inside the new one"),
+        ("not_array", {"status": D, "degradation_reasons": "sensor_unconnected"},
+         "a string"),
+        ("not_string", {"status": D, "degradation_reasons": [1]}, "a number"),
+        ("degraded_with_critical_token", {"status": D, "degradation_reasons":
+                                          ["decision_record_lost"]},
+         "a critical condition under degraded"),
+        ("degraded_with_mixed_tokens", {"status": D, "degradation_reasons":
+                                        ["sensor_unconnected", "tier_d_alert_delivery_unconfirmed"]},
+         "the most severe token decides the floor"),
+        ("unknown_critical_under_degraded", {"status": D, "degradation_reasons":
+                                             ["subsystem_state_unknown_critical"]},
+         "unknown critical visibility is critical"),
+        ("unknown_critical", {"status": C, "degradation_reasons":
+                              ["subsystem_state_unknown_critical"]},
+         "the token alone, with no per-subsystem field"),
+        ("degraded_umbrella_only", {"status": D, "degradation_reasons":
+                                    ["firmware_liveness_degraded"]},
+         "an older runtime naming only the umbrella stays accepted"),
+        ("critical_umbrella_only", {"status": C, "degradation_reasons":
+                                    ["firmware_liveness_degraded"]},
+         "a status above its tokens' severity is accepted"),
+        ("duplicate_out_of_order", {"status": D, "degradation_reasons":
+                                    ["sensor_unconnected", "community_skills_refused",
+                                     "sensor_unconnected"]},
+         "uniqueness is judged before order"),
+        ("not_ordered", {"status": D, "degradation_reasons":
+                         ["sensor_unconnected", "community_skills_refused"]}, "reversed"),
+        ("unknown", {"status": D, "degradation_reasons": ["sensor_disconnected"]},
+         "outside the vocabulary"),
+    ]
+    return [{"name": n, "heartbeat": hb, "expected": gateway_verdict(hb), "note": note}
+            for n, hb, note in specs]
+
+
+# ── request framing ──────────────────────────────────────────────────────────
+
+ACCEPTED = {b"", b"\n", b"GET_HEALTH", b"GET_HEALTH\n"}
+
+
+def frame(writes: list[bytes], after: str) -> str:
+    """Judge a request as the server receives it, byte by byte, whatever the writes."""
+    held = bytearray()
+    for byte in b"".join(writes):
+        held.append(byte)
+        if len(held) > 1024:
+            return "request_too_large"
+        if byte == 0x0A:
+            # The request ends here; anything after is discarded unread.
+            return "ok" if bytes(held) in ACCEPTED else "unsupported_request"
+    if after == "silent":
+        return "unsupported_request"
+    return "ok" if bytes(held) in ACCEPTED else "unsupported_request"
+
+
+def request_cases() -> list[dict]:
+    g = b"GET_HEALTH"
+    one = [
+        ("empty", b""), ("lf", b"\n"), ("get", g), ("get_lf", g + b"\n"),
+        ("get_two_lf", g + b"\n\n"), ("two_lf", b"\n\n"), ("get_crlf", g + b"\r\n"),
+        ("cr", b"\r"), ("get_cr", g + b"\r"), ("lf_get", b"\n" + g),
+        ("space_get", b" " + g), ("get_space", g + b" "), ("tab_get", b"\t" + g),
+        ("get_vt", g + b"\x0b"), ("get_ff", g + b"\x0c"),
+        ("fs_get_gs", b"\x1c" + g + b"\x1d"), ("get_rs", g + b"\x1e"), ("get_us", g + b"\x1f"),
+        ("get_nel", g + "\u0085".encode()), ("nbsp_get", "\u00a0".encode() + g),
+        ("get_line_separator", g + "\u2028".encode()),
+        ("get_paragraph_separator", g + "\u2029".encode()),
+        ("bom_get", "\ufeff".encode() + g), ("get_nul", g + b"\x00"), ("nul", b"\x00"),
+        ("invalid_utf8_inside", b"GET_\xffHEALTH"), ("invalid_utf8_alone", b"\xff"),
+        ("get_invalid_utf8", g + b"\xc3"), ("lower", b"get_health"),
+        ("prefix", b"GET_HEALT"), ("suffix", b"GET_HEALTHX"), ("space", b" "),
+        ("fullwidth_get", "ＧＥＴ_ＨＥＡＬＴＨ".encode()),
+        ("get_lf_then_data", g + b"\n\xffjunk"),
+        ("get_lf_then_get", g + b"\nGET_HEALTH\n"),
+        ("max_unaccepted", b"A" * 1024), ("over_max", b"A" * 1025),
+        ("line_1023_lf", b"x" * 1023 + b"\n"), ("line_1024_lf", b"x" * 1024 + b"\n"),
+        ("get_lf_then_over", g + b"\n" + b"B" * 1014),
+        ("get_padded_at", g + b" " * 1014),
+    ]
+    specs = [(n, [raw] if raw else [], "eof") for n, raw in one]
+    specs += [
+        ("split_get_lf", [b"GET_", b"HEALTH\n"], "silent"),
+        ("split_byte_by_byte", [bytes([c]) for c in g + b"\n"], "silent"),
+        ("split_get_then_eof", [b"GET_HEA", b"LTH"], "eof"),
+        ("split_get_lf_then_data", [g, b"\n\xffjunk"], "silent"),
+        ("split_data_after_lf", [g + b"\n", b"\xffjunk"], "silent"),
+        ("split_two_lf", [g + b"\n", b"\n"], "eof"),
+        ("split_lf_then_get", [b"\n", g], "eof"),
+        ("split_1000_25", [b"A" * 1000, b"A" * 25], "silent"),
+        ("split_1000_24", [b"A" * 1000, b"A" * 24], "eof"),
+        ("split_1000_24_silent", [b"A" * 1000, b"A" * 24], "silent"),
+        ("split_line_1024_lf", [b"x" * 1000, b"x" * 24 + b"\n"], "silent"),
+        ("split_line_1023_lf", [b"x" * 1000, b"x" * 23 + b"\n"], "silent"),
+        ("unfinished_get", [g], "silent"),
+        ("unfinished_partial", [b"GET_"], "silent"),
+        ("unfinished_nothing", [], "silent"),
+        ("empty_then_eof", [], "eof"),
+    ]
+    return [{"name": n, "writes_hex": [w.hex() for w in writes], "after": after,
+             "bytes_written": sum(len(w) for w in writes), "expected": frame(writes, after)}
+            for n, writes, after in specs]
+
+
+# ── integers and expiry ──────────────────────────────────────────────────────
+
+def int_ok(text: str) -> bool:
+    body = text.removeprefix("-")
+    if not body.isdigit() or (len(body) > 1 and body[0] == "0") or not body.isascii():
+        return False
+    return 0 <= int(text) <= INT_MAX
+
+
+def integer_cases() -> list[dict]:
+    texts = ["0", "1", "9007199254740991", "9007199254740992", "9223372036854775807",
+             "18446744073709551616", "-1", "-9007199254740991", "1.0", "1e3", "1E0",
+             "0.5", "01", "\"1\"", "true", "null"]
+    return [{"json": t, "expected": "accept" if int_ok(t) else "refuse"} for t in texts]
+
+
+def expiry_ok(m: dict) -> bool:
+    e, v, x = m.get("expiry", ABSENT), m.get("valid_until", ABSENT), m.get("is_expired", ABSENT)
+    if not isinstance(x, bool):
+        return False
+    if e == "never":
+        return v is None and x is False
+    if e == "at":
+        return type(v) is int and 0 <= v <= INT_MAX
+    return False
+
+
+def expiry_cases() -> list[dict]:
+    specs = [
+        {"expiry": "never", "valid_until": None, "is_expired": False},
+        {"expiry": "at", "valid_until": 1767225600, "is_expired": False},
+        {"expiry": "at", "valid_until": 1767225600, "is_expired": True},
+        {"expiry": "never", "valid_until": 9223372036854775807, "is_expired": False},
+        {"expiry": "never", "valid_until": None, "is_expired": True},
+        {"expiry": "at", "valid_until": None, "is_expired": False},
+        {"valid_until": None, "is_expired": False},
+        {"expiry": None, "valid_until": None, "is_expired": False},
+        {"expiry": "forever", "valid_until": None, "is_expired": False},
+        {"expiry": "at", "valid_until": 9007199254740992, "is_expired": False},
+        {"expiry": "at", "valid_until": "1767225600", "is_expired": False},
+    ]
+    return [{"device_policy": m, "expected": "accept" if expiry_ok(m) else "refuse"}
+            for m in specs]
+
+
+def fold_cases() -> list[dict]:
+    tokens = list(SEVERITY)
+    seqs = [("none", [])]
+    seqs += [(f"alone_{t}", [t]) for t in tokens]
+    seqs += [(f"pair_{a}__{b}", [a, b]) for a, b in itertools.permutations(tokens, 2)]
+    seqs += [("all_forward", tokens), ("all_reverse", list(reversed(tokens)))]
+    return [{"name": n, "holding": h, "expected": fold(h)} for n, h in seqs]
+
+
+# ── whole served responses: snapshot checks 1 to 10 ──────────────────────────
+
+def full_health() -> dict:
+    """A whole healthy served snapshot, every member as its table gives it."""
+    return {
+        "contract_version": "runtime-health/v4", "device_id": "site-a-edge-01",
+        "uptime_s": 3600.5, "health_socket_path": "/run/ori/health.sock",
+        "status": "ok", "critical": False, "degradation_reasons": [],
+        "capability_posture": {
+            "state": "available", "available": True, "sms_available": True,
+            "whatsapp_available": False, "gateway_reachable": False, "local_slm_loaded": False,
+            "relay_connected": False, "internet_available": True,
+            "checked_at_ms": 1717000000000, "expires_at_ms": 1717000060000,
+            "gateway_last_heartbeat_ms": None},
+        "sensors": [{
+            "id": "load-current", "type": "ads1115_current", "protocol": "i2c",
+            "poll_interval_ms": 1000, "connection": "connected", "connected": True,
+            "last_seen_ms": 1716999999000, "stale": False, "measurement_degraded": False,
+            "consecutive_refusals": 0}],
+        "last_alert_timestamps": {"by_channel": {}, "by_trigger": {}},
+        "device_policy": {
+            "state": "available", "enabled": True, "available": True, "policy_held": True,
+            "policy_version": 3,
+            "tier": "standard", "relay_b_enabled": False, "relay_c_enabled": False,
+            "cloud_llm_enabled": False, "alert_sms_monthly_cap": None,
+            "alert_whatsapp_monthly_cap": None, "expiry": "never", "valid_until": None,
+            "issued_at": 1716000000, "is_expired": False},
+        "alert_outbox": {
+            "state": "available", "backlog_count": 0, "oldest_queued_original_ts": None,
+            "oldest_queued_at_ms": None, "oldest_queued_age_ms": None,
+            "tier_d_unresolved_count": 0, "tier_d_max_attempts": None,
+            "tier_d_oldest_age_ms": None, "tier_d_age_bound_ms": 300000,
+            "oldest_non_tier_d_age_ms": None, "overdue_bound_ms": 3600000,
+            "retry_interval_minutes": 0.5, "max_non_tier_d_attempts": 10,
+            "tier_d_critical_warning_threshold": 3, "batch_size": 50},
+        "remote_command_lockout": {
+            "state": "available", "enforcement_enabled": False, "risk_window_ms": 3600000,
+            "stale_after_ms": 86400000, "incident_sender_limit": 100, "senders": []},
+        "gateway_broker_posture": {
+            "state": "available", "available": True, "gateway_enabled": False,
+            "deployment_check": "warning", "anonymous_access": "unknown", "acl_policy": "unknown",
+            "require_credentials": False, "credentials_configured": False,
+            "requires_acl_hardening": False},
+        "state_store_encryption": {
+            "state": "available", "available": True, "mode": "disabled", "satisfied": False,
+            "marker_configured": False, "path_prefix_configured": False},
+        "evidence": {
+            "state": "disabled", "enabled": False, "available": False, "public_key_hex": "",
+            "protocol_version": "", "action_event_type": "", "anchor_epoch_id": "",
+            "inbound_route_connected": False, "posture_problems": [],
+            "action_records": {
+                "state": "available", "pending": 0, "outcome_unknown": 0,
+                "dispatch_unproven": 0, "lost": 0, "ceiling": 64, "unknown_live": 0,
+                "oldest_pending_age_ms": None, "recovery_failed": False},
+            "attestation_summary_available": False, "registration_available": True,
+            "delivery_ledger_available": False, "registration_status": "disabled",
+            "registration_pending_since_ms": None, "registration_confirmation_overdue": False,
+            "registration_offer": "not_applicable", "last_disposition": None},
+        "action_log_records": {
+            "state": "available", "pending": 0, "oldest_pending_age_ms": None, "ceiling": 1000,
+            "lost": 0, "stall_bound_ms": 30000, "decision_records_lost": 0,
+            "loss_incidents": []},
+        "commissioning": {
+            "state": "available", "binding_seq": 0, "binding_hash": None,
+            "anchors_configured": False, "actuation_licensed": True, "problems": [],
+            "zones": [], "last_verdict": None},
+        "safety_registry": {"state": "disabled"},
+        "safety_zones": [],
+        "community_skills": {"state": "available", "anchor_usable": True, "refused_skills": 0},
+        "config_authority": {
+            "state": "available", "signature_required": False, "signature_verified": False,
+            "dotenv_loaded": False, "unsigned_value_source": False},
+        "firmware_liveness": {"state": "disabled"},
+        "firmware_reading_age": {"state": "disabled"},
+        "firmware_controller_profiles": {"state": "disabled"},
+        "skill_hooks": {"state": "disabled"},
+        "telemetry_export": {"state": "disabled"},
+        "diagnostics": {},
+    }
+
+
+def envelope_text(health: dict | None = None, **envelope) -> str:
+    body = {"schema_version": 1, "ok": True, "health": full_health() if health is None else health}
+    body.update(envelope)
+    return json.dumps(body, ensure_ascii=False) + "\n"
+
+
+def edited(path: tuple, value) -> dict:
+    h = full_health()
+    node = h
+    for key in path[:-1]:
+        node = node[key]
+    if value is ABSENT:
+        del node[path[-1]]
+    else:
+        node[path[-1]] = value
+    return h
+
+
+def zone_entry(trip_age_ms) -> dict:
+    """A verified, protected tripped pair; only trip_age_ms varies."""
+    return {"zone_id": "zone-a", "profile_id": "profile-a", "activation": "active",
+            "trip_state": "tripped", "command_status": "command_issued",
+            "effect_verified": "matched", "measurement_degraded": False,
+            "rejected_input_active": False, "last_rejected_reason": "", "binding_seq": 2,
+            "trip_age_ms": trip_age_ms,
+            "qualification": {"state": "none", "fixture_hash": "", "expires_at_ms": None,
+                              "sessions_used": 0, "sessions_remaining": None,
+                              "min_acceptable_seq": 0},
+            "protection_claim": "protected"}
+
+
+def served(edits: list, status: str, reasons: list[str]) -> dict:
+    h = full_health()
+    for path, value in edits:
+        node = h
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = value
+    h.update(status=status, critical=status == C, degradation_reasons=reasons)
+    return h
+
+
+def profiles_block(unmapped: list[int]) -> dict:
+    """An available profiles block with one as_of alarm channel: word 0b1011."""
+    digest = "sha256:99563dd574a24b1530350600e7c0a668b0afca0df46da165d30dcbb7e7297c01"
+    return {
+        "state": "available",
+        "documents_held": [{"id": "example-rectifier", "digest": digest}],
+        "documents_refused": [],
+        "alarm_channels": [{
+            "device_id": "ori-fw-7c9f2b3a", "channel": "alarm0", "state": "as_of",
+            "reading": {
+                "key_epoch_id": "epoch-1", "boot_id": 41, "seq": 1207,
+                "receiver_accepted_at_ms": 1716999990000, "word": 11,
+                "profile": {"controller_profile_id": "example-rectifier", "digest": digest,
+                            "profile_channel": "alarm_word_1"},
+                "profile_status": "usable", "liveness_bound": "unbounded"},
+            "asserted": [{"id": "rectifier_fault", "meaning": "Rectifier fault"}],
+            "not_asserted_at_that_poll": ["mains_failure"],
+            "unmapped_set_bits": unmapped}],
+    }
+
+
+def response_cases() -> list[dict]:
+    base = envelope_text()
+    specs = [
+        ("whole_healthy", base, "accept", "every step passes"),
+        ("not_json", base[:40], "envelope_invalid", "truncated"),
+        ("refusal_envelope",
+         json.dumps({"schema_version": 1, "ok": False, "error": {
+             "code": "internal_error", "detail": "snapshot could not be built"}}) + "\n",
+         "envelope_invalid", "a refusal is not a served snapshot"),
+        ("schema_version_2", envelope_text(schema_version=2), "envelope_invalid",
+         "the envelope is v3's"),
+        ("envelope_extra_member", envelope_text(served_at=1), "envelope_invalid",
+         "a member the envelope does not carry"),
+        ("envelope_duplicate_ok", base.replace('"ok": true', '"ok": true, "ok": true', 1),
+         "envelope_invalid", "an envelope member named twice"),
+        ("health_extra_member", envelope_text(edited(("safety",), {})), "members_invalid",
+         "registry internals as a top-level member"),
+        ("health_missing_member", envelope_text(edited(("diagnostics",), ABSENT)),
+         "members_invalid", "a top-level member absent"),
+        ("health_duplicate_top_level",
+         base.replace('"status": "ok"', '"status": "ok", "status": "ok"', 1),
+         "members_invalid", "a top-level member named twice"),
+        ("health_duplicate_nested",
+         base.replace('"unsigned_value_source": false',
+                      '"unsigned_value_source": false, "unsigned_value_source": false', 1),
+         "members_invalid", "a member named twice inside a block"),
+        ("integer_over_range", envelope_text(edited(("alert_outbox", "backlog_count"),
+                                                    9007199254740992)),
+         "integer_invalid", "one past 2^53-1"),
+        ("integer_fraction", base.replace('"ceiling": 1000', '"ceiling": 1000.0', 1),
+         "integer_invalid", "an int member written with a fraction"),
+        ("integer_negative", envelope_text(edited(("sensors", 0, "consecutive_refusals"), -1)),
+         "integer_invalid", "under the default range"),
+        ("integer_sentinel", envelope_text(edited(("device_policy", "valid_until"),
+                                                  9223372036854775807)),
+         "integer_invalid", "the int64 sentinel"),
+        ("float_negative", envelope_text(edited(("uptime_s",), -1.5)), "integer_invalid",
+         "a float under zero"),
+        ("state_not_allowed", envelope_text(edited(("firmware_reading_age",),
+                                                   {"state": "starting"})),
+         "shape_invalid", "firmware_reading_age decides no severity and never starts"),
+        ("tied_boolean_disagrees", envelope_text(edited(("capability_posture", "available"),
+                                                        False)),
+         "shape_invalid", "available false while state is available"),
+        ("member_behind_flag", envelope_text(edited(("evidence", "delivery_stop_status"),
+                                                    "not_stopped")),
+         "shape_invalid", "a delivery-ledger row while its flag is false"),
+        ("member_while_unavailable", envelope_text(served(
+            [(("config_authority", "state"), "unavailable")],
+            "degraded", ["subsystem_state_unknown"])),
+         "shape_invalid", "available-only members beside state unavailable, served degraded"),
+        ("status_word_invalid", envelope_text(edited(("status",), "healthy")),
+         "status_invalid", "the heartbeat's word is not a local status"),
+        ("reasons_unknown_token", envelope_text(served(
+            [], "ok", ["sensor_disconnected"])),
+         "reasons_malformed", "a token outside the vocabulary; step 9 fails only through it"),
+        ("reasons_not_holding", envelope_text(served(
+            [], "ok", ["sensor_unconnected"])),
+         "reasons_mismatch", "a token whose condition does not hold, served ok"),
+        ("set_out_of_order", envelope_text(served(
+            [(("commissioning", "problems"), ["retained_binding_unreadable", "binding_missing"])],
+            "degraded", ["commissioning_problem"])),
+         "shape_invalid", "a set out of byte order, its condition served correctly"),
+        ("set_duplicate", envelope_text(served(
+            [(("commissioning", "problems"), ["binding_missing", "binding_missing"])],
+            "degraded", ["commissioning_problem"])),
+         "shape_invalid", "a set with a duplicate, its condition served correctly"),
+        ("unmapped_bits_out_of_order", envelope_text(edited(
+            ("firmware_controller_profiles",), profiles_block([3, 1]))),
+         "shape_invalid", "unmapped_set_bits not ascending, everything else valid"),
+        ("controller_profiles_available", envelope_text(edited(
+            ("firmware_controller_profiles",), profiles_block([1, 3]))),
+         "accept", "the same block with its bits ascending"),
+        ("evidence_available_whole", envelope_text(edited(("evidence",), evidence_available())),
+         "accept", "every evidence row present and well formed"),
+        ("controller_profiles_unavailable", envelope_text(edited(
+            ("firmware_controller_profiles",), {"state": "unavailable"})),
+         "accept", "decides no severity"),
+        ("boolean_wrong_type", envelope_text(edited(("capability_posture", "sms_available"),
+                                                    "yes")),
+         "type_invalid", "a boolean member written as a string"),
+        ("string_wrong_type", envelope_text(edited(("health_socket_path",), 7)),
+         "type_invalid", "a string member written as a number"),
+        ("array_wrong_type", envelope_text(edited(("commissioning", "problems"),
+                                                  "binding_missing")),
+         "type_invalid", "an array member written as a string"),
+        ("value_outside_vocabulary", envelope_text(edited(
+            ("gateway_broker_posture", "deployment_check"), "strict")),
+         "type_invalid", "a value outside its vocabulary"),
+        ("diagnostics_integer_over_range", envelope_text(edited(
+            ("diagnostics",), {"safety": {"suppressed_alerts": 9007199254740992}})),
+         "accept", "nothing inside diagnostics is judged"),
+        ("diagnostics_negative_integer", envelope_text(edited(
+            ("diagnostics",), {"telemetry_export": {"refused_at_ms": -1}})),
+         "accept", "a bad diagnostic value never takes the snapshot down"),
+        ("diagnostics_unknown_namespace", envelope_text(edited(
+            ("diagnostics",), {"registry_internals": {}})),
+         "members_invalid", "diagnostics names only the listed namespaces"),
+        ("diagnostics_namespace_not_object", envelope_text(edited(
+            ("diagnostics",), {"safety": []})),
+         "type_invalid", "each namespace's value is an object"),
+        ("capability_posture_unavailable", envelope_text(edited(
+            ("capability_posture",), {"state": "unavailable", "available": False})),
+         "accept", "decides no severity"),
+        ("device_policy_unavailable", envelope_text(edited(
+            ("device_policy",), {"state": "unavailable", "enabled": True, "available": False})),
+         "accept", "decides no severity"),
+        ("alert_outbox_unavailable", envelope_text(served(
+            [(("alert_outbox",), {"state": "unavailable", "tier_d_age_bound_ms": 300000,
+                                  "overdue_bound_ms": 3600000, "retry_interval_minutes": 0.5,
+                                  "max_non_tier_d_attempts": 10,
+                                  "tier_d_critical_warning_threshold": 3, "batch_size": 50})],
+            "critical", ["subsystem_state_unknown_critical"])),
+         "accept", "the outbox can raise a critical condition, so unreadable is critical"),
+        ("trip_age_null_while_tripped", envelope_text(served(
+            [(("safety_registry",), {"state": "available",
+                                     "trip_verification_deadline_ms": 10000}),
+             (("safety_zones",), [zone_entry(trip_age_ms=None)])], "ok", [])),
+         "shape_invalid", "a tripped pair must carry its trip age"),
+        ("trip_deadline_over_ceiling", envelope_text(served(
+            [(("safety_registry",), {"state": "available",
+                                     "trip_verification_deadline_ms": 60001})], "ok", [])),
+         "shape_invalid", "the deadline's ceiling is 60000"),
+        ("trip_verified_whole", envelope_text(served(
+            [(("safety_registry",), {"state": "available",
+                                     "trip_verification_deadline_ms": 10000}),
+             (("safety_zones",), [zone_entry(trip_age_ms=4000)])], "ok", [])),
+         "accept", "a verified trip, served whole"),
+        ("alert_bound_above_default", envelope_text(edited(
+            ("alert_outbox", "overdue_bound_ms"), 3600001)),
+         "shape_invalid", "a bound above its default is refused at load, never served"),
+        ("alert_threshold_above_default", envelope_text(edited(
+            ("alert_outbox", "tier_d_critical_warning_threshold"), 4)),
+         "shape_invalid", "a threshold above its default"),
+        ("loss_counter_not_sum", envelope_text(edited(("action_log_records", "lost"), 1)),
+         "shape_invalid", "lost counted with no incident behind it"),
+        ("acknowledged_without_time", envelope_text(served(
+            [(("action_log_records", "loss_incidents"),
+              [{**incident("decision_record_lost", True), "acknowledged_at_ms": None}]),
+             (("action_log_records", "decision_records_lost"), 1)], "ok", [])),
+         "shape_invalid", "acknowledged_at_ms is null only while unacknowledged"),
+        ("incidents_out_of_order", envelope_text(served(
+            [(("action_log_records", "loss_incidents"),
+              [incident("decision_record_lost", True, iid="inc-0002"),
+               incident("decision_record_lost", True, iid="inc-0001")]),
+             (("action_log_records", "decision_records_lost"), 2)], "ok", [])),
+         "shape_invalid", "incidents are ordered by incident_id"),
+        ("acknowledged_incident_whole", envelope_text(served(
+            [(("action_log_records", "loss_incidents"),
+              [incident("decision_record_lost", True)]),
+             (("action_log_records", "decision_records_lost"), 1)], "ok", [])),
+         "accept", "an acknowledged incident, still counted, names nothing"),
+        ("device_policy_none_held", envelope_text(edited(
+            ("device_policy",), {"state": "available", "enabled": True, "available": True,
+                                 "policy_held": False})),
+         "accept", "enabled with no policy held is available, not unavailable"),
+        ("broker_posture_unavailable", envelope_text(edited(
+            ("gateway_broker_posture",), {"state": "unavailable", "available": False})),
+         "accept", "decides no severity"),
+        ("encryption_unavailable", envelope_text(edited(
+            ("state_store_encryption",), {"state": "unavailable", "available": False})),
+         "accept", "decides no severity"),
+        ("disabled_block_with_member", envelope_text(edited(("firmware_liveness", "loop"),
+                                                            "running")),
+         "shape_invalid", "a disabled block carries only state"),
+        ("status_without_reason", envelope_text(edited(("status",), "degraded")),
+         "status_mismatch", "degraded while nothing holds"),
+        ("critical_string", envelope_text(edited(("critical",), "false")),
+         "critical_mismatch", "critical must be a boolean"),
+    ]
+    return [{"name": n, "response": text, "expected": v, "note": note}
+            for n, text, v, note in specs]
+
+
+def unrepresentable_cases() -> list[dict]:
+    specs = [
+        ("device_policy.valid_until", "9223372036854775807"),
+        ("alert_outbox.backlog_count", "9007199254740992"),
+        ("alert_outbox.backlog_count", "9007199254740991"),
+        ("evidence.stopped_local_bytes", "18446744073709551616"),
+        ("action_log_records.lost", "0"),
+    ]
+    return [{"member": m, "value": v,
+             "expected": "serve" if 0 <= int(v) <= INT_MAX else "internal_error"}
+            for m, v in specs]
+
+
+# ── the remote health projection and whole-snapshot heartbeats ────────────────
+
+def evidence_available() -> dict:
+    return {
+        "state": "available", "enabled": True, "available": True,
+        "public_key_hex": "ab" * 32, "protocol_version": "ori.evidence.v2",
+        "action_event_type": "SAFETY_ACTION_EXECUTED", "anchor_epoch_id": "epoch-1",
+        "inbound_route_connected": True, "posture_problems": [],
+        "action_records": {
+            "state": "available", "pending": 0, "outcome_unknown": 0, "dispatch_unproven": 0,
+            "lost": 0, "ceiling": 64, "unknown_live": 0, "oldest_pending_age_ms": None,
+            "recovery_failed": False},
+        "attestation_summary_available": True, "registration_available": True,
+        "delivery_ledger_available": True, "chain_head_hash": "cd" * 32,
+        "pending_export_count": 0, "last_attested_action_id": 12,
+        "attestation_gap_count": 0, "status_counts": {"signed": 12},
+        "contributor_links_unresolved": 0, "registration_status": "confirmed",
+        "registration_pending_since_ms": None, "registration_confirmation_overdue": False,
+        "registration_offer": "not_applicable", "last_disposition": None,
+        "delivery_stop_status": "not_stopped", "stopped_local_artifact_count": 0,
+        "stopped_local_bytes": 0, "oldest_stopped_local_since_ms": None,
+        "foreign_identity_pending_count": 0, "ingest_refusal_count": 0,
+        "last_ingest_refusal": None, "courier_answer_faults": 0,
+        "awaiting_receipt_count": 0, "oldest_awaiting_receipt_age_ms": None,
+    }
+
+
+PHONE = "+2348000000000"
+SUBORDINATE = "ori-fw-7c9f2b3a"
+
+
+def rich_health() -> dict:
+    """A whole snapshot carrying every local-only member, served consistently."""
+    h = full_health()
+    h["last_alert_timestamps"] = {"by_channel": {"sms": 1716999000000},
+                                  "by_trigger": {"dangerous_overcurrent": 1716999000000}}
+    h["remote_command_lockout"]["enforcement_enabled"] = True
+    h["remote_command_lockout"]["senders"] = [{
+        "channel": "sms", "from_number": PHONE, "risk_level": "critical", "locked_out": True,
+        "enforcement_enabled": True, "incident_count": 4, "rejection_count": 9,
+        "window_ms": 3600000, "checked_at_ms": 1716999000000, "reason": "rejection_volume",
+        "stale": False}, {
+        "channel": "whatsapp", "from_number": "+2348000000001", "risk_level": "normal",
+        "locked_out": False, "enforcement_enabled": True, "incident_count": 0,
+        "rejection_count": 1, "window_ms": 3600000, "checked_at_ms": 1716999000000,
+        "reason": "", "stale": False}]
+    h["commissioning"]["last_verdict"] = {"stage": "verify", "reason": "signature_invalid",
+                                          "binding_seq": 2, "at_ms": 1716990000000}
+    h["firmware_liveness"] = {
+        "state": "available", "loop": "running", "started_age_ms": 600000, "interval_ms": 15000,
+        "per_device_timeout_ms": 5000, "max_concurrent": 8, "expiry_window_ms": 60000,
+        "supervised_devices": 2, "supported_device_capacity": 16,
+        "worst_case_device_latency_ms": 5000, "consecutive_tick_failures": 0,
+        "last_successful_tick_age_ms": 1000, "expiring_device_ids": [SUBORDINATE],
+        "degraded": True}
+    h["firmware_reading_age"] = {"state": "available", "signing_runtime": True, "devices": [
+        {"device_id": "ori-fw-00000000",
+         "latest_reading": {"key_epoch_id": "epoch-1", "boot_id": 3, "seq": 88},
+         "liveness_bound": "unbounded"},
+        {"device_id": SUBORDINATE,
+         "latest_reading": {"key_epoch_id": "epoch-1", "boot_id": 41, "seq": 1207},
+         "liveness_bound": {"name": "runtime liveness bound", "age_upper_ms": 1500,
+                            "as_of_ms": 1717000000000}}]}
+    profiles = profiles_block([1, 3])
+    profiles["documents_refused"] = [{"file": "broken-profile.json",
+                                      "reason": "invalid_profile_document"}]
+    h["firmware_controller_profiles"] = profiles
+    h["diagnostics"] = {
+        "firmware_mqtt_operator": {"socket_path": "/var/lib/ori/data/firmware-mqtt.sock"},
+        "firmware_liveness": {"last_error": "TimeoutError: publish timed out"}}
+    folded = fold(holding(h))
+    h.update(folded)
+    return h
+
+
+BLOCK_MEMBERS = {
+    "capability_posture": ["state", "available", "sms_available", "whatsapp_available",
+                           "gateway_reachable", "local_slm_loaded", "relay_connected",
+                           "internet_available", "checked_at_ms", "expires_at_ms",
+                           "gateway_last_heartbeat_ms"],
+    "device_policy": ["state", "enabled", "available", "policy_held", "policy_version", "tier",
+                      "relay_b_enabled", "relay_c_enabled", "cloud_llm_enabled",
+                      "alert_sms_monthly_cap", "alert_whatsapp_monthly_cap", "expiry",
+                      "valid_until", "issued_at", "is_expired"],
+    "alert_outbox": ["state", "backlog_count", "tier_d_unresolved_count", "tier_d_max_attempts",
+                     "tier_d_oldest_age_ms", "tier_d_age_bound_ms", "oldest_non_tier_d_age_ms",
+                     "overdue_bound_ms", "oldest_queued_original_ts", "oldest_queued_at_ms",
+                     "oldest_queued_age_ms", "retry_interval_minutes", "max_non_tier_d_attempts",
+                     "tier_d_critical_warning_threshold", "batch_size"],
+    "gateway_broker_posture": ["state", "available", "gateway_enabled", "deployment_check",
+                               "anonymous_access", "acl_policy", "require_credentials",
+                               "credentials_configured", "requires_acl_hardening"],
+    "state_store_encryption": ["state", "available", "mode", "satisfied", "marker_configured",
+                               "path_prefix_configured"],
+    "evidence": list(evidence_available()),
+    "action_log_records": ["state", "pending", "oldest_pending_age_ms", "ceiling", "lost",
+                           "stall_bound_ms", "decision_records_lost", "loss_incidents"],
+    "commissioning": ["state", "binding_seq", "binding_hash", "anchors_configured",
+                      "actuation_licensed", "problems", "zones", "last_verdict"],
+    "safety_registry": ["state", "trip_verification_deadline_ms"],
+    "community_skills": ["state", "anchor_usable", "refused_skills"],
+    "config_authority": ["state", "signature_required", "signature_verified", "dotenv_loaded",
+                         "unsigned_value_source"],
+    "skill_hooks": ["state", "required_unavailable", "optional_unavailable"],
+    "telemetry_export": ["state", "transport_available", "suspended", "queued_events",
+                         "retained_events", "dropped_events", "unconfirmed_events",
+                         "declined_events", "refused_events"],
+}
+SENSOR_MEMBERS = ["id", "type", "protocol", "poll_interval_ms", "connection", "connected",
+                  "last_seen_ms", "stale", "measurement_degraded", "consecutive_refusals"]
+
+
+def keep(block: dict, members: list[str]) -> dict:
+    return {k: copy_value(block[k]) for k in members if k in block}
+
+
+def copy_value(value):
+    return json.loads(json.dumps(value))
+
+
+def project(h: dict) -> dict:
+    """The remote health projection: an allowlist, never the snapshot less some fields."""
+    out = {"projection": "runtime-health/v4/remote"}
+    for key in ("device_id", "uptime_s", "status", "critical", "degradation_reasons"):
+        out[key] = copy_value(h[key])
+    out["unknown_critical_blocks"] = sorted(
+        name for name in CRITICAL_CAPABLE if h[name]["state"] == "unavailable")
+    for name, members in BLOCK_MEMBERS.items():
+        out[name] = keep(h[name], members)
+    verdict = out["commissioning"].get("last_verdict")
+    if isinstance(verdict, dict):
+        out["commissioning"]["last_verdict"] = {"binding_seq": verdict["binding_seq"],
+                                                "at_ms": verdict["at_ms"]}
+    out["sensors"] = [keep(s, SENSOR_MEMBERS) for s in h["sensors"]]
+    out["safety_zones"] = copy_value(h["safety_zones"])
+    out["last_alert_timestamps"] = {"by_channel": copy_value(
+        h["last_alert_timestamps"]["by_channel"])}
+    lock = h["remote_command_lockout"]
+    out["remote_command_lockout"] = keep(lock, ["state", "enforcement_enabled", "risk_window_ms",
+                                                "stale_after_ms", "incident_sender_limit"])
+    if lock["state"] == "available":
+        out["remote_command_lockout"]["sender_count"] = len(lock["senders"])
+        out["remote_command_lockout"]["locked_out_sender_count"] = sum(
+            1 for s in lock["senders"] if s["locked_out"])
+    fl = h["firmware_liveness"]
+    out["firmware_liveness"] = {k: copy_value(v) for k, v in fl.items()
+                                if k != "expiring_device_ids"}
+    if fl["state"] == "available":
+        out["firmware_liveness"]["expiring_device_count"] = len(fl["expiring_device_ids"])
+    ra = h["firmware_reading_age"]
+    out["firmware_reading_age"] = keep(ra, ["state", "signing_runtime"])
+    if ra["state"] == "available":
+        out["firmware_reading_age"]["device_count"] = len(ra["devices"])
+        out["firmware_reading_age"]["unbounded_device_count"] = sum(
+            1 for d in ra["devices"] if d["liveness_bound"] == "unbounded")
+    cp = h["firmware_controller_profiles"]
+    out["firmware_controller_profiles"] = keep(cp, ["state", "documents_held"])
+    if cp["state"] == "available":
+        chans = cp["alarm_channels"]
+        out["firmware_controller_profiles"].update(
+            documents_refused_count=len(cp["documents_refused"]),
+            alarm_channel_count=len(chans),
+            alarm_as_of_count=sum(1 for c in chans if c["state"] == "as_of"),
+            alarm_unknown_count=sum(1 for c in chans if c["state"] == "unknown"))
+    return out
+
+
+def projection_cases() -> list[dict]:
+    rich = rich_health()
+    local = [PHONE, "+2348000000001", "signature_invalid", SUBORDINATE, "ori-fw-00000000", "/var/lib/ori", "TimeoutError",
+             "/run/ori/health.sock", "dangerous_overcurrent", "broken-profile.json"]
+    cases = [("whole_healthy", full_health(), "every block as a healthy runtime serves it"),
+             ("every_local_only_member", rich,
+              ("senders, subordinate identities, refused files, trigger names, paths and "
+               "exception text, none of which may leave the socket"))]
+    hung = full_health()
+    hung["skill_hooks"] = {"state": "unavailable"}
+    hung["alert_outbox"] = {k: hung["alert_outbox"][k] for k in (
+        "retry_interval_minutes", "max_non_tier_d_attempts",
+        "tier_d_critical_warning_threshold", "batch_size", "tier_d_age_bound_ms",
+        "overdue_bound_ms")}
+    hung["alert_outbox"]["state"] = "unavailable"
+    hung.update(fold(holding(hung)))
+    cases.append(("unknown_critical_blocks", hung,
+                  "two critical-capable blocks unreadable, named by block"))
+    malformed = full_health()
+    malformed["status"] = "warning"
+    cases.append(("snapshot_fails_triple_check", malformed,
+                  "the minimal projection, nothing else from the snapshot"))
+    out = []
+    for name, h, note in cases:
+        runtime = {"device_id": "ori-runtime-configured"}
+        projected = project(h) if triple_check(h) is None else {
+            "projection": "runtime-health/v4/remote", "device_id": runtime["device_id"],
+            "status": C, "critical": True, "degradation_reasons": [INVALID]}
+        text = json.dumps(projected, ensure_ascii=False)
+        assert not any(s in text for s in local), name
+        case = {"name": name, "snapshot": h, "expected": projected,
+                "must_not_contain": [s for s in local if s in json.dumps(h)],
+                "note": note}
+        if triple_check(h) is not None:
+            assert runtime["device_id"] != h["device_id"]
+            case["runtime"] = runtime
+        out.append(case)
+    return out
+
+
+def heartbeat_full(h: dict, unservable: bool, runtime: dict) -> tuple[str | None, dict]:
+    step = triple_check(h) or ("snapshot_unservable" if unservable else None)
+    hb = {"device_id": runtime["device_id"], "last_seen_ms": runtime["now_ms"],
+          "gateway_seen_ms": 0, "active_triggers": []}
+    if step is not None:
+        hb.update(status=C, degradation_reasons=[INVALID])
+        return step, hb
+    hb["status"] = "healthy" if h["status"] == "ok" else h["status"]
+    if h["degradation_reasons"]:
+        hb["degradation_reasons"] = list(h["degradation_reasons"])
+    ev = h["evidence"]
+    if ev["state"] == "available" and ev["attestation_summary_available"]:
+        hb["evidence"] = {"chain_head_hash": ev["chain_head_hash"],
+                          "attestation_gap_count": ev["attestation_gap_count"],
+                          "available": True, "action_event_type": ev["action_event_type"]}
+    return None, hb
+
+
+def heartbeat_snapshot_cases() -> list[dict]:
+    runtime = {"device_id": "site-a-edge-01", "now_ms": 1717000000000, "auth_enabled": False}
+    with_evidence = full_health()
+    with_evidence["evidence"] = evidence_available()
+    unread = full_health()
+    unread["evidence"] = evidence_available()
+    unread["evidence"]["attestation_summary_available"] = False
+    for k in ("last_attested_action_id", "attestation_gap_count", "status_counts",
+              "contributor_links_unresolved"):
+        del unread["evidence"][k]
+    unread.update(fold(holding(unread)))
+    over = full_health()
+    over["alert_outbox"]["backlog_count"] = 9007199254740992
+    specs = [
+        ("healthy_evidence_disabled", full_health(), False,
+         "healthy; evidence disabled, so no evidence block"),
+        ("healthy_evidence_available", with_evidence, False,
+         "the evidence block from the snapshot's own rows"),
+        ("attestation_summary_unread", unread, False,
+         "no evidence block, never zeros; the snapshot names subsystem_state_unknown"),
+        ("critical_with_local_only_members", rich_health(), False,
+         "nothing local-only reaches the heartbeat"),
+        ("integer_the_socket_refuses", over, True,
+         "a snapshot the socket would refuse is malformed for the heartbeat too"),
+    ]
+    out = []
+    for name, h, unservable, note in specs:
+        step, hb = heartbeat_full(h, unservable, runtime)
+        out.append({"name": name, "snapshot": h, "runtime": runtime, "failed_step": step,
+                    "expected": hb, "note": note})
+    return out
+
+
+def build() -> bytes:
+    corpus = {
+        "contract": "ori-specs/runtime-health/v4.md",
+        "version": 4,
+        "comment": (
+            "Golden vectors for runtime-health/v4 Severity, Heartbeat Mapping, Request and "
+            "Representation, and for the gateway-api/v2 runtime node heartbeat "
+            "degradation_reasons validation as runtime-health/v4 amends it. A 'snapshot' "
+            "carries only the members the condition table reads; every other member of the "
+            "payload is out of scope here; a response_cases response is whole. In "
+            "heartbeat_cases an absent "
+            "'degradation_reasons' in 'expected' means the heartbeat omits the field. In "
+            "request_cases each entry of 'writes_hex' is one client write, delivered in "
+            "order; 'after' is what the client does once they are sent. A "
+            "conforming implementation reproduces every 'expected'."),
+        "conditions": {t: (C if t == INVALID else SEVERITY.get(t)) for t in VOCAB},
+        "heartbeat_only": [INVALID],
+        "max_reasons": MAX_REASONS,
+        "fold_cases": fold_cases(),
+        "snapshot_cases": snapshot_cases(),
+        "served_cases": served_cases(),
+        "heartbeat_cases": heartbeat_cases(),
+        "fallback_heartbeat_case": fallback_heartbeat_case(),
+        "response_cases": response_cases(),
+        "projection_cases": projection_cases(),
+        "heartbeat_snapshot_cases": heartbeat_snapshot_cases(),
+        "unrepresentable_cases": unrepresentable_cases(),
+        "gateway_reason_cases": gateway_cases(),
+        "request_cases": request_cases(),
+        "integer_cases": integer_cases(),
+        "expiry_cases": expiry_cases(),
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
