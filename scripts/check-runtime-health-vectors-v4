@@ -2288,8 +2288,20 @@ def _with(s: dict, path: str, value: Any) -> dict:
     return t
 
 
-def coverage(corpus: dict, m: dict) -> list[str]:
+def coverage(corpus: dict, m: dict,
+             response_cache: dict[tuple[str, str], tuple[int, ...]] | None = None) -> list[str]:
     """What the text names that no case exercises, as properties of the cases."""
+    # This cache belongs to one mutation run and one unchanged coverage model.
+    # Exact response bytes and every relaxed rule participate in its key. A
+    # changed response therefore recomputes; no case or coverage test is skipped.
+    def failures(text: str, **knobs: Any) -> list[int]:
+        if response_cache is None:
+            return response_failures({**m, **knobs}, text)
+        key = (text, json.dumps(knobs, sort_keys=True))
+        if key not in response_cache:
+            response_cache[key] = tuple(response_failures({**m, **knobs}, text))
+        return list(response_cache[key])
+
     gaps: list[str] = []
     conds = list(m["severity"])
     held = [tuple(c["holding"]) for c in corpus["fold_cases"]]
@@ -2465,7 +2477,7 @@ def coverage(corpus: dict, m: dict) -> list[str]:
                 return (block_named(s, name) or {}).get("state") == "unavailable" \
                     and not holding(m, s)
             if not any(unread(s, None) for s, _ in snaps) and not any(
-                    response_failures(m, c["response"]) == [] and unread(
+                    failures(c["response"]) == [] and unread(
                         plain(_doc(c["response"])["health"]), None)
                     for c in corpus["response_cases"]):
                 gaps.append(f"snapshot or response: {name} unavailable, deciding nothing")
@@ -2640,7 +2652,7 @@ def coverage(corpus: dict, m: dict) -> list[str]:
         if not any(test(v, h) for v, h in gws):
             gaps.append(f"gateway: {label}")
 
-    resp = [(response_failures(m, c["response"]), c["response"]) for c in corpus["response_cases"]]
+    resp = [(failures(c["response"]), c["response"]) for c in corpus["response_cases"]]
     for n in m["snapshot_steps"]:
         if not any(f[:1] == [n] for f, _ in resp):
             gaps.append(f"response: check {n} the first to fail")
@@ -2656,9 +2668,9 @@ def coverage(corpus: dict, m: dict) -> list[str]:
             gaps.append(f"response: {label}")
     def relaxed(text: str, step: int, **knobs: Any) -> bool:
         """The response fails `step` alone, and passes it once these rules are relaxed."""
-        if independent(m, response_failures(m, text)) != [step]:
+        if independent(m, failures(text)) != [step]:
             return False
-        return step not in response_failures({**m, **knobs}, text)
+        return step not in failures(text, **knobs)
 
     wide = (-(2**63), 2**64)
     S_MEMBERS, S_INT, S_TYPE, S_SHAPE = (step_of(m, v) for v in (
@@ -2700,7 +2712,7 @@ def coverage(corpus: dict, m: dict) -> list[str]:
             ("a row behind a false flag", lambda t: _flag_row(t, m)),
             ("an available-only member while unavailable", lambda t: _state_rows(t, m, "unavailable")),
             ("a member in a disabled block", lambda t: _state_rows(t, m, "disabled"))):
-        if not any(test(t) and response_failures(m, t)[:1] == [S_SHAPE] for _, t in resp):
+        if not any(test(t) and failures(t)[:1] == [S_SHAPE] for _, t in resp):
             gaps.append(f"response: {label}")
     if not any(v == verdict_of("elements are unique") and listed(h) != sorted(
             listed(h), key=lambda t: str(t).encode()) for v, h in gws):
@@ -2870,10 +2882,13 @@ def _invalid_utf8(b: bytes) -> bool:
     return False
 
 
-def run(corpus_bytes: bytes, m: dict, coverage_model: dict | None = None) -> None:
+def run(corpus_bytes: bytes, m: dict, coverage_model: dict | None = None,
+        coverage_cache: tuple[dict, dict[tuple[str, str], tuple[int, ...]]] | None = None) -> None:
     corpus = load(corpus_bytes)
     problems = check(corpus, m)
-    problems += [f"not covered: {g}" for g in dict.fromkeys(coverage(corpus, coverage_model or m))]
+    covered_model = coverage_model or m
+    cache = coverage_cache[1] if coverage_cache is not None and coverage_cache[0] is covered_model else None
+    problems += [f"not covered: {g}" for g in dict.fromkeys(coverage(corpus, covered_model, cache))]
     if problems:
         raise Failure(f"{len(problems)} disagreement(s):\n  " + "\n  ".join(problems))
 
@@ -2882,12 +2897,33 @@ def run(corpus_bytes: bytes, m: dict, coverage_model: dict | None = None) -> Non
 
 def mutations(corpus_bytes: bytes, model: dict) -> int:
     base = json.loads(corpus_bytes)
+    # Retain the model itself, not its id: ids may be reused after collection.
+    # Model mutants are checked against their changed model, while coverage is
+    # deliberately measured against the original contract, as before.
+    coverage_cache: tuple[dict, dict[tuple[str, str], tuple[int, ...]]] = (model, {})
+    # Exercise memoization itself before trusting it: cold/warm equivalence,
+    # changed bytes, and restoration. These checks also run in hosted CI.
+    expected_coverage = coverage(base, model)
+    if coverage(base, model, coverage_cache[1]) != expected_coverage:
+        raise Failure("cold coverage cache disagrees with uncached coverage")
+    if coverage(base, model, coverage_cache[1]) != expected_coverage:
+        raise Failure("warm coverage cache disagrees with uncached coverage")
+    changed_responses = copy.deepcopy(base)
+    for case in changed_responses["response_cases"]:
+        case["response"] = "{}"
+    changed_coverage = coverage(changed_responses, model)
+    if changed_coverage == expected_coverage:
+        raise Failure("coverage cache invalidation probe does not change coverage")
+    if coverage(changed_responses, model, coverage_cache[1]) != changed_coverage:
+        raise Failure("changed response bytes reused stale coverage")
+    if coverage(base, model, coverage_cache[1]) != expected_coverage:
+        raise Failure("restored response bytes reused changed coverage")
 
     def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
         def go() -> None:
             mutated = copy.deepcopy(base)
             edit(mutated)
-            run(json.dumps(mutated).encode(), model)
+            run(json.dumps(mutated).encode(), model, coverage_cache=coverage_cache)
         return go
 
     def model_mutant(**changes: Any) -> Callable[[], None]:
@@ -2898,7 +2934,7 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                     mutated[key] = {**mutated[key], **value}
                 else:
                     mutated[key] = value
-            run(corpus_bytes, mutated, coverage_model=model)
+            run(corpus_bytes, mutated, coverage_model=model, coverage_cache=coverage_cache)
         return go
 
     def text_mutant(doc: str, old: str, new: str) -> Callable[[], None]:
