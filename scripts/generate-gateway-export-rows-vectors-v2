@@ -25,6 +25,7 @@ KINDS = ("dispatch", "contributor", "contributor_legacy")
 T0 = 1717000000000
 B0 = 1716998400000  # a multiple of every bucket width used below
 ABSENT = object()
+MAX_INT = 2**53 - 1
 
 
 def key(n: int) -> str:
@@ -41,9 +42,8 @@ def reading_verdict(row: dict) -> str | None:
     if row.get("producer_time") == "not_reported" and (row.get("_point") or (
             row.get("tier") == "raw" and "bucket_ms" not in row)):
         receipt = row.get("received_at_ms")
-        if (not isinstance(receipt, int) or isinstance(receipt, bool) or receipt <= 0
-                or receipt != row.get("timestamp")):
-            return "receipt_not_timestamp"
+        if not isinstance(receipt, int) or isinstance(receipt, bool) or not 1 <= receipt <= MAX_INT:
+            return "receipt_missing"
     return None
 
 
@@ -134,7 +134,8 @@ def reading_rows() -> list[dict]:
     raw = {"sensor_id": "panel-feed-ch0", "sensor_type": "current", "unit": "ampere", "quality": 1.0,
            "sample_count": 1, "tier": "raw", "value": 8.21}
     cases = [
-        ("firmware reading, receipt in timestamp", {**raw, "timestamp": T0 + 480, "received_at_ms": T0 + 480,
+        ("firmware reading: reached the runtime, then stored 3 ms later",
+         {**raw, "timestamp": T0 + 480, "received_at_ms": T0 + 483,
                                                      "producer_time": "not_reported"}),
         ("polled reading, measured and received apart", {**raw, "timestamp": T0, "received_at_ms": T0 + 480,
                                                           "producer_time": "reported"}),
@@ -143,12 +144,11 @@ def reading_rows() -> list[dict]:
         ("compacted row from before the basis was recorded", {**raw, "tier": "hourly", "sample_count": 12,
                                                                "timestamp": T0, "received_at_ms": T0 + 3599900,
                                                                "producer_time": "unknown"}),
-        ("compacted not_reported row is not held to the raw receipt rule",
-         {**raw, "tier": "5min", "sample_count": 3, "timestamp": T0, "received_at_ms": T0 + 299000,
-          "producer_time": "not_reported"}),
-        ("bucketed not_reported row is not held to the raw receipt rule",
+        ("compacted not_reported row with no receipt is not held to the raw receipt rule",
+         {**raw, "tier": "5min", "sample_count": 3, "timestamp": T0, "producer_time": "not_reported"}),
+        ("bucketed not_reported row with no receipt is not held to the raw receipt rule",
          {**raw, "tier": "bucketed", "bucket_ms": 3600000, "start_ms": T0, "end_ms": T0 + 3600000,
-          "timestamp": T0, "received_at_ms": T0 + 3599000, "producer_time": "not_reported"}),
+          "timestamp": T0, "producer_time": "not_reported"}),
         ("row from a runtime that predates producer_time", {**raw, "timestamp": T0, "received_at_ms": T0 + 480}),
         ("row from a runtime that predates the receipt", {**raw, "timestamp": T0}),
         ("history point, not_reported", {"_point": True, "value": 8.21, "timestamp": T0 + 480,
@@ -165,18 +165,26 @@ def reading_rows() -> list[dict]:
                                                 "producer_time": None}),
         ("producer_time differs only in case", {**raw, "timestamp": T0, "received_at_ms": T0,
                                                 "producer_time": "Reported"}),
-        ("not_reported raw row whose receipt differs", {**raw, "timestamp": T0, "received_at_ms": T0 + 480,
+        ("cached subscription value stored again long after it arrived",
+         {**raw, "timestamp": T0, "received_at_ms": T0 + 600000,
                                                         "producer_time": "not_reported"}),
         ("not_reported raw row with no receipt", {**raw, "timestamp": T0, "producer_time": "not_reported"}),
         ("not_reported raw row with a null receipt", {**raw, "timestamp": T0, "received_at_ms": None,
                                                       "producer_time": "not_reported"}),
-        ("not_reported history point whose receipt differs", {"_point": True, "value": 1.0, "timestamp": T0,
-                                                              "received_at_ms": T0 + 1,
+        ("not_reported history point with no receipt", {"_point": True, "value": 1.0, "timestamp": T0,
                                                               "producer_time": "not_reported"}),
-        ("not_reported raw row whose receipt and timestamp are both zero",
+        ("not_reported raw row whose receipt is zero",
          {**raw, "timestamp": 0, "received_at_ms": 0, "producer_time": "not_reported"}),
         ("not_reported raw row whose receipt is fractional",
-         {**raw, "timestamp": T0 + 0.5, "received_at_ms": T0 + 0.5, "producer_time": "not_reported"}),
+         {**raw, "timestamp": T0, "received_at_ms": T0 + 0.5, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is integral but written with a fraction",
+         {**raw, "timestamp": T0, "received_at_ms": float(T0 + 3), "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is one past the integer bound",
+         {**raw, "timestamp": T0, "received_at_ms": MAX_INT + 1, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is the lower bound",
+         {**raw, "timestamp": T0, "received_at_ms": 1, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is the integer bound",
+         {**raw, "timestamp": T0, "received_at_ms": MAX_INT, "producer_time": "not_reported"}),
     ]
     out = []
     for name, row in cases:
@@ -189,8 +197,8 @@ def reading_rows() -> list[dict]:
 
 
 def action_rows() -> list[dict]:
-    base = {"action_name": "open_relay", "tier": "D", "timestamp": T0 + 950}
-    act = {**base, "executed": True, "action_taken": "open_relay"}
+    base = {"action_name": "trip_relay", "tier": "D", "timestamp": T0 + 950}
+    act = {**base, "executed": True, "action_taken": "trip_relay"}
     joined = {**base, "executed": False, "action_taken": "coalesced"}
     cases = [
         ("dispatch", {**act, "record_kind": "dispatch", "record_key": key(1), "contributed_to": None}),
@@ -273,7 +281,7 @@ def bucket_cases() -> list[dict]:
             r(B0 + 10, B0 + 20, 4.0, "reported"), r(B0 + 30, B0 + 30, 6.0, "not_reported"),
             r(B0 + 40, B0 + 50, 5.0, "reported", 3), r(B0, B0 + 3599000, 2.0, "unknown", 12),
             r(B0 + 70, B0 + 70, 9.0, "not_reported")]),
-        ("raw rows at a boundary: not_reported by its receipt, reported by its measurement", H, [
+        ("raw rows at a boundary: not_reported by when it reached the runtime, reported by its measurement", H, [
             r(B0 + H - 1, B0 + H - 1, 1.0, "reported"), r(B0 + H, B0 + H, 2.0, "not_reported"),
             r(B0 + H - 5, B0 + H + 7, 3.0, "reported")]),
         ("bases interleave across buckets", H, [
@@ -312,23 +320,25 @@ def paging_cases() -> list[dict]:
 def resolution_cases() -> list[dict]:
     def row(k, kind, holder):
         coalesced = kind != "dispatch"
-        return {"action_name": "open_relay", "tier": "D", "timestamp": T0 + 950,
-                "executed": not coalesced, "action_taken": "coalesced" if coalesced else "open_relay",
+        return {"action_name": "trip_relay", "tier": "D", "timestamp": T0 + 950,
+                "executed": not coalesced, "action_taken": "coalesced" if coalesced else "trip_relay",
                 "record_kind": kind, "record_key": k, "contributed_to": holder}
 
     pages = [
         [row(key(4), "contributor", key(5)), row(key(1), "dispatch", None), row(key(2), "contributor", key(1))],
         [row(key(3), "contributor", key(99)), row(None, "contributor_legacy", None)],
-        [row(key(5), "dispatch", None), row(key(6), "contributor", key(2))],
+        [row(key(5), "dispatch", None), row(key(6), "contributor", key(2)), row(key(7), "dispatch", None)],
+        [row(key(8), "contributor", key(7)), row(key(7), "dispatch", None)],
     ]
     rows = [r for p in pages for r in p]
     assert all(action_verdict(r) is None for r in rows)
-    keys = {r["record_key"] for r in rows if r["record_kind"] == "dispatch"}
+    carried = [r["record_key"] for r in rows if r["record_key"] is not None]
+    keys = {r["record_key"] for r in rows if r["record_kind"] == "dispatch" and carried.count(r["record_key"]) == 1}
     expected = [{"record_key": r["record_key"],
                  "holder": r["contributed_to"] if r["contributed_to"] in keys else None}
                 for r in rows if r["record_kind"] == "contributor"]
     return [{"name": "contributors resolved across a complete traversal: holder on the same page, "
-                     "on a later page, missing, or not a dispatch",
+                     "on a later page, missing, not a dispatch, or carried by two rows",
              "pages": pages, "expected": expected}]
 
 

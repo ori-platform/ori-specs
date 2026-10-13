@@ -136,8 +136,6 @@ def listed(phrase: str, where: str) -> list[str]:
 # models it. A {vocab} cell is matched as a template and its list is read.
 CHECKS = {
     "`producer_time`, when present, is {vocab}": "pt_member",
-    "a history point, or an unbucketed row whose `tier` is `raw`, whose `producer_time` is "
-    "`not_reported` carries `received_at_ms`, a positive integer equal to its `timestamp`": "receipt",
     "`record_kind`, when present, is {vocab}": "rk_member",
     "`record_key` is `null` or a non-empty string": "key",
     "`contributed_to` is a non-empty string on a `contributor` row, other than the row's own "
@@ -147,8 +145,17 @@ CHECKS = {
     "a `contributor` row has `executed` `false`": "executed",
 }
 
+RECEIPT_CHECK = (r"a history point, or an unbucketed row whose `tier` is `raw`, whose "
+                 r"`producer_time` is `not_reported` carries `received_at_ms`, an integer from "
+                 r"(\d+) to (\d+) written without a fraction or an exponent")
+
 HELD = {
     SEC_PT: [
+        "`producer_time` says what that time is.",
+        "it describes the value actually sent in `timestamp`, including one the runtime put there "
+        "because the reading had none.",
+        "`received_at_ms` is the runtime's clock when it stored the reading, a second reading of its "
+        "clock that need not equal a `not_reported` `timestamp`",
         "A record with no `producer_time`, from a runtime that predates the member, is read as "
         "`unknown`, and so is a value outside the three or of another JSON type.",
     ],
@@ -162,8 +169,13 @@ HELD = {
         "`tier` is `bucketed` and `quality` is `null`.",
         "A row falls in the bucket whose `start_ms` is its `timestamp` rounded down to a multiple "
         "of `bucket_ms`.",
-        "A raw `not_reported` reading is therefore bucketed by its receipt, and a compacted row by "
-        "the start of its own bucket.",
+        "A raw `not_reported` reading is therefore bucketed by when it reached the runtime, and a "
+        "compacted row by the start of its own bucket.",
+        "Over compacted rows, which keep only their mean, `min_value` and `max_value` are the least "
+        "and greatest of those means, not of the readings they summarise.",
+        "An unbucketed row whose `tier` is `raw` and whose `producer_time` is `not_reported` carries "
+        "`received_at_ms`: a reading that reached the runtime was stored by it. A history point in "
+        "the reasoning request obeys the same rule.",
         "A consumer reads an absent, non-positive or fractional value as no receipt, never as an "
         "instant, and never fills it from `timestamp`.",
     ],
@@ -190,15 +202,18 @@ HELD = {
         "A row from a runtime that sends no `record_kind` is read as `contributor_legacy` when its "
         "`action_taken` is `coalesced` and as `dispatch` otherwise",
         "A consumer resolves it across a complete traversal of the pages.",
-        "The holder is a `dispatch` row: a key the consumer does not find, or one that names a row "
-        "of another kind, is unresolved, which is not an error in the export and not an act.",
+        "The holder is a `dispatch` row: a key the consumer does not find, one that names a row of "
+        "another kind, and one that more than one row of the traversal carries are unresolved, "
+        "which is not an error in the export and not an act.",
         "Rows are ordered by `timestamp` descending, and rows with equal `timestamp` by the order "
         "the runtime stored them, latest first, so that no two rows share a position.",
         "`next_page_token` names a position in that order, never a count of rows to skip: the next "
         "page begins with the first row stored when it is requested whose position is after the "
         "last row returned, whether or not that row is still stored.",
-        "`record_key` is the row's own key, a non-empty string no other row of the device carries, "
-        "and `null` on a row written before the runtime assigned keys.",
+        "`record_key` is the row's own key, a non-empty string, and `null`, never the empty "
+        "string, on a row written before the runtime assigned keys.",
+        "a store can hold keys duplicated before keys were constrained, and the runtime exports "
+        "them as they are.",
     ],
 }
 
@@ -225,6 +240,7 @@ def contract_model(text: str | None = None) -> dict:
 
     step_rows = table(bodies[SEC_AL], ["Step", "Family", "Check", "Verdict on failure"], SEC_AL)
     steps = []
+    receipt_bounds = None
     for index, (num, family, check, verdict) in enumerate(step_rows, 1):
         if num != str(index):
             raise Failure(f"step table: row {index} is numbered {num!r}; steps must run 1, 2, 3 ...")
@@ -239,6 +255,10 @@ def contract_model(text: str | None = None) -> dict:
                     key, vocab = name, listed(check[len(head):], f"step {num}")
             elif check == template:
                 key = name
+        bounds = re.fullmatch(RECEIPT_CHECK, check)
+        if bounds:
+            key = "receipt"
+            receipt_bounds = (int(bounds.group(1)), int(bounds.group(2)))
         if key is None:
             raise Failure(f"step table: step {num} check {check!r} has no model in this checker")
         if key == "pt_member" and vocab != pt_vocab:
@@ -256,6 +276,8 @@ def contract_model(text: str | None = None) -> dict:
     if fams != sorted(fams, key=lambda f: fams.index(f)):
         raise Failure(f"step table: a family's steps are not contiguous: {fams}")
 
+    if receipt_bounds is None:
+        raise Failure("step table: no receipt check")
     match = re.search(r"exported as one row for each, in the order ((?:`[a-z_]+`, )+)after "
                       r"ordering by `start_ms`", flat(bodies[SEC_SH]))
     if match is None:
@@ -273,22 +295,25 @@ def contract_model(text: str | None = None) -> dict:
         "receipt_where": ("history_point",),     # where step 2 applies regardless of tier
         "older_read": lambda row: "contributor_legacy" if row.get("action_taken") == "coalesced"
         else "dispatch",
-        "receipt_integer": True, "receipt_positive": True,
+        "receipt_bounds": receipt_bounds, "receipt_form": True, "receipt_equal": False,
         "weighted": True, "receipt_agg": max, "bucket_by": "timestamp", "split_basis": True,
         "ties_latest_first": True, "token": "position",
-        "holder_kinds": ("dispatch",), "resolve_scope": "traversal",
+        "holder_kinds": ("dispatch",), "duplicates": "unresolved", "resolve_scope": "traversal",
     }
 
 
 # --- the model ------------------------------------------------------------------------
 
-def is_receipt(value: Any, m: dict | None = None) -> bool:
-    """A receipt: a positive integer. Absent, non-positive or fractional is none."""
-    integer = m["receipt_integer"] if m else True
-    positive = m["receipt_positive"] if m else True
+def is_receipt(value: Any, m: dict) -> bool:
+    """Step 2's receipt: an integer within the step's bounds, written without a
+    fraction or an exponent. Python's json yields int exactly for such a token,
+    and float for any token with a fraction or an exponent, 3.0 included."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return (isinstance(value, int) or not integer) and (value > 0 or not positive)
+    if isinstance(value, float) and (m["receipt_form"] or value != int(value)):
+        return False
+    lo, hi = m["receipt_bounds"]
+    return lo <= value <= hi
 
 
 def pred_fails(m: dict, key: str, row: dict, where: str | None) -> bool:
@@ -303,8 +328,8 @@ def pred_fails(m: dict, key: str, row: dict, where: str | None) -> bool:
             where == "sensor_history" and row.get("tier") == "raw" and not row.get("bucket_ms"))
         if not applies:
             return False
-        return not (is_receipt(row.get("received_at_ms"), m)
-                    and row.get("received_at_ms") == row.get("timestamp"))
+        return not (is_receipt(row.get("received_at_ms"), m) and (
+            not m["receipt_equal"] or row.get("received_at_ms") == row.get("timestamp")))
     # action_log: a row with no record_kind passes steps 3 to 7.
     if not present(row, "record_kind"):
         return False
@@ -422,11 +447,13 @@ def resolve(m: dict, case: dict) -> list[dict]:
     out = []
     for p, page in enumerate(case["pages"]):
         scope = [r for pg in case["pages"] for r in pg] if m["resolve_scope"] == "traversal" else page
-        index = {r["record_key"]: r for r in scope if r.get("record_key") is not None}
         for row in page:
             if row.get("record_kind") != "contributor":
                 continue
-            holder = index.get(row["contributed_to"])
+            carriers = [r for r in scope if r.get("record_key") == row["contributed_to"]]
+            if len(carriers) > 1 and m["duplicates"] == "first":
+                carriers = carriers[:1]
+            holder = carriers[0] if len(carriers) == 1 else None
             ok = holder is not None and holder.get("record_kind") in m["holder_kinds"] \
                 and not failing(m, "action_log", holder)
             out.append({"record_key": row["record_key"], "holder": row["contributed_to"] if ok else None})
@@ -517,7 +544,8 @@ def check(corpus: dict, m: dict) -> list[str]:
                                 f"{case['expected'][k]!r}, recomputed {v!r}")
     for case in corpus["buckets"]:
         for row in case["rows"]:
-            if row.get("producer_time") not in m["pt_vocab"] or not is_receipt(row.get("sample_count")):
+            if row.get("producer_time") not in m["pt_vocab"] or not (
+                    isinstance(row.get("sample_count"), int) and row["sample_count"] > 0):
                 problems.append(f"buckets {case['name']!r}: input row {row} is not a valid runtime row")
         got = buckets_of(m, case)
         if not same(case["expected"], got):
@@ -533,9 +561,6 @@ def check(corpus: dict, m: dict) -> list[str]:
                             f"recomputed {got}")
     for case in corpus["resolution"]:
         rows = [r for page in case["pages"] for r in page]
-        keys = [r["record_key"] for r in rows if r.get("record_key") is not None]
-        if len(set(keys)) != len(keys):
-            problems.append(f"resolution {case['name']!r}: a record_key repeats on the device")
         for r in rows:
             for s in failing(m, "action_log", r):
                 problems.append(f"resolution {case['name']!r}: row {r} fails step {s['step']} "
@@ -563,13 +588,31 @@ def coverage(corpus: dict, m: dict) -> list[str]:
             if not any(f and f[0] is a and b in f for _, f in cases):
                 gaps.append(f"step order {a['step']} before {b['step']}: no case fails both, "
                             f"so the order of {a['verdict']} and {b['verdict']} is unproved")
-    for what, bad in (("non-positive", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v <= 0),
-                      ("fractional", lambda v: isinstance(v, float) and v > 0 and v != int(v))):
-        if not any(f and f[0]["pred"] == "receipt" and bad(c["row"].get("received_at_ms"))
-                   and c["row"].get("received_at_ms") == c["row"].get("timestamp")
-                   for c, f in readings):
-            gaps.append(f"step 2: no case whose receipt equals its timestamp and is refused only "
-                        f"for being {what}")
+    lo, hi = m["receipt_bounds"]
+    receipt_cases = [(c["row"].get("received_at_ms"), not f) for c, f in readings
+                     if c["row"].get("producer_time") == "not_reported" and "received_at_ms" in c["row"]
+                     and (not f or f[0]["pred"] == "receipt")]
+    wants = (
+        ("accepted at the lower bound", lambda v, ok: ok and type(v) is int and v == lo),
+        ("refused one below the lower bound", lambda v, ok: not ok and type(v) is int and v == lo - 1),
+        ("accepted at the upper bound", lambda v, ok: ok and type(v) is int and v == hi),
+        ("refused one past the upper bound", lambda v, ok: not ok and type(v) is int and v == hi + 1),
+        ("refused an in-range integral value written with a fraction",
+         lambda v, ok: not ok and type(v) is float and v == int(v) and lo <= v <= hi),
+        ("refused a fractional value", lambda v, ok: not ok and type(v) is float and v != int(v)),
+        ("accepted a receipt that differs from its timestamp", None),
+    )
+    for what, test in wants:
+        if test is None:
+            hit = any(not f and c["row"].get("producer_time") == "not_reported"
+                      and "received_at_ms" in c["row"]
+                      and c["row"]["received_at_ms"] != c["row"].get("timestamp")
+                      and (c["where"] == "history_point" or c["row"].get("tier") == "raw")
+                      for c, f in readings)
+        else:
+            hit = any(test(v, ok) for v, ok in receipt_cases)
+        if not hit:
+            gaps.append(f"step 2 receipt: no case {what}")
     valid_pt = {c["row"]["producer_time"] for c, f in readings if not f and "producer_time" in c["row"]}
     for v in m["pt_vocab"]:
         if v not in valid_pt:
@@ -657,20 +700,26 @@ def coverage(corpus: dict, m: dict) -> list[str]:
     # Resolution: holder on a later page, missing, of another kind.
     seen = set()
     for case in corpus["resolution"]:
-        where = {r["record_key"]: (p, r) for p, pg in enumerate(case["pages"]) for r in pg
-                 if r.get("record_key") is not None}
+        where: dict = {}
+        for p, pg in enumerate(case["pages"]):
+            for r in pg:
+                if r.get("record_key") is not None:
+                    where.setdefault(r["record_key"], []).append((p, r))
         for p, pg in enumerate(case["pages"]):
             for r in pg:
                 if r.get("record_kind") != "contributor":
                     continue
-                hit = where.get(r["contributed_to"])
-                if hit is None:
+                hits = where.get(r["contributed_to"], [])
+                hit = hits[0] if len(hits) == 1 else None
+                if len(hits) > 1:
+                    seen.add("carried by two rows")
+                elif hit is None:
                     seen.add("missing")
                 elif hit[1].get("record_kind") != "dispatch":
                     seen.add("another kind")
                 elif hit[0] > p:
                     seen.add("later page")
-    for want in ("later page", "missing", "another kind"):
+    for want in ("later page", "missing", "another kind", "carried by two rows"):
         if want not in seen:
             gaps.append(f"resolution: no contributor whose holder is {want}")
     return gaps
@@ -853,8 +902,17 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
         ("a null member read as absent",
          model_mutant("verdict", present=lambda row, k: row.get(k) is not None)),
         ("a failing reading keeps its sent basis", model_mutant("time_basis", failing_basis="as_sent")),
-        ("a fractional receipt accepted", model_mutant("verdict", receipt_integer=False)),
-        ("a non-positive receipt accepted", model_mutant("verdict", receipt_positive=False)),
+        ("an integral float receipt accepted", model_mutant("verdict", receipt_form=False)),
+        ("lower bound one low", model_mutant("verdict", receipt_bounds=(model["receipt_bounds"][0] - 1,
+                                                                       model["receipt_bounds"][1]))),
+        ("lower bound one high", model_mutant("verdict", receipt_bounds=(model["receipt_bounds"][0] + 1,
+                                                                        model["receipt_bounds"][1]))),
+        ("upper bound one high", model_mutant("verdict", receipt_bounds=(model["receipt_bounds"][0],
+                                                                        model["receipt_bounds"][1] + 1))),
+        ("upper bound one low", model_mutant("verdict", receipt_bounds=(model["receipt_bounds"][0],
+                                                                       model["receipt_bounds"][1] - 1))),
+        ("receipt must equal timestamp", model_mutant("verdict", receipt_equal=True)),
+        ("a duplicated holder key resolves to its first row", model_mutant("holders", duplicates="first")),
         ("step 2 skips history points", model_mutant("verdict", receipt_where=())),
         ("step 2 applies to every reading",
          model_mutant("verdict", receipt_where=WHERE)),
@@ -875,7 +933,7 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
     # Contract text: the tables and sentences the model reads.
     cases += [
         ("text: step 1 verdict renamed", text_mutant(
-            "| `producer_time_invalid` |", "| `receipt_not_timestamp_x` |", "verdict")),
+            "| `producer_time_invalid` |", "| `producer_time_invalid_x` |", "verdict")),
         ("text: step rows 3 and 4 renumbered", text_mutant(
             "| 3 | `action_log`", "| 9 | `action_log`", "numbered")),
         ("text: a check reworded", text_mutant(
