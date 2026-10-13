@@ -751,6 +751,14 @@ def verify(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
     else:
         sealed = {e["envelope_digest"]: e["anchor_epoch_id"] for e in corpus["sealed_envelopes"]}
         sealed |= {a["digest"]: a["anchor_epoch_id"] for a in corpus["sealed_artifacts"]}
+        named = next((a for a in corpus["sealed_artifacts"]
+                      if a["digest"] == art["triggering_digest"]), None)
+        # The Test vectors schema: this corpus's dispositions name only `sealed_artifacts`, never
+        # a registration; registration-bound dispositions live in the v2 disposition corpus.
+        if art["triggering_digest"] in sealed and (named is None
+                                                   or named["artifact_type"] == "anchor_registration"):
+            out.append(f"[schema] {where}: a disposition here names only a sealed artifact that is "
+                       "not a registration")
         if art["triggering_digest"] not in sealed:
             out.append(refused("binding_mismatch", "triggering_digest names nothing sealed"))
         elif art["anchor_epoch_id"] != sealed[art["triggering_digest"]] and not (
@@ -760,6 +768,13 @@ def verify(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
 
 
 # --- held state ---------------------------------------------------------------------------
+
+def stop_of(disposition: dict) -> dict:
+    """The stop record an epoch or identity disposition produces, as the schema gives it."""
+    return {"scope": disposition["scope"],
+            "anchor_epoch_id": disposition["anchor_epoch_id"] if disposition["scope"] == "epoch"
+            else ""}
+
 
 def projection_of(record: dict, members: set[str]) -> dict:
     return {k: record[k] for k in sorted(members)}
@@ -828,12 +843,24 @@ def held_values(state: dict, corpus: dict, rules: dict, where: str) -> list[str]
         if o["state"] not in ("open", "confirmed"):
             bad("registration_obligations", "state", o["state"])
         integer("registration_obligations", "closed_at_ms", o["closed_at_ms"], null=True)
-    sealed = {e["envelope_digest"] for e in corpus["sealed_envelopes"]} | {
-        a["digest"] for a in corpus["sealed_artifacts"]}
+    # Step 5: the subject is an artifact this runtime sealed, the disposition names that
+    # subject's epoch, `""` only under `artifact` scope, and a `retained_pending` names an anchor
+    # registration. A sealed registration carries no digest here, so none can be named.
+    subjects = {a["digest"]: (a["artifact_type"], a["anchor_epoch_id"])
+                for a in corpus["sealed_artifacts"] if a["artifact_type"] != "anchor_registration"}
     for r in state["dispositions"]:
-        if r["triggering_digest"] not in sealed:
+        subject = subjects.get(r["triggering_digest"])
+        if subject is None:
             bad("dispositions", "triggering_digest", r["triggering_digest"])
-        epoch("dispositions", "anchor_epoch_id", r["anchor_epoch_id"])
+        elif r["anchor_epoch_id"] == "" and r["scope"] == "artifact":
+            pass
+        elif r["anchor_epoch_id"] != subject[1]:
+            bad("dispositions", "anchor_epoch_id", (r["anchor_epoch_id"], "subject", subject[1]))
+        if subject is not None and r["disposition"] == "retained_pending" \
+                and subject[0] != "anchor_registration":
+            bad("dispositions", "disposition", ("retained_pending names", subject[0]))
+        if not (r["anchor_epoch_id"] == "" and r["scope"] == "artifact"):
+            epoch("dispositions", "anchor_epoch_id", r["anchor_epoch_id"])
         if rules["values"].get(r["disposition"]) != r["scope"]:
             bad("dispositions", "scope", (r["scope"], r["disposition"]))
         integer("dispositions", "decided_at_ms", r["decided_at_ms"])
@@ -841,8 +868,11 @@ def held_values(state: dict, corpus: dict, rules: dict, where: str) -> list[str]
     for r in state["stops"]:
         if not isinstance(r, dict) or set(r) != STOP_MEMBERS or r["scope"] not in ("epoch", "identity"):
             bad("stops", "scope", r)
-        else:
+        elif r["scope"] == "epoch":
             epoch("stops", "anchor_epoch_id", r["anchor_epoch_id"])
+        elif r["anchor_epoch_id"] != "":
+            # An identity stop covers every epoch of the identity and names none.
+            bad("stops", "anchor_epoch_id", r["anchor_epoch_id"])
     return out
 
 
@@ -882,6 +912,12 @@ def check_state(state: Any, corpus: dict, where: str, projection: set[str],
         if o["state"] not in ("open", "confirmed") or (o["state"] == "confirmed") is not (
                 record is not None) or (o["closed_at_ms"] is None) is not (o["state"] == "open"):
             out.append(f"[state] {where}: obligation {o['anchor_epoch_id'][:15]} state")
+        # One application closes the obligation and records the confirmation, at one
+        # `receiver_now_ms`, with the key the registration sealed.
+        elif record is not None and (o["closed_at_ms"] != record["applied_at_ms"]
+                                     or o["pubkey_hex"] != record["pubkey_hex"]):
+            out.append(f"[state] {where}: obligation {o['anchor_epoch_id'][:15]} closed at "
+                       f"{o['closed_at_ms']}, its confirmation applied at {record['applied_at_ms']}")
     active = state["active_epoch"]
     if active is not None:
         # An earlier receiver may have left a projection that disagrees with its confirmation
@@ -891,12 +927,26 @@ def check_state(state: Any, corpus: dict, where: str, projection: set[str],
             out.append(f"[state] {where}: active_epoch is not a projection of a held confirmation")
     stops = []
     for record in state["dispositions"]:
-        if record["scope"] == "epoch":
-            stops.append({"scope": "epoch", "anchor_epoch_id": record["anchor_epoch_id"]})
-        elif record["scope"] != "artifact":
-            out.append(f"[state] {where}: a {record['scope']} disposition is not modelled")
+        if record["scope"] in ("epoch", "identity"):
+            stops.append(stop_of(record))
     if state["stops"] != stops:
         out.append(f"[state] {where}: stops are not those the held dispositions produce")
+    # Every record is final and of one fact: a repeat is applied with no new state, and a
+    # second disposition whose stop is in force is `superseded`, so no record repeats.
+    for member, key in (("dispositions", lambda r: json.dumps(r, sort_keys=True)),
+                        ("stops", lambda r: json.dumps(r, sort_keys=True)),
+                        ("epoch_confirmations", lambda r: r["anchor_epoch_id"]),
+                        ("custody", lambda r: r["local_seq"]),
+                        ("receipts", lambda r: r["local_seq"]),
+                        ("registration_obligations",
+                         lambda r: (r["anchor_epoch_id"], r["pubkey_hex"]))):
+        keys = [key(r) for r in state[member]]
+        if len(set(keys)) != len(keys):
+            out.append(f"[state] {where}: {member} holds a final record twice")
+    scoped = [json.dumps(stop_of(r), sort_keys=True) for r in state["dispositions"]
+              if r["scope"] in ("epoch", "identity")]
+    if len(set(scoped)) != len(scoped):
+        out.append(f"[state] {where}: two stop-producing dispositions for one scope")
     if type(state["application_storage_fault"]) is not bool:
         out.append(f"[state] {where}: application_storage_fault is not a bool")
     return out
@@ -972,13 +1022,11 @@ def decide(case: dict, corpus: dict, rules: dict) -> dict:
             fail("the disposition rule is no longer v2's byte-identical repeat")
         if held is not None:
             pass
-        elif art["scope"] in ("epoch", "identity") and any(
-                s["scope"] == art["scope"] and s.get("anchor_epoch_id") == art["anchor_epoch_id"]
-                for s in before["stops"]):
+        elif art["scope"] in ("epoch", "identity") and stop_of(art) in before["stops"]:
             expected, reason = "reject", "superseded"
-        elif art["scope"] == "epoch":
+        elif art["scope"] in ("epoch", "identity"):
             after["dispositions"].append(disposition_record(art))
-            after["stops"].append({"scope": "epoch", "anchor_epoch_id": art["anchor_epoch_id"]})
+            after["stops"].append(stop_of(art))
             writes = 2
         else:
             fail(f"{case['name']}: a {art['scope']} {art['disposition']} first application is "
@@ -1278,6 +1326,8 @@ def _check_corpus(corpus: dict, rules: dict) -> list[str]:
             want = "sha256:" + hashlib.sha256(f"{LABEL} {label} {env['local_seq']}".encode()).hexdigest()
             if env[member] != want:
                 out.append(f"[file] sealed envelope {env['local_seq']} {member}")
+    if any(a.get("artifact_type") == "anchor_registration" for a in corpus["sealed_artifacts"]):
+        out.append("[schema] sealed_artifacts holds a registration, which no disposition here names")
     for i, art in enumerate(corpus["sealed_artifacts"], 1):
         if art["digest"] != "sha256:" + hashlib.sha256(f"{LABEL} checkpoint {i}".encode()).hexdigest():
             out.append(f"[file] sealed artifact {i} digest")
@@ -1390,6 +1440,178 @@ def retained_value_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict]
                     lambda c, v=value: [c["cases"][0][side].update(application_storage_fault=v)
                                         for side in ("held_before", "held_after")]))
     return out
+
+
+def subject_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """A disposition naming a registration, or a sealed envelope, held or arriving: the schema
+    says this corpus's dispositions name only sealed artifacts that are not registrations."""
+    dis = _first(corpus, "evidence_disposition")
+    registration = {"artifact_type": "anchor_registration",
+                    "anchor_epoch_id": corpus["device"]["sealing_epoch"],
+                    "digest": "sha256:" + hashlib.sha256(b"a sealed registration").hexdigest()}
+
+    def arriving(digest_of: Callable[[dict], str], extra: dict | None = None) -> Callable[[dict], Any]:
+        def go(c: dict) -> None:
+            if extra:
+                c["sealed_artifacts"].append(dict(extra))
+            c["cases"][dis]["artifact"].update(triggering_digest=digest_of(c))
+            _resign(c["cases"][dis], c, rules)
+        return go
+
+    def held(c: dict) -> None:
+        c["sealed_artifacts"].append(dict(registration))
+        case = next(x for x in c["cases"] if x["name"] == "receipt_union_over_held_prefix")
+        for side in ("held_before", "held_after"):
+            case[side]["dispositions"].append({
+                "triggering_digest": registration["digest"],
+                "anchor_epoch_id": registration["anchor_epoch_id"], "scope": "artifact",
+                "disposition": "artifact_terminal", "decided_at_ms": 1787000003000,
+                "key_id": c["cases"][dis]["artifact"]["key_id"]})
+    return [
+        ("subject: an arriving disposition names a sealed envelope", "[schema]",
+         arriving(lambda c: c["sealed_envelopes"][0]["envelope_digest"])),
+        ("subject: an arriving disposition names a registration", "[schema]",
+         arriving(lambda c: registration["digest"], registration)),
+        ("subject: a held disposition names a registration", "[state]|triggering_digest", held),
+    ]
+
+
+def permitted_states(corpus: dict) -> list[tuple[str, Callable[[dict], Any]]]:
+    """Held states the text allows that a stricter checker might refuse."""
+    def both(name: str, edit: Callable[[dict], Any]) -> Callable[[dict], Any]:
+        def go(c: dict) -> None:
+            case = next(x for x in c["cases"] if x["name"] == name)
+            for side in ("held_before", "held_after"):
+                edit(case[side])
+        return go
+
+    key = next(k["key_id"] for k in corpus["authority_key_registry"]["keys"]
+               if k["purpose"] == "evidence_authority_disposition")
+    terminal = {"triggering_digest": corpus["sealed_artifacts"][0]["digest"], "anchor_epoch_id": "",
+                "scope": "artifact", "disposition": "artifact_terminal",
+                "decided_at_ms": 1787000003000, "key_id": key}
+    return [
+        ("an artifact-scoped terminal disposition naming no epoch",
+         both("receipt_union_over_held_prefix", lambda h: h["dispositions"].append(dict(terminal)))),
+        ("a projection an earlier receiver left disagreeing with its record",
+         both("confirmation_identical", lambda h: h["active_epoch"].update(actor="earlier@site"))),
+        ("an identity disposition and its identity stop, naming no epoch",
+         both("receipt_union_over_held_prefix", lambda h: (
+             h["dispositions"].append({**terminal, "scope": "identity",
+                                       "disposition": "identity_replacement_required",
+                                       "anchor_epoch_id": corpus["sealed_artifacts"][0][
+                                           "anchor_epoch_id"]}),
+             h["stops"].append({"scope": "identity", "anchor_epoch_id": ""})))),
+        ("confirmation application times decreasing along the list",
+         both("confirmation_earlier_epoch_agreeing_restatement", _times_step_back)),
+        ("disposition decision times decreasing along the list",
+         both("receipt_union_over_held_prefix", lambda h: h["dispositions"].extend([
+             {**terminal, "triggering_digest": corpus["sealed_artifacts"][0]["digest"],
+              "anchor_epoch_id": corpus["sealed_artifacts"][0]["anchor_epoch_id"],
+              "decided_at_ms": 1787000009000},
+             {**terminal, "triggering_digest": corpus["sealed_artifacts"][1]["digest"],
+              "anchor_epoch_id": corpus["sealed_artifacts"][1]["anchor_epoch_id"],
+              "decided_at_ms": 1787000001000}]))),
+    ]
+
+
+def _times_step_back(h: dict) -> None:
+    """The first-applied confirmation carries the later time, as a clock step-back leaves it."""
+    first, second = h["epoch_confirmations"][0], h["epoch_confirmations"][1]
+    first["applied_at_ms"] = second["applied_at_ms"] + 5000
+    for o in h["registration_obligations"]:
+        if o["anchor_epoch_id"] == first["anchor_epoch_id"]:
+            o["closed_at_ms"] = first["applied_at_ms"]
+
+
+def relationship_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """Each relationship between held records broken identically in held_before and held_after,
+    so the case's answer still follows; each must be refused for that relationship."""
+    def both(name: str, edit: Callable[[dict], Any]) -> Callable[[dict], Any]:
+        def go(c: dict) -> None:
+            case = next(x for x in c["cases"] if x["name"] == name)
+            for side in ("held_before", "held_after"):
+                edit(case[side])
+        return go
+
+    def first(pred: Callable[[dict], bool]) -> str:
+        return next(c["name"] for c in corpus["cases"] if pred(c["held_before"])
+                    and c["held_before"] == {**c["held_after"],
+                                             "application_storage_fault":
+                                             c["held_before"]["application_storage_fault"]})
+
+    disp = first(lambda h: bool(h["dispositions"]))
+    conf = first(lambda h: any(o["state"] == "confirmed" for o in h["registration_obligations"]))
+    cust = first(lambda h: bool(h["custody"]))
+    rec = first(lambda h: bool(h["receipts"]))
+    other_epoch = next(r["anchor_epoch_id"] for r in corpus["sealed_registrations"]
+                       if r["anchor_epoch_id"] != corpus["device"]["sealing_epoch"])
+    checkpoint = corpus["sealed_artifacts"][0]["digest"]
+    envelope = corpus["sealed_envelopes"][0]
+    template = {"triggering_digest": checkpoint,
+                "anchor_epoch_id": corpus["sealed_artifacts"][0]["anchor_epoch_id"],
+                "scope": "epoch", "disposition": "epoch_reprovisioning_required",
+                "decided_at_ms": 1787000003000,
+                "key_id": next(k["key_id"] for k in corpus["authority_key_registry"]["keys"]
+                               if k["purpose"] == "evidence_authority_disposition")}
+
+    def confirmed(h: dict) -> dict:
+        return next(o for o in h["registration_obligations"] if o["state"] == "confirmed")
+
+    edits: list[tuple[str, str, str, Callable[[dict], Any]]] = [
+        ("a disposition names another epoch than its subject's", disp, "subject",
+         lambda h: h["dispositions"][0].update(anchor_epoch_id=other_epoch) or h["stops"][0].update(
+             anchor_epoch_id=other_epoch)),
+        ("an epoch-scoped disposition names no epoch", disp, "dispositions.anchor_epoch_id",
+         lambda h: h["dispositions"][0].update(anchor_epoch_id="") or h["stops"][0].update(
+             anchor_epoch_id="")),
+        ("a retained_pending names a checkpoint", rec, "retained_pending names",
+         lambda h: h["dispositions"].append({
+             "triggering_digest": checkpoint, "anchor_epoch_id": corpus["sealed_artifacts"][0][
+                 "anchor_epoch_id"], "scope": "artifact", "disposition": "retained_pending",
+             "decided_at_ms": 1787000003000, "key_id": next(
+                 k["key_id"] for k in corpus["authority_key_registry"]["keys"]
+                 if k["purpose"] == "evidence_authority_disposition")})),
+        ("a disposition and its stop held twice", disp, "twice",
+         lambda h: (h["dispositions"].append(dict(h["dispositions"][0])),
+                    h["stops"].append(dict(h["stops"][0])))),
+        ("a second stop-producing disposition for one epoch", disp, "one scope",
+         lambda h: (h["dispositions"].append({**h["dispositions"][0], "decided_at_ms": 1}),
+                    h["stops"].append(dict(h["stops"][0])))),
+        ("a stop without its disposition", disp, "stops are not",
+         lambda h: h["dispositions"].clear()),
+        ("a disposition without its stop", disp, "stops are not", lambda h: h["stops"].clear()),
+        ("an obligation closed at another time than its confirmation applied", conf, "closed at",
+         lambda h: confirmed(h).update(closed_at_ms=confirmed(h)["closed_at_ms"] + 1)),
+        ("a confirmation applied at another time than its obligation closed", conf, "closed at",
+         lambda h: next(r for r in h["epoch_confirmations"]
+                        if r["anchor_epoch_id"] == confirmed(h)["anchor_epoch_id"]).update(
+             applied_at_ms=confirmed(h)["closed_at_ms"] + 1)),
+        ("an obligation confirmed with no confirmation", conf, "state",
+         lambda h: h["epoch_confirmations"].clear() or h.update(active_epoch=None)),
+        ("a confirmation held twice", conf, "confirmation for",
+         lambda h: h["epoch_confirmations"].append(dict(h["epoch_confirmations"][0]))),
+        ("an obligation lost", conf, "not one obligation",
+         lambda h: h["registration_obligations"].pop()),
+        ("custody held twice for one envelope", cust, "custody",
+         lambda h: h["custody"].append(dict(h["custody"][0]))),
+        ("a sequence receipted twice", rec, "receipts",
+         lambda h: h["receipts"].append(dict(h["receipts"][0]))),
+        ("a disposition names a sealed envelope", rec, "triggering_digest",
+         lambda h: h["dispositions"].append({**template, "scope": "artifact",
+                                             "disposition": "artifact_terminal",
+                                             "triggering_digest": envelope["envelope_digest"],
+                                             "anchor_epoch_id": envelope["anchor_epoch_id"]})),
+        ("an identity stop names an epoch", rec, "stops",
+         lambda h: (h["dispositions"].append({**template, "scope": "identity",
+                                              "disposition": "identity_replacement_required"}),
+                    h["stops"].append({"scope": "identity",
+                                       "anchor_epoch_id": template["anchor_epoch_id"]}))),
+        ("an epoch stop names no epoch", disp, "stops", lambda h: h["stops"][0].update(
+            anchor_epoch_id="")),
+    ]
+    return [(f"relationship: {label}", f"[state]|{needle}", both(name, edit))
+            for label, name, needle, edit in edits]
 
 
 def vocabulary_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
@@ -1598,6 +1820,8 @@ def corpus_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[
                             _resign(c["cases"][i], c, r))))
     out += vocabulary_mutants(corpus, rules)
     out += retained_value_mutants(corpus)
+    out += relationship_mutants(corpus)
+    out += subject_mutants(corpus, rules)
     for label in coverage_classes(corpus):
         out.append((f"without {label}", "[coverage]",
                     lambda c, label=label: c.update(cases=[
@@ -1757,6 +1981,14 @@ def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tu
         if set(found) - base_set:
             continue
         survived.append(f"re-pin: {label}")
+    # States the text permits, held in both before and after: each must still pass.
+    for label, edit in permitted_states(corpus):
+        count += 1
+        good = copy.deepcopy(corpus)
+        edit(good)
+        new = [f for f in check_corpus(good, rules) if f not in base_set]
+        if new:
+            survived.append(f"permitted state refused: {label}: {new[0]}")
     for label, wanted, edit in corpus_mutants(corpus, rules):
         count += 1
         bad = copy.deepcopy(corpus)
@@ -1773,6 +2005,12 @@ def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tu
         except Failure as error:
             found = [f"[model] {error}"]
         new = [f for f in found if f not in base_set]
+        if isinstance(wanted, str) and "|" in wanted:
+            prefix, needle = wanted.split("|", 1)
+            if any(f.startswith(prefix) and needle in f for f in new):
+                continue
+            survived.append(f"{label}: refused for {new[:1] or 'nothing'}, not {wanted}")
+            continue
         tags = wanted if isinstance(wanted, tuple) else (wanted,)
         other = [f for f in new if f.startswith("[refused:") and not f.startswith(tags)]
         if other:
