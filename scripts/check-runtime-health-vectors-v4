@@ -152,6 +152,7 @@ V4_SECTIONS = (
     ('## Health Payload > ### `gateway_broker_posture` object', False),
     ('## Health Payload > ### `state_store_encryption` object', False),
     ('## Health Payload > ### `evidence` object', True),
+    ('## Health Payload > ### `evidence` object > #### Application-storage fault', True),
     ('## Health Payload > ### `evidence` object > #### Awaiting-receipt age', True),
     ('## Health Payload > ### `evidence` object > #### `action_records` object', True),
     ('## Health Payload > ### `action_log_records` object', True),
@@ -471,6 +472,9 @@ PREDICATES: dict[str, tuple[str, Callable[[dict, dict], bool]]] = {
          "`contributor_links_unresolved > 0`, in every evidence state."),
         lambda s, m: flagged(s, m, "attestation_summary_available",
                              "contributor_links_unresolved")),
+    "evidence_application_storage_fault": (
+        "`evidence.application_storage_fault` is `true`. Holds in every evidence state.",
+        lambda s, m: s["evidence"]["application_storage_fault"] is True),
     "commissioning_problem": (
         "`commissioning.problems` is non-empty.",
         lambda s, m: (b := _blk(s, "commissioning")) is not None and len(b["problems"]) > 0),
@@ -1226,6 +1230,19 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     m["schema"] = {name: section_schema(v4[path], name) for name, path in BLOCK_SECTIONS.items()}
     prose_objects(v4[BLOCK_SECTIONS["evidence"]], m["schema"]["evidence"])
     m["schema"]["evidence"]["action_records"]["sub"] = m["schema"]["evidence.action_records"]
+    asf = [r for r in table(v4[BLOCK_SECTIONS["evidence"]], ["Field", "Type", "Present", "Notes"])
+           if r[0] == "`application_storage_fault`"]
+    off = re.fullmatch(r"See \[Application-storage fault\]\(#application-storage-fault\)\. "
+                       r"Always `false` when `state` is `(\w+)` or `(\w+)`\.",
+                       asf[0][3] if len(asf) == 1 else "")
+    if off is None or asf[0][1:3] != ["`bool`", "always"]:
+        raise Failure("the evidence application_storage_fault row is not as this script reads it")
+    m["fault_off_states"] = off.groups()
+    rule = next((r for r, name in CONSISTENCY if name == "fault_off"), "")
+    if tuple(re.findall(r"`([\w.]+)`", rule.split(" when ")[1])) != (
+            "evidence.state", *m["fault_off_states"]):
+        raise Failure("the consistency rule and the evidence row name different states for the "
+                      "application-storage fault")
     m["bound"] = section_schema(
         v4["## Health Payload > ### `firmware_reading_age` object > #### Liveness bound object"],
         "liveness bound")
@@ -1496,12 +1513,12 @@ def shape(m: dict, s: dict, startup: dict | None) -> list[str]:
         bad += entries(m, "commissioning", com, "zones")
     ev = s["evidence"]
     flags = ("attestation_summary_available", "registration_available", "delivery_ledger_available")
-    evkeys = {"state", "posture_problems", "action_records", *flags}
+    evkeys = {"state", "posture_problems", "action_records", "application_storage_fault", *flags}
     if not all(type(ev.get(f)) is bool for f in flags):
         bad.append("evidence flags not booleans")
     else:
         st = ev["state"]
-        bad += flag_faults(ev)
+        bad += flag_faults(ev) + fault_signal_faults(m, ev)
         want_keys = set(evkeys)
         if ev["attestation_summary_available"]:
             want_keys.add("contributor_links_unresolved")
@@ -2084,7 +2101,7 @@ def block_shape_ok(m: dict, name: str, block: Any) -> bool:
     if name == "evidence":
         if not block_shape_ok(m, "evidence.action_records", block.get("action_records")):
             return False
-        if m["check_flags"] and flag_faults(block):
+        if m["check_flags"] and (flag_faults(block) or fault_signal_faults(m, block)):
             return False
     return True
 
@@ -2093,6 +2110,8 @@ CONSISTENCY = (
     (("`safety_zones[].trip_age_ms` is an integer exactly when `trip_state` is `tripped`, and "
       "`null` otherwise;"), "trip_age"),
     ("`safety_registry.trip_verification_deadline_ms` is at most `60000`;", "deadline"),
+    (("`evidence.application_storage_fault` is `false` when `evidence.state` is `disabled` or "
+      "`starting`;"), "fault_off"),
     (("`alert_outbox.tier_d_critical_warning_threshold` is `1` to `3`, `tier_d_age_bound_ms` is "
       "`1` to `300000`, and `overdue_bound_ms` is `1` to `3600000`;"), "alert_bounds"),
     (("`action_log_records.lost` is the sum of `count` over every `action_record_lost` "
@@ -2128,6 +2147,10 @@ def consistency_faults(m: dict, h: dict) -> list[str]:
         d = _int(reg["trip_verification_deadline_ms"])
         if d is None or d > m["trip_deadline_max"]:
             bad.append("deadline")
+    ev = h.get("evidence")
+    if "fault_off" in on and isinstance(ev, dict) and ev.get("application_storage_fault") is True \
+            and ev.get("state") in m["fault_off_states"]:
+        bad.append("fault_off")
     ao = h.get("alert_outbox") or {}
     if "alert_bounds" in on:
         for key, ceiling in ALERT_DEFAULTS.items():
@@ -2167,6 +2190,15 @@ def flag_faults(ev: dict) -> list[str]:
     if st != "available" and ev.get("delivery_ledger_available") is not False:
         bad.append(f"delivery_ledger_available true while {st}")
     return bad
+
+
+def fault_signal_faults(m: dict, ev: dict) -> list[str]:
+    """The application-storage fault signal's row: always present, a bool. Its states are the
+    consistency rule's, which check 5 enforces."""
+    v = ev.get("application_storage_fault")
+    if type(v) is not bool:
+        return [f"application_storage_fault {v!r} is not a bool"]
+    return []
 
 
 def response_failures(m: dict, text: str) -> list[int]:
@@ -2724,6 +2756,17 @@ def coverage(corpus: dict, m: dict,
     some("Tier C pending one under ceiling", lambda s, _: av(s, "evidence.action_records")
          and s["evidence"]["action_records"]["pending"]
          == s["evidence"]["action_records"]["ceiling"] - 1)
+    # The application-storage fault signal is held in memory, independent of the store, and
+    # its condition holds in every evidence state: raised while the delivery ledger, which
+    # holds the ingest refusal ledger, was not read, and while evidence is unavailable.
+    some("the application-storage fault with the delivery ledger unread", lambda s, _:
+         s["evidence"]["application_storage_fault"] is True
+         and s["evidence"]["delivery_ledger_available"] is False
+         and "evidence_application_storage_fault" in holding(m, s))
+    some("the application-storage fault while evidence is unavailable", lambda s, _:
+         s["evidence"]["state"] == "unavailable"
+         and s["evidence"]["application_storage_fault"] is True
+         and "evidence_application_storage_fault" in holding(m, s))
     for name in m["starting_blocks"]:
         for state in ("starting", "unavailable"):
             some(f"{name} {state}", lambda s, _, name=name, state=state:
@@ -2975,7 +3018,9 @@ def coverage(corpus: dict, m: dict,
     for label, test in (
             ("a row behind a false flag", lambda t: _flag_row(t, m)),
             ("an available-only member while unavailable", lambda t: _state_rows(t, m, "unavailable")),
-            ("a member in a disabled block", lambda t: _state_rows(t, m, "disabled"))):
+            ("a member in a disabled block", lambda t: _state_rows(t, m, "disabled")),
+            *((f"the application-storage fault raised while evidence is {st}",
+               lambda t, st=st: _fault_raised_in(t, st)) for st in m["fault_off_states"])):
         if not any(test(t) and failures(t)[:1] == [S_SHAPE] for _, t in resp):
             gaps.append(f"response: {label}")
     if not any(v == verdict_of("elements are unique") and listed(h) != sorted(
@@ -3200,6 +3245,13 @@ def _flag_row(text: str, m: dict) -> bool:
         for section, flag in SECTION_FLAGS.items())
 
 
+def _fault_raised_in(text: str, state: str) -> bool:
+    doc = _doc(text)
+    ev = (doc.get("health") or {}).get("evidence") if isinstance(doc, dict) else None
+    return isinstance(ev, dict) and ev.get("state") == state \
+        and ev.get("application_storage_fault") is True
+
+
 def _state_rows(text: str, m: dict, state: str) -> bool:
     doc = _doc(text)
     health = doc.get("health") if isinstance(doc, dict) else None
@@ -3368,6 +3420,21 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("unavailable evidence names no posture problem", model_mutant(pred={
              "evidence_posture_problem": lambda s, m: bool(s["evidence"]["posture_problems"])
              and s["evidence"]["state"] != "unavailable"})),
+        ("the storage fault named only while the delivery ledger is read", model_mutant(pred={
+             "evidence_application_storage_fault": lambda s, m:
+             s["evidence"]["application_storage_fault"] is True
+             and s["evidence"]["delivery_ledger_available"] is True})),
+        ("unavailable evidence names no storage fault", model_mutant(pred={
+             "evidence_application_storage_fault": lambda s, m:
+             s["evidence"]["application_storage_fault"] is True
+             and s["evidence"]["state"] != "unavailable"})),
+        ("the storage fault allowed while evidence is disabled or starting",
+         model_mutant(fault_off_states=())),
+        *((f"the storage fault allowed while evidence is {st}", model_mutant(
+            fault_off_states=tuple(x for x in model["fault_off_states"] if x != st)))
+          for st in model["fault_off_states"]),
+        ("the storage fault consistency rule dropped", model_mutant(
+            consistency=[x for _, x in CONSISTENCY if x != "fault_off"])),
         ("T4 skipped", model_mutant(skip_t="T4")),
         ("T5 skipped", model_mutant(skip_t="T5")),
         *((f"{b} not critical-capable", model_mutant(critical_capable=[
@@ -3800,6 +3867,13 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "sentence changed in v4 ## Health Payload > ### `evidence` object > #### Awaiting-receipt",
             text_mutant("v4", "supplies no `r` from it, and does not conform.",
                         "supplies no `r` from it."))),
+        ("text: a read fault acknowledged", because(
+            "sentence changed in v4 ## Conformance > ### Behavioural checks",
+            text_mutant("v4", "would have led to a refusal | No acknowledgement;",
+                        "would have led to a refusal | The refusal acknowledged;"))),
+        ("text: a refusal-record fault left unanswered", because(
+            "sentence changed in v4 ## Conformance > ### Behavioural checks",
+            text_mutant("v4", "| The refusal answered with its reason;", "| No acknowledgement;"))),
         ("text: evidence-exchange/v2 integers widened", because(
             "c's domain", text_mutant("ee", "satisfy `|n| <= 9007199254740991`",
                                       "satisfy `|n| <= 9007199254740992`"))),
@@ -4238,6 +4312,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `action_records` | `object` | always | See below.',
             ('Reported whatever the evidence state, because the records it counts exist '
              'without evidence. |'),
+            ('| `application_storage_fault` | `bool` | always | See [Application-storage '
+             'fault](#application-storage-fault).'),
+            'Always `false` when `state` is `disabled` or `starting`. |',
             '| `attestation_summary_available` | `bool` | always | |',
             '| `registration_available` | `bool` | always | |',
             '| `delivery_ledger_available` | `bool` | always | |',
@@ -4284,14 +4361,44 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('`last_disposition` is `{disposition, scope, observed_at_ms}`, typed '
              "`string`, `string`, `int`; its values are evidence-exchange/v2's."),
             ('`last_ingest_refusal` is `{artifact_type, reason, observed_at_ms}`, typed '
-             "`string`, `string`, `int`; its `reason` is from evidence-exchange/v2's "
-             'rejection vocabulary.'),
+             '`string`, `string`, `int`; its `reason` is from the receiver rejection vocabulary '
+             'of '
+             '[evidence-exchange/v3.md](../evidence-exchange/v3.md#receiver-rejection-vocabulary).'),
             ('v3\'s text for every row marked "As v3" governs its meaning, vocabulary and '
              'the gates it must not touch, except that v3\'s `null` "when unavailable" is '
              'replaced by the row\'s absence under its section flag, and v3\'s "absence '
              'means unknown" for a registration row is replaced by `registration_available`.'),
             ('`awaiting_receipt_count` and its age are diagnostics: they contribute no '
              'condition, and they gate nothing.'),
+        ),
+        '## Health Payload > ### `evidence` object > #### Application-storage fault': (
+            ('`application_storage_fault` is `true` once the runtime has failed to decide or '
+             'apply a verified inbound evidence artifact because its store faulted, as '
+             '[evidence-exchange/v3.md](../evidence-exchange/v3.md#store-faults) defines a store '
+             'fault, and stays `true` until the runtime next completes the application of a '
+             'verified inbound artifact answered as applied.'),
+            ('Every store fault raises it, whether or not it is already raised, and a raised '
+             'signal stays raised.'),
+            'An agreeing restatement answered as applied clears it.',
+            ('A refusal never clears it, and raises it only when the record of that refusal '
+             'cannot be written: the refusal is still answered, as '
+             '[evidence-exchange/v3.md](../evidence-exchange/v3.md#store-faults) requires.'),
+            ('**In memory, independent of the store.** The runtime keeps the signal in memory, '
+             'never in the store, so it is reported while the store, the delivery ledger or the '
+             'ingest refusal ledger cannot be read or cannot be written.'),
+            ("A restart starts it `false`; while the fault persists, the courier's redelivery of "
+             'the undecided artifact raises it again.'),
+            '**Not an ingest refusal.** A store fault is not a rejection of the artifact.',
+            ('It never enters `ingest_refusal_count` or `last_ingest_refusal`, and no rejection '
+             'reason stands for it.'),
+            ('**It gates nothing.** It MUST NOT gate, delay, suppress, or mark unavailable an '
+             'approved Tier C action, any Tier D execution, or an in-force commissioned safety '
+             'binding, zone, or safety profile.'),
+            'Nor does it stop the receiver deciding a later artifact.',
+            'It is a diagnostic of one receiver path.',
+            ('Enforcement lives in ori-runtime, in its inbound evidence route and delivery '
+             'ledger, which decide what a store fault is and when an application completes; no '
+             'snapshot check can confirm when the signal was raised.'),
         ),
         '## Health Payload > ### `evidence` object > #### Awaiting-receipt age': (
             'An envelope awaiting a receipt has two custody instants, read from two clocks.',
@@ -4836,6 +4943,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| `evidence_contributor_link_unresolved` | `degraded` | '
              '`evidence.attestation_summary_available` is `true` and '
              '`contributor_links_unresolved > 0`, in every evidence state. |'),
+            ('| `evidence_application_storage_fault` | `degraded` | '
+             '`evidence.application_storage_fault` is `true`.'),
+            'Holds in every evidence state. |',
             '| `commissioning_problem` | `degraded` | `commissioning.problems` is non-empty. |',
             ('| `safety_zone_active_unprotected` | `degraded` | Some `safety_zones[]` '
              'entry has `activation:'),
@@ -5128,6 +5238,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('`safety_zones[].trip_age_ms` is an integer exactly when `trip_state` is '
              '`tripped`, and `null` otherwise;'),
             '`safety_registry.trip_verification_deadline_ms` is at most `60000`;',
+            ('`evidence.application_storage_fault` is `false` when `evidence.state` is '
+             '`disabled` or `starting`;'),
             ('`alert_outbox.tier_d_critical_warning_threshold` is `1` to `3`, '
              '`tier_d_age_bound_ms` is `1` to `300000`, and `overdue_bound_ms` is `1` to '
              '`3600000`;'),
@@ -5245,6 +5357,24 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'A3 and A4. |'),
             ("| The runtime's clock set back past `r`, and past both `r` and `c` | The age "
              '`t − c`, bounded by A3 and A4; then `0`. |'),
+            ('| A store fault injected while the real inbound route applies a verified receipt, '
+             'epoch confirmation or disposition, after a first write and at commit | '
+             '`application_storage_fault: true`, `evidence_application_storage_fault`, '
+             '`degraded`;'),
+            ('`ingest_refusal_count` and `last_ingest_refusal` unchanged; a Tier D execution in '
+             'the same interval runs as it would with no fault. |'),
+            ('| A store fault injected on the read of the held record a decision needs, for an '
+             'artifact the read would have led to a refusal | No acknowledgement;'),
+            '`application_storage_fault: true`, `evidence_application_storage_fault`, `degraded`;',
+            '`ingest_refusal_count` and `last_ingest_refusal` unchanged. |',
+            ('| A store fault injected on writing the record of a decided refusal, such as a '
+             'conflicting custody acknowledgement | The refusal answered with its reason;'),
+            '`application_storage_fault: true`, `evidence_application_storage_fault`, `degraded`;',
+            ('`ingest_refusal_count` and `last_ingest_refusal` unchanged, since the record was '
+             'not written. |'),
+            ('| The fault cleared, then the same artifact redelivered in a fresh envelope and '
+             'applied | `application_storage_fault: false`, and the condition no longer named. |'),
+            '| A refusal while the signal is raised | `application_storage_fault` still `true`. |',
         ),
         '## Vectors': (
             ('`runtime-health/health-vectors-v4.json`, written by '
@@ -5382,6 +5512,10 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'configuration signature supplied values the runtime is running on. |'),
             ("| `decision_record_lost` | `critical` | An operator's decision whose record "
              'the store never took, and no authenticated operator has acknowledged the loss. |'),
+            ('| `evidence_application_storage_fault` | `degraded` | Since the runtime last '
+             'started, its store failed while deciding or applying a verified inbound evidence '
+             'artifact, or while recording a refusal, and no inbound artifact has been applied '
+             'since; never while evidence is `disabled` or `starting`. |'),
             ('| `evidence_contributor_link_unresolved` | `degraded` | A contributor '
              'record names a holder whose record of the act was lost. |'),
             ('| `evidence_courier_answer_unrecognised` | `degraded` | The delivery ledger '
@@ -5458,18 +5592,18 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'inconsistently.'),
             ('Tokens are unique, in byte order, and number at most **32** — an exact '
              'bound rather than "bounded", so conformance is checkable without judgement.'),
-            'The vocabulary holds 31 tokens.',
+            'The vocabulary holds 32 tokens.',
             ('A conforming heartbeat names either `health_snapshot_invalid` alone, or a '
-             'combination of the other 30.'),
-            ('Not all 30 can hold at once, because a block that names '
-             '`subsystem_state_unknown_critical` cannot also name its own conditions, but '
-             'the bound admits all 30 together.'),
+             'combination of the other 31.'),
+            ('Not all 31 can hold at once, because a block that names '
+             '`subsystem_state_unknown_critical` cannot also name its own conditions, but the '
+             'bound admits all 31 together.'),
             ('A conforming runtime never emits `firmware_liveness_degraded` alone, '
              'because its local triple check refuses that snapshot (runtime-health/v4 '
              'step T4), though a receiver accepts it.'),
-            ('The bound of 32 admits every such combination and leaves room for two '
-             'additions without a change to the bound; step 9 refuses '
-             '`health_snapshot_invalid` beside any other token.'),
+            ('The bound of 32 admits every such combination and leaves room for one addition '
+             'without a change to the bound; step 9 refuses `health_snapshot_invalid` beside any '
+             'other token.'),
             ('**Validation order is normative.** It applies after authentication and '
              'generic JSON syntax parsing, but **before typed decoding or normalisation** '
              '— otherwise a typed decoder would already have rejected the array-type and '

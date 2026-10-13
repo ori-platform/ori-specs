@@ -1,0 +1,1664 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the restated-records corpus against evidence-exchange/v3.
+
+`evidence-exchange/vectors/receiver-state/restated-records-v3.json` fixes what a
+runtime does with a verified inbound artifact that names a fact it already
+holds a final record of. Shares no code with
+scripts/generate-evidence-exchange-receiver-state-vectors-v3, and was written
+without reading it: every expected value is recomputed here from the contract.
+
+- every artifact's preimage, authenticator and binding are recomputed from the
+  published material the file carries: the custody MAC under the generation
+  its derived `key_id` selects, every Ed25519 signature under the key
+  `(purpose, key_id)` selects from a registry this script holds to the
+  registry rules, and each receipt's `range_digest` over the sealed chain rows;
+- each case's answer, reason, applied sequences and every held record after
+  are recomputed from the restatement rules, all or nothing, the store-fault
+  rule, step 6 of the disposition verification, and runtime-health/v4's
+  application-storage fault signal, then compared with the literal;
+- every held record before is a state those rules can reach;
+- every case class the Test vectors paragraph names is present, as a property
+  of the cases rather than of their names.
+
+The agree/conflict table and the field tables are read from the text, and the
+text the rules come from is pinned unit for unit in
+scripts/evidence-exchange-restatement-pinned-units.json, so a reworded rule
+fails here rather than passing unread.
+
+The case schema, the store-fault points and where each applies, and the
+active-epoch projection's members are read from the text, and the effective
+epoch is the epoch the projection names, so it is checked through the
+projection rather than as a record of its own.
+
+    python3 scripts/check-evidence-exchange-receiver-state-vectors-v3
+    python3 scripts/check-evidence-exchange-receiver-state-vectors-v3 --mutations
+
+Requires the `cryptography` package; refuses to run without it rather than
+skipping the signatures. Lists every disagreement, not only the first.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import re
+import sys
+from collections.abc import Callable
+from typing import Any, NoReturn
+
+try:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
+except ImportError:  # pragma: no cover - the gate must not pass silently
+    print(
+        "check-evidence-exchange-receiver-state-vectors-v3: the cryptography package is required",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+NAME = "check-evidence-exchange-receiver-state-vectors-v3"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "evidence-exchange" / "v3.md"
+HEALTH = ROOT / "runtime-health" / "v4.md"
+CORPUS = ROOT / "evidence-exchange" / "vectors" / "receiver-state" / "restated-records-v3.json"
+PINNED = ROOT / "scripts" / "evidence-exchange-restatement-pinned-units.json"
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> NoReturn:
+    raise Failure(message)
+
+
+# --- the pinned text ---------------------------------------------------------------------
+
+TEXT_BLOCKS = (
+    # The same rules restated elsewhere in the contract: a rewording of any of them fails here.
+    (CONTRACT, "- **Restated records.** A verified artifact that restates", "Each party's conformance claim"),
+    (CONTRACT, "A verified acknowledgement for an envelope whose custody is already recorded",
+     "### Delivery receipt"),
+    (CONTRACT, "A runtime receiving a receipt whose range includes sequences it already holds",
+     "**What a receipt does and does not prove.**"),
+    (CONTRACT, "A runtime refuses a verified epoch confirmation whose `device_id` is not its",
+     "What this exchange takes from"),
+    (CONTRACT, "- The first record of a fact is final.", "## Chain row format"),
+    (CONTRACT, "6. Its effect is not already in force", "**Effects at the runtime.**"),
+    (CONTRACT, "## Restated records", "## Three state models"),
+    (CONTRACT, "| Custody ack byte-identical to the one whose custody is held", "### Test vectors"),
+    (CONTRACT, "**Restated records** are fixed by", "**Dispositions** are fixed by"),
+    (HEALTH, "#### Application-storage fault", "#### Awaiting-receipt age"),
+)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _block_units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith("|"):
+            units.extend(
+                _norm(line)
+                for line in lines
+                if line.strip() and not re.fullmatch(r"\|[\s:|-]+\|", line.strip())
+            )
+        else:
+            prose = _norm(paragraph)
+            units.extend(u for u in re.split(r"(?<=[.:;])\s+(?=[A-Z`*\[(])", prose) if u)
+    return units
+
+
+def _block(body: str, start_marker: str, end_marker: str, source: pathlib.Path) -> tuple[int, int]:
+    start = body.find(start_marker)
+    end = body.find(end_marker, start)
+    if start < 0 or end < start:
+        fail(f"{source.name} lacks the block starting {start_marker[:50]!r}")
+    return start, end
+
+
+def units_of(texts: dict) -> list[str]:
+    units: list[str] = []
+    for source, start_marker, end_marker in TEXT_BLOCKS:
+        body = texts[source]
+        start, end = _block(body, start_marker, end_marker, source)
+        units.extend(_block_units(body[start:end]))
+    return units
+
+
+def read_texts() -> dict:
+    return {
+        CONTRACT: CONTRACT.read_text(encoding="utf-8"),
+        HEALTH: HEALTH.read_text(encoding="utf-8"),
+    }
+
+
+def check_contract_text(texts: dict) -> None:
+    units = units_of(texts)
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    if units != pinned:
+        added = [u for u in units if u not in pinned]
+        removed = [u for u in pinned if u not in units]
+        fail(
+            "the restatement text differs from the pinned units, in content or order. Re-pinning "
+            "is a semantic change: update scripts/evidence-exchange-restatement-pinned-units.json "
+            "only together with this corpus and, where a rule changed, this checker\n"
+            + "".join(f"  + {u}\n" for u in added)
+            + "".join(f"  - {u}\n" for u in removed)
+        )
+
+
+# Each rule the model applies, word for word. Rewording one changes this checker, never only
+# the pin: a sentence missing here stops the model rather than letting it guess.
+REQUIRED_SENTENCES = {
+    "pre-checks": (
+        "An artifact that fails one of those is refused for that reason, never "
+        "`restatement_conflict`."
+    ),
+    "agree changes nothing": (
+        "It is accepted and answered as applied, and changes no member of the held record."
+    ),
+    "first provenance stays": (
+        "The first record's provenance stays: its `key_id` is never replaced by the "
+        "restatement's."
+    ),
+    "only the custody record time": (
+        "It may supply a receiver-local fact the receiver had not recorded for that record, which "
+        "in this revision is only the record time of a custody record kept without one, and it "
+        "supplies nothing else; or"
+    ),
+    "conflict writes nothing": (
+        "It is refused `restatement_conflict`, and nothing is written to any held record, a "
+        "missing record time included."
+    ),
+    "receipt applies only the new": (
+        "The receipt applies exactly the sequences of its range not yet receipted, each with "
+        "this receipt's `accepted_at_ms` and `key_id`."
+    ),
+    "receipt keeps first": (
+        "Each sequence already receipted keeps its first `accepted_at_ms` and `key_id`."
+    ),
+    "all held receipt": (
+        "A receipt whose range holds only receipted sequences applies nothing and is answered as "
+        "applied."
+    ),
+    "restated confirmation moves nothing": (
+        "Neither answer to a restated confirmation changes the confirmation record, the "
+        "active-epoch projection, and so the effective epoch, or the registration obligation."
+    ),
+    "projection written for the sealing epoch": (
+        "each equal to the confirmation record's for that epoch, and it is written only when the "
+        "confirmed epoch is the one the receiver seals under."
+    ),
+    "effective epoch is the projection's": (
+        "The **effective epoch** is the epoch the projection names."
+    ),
+    "effective epoch is no record": (
+        "It is not a separate record: it changes exactly when the projection does."
+    ),
+    "a read fault leaves even a refusal undecided": (
+        "A fault on a read the decision needs is a store fault whatever the decision would have "
+        "been, a refusal included: the artifact is left undecided, with no rejection reason."
+    ),
+    "every store fault raises the signal": (
+        "Every store fault raises it, whether or not it is already raised, and a raised signal "
+        "stays raised."
+    ),
+    "first confirmation": (
+        "A confirmation for an epoch with no confirmation record is not a restatement and takes "
+        "v2's rules: the active-epoch projection moves only for the epoch the receiver seals "
+        "under, so a confirmation for an earlier epoch never rolls the active epoch back."
+    ),
+    "first confirmation applies": (
+        "| Epoch confirmation of the epoch the device seals under, while only an earlier epoch is "
+        "confirmed | Not a restatement; apply as v2 does: record it, move the projection, close "
+        "the obligation |"
+    ),
+    "byte-identical disposition": (
+        "A byte-identical repetition of an applied disposition is applied again with no new state."
+    ),
+    "superseded": (
+        "Its effect is not already in force: a disposition for a registration already "
+        "confirmed or already closed, and an `epoch` or `identity` disposition whose stop is "
+        "already in force, are refused `superseded`."
+    ),
+    "all or nothing": (
+        "Every record a verified artifact changes is written in one transaction, or none is: for "
+        "a custody acknowledgement, its custody record; for a receipt, every sequence it applies; "
+        "for an epoch confirmation, its confirmation record, the active-epoch projection and the "
+        "registration obligation; for a disposition, every record its effect changes."
+    ),
+    "rollback": (
+        "On a store fault on the read, a write of the application or its commit, the receiver "
+        "rolls the transaction back, so every held record is as it was before the artifact "
+        "arrived."
+    ),
+    "one outcome at each undecided point": (
+        "A store fault on the read, on any write of the application, or at its commit has the "
+        "same outcome at each, below."
+    ),
+    "no decision": (
+        "It applies nothing, records the artifact as neither applied nor refused, and uses no "
+        "reason from the [receiver rejection vocabulary](#receiver-rejection-vocabulary): a store "
+        "fault is not a statement about the artifact."
+    ),
+    "decided afresh": (
+        "A later delivery of the same artifact is decided afresh against the held records, as if "
+        "the faulted attempt had not occurred, so v2's repeat rule for dispositions and the "
+        "restatement rules above never treat it as a repetition of the faulted attempt."
+    ),
+    "decided last": (
+        "`restatement_conflict` is decided last: only an artifact that no other reason in this "
+        "table refuses can be refused for it."
+    ),
+    "first application time": (
+        "| `receiver_now_ms` | The receiver's clock when it decides: the record time a custody "
+        "record, the applied time a confirmation record and the closing time an obligation take "
+        "when this artifact first writes them. |"
+    ),
+    "signal raise and clear": (
+        "`application_storage_fault` is `true` once the runtime has failed to decide or apply a "
+        "verified inbound evidence artifact because its store faulted, as "
+        "[evidence-exchange/v3.md](../evidence-exchange/v3.md#store-faults) defines a store fault, "
+        "and stays `true` until the runtime next completes the application of a verified inbound "
+        "artifact answered as applied."
+    ),
+    "signal cleared by agreement": "An agreeing restatement answered as applied clears it.",
+    "signal kept by refusal": (
+        "A refusal never clears it, and raises it only when the record of that refusal cannot be "
+        "written: the refusal is still answered, as "
+        "[evidence-exchange/v3.md](../evidence-exchange/v3.md#store-faults) requires."
+    ),
+    "superseded neither agrees nor conflicts": (
+        "It neither agrees nor conflicts, and it changes nothing."
+    ),
+    "compared with the record": (
+        "A restatement is compared with the confirmation record, never with the projection."
+    ),
+    "projection left as found": (
+        "A projection that an earlier receiver left disagreeing with its epoch's confirmation "
+        "record, as one that let the last confirmation win could, is left as found: neither "
+        "answer to a restatement repairs or rewrites it."
+    ),
+    "operational faults only": (
+        "A store constraint that refuses the application of a verified artifact is a defect in "
+        "the receiver, never a store fault: a conforming receiver writes only what these rules "
+        "permit, so it has no such case."
+    ),
+    "a decided refusal stands": "A refusal already decided is not undone by a store fault.",
+    "unwritable refusal record": (
+        "When the receiver has decided to refuse an artifact and then cannot write the record of "
+        "that refusal, it still answers the refusal with its reason, every held record stays as "
+        "it was, and the failed write raises the application-storage fault signal."
+    ),
+    "the refusal-record point": "The corpus calls this point `at_refusal_record`.",
+    "no acknowledgement on any carriage": (
+        "Whatever inbound carriage delivered the artifact, the receiver answers a store fault "
+        "that leaves the artifact undecided with no ingest acknowledgement, and once the rollback "
+        "completes it releases the delivered message, so that the courier delivers the artifact "
+        "again."
+    ),
+    "a refusal with an unwritten record is acknowledged": (
+        "A decided refusal whose record could not be written is acknowledged as that refusal."
+    ),
+    "the refusal-record exception": (
+        "A fault writing a decided refusal's record is the one exception, stated after the "
+        "rollback rule."
+    ),
+    "store faults include the refusal record": (
+        "that stops it reading a record the decision needs, writing or committing an "
+        "application, or writing the record of a refusal it has decided."
+    ),
+    "invariant: the refusal-record exception": (
+        "A store fault leaves every held record as it was and the artifact undecided, except a "
+        "failed write of a decided refusal's record, which leaves every held record as it was "
+        "and still answers that refusal."
+    ),
+    "what changed: neither answer changes the record": (
+        "A verified artifact that restates a final record the receiver already holds is accepted "
+        "when it agrees with that record and refused `restatement_conflict` when it conflicts, "
+        "and neither answer changes the held record."
+    ),
+    "custody pointer": (
+        "A verified acknowledgement for an envelope whose custody is already recorded is a "
+        "restatement, decided under [Restated records](#restated-records)."
+    ),
+    "receipt pointer": (
+        "A runtime receiving a receipt whose range includes sequences it already holds receipted "
+        "applies it as [Restated records](#restated-records) says."
+    ),
+    "confirmation pointer": (
+        "A verified confirmation for an epoch already confirmed is a restatement, decided under "
+        "[Restated records](#restated-records)."
+    ),
+    "first record is final": "The first record of a fact is final.",
+    "invariant: never rewrites": (
+        "A restatement never rewrites it or its provenance; one that agrees is accepted and one "
+        "that conflicts is refused `restatement_conflict`."
+    ),
+}
+
+ARTIFACT_TITLES = {
+    "custody_acknowledgement": "Custody acknowledgement",
+    "delivery_receipt": "Delivery receipt",
+    "epoch_confirmation": "Epoch confirmation",
+    "evidence_disposition": "Evidence disposition",
+}
+AUTHENTICATOR = {"custody_acknowledgement": "mac"}
+HELD_MEMBERS = (
+    "custody", "receipts", "epoch_confirmations", "active_epoch", "registration_obligations",
+    "dispositions", "stops", "application_storage_fault",
+)
+STORE_FAULT_POINTS = ("at_read", "after_first_write", "at_commit", "at_refusal_record")
+REFUSAL_RECORD = "at_refusal_record"
+STOP_MEMBERS = {"scope", "anchor_epoch_id"}
+# The held records, as the restated-records table names them. Member names are the file's;
+# what each holds is the table's.
+RECORD_MEMBERS = {
+    "custody": {"local_seq", "custody_at_ms", "key_id", "recorded_at_ms"},
+    "receipts": {"local_seq", "accepted_at_ms", "key_id"},
+    "epoch_confirmations": {"device_id", "anchor_epoch_id", "pubkey_hex", "actor",
+                            "confirmed_at_ms", "key_id", "applied_at_ms"},
+    "registration_obligations": {"anchor_epoch_id", "pubkey_hex", "state", "closed_at_ms"},
+    "dispositions": {"triggering_digest", "anchor_epoch_id", "scope", "disposition",
+                     "decided_at_ms", "key_id"},
+}
+
+
+def _table(text: str, header: str) -> list[list[str]]:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if _norm(line) == header:
+            rows = []
+            for row in lines[i + 2:]:
+                if not row.strip().startswith("|"):
+                    break
+                rows.append([c.strip() for c in row.strip().strip("|").split("|")])
+            return rows
+    fail(f"the contract has no table headed {header!r}")
+    return []
+
+
+def _section(text: str, heading: str) -> str:
+    start = text.find("\n" + heading + "\n")
+    if start < 0:
+        fail(f"the contract has no section {heading!r}")
+    end = text.find("\n#", start + len(heading) + 2)
+    return text[start:end]
+
+
+def contract_rules(texts: dict) -> dict:
+    """Read every rule the model applies from the text."""
+    text = texts[CONTRACT]
+    pinned = "\n".join(units_of(texts))
+    for key, sentence in REQUIRED_SENTENCES.items():
+        if _norm(sentence) not in pinned:
+            fail(
+                f"the contract no longer states the {key!r} rule word for word; changing it "
+                "changes this checker, never only the pin"
+            )
+    rules: dict[str, Any] = {}
+    domains = {}
+    for row in _table(text, "| Artifact | Domain | Algorithm | Key purpose |"):
+        domains[row[0]] = row
+    rules["domain"], rules["purpose"], rules["algorithm"] = {}, {}, {}
+    for kind, title in ARTIFACT_TITLES.items():
+        if title not in domains:
+            fail(f"the domain table has no row for {title}")
+        _, domain, algorithm, purpose = domains[title]
+        found = re.fullmatch(r"`([a-z0-9_.]+)\\0`", domain)
+        if found is None:
+            fail(f"the {title} domain is not an ASCII string with its NUL: {domain!r}")
+        rules["domain"][kind] = found.group(1).encode("ascii") + b"\0"
+        rules["algorithm"][kind] = algorithm
+        rules["purpose"][kind] = purpose.strip("`")
+    rules["fields"] = {}
+    for kind, title in ARTIFACT_TITLES.items():
+        rows = _table(_section(text, "### " + title), "| Field | Type | Notes |")
+        rules["fields"][kind] = {r[0].strip("`"): r[1].strip("`") for r in rows}
+    rules["values"] = {
+        r[0].strip("`"): r[1].strip("`")
+        for r in _table(text, "| `disposition` | `scope` | Terminal | Meaning |")
+    }
+    rules["reasons"] = [r[0].strip("`") for r in _table(text, "| Reason | Meaning |")]
+    rules["agreement"] = {}
+    for row in _table(text, "| Artifact | Agrees when | Conflicts when |"):
+        kind = next((k for k, t in ARTIFACT_TITLES.items() if t == row[0]), None)
+        if kind is None:
+            fail(f"the agreement table names an artifact this checker does not know: {row[0]!r}")
+        agrees, conflicts = row[1], row[2]
+        compared = re.match(r"Its ((?:`\w+`(?:, | and )?)+) (?:equals|each equal) the held", agrees)
+        if agrees.startswith("Always, once it is verified.") and conflicts.startswith("Never."):
+            rules["agreement"][kind] = ("always",)
+        elif agrees.startswith("v2's rule, unchanged: a byte-identical repetition") \
+                and conflicts.startswith("Never: a disposition with no new effect is refused "
+                                         "`superseded`"):
+            rules["agreement"][kind] = ("byte_identical",)
+        elif compared is not None:
+            fields = re.findall(r"`(\w+)`", compared.group(1))
+            named = re.findall(r"`(\w+)`", conflicts.split(" differs")[0])
+            if set(named) != set(fields) and not (
+                    len(fields) > 1 and conflicts.startswith("Any one of them differs")):
+                fail(f"the {row[0]} row compares {fields} and conflicts on {named}")
+            rules["agreement"][kind] = ("fields", tuple(fields))
+        else:
+            fail(f"the {row[0]} agreement rule is not one this checker reads: {agrees[:60]!r}")
+    if set(rules["agreement"]) != set(ARTIFACT_TITLES):
+        fail("the agreement table does not carry exactly the four inbound artifacts")
+    small = _table(text, "| y, as 32 little-endian bytes | Points of small order |")
+    rules["small_order_y"] = {r[0].strip("`") for r in small}
+    salt = re.search(r'salt\s+= "([^"]+)" as ASCII, no NUL', text)
+    info = re.search(r'info\s+= "([^"]+)" as ASCII, no NUL', text)
+    length = re.search(r"length = (\d+) bytes", text)
+    if not (salt and info and length):
+        fail("the custody key_id derivation is not stated as this checker reads it")
+    rules["hkdf"] = (salt.group(1).encode(), info.group(1).encode(), int(length.group(1)))
+    schema(text, rules)
+    rules["defects"] = defect_reasons(text)
+    if set(rules["defects"].values()) - set(rules["reasons"]):
+        fail("a defect's reason is outside the vocabulary")
+    return rules
+
+
+PROJECTION_SENTENCE = re.compile(
+    r"Its members are ((?:`\w+`(?:, | and )?)+), each equal to the confirmation record's for that "
+    r"epoch")
+
+
+def schema(text: str, rules: dict) -> None:
+    """The case schema the Test vectors paragraph states, held against this model's."""
+    block = text[text.find("**Restated records** are fixed by"):text.find("**Dispositions** are fixed by")]
+    tables = [t for t in re.split(r"\n\s*\n", block) if t.lstrip().startswith("| Member | Content |")]
+    if len(tables) != 2:
+        fail("the Test vectors paragraph no longer carries the case and held-record tables")
+    case_rows = _table(tables[0], "| Member | Content |")
+    members = [m for row in case_rows for m in re.findall(r"`(\w+)`", row[0])]
+    if set(members) != set(CASE_KEYS) or len(members) != len(CASE_KEYS):
+        fail(f"the text's case members {members} are not this model's")
+    fault = next(r[1] for r in case_rows if r[0] == "`store_fault`")
+    points = re.findall(r"`(\w+)`, (?:on|at) ", fault)
+    if tuple(points) != STORE_FAULT_POINTS \
+            or "which applies only to an application that writes more than one record" not in fault \
+            or "at the commit of an application that writes at least one record" not in fault \
+            or "before any decision" not in fault \
+            or ("on writing the record of a refusal already decided, which applies only to a "
+                "decided refusal: the answer is that refusal with its reason, every held record is "
+                "unchanged, and the signal is raised") not in fault:
+        fail(f"the store_fault points or where each applies are not as this model reads them: "
+             f"{points}")
+    rules["fault_min_writes"] = {"at_read": 0, "after_first_write": 2, "at_commit": 1}
+    answer = next(r[1] for r in case_rows if r[0] == "`expected`")
+    if f"a store fault at any point but `{REFUSAL_RECORD}`, which answers `reject`" not in answer:
+        fail("the expected row no longer answers a refusal-record fault with the refusal")
+    held_rows = _table(tables[1], "| Member | Content |")
+    order = [row[0].strip("`") for row in held_rows]
+    if order != list(HELD_MEMBERS):
+        fail(f"the text's held members {order} are not this model's {list(HELD_MEMBERS)}")
+    shapes = {}
+    for row in held_rows:
+        braces = re.search(r"`\{([^}]*)\}`", row[1])
+        shapes[row[0].strip("`")] = None if braces is None else {
+            m.strip() for m in braces.group(1).split(",")}
+    for member, wanted in RECORD_MEMBERS.items():
+        if shapes.get(member) != wanted:
+            fail(f"the text gives {member} records {shapes.get(member)}, this model {wanted}")
+    if shapes.get("stops") != STOP_MEMBERS:
+        fail(f"the text gives stop records {shapes.get('stops')}")
+    projection = PROJECTION_SENTENCE.search(_norm(text))
+    named = set(re.findall(r"`(\w+)`", projection.group(1))) if projection else None
+    if named is None or named != shapes.get("active_epoch") \
+            or not named < RECORD_MEMBERS["epoch_confirmations"]:
+        fail(f"the active-epoch projection's members {named} disagree with its table row "
+             f"{shapes.get('active_epoch')} or are not the confirmation record's")
+    rules["projection"] = named
+
+
+# --- crypto and canonical bytes ----------------------------------------------------------
+
+P = 2**255 - 19
+D = (-121665 * pow(121666, P - 2, P)) % P
+
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(
+        obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def hkdf(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out, block, counter = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def refused_point(public_hex: str, small_order_y: set[str]) -> str | None:
+    """RFC 8032 section 5.1.3 decoding and the small-order rule, as the registry section states."""
+    raw = bytes.fromhex(public_hex)
+    n = int.from_bytes(raw, "little")
+    sign, y = n >> 255, n & ((1 << 255) - 1)
+    if y >= P:
+        return "y is not below p"
+    u, v = (y * y - 1) % P, (D * y * y + 1) % P
+    x2 = u * pow(v, P - 2, P) % P
+    if x2 != 0 and pow(x2, (P - 1) // 2, P) != 1:
+        return "no square root"
+    if x2 == 0 and sign:
+        return "x is 0 and the sign bit is set"
+    if raw[:31].hex() + format(raw[31] & 0x7F, "02x") in small_order_y:
+        return "small order"
+    return None
+
+
+# --- the published material --------------------------------------------------------------
+
+def material(corpus: dict, rules: dict, out: list[str]) -> dict:
+    keys: dict[str, dict] = {}
+    registry = corpus["authority_key_registry"]
+    if set(registry) != {"schema", "keys"} or registry["schema"] != "ori.evidence_authority_keys.v1" \
+            or not isinstance(registry["keys"], list) or not registry["keys"]:
+        out.append("[material] authority_key_registry is not a registry document")
+        return {"authority": {}, "custody": {}}
+    purposes = set(rules["purpose"].values()) - {"gateway_custody"}
+    seen: dict[str, str] = {}
+    for key in registry["keys"]:
+        if set(key) != {"key_id", "public_key_hex", "purpose", "status"} \
+                or not all(isinstance(v, str) for v in key.values()):
+            out.append(f"[material] registry key with members {sorted(key)}")
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}", key["public_key_hex"]):
+            out.append(f"[material] public_key_hex {key['public_key_hex']!r}")
+            continue
+        derived = "sha256:" + hashlib.sha256(bytes.fromhex(key["public_key_hex"])).hexdigest()
+        if key["key_id"] != derived:
+            out.append(f"[material] registry key_id {key['key_id']} does not derive")
+        if key["purpose"] not in purposes or key["status"] not in ("active", "verify_only", "revoked"):
+            out.append(f"[material] registry key {key['key_id']} purpose or status")
+        if key["key_id"] in seen:
+            out.append(f"[material] registry key_id {key['key_id']} held twice")
+        seen[key["key_id"]] = key["purpose"]
+        why = refused_point(key["public_key_hex"], rules["small_order_y"])
+        if why:
+            out.append(f"[material] registry key {key['key_id']} refused: {why}")
+        seed = corpus["authority_seeds"].get(key["key_id"])
+        if seed is None or Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed)).public_key() \
+                .public_bytes_raw().hex() != key["public_key_hex"]:
+            out.append(f"[material] no published seed reproduces {key['key_id']}")
+        keys[key["key_id"]] = key
+    for purpose in {k["purpose"] for k in keys.values()}:
+        active = [k for k in keys.values() if k["purpose"] == purpose and k["status"] == "active"]
+        if len(active) != 1:
+            out.append(f"[material] {purpose} holds {len(active)} active keys")
+    if set(corpus["authority_seeds"]) != set(keys):
+        out.append("[material] authority_seeds name keys the registry does not hold")
+    custody: dict[str, dict] = {}
+    reg = corpus["custody_registry"]
+    if set(reg) != {"active", "verify_only"}:
+        out.append(f"[material] custody_registry holds {sorted(reg)}")
+    for status, generation in reg.items():
+        secret = bytes.fromhex(generation["secret_hex"])
+        try:
+            secret.decode("utf-8")
+        except UnicodeDecodeError:
+            out.append(f"[material] custody {status} secret is not UTF-8")
+        derived = "hkdf-sha256:" + hkdf(secret, *rules["hkdf"]).hex()
+        if generation["key_id"] != derived:
+            out.append(f"[material] custody {status} key_id does not derive from its secret")
+        if derived in custody:
+            out.append("[material] two custody generations derive one key_id")
+        custody[derived] = {"status": status, "secret": secret}
+    return {"authority": keys, "custody": custody}
+
+
+# Each defect whose reason the vocabulary assigns by its own wording: the phrase that assigns
+# it, found in exactly one reason's Meaning cell, gives the reason.
+DEFECT_PHRASES = {
+    "range_domain": "`from_seq` is below `1`, or `to_seq` is below `from_seq`",
+    "range_digest": "a receipt's `range_digest` does not match the chain rows this runtime sealed "
+                    "for its range",
+    "range_unsealed": "or a receipt's range includes one",
+    "local_seq_unsealed": "The artifact names a `local_seq` this runtime has not sealed",
+    "disposition_version": "a disposition whose `v` is not `1`",
+    "version": "The `v` of a custody acknowledgement, a delivery receipt or an epoch "
+               "confirmation is not a version this receiver interprets",
+}
+
+
+def defect_reasons(text: str) -> dict[str, str]:
+    rows = _table(text, "| Reason | Meaning |")
+    out = {}
+    for defect, phrase in DEFECT_PHRASES.items():
+        owners = [r[0].strip("`") for r in rows if phrase in r[1]]
+        if len(owners) != 1:
+            fail(f"the vocabulary assigns {defect} to {owners}, not one reason")
+        out[defect] = owners[0]
+    if "decided from the bytes alone" not in next(
+            r[1] for r in rows if r[0].strip("`") == out["range_domain"]):
+        fail("the vocabulary no longer decides a receipt's range domain from the bytes alone")
+    return out
+
+
+def verify(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
+    """Every check the contract orders before application. A failure is tagged with the reason
+    the vocabulary refuses it for, `[refused:<reason>]`."""
+    kind, art, where = case["artifact_type"], case["artifact"], case["name"]
+    why = rules["defects"]
+
+    def refused(reason: str, detail: str) -> str:
+        return f"[refused:{reason}] {where}: {detail}"
+
+    out: list[str] = []
+    fields = rules["fields"].get(kind)
+    if fields is None:
+        return [f"[shape] {where}: artifact_type {kind!r} is not an inbound artifact"]
+    if not isinstance(art, dict) or set(art) != set(fields):
+        return [refused("malformed", f"artifact members are not exactly {sorted(fields)}")]
+    for name, typ in fields.items():
+        if (typ == "int") is not (type(art[name]) is int) or (typ == "string") is not isinstance(
+                art[name], str):
+            out.append(refused("malformed", f"{name} is not {typ}"))
+    if out:
+        return out
+    if art["v"] != 1:
+        return [refused(why["disposition_version"] if kind == "evidence_disposition"
+                        else why["version"], "v is not 1")]
+    if kind == "delivery_receipt" and (art["from_seq"] < 1 or art["to_seq"] < art["from_seq"]):
+        return [refused(why["range_domain"], "the range is not a closed interval of sequences")]
+    if kind == "evidence_disposition" and rules["values"].get(art["disposition"]) != art["scope"]:
+        return [refused("malformed", "disposition and scope are not a permitted pair")]
+    tag = AUTHENTICATOR.get(kind, "signature")
+    body = {k: v for k, v in art.items() if k != tag}
+    preimage = rules["domain"][kind] + canonical(body)
+    if case["canonical_hex"] != preimage.hex():
+        out.append(f"[canonical] {where}: canonical_hex is not the domain, NUL and canonical body")
+    if case["authenticator"] != "valid":
+        out.append(f"[authenticator] {where}: authenticator is not 'valid'")
+    if kind == "custody_acknowledgement":
+        if not re.fullmatch(r"hkdf-sha256:[0-9a-f]{32}", art["key_id"]) \
+                or not re.fullmatch(r"hmac-sha256:[0-9a-f]{64}", art["mac"]):
+            return out + [refused("malformed", "key_id or mac shape")]
+        generation = mat["custody"].get(art["key_id"])
+        if generation is None:
+            return out + [refused("unknown_key", "custody key_id held by no generation")]
+        if not hmac.compare_digest(
+                "hmac-sha256:" + hmac.new(generation["secret"], preimage, hashlib.sha256).hexdigest(),
+                art["mac"]):
+            return out + [refused("bad_authenticator", "MAC does not verify under its generation")]
+    else:
+        sig = art["signature"]
+        if not re.fullmatch(r"ed25519:[A-Za-z0-9+/]{86}==", sig):
+            return out + [refused("malformed", "signature shape")]
+        key = mat["authority"].get(art["key_id"])
+        purpose = rules["purpose"][kind]
+        if key is None:
+            return out + [refused("unknown_key", "key_id held for no purpose")]
+        if key["purpose"] != purpose:
+            return out + [refused("wrong_purpose", f"key_id held for {key['purpose']}")]
+        if key["status"] not in ("active", "verify_only"):
+            return out + [refused("retired_key", f"key_id held {key['status']}")]
+        try:
+            Ed25519PublicKey.from_public_bytes(bytes.fromhex(key["public_key_hex"])).verify(
+                base64.b64decode(sig[len("ed25519:"):], validate=True), preimage)
+        except (InvalidSignature, ValueError):
+            return out + [refused("bad_authenticator", "signature does not verify under its key")]
+    if art["device_id"] != corpus["device"]["device_id"]:
+        return out + [refused("binding_mismatch", "device_id is not the receiver's")]
+    envelopes = {e["local_seq"]: e for e in corpus["sealed_envelopes"]}
+    if kind == "custody_acknowledgement":
+        env = envelopes.get(art["local_seq"])
+        if env is None:
+            out.append(refused(why["local_seq_unsealed"], "local_seq not sealed"))
+        elif env["envelope_digest"] != art["envelope_digest"]:
+            out.append(refused("binding_mismatch", "envelope_digest is not the sealed envelope's"))
+    elif kind == "delivery_receipt":
+        span = range(art["from_seq"], art["to_seq"] + 1)
+        if any(s not in envelopes for s in span):
+            out.append(refused(why["range_unsealed"], "the range includes a sequence not sealed"))
+        else:
+            digest = "sha256:" + hashlib.sha256(b"".join(
+                bytes.fromhex(envelopes[s]["chain_row_digest"].removeprefix("sha256:"))
+                for s in span)).hexdigest()
+            if digest != art["range_digest"]:
+                out.append(refused(why["range_digest"],
+                                   "range_digest is not over the sealed chain rows"))
+    elif kind == "epoch_confirmation":
+        if {"anchor_epoch_id": art["anchor_epoch_id"], "pubkey_hex": art["pubkey_hex"]} \
+                not in corpus["sealed_registrations"]:
+            out.append(refused("binding_mismatch", "epoch and key are not a sealed registration"))
+    else:
+        sealed = {e["envelope_digest"]: e["anchor_epoch_id"] for e in corpus["sealed_envelopes"]}
+        sealed |= {a["digest"]: a["anchor_epoch_id"] for a in corpus["sealed_artifacts"]}
+        if art["triggering_digest"] not in sealed:
+            out.append(refused("binding_mismatch", "triggering_digest names nothing sealed"))
+        elif art["anchor_epoch_id"] != sealed[art["triggering_digest"]] and not (
+                art["anchor_epoch_id"] == "" and art["scope"] == "artifact"):
+            out.append(refused("binding_mismatch", "anchor_epoch_id is not the sealed artifact's"))
+    return out
+
+
+# --- held state ---------------------------------------------------------------------------
+
+def projection_of(record: dict, members: set[str]) -> dict:
+    return {k: record[k] for k in sorted(members)}
+
+
+def check_state(state: Any, corpus: dict, where: str, projection: set[str]) -> list[str]:
+    """A held state these rules can reach."""
+    if not isinstance(state, dict) or list(state) != list(HELD_MEMBERS):
+        return [f"[state] {where}: members are not {list(HELD_MEMBERS)}"]
+    out: list[str] = []
+    for member, wanted in RECORD_MEMBERS.items():
+        records = state[member]
+        if not isinstance(records, list) or any(
+                not isinstance(r, dict) or set(r) != wanted for r in records):
+            out.append(f"[state] {where}: {member} records are not {sorted(wanted)}")
+            return out
+    sealed = {e["local_seq"] for e in corpus["sealed_envelopes"]}
+    for member in ("custody", "receipts"):
+        seqs = [r["local_seq"] for r in state[member]]
+        if seqs != sorted(set(seqs)) or not set(seqs) <= sealed:
+            out.append(f"[state] {where}: {member} not ascending, unique and sealed")
+    confirmed = {}
+    for record in state["epoch_confirmations"]:
+        binding = {"anchor_epoch_id": record["anchor_epoch_id"], "pubkey_hex": record["pubkey_hex"]}
+        if binding not in corpus["sealed_registrations"] or record["anchor_epoch_id"] in confirmed:
+            out.append(f"[state] {where}: confirmation for {record['anchor_epoch_id'][:15]} unreachable")
+        confirmed[record["anchor_epoch_id"]] = record
+    obligations = state["registration_obligations"]
+    if [{"anchor_epoch_id": o["anchor_epoch_id"], "pubkey_hex": o["pubkey_hex"]}
+            for o in obligations] != corpus["sealed_registrations"]:
+        out.append(f"[state] {where}: not one obligation per sealed registration, in order")
+    for o in obligations:
+        record = confirmed.get(o["anchor_epoch_id"])
+        if o["state"] not in ("open", "confirmed") or (o["state"] == "confirmed") is not (
+                record is not None) or (o["closed_at_ms"] is None) is not (o["state"] == "open"):
+            out.append(f"[state] {where}: obligation {o['anchor_epoch_id'][:15]} state")
+    active = state["active_epoch"]
+    if active is not None:
+        # An earlier receiver may have left a projection that disagrees with its confirmation
+        # record; the text leaves it as found, so only its shape and epoch are held here.
+        record = confirmed.get(active.get("anchor_epoch_id")) if isinstance(active, dict) else None
+        if record is None or set(active) != projection:
+            out.append(f"[state] {where}: active_epoch is not a projection of a held confirmation")
+    stops = []
+    for record in state["dispositions"]:
+        if record["scope"] == "epoch":
+            stops.append({"scope": "epoch", "anchor_epoch_id": record["anchor_epoch_id"]})
+        elif record["scope"] != "artifact":
+            out.append(f"[state] {where}: a {record['scope']} disposition is not modelled")
+    if state["stops"] != stops:
+        out.append(f"[state] {where}: stops are not those the held dispositions produce")
+    if type(state["application_storage_fault"]) is not bool:
+        out.append(f"[state] {where}: application_storage_fault is not a bool")
+    return out
+
+
+# --- the model ----------------------------------------------------------------------------
+
+def restates(kind: str, art: dict, held: dict) -> Any:
+    """The held record the artifact restates, or None when it names no held fact."""
+    if kind == "custody_acknowledgement":
+        return next((r for r in held["custody"] if r["local_seq"] == art["local_seq"]), None)
+    if kind == "delivery_receipt":
+        span = range(art["from_seq"], art["to_seq"] + 1)
+        held_seqs = [r for r in held["receipts"] if r["local_seq"] in span]
+        return held_seqs or None
+    if kind == "epoch_confirmation":
+        return next((r for r in held["epoch_confirmations"]
+                     if r["anchor_epoch_id"] == art["anchor_epoch_id"]), None)
+    return next((r for r in held["dispositions"] if r == disposition_record(art)), None)
+
+
+def disposition_record(art: dict) -> dict:
+    return {k: art[k] for k in RECORD_MEMBERS["dispositions"]}
+
+
+def decide(case: dict, corpus: dict, rules: dict) -> dict:
+    """The answer and every held record after, recomputed. `writes` counts changed records."""
+    kind, art = case["artifact_type"], case["artifact"]
+    before, now = case["held_before"], case["receiver_now_ms"]
+    after = copy.deepcopy(before)
+    rule = rules["agreement"][kind]
+    held = restates(kind, art, before)
+    expected, reason, applied, writes = "accept", None, None, 0
+    if kind == "custody_acknowledgement":
+        if held is None:
+            after["custody"].append({"local_seq": art["local_seq"], "custody_at_ms": art["custody_at_ms"],
+                                     "key_id": art["key_id"], "recorded_at_ms": now})
+            after["custody"].sort(key=lambda r: r["local_seq"])
+            writes = 1
+        elif rule[0] == "fields" and all(art[f] == held[f] for f in rule[1]):
+            if held["recorded_at_ms"] is None:
+                next(r for r in after["custody"] if r["local_seq"] == art["local_seq"])[
+                    "recorded_at_ms"] = now
+                writes = 1
+        else:
+            expected, reason = "reject", "restatement_conflict"
+    elif kind == "delivery_receipt":
+        if rule != ("always",):
+            fail("the receipt rule is no longer 'always agrees'; this checker has no other model")
+        have = {r["local_seq"] for r in before["receipts"]}
+        applied = [s for s in range(art["from_seq"], art["to_seq"] + 1) if s not in have]
+        after["receipts"] += [{"local_seq": s, "accepted_at_ms": art["accepted_at_ms"],
+                               "key_id": art["key_id"]} for s in applied]
+        after["receipts"].sort(key=lambda r: r["local_seq"])
+        writes = len(applied)
+    elif kind == "epoch_confirmation":
+        if held is not None:
+            if rule[0] != "fields" or any(art[f] != held[f] for f in rule[1]):
+                expected, reason = "reject", "restatement_conflict"
+        else:
+            record = {k: art[k] for k in RECORD_MEMBERS["epoch_confirmations"] - {"applied_at_ms"}}
+            record["applied_at_ms"] = now
+            after["epoch_confirmations"].append(record)
+            for o in after["registration_obligations"]:
+                if o["anchor_epoch_id"] == art["anchor_epoch_id"] and o["pubkey_hex"] == art["pubkey_hex"]:
+                    o["state"], o["closed_at_ms"] = "confirmed", now
+            writes = 2
+            if art["anchor_epoch_id"] == corpus["device"]["sealing_epoch"]:
+                after["active_epoch"] = projection_of(record, rules["projection"])
+                writes = 3
+    else:
+        if rule != ("byte_identical",):
+            fail("the disposition rule is no longer v2's byte-identical repeat")
+        if held is not None:
+            pass
+        elif art["scope"] in ("epoch", "identity") and any(
+                s["scope"] == art["scope"] and s.get("anchor_epoch_id") == art["anchor_epoch_id"]
+                for s in before["stops"]):
+            expected, reason = "reject", "superseded"
+        elif art["scope"] == "epoch":
+            after["dispositions"].append(disposition_record(art))
+            after["stops"].append({"scope": "epoch", "anchor_epoch_id": art["anchor_epoch_id"]})
+            writes = 2
+        else:
+            fail(f"{case['name']}: a {art['scope']} {art['disposition']} first application is "
+                 "not modelled; extend this checker from the text before adding it")
+    fault = case["store_fault"]
+    if fault is not None:
+        if fault not in STORE_FAULT_POINTS:
+            fail(f"[store_fault] {case['name']}: store_fault {fault!r} is not null or a point "
+                 f"{STORE_FAULT_POINTS}")
+        if fault == REFUSAL_RECORD:
+            # Only a decided refusal writes a refusal record: it is still answered, nothing held
+            # changes, and the failed write raises the signal.
+            if expected != "reject":
+                fail(f"[store_fault] {case['name']}: {fault} cannot occur on a decision that is "
+                     f"not a refusal")
+            after = copy.deepcopy(before)
+            after["application_storage_fault"] = True
+            return {"expected": "reject", "reason": reason, "applied": None, "after": after,
+                    "writes": 0}
+        written = writes if expected == "accept" else 0
+        if written < rules["fault_min_writes"][fault]:
+            fail(f"[store_fault] {case['name']}: {fault} cannot occur on a decision that writes "
+                 f"{written} record(s)")
+        # Every store fault rolls back, leaves the artifact undecided and raises the signal,
+        # whatever the decision would have been.
+        after = copy.deepcopy(before)
+        after["application_storage_fault"] = True
+        return {"expected": "undecided", "reason": None, "applied": None, "after": after,
+                "writes": writes}
+    if expected == "accept":
+        after["application_storage_fault"] = False
+    return {"expected": expected, "reason": reason,
+            "applied": applied if kind == "delivery_receipt" else None,
+            "after": after, "writes": writes}
+
+
+def compare_after(case: dict, got: dict, where: str) -> list[str]:
+    out = []
+    want, lit = got["after"], case["held_after"]
+    if not isinstance(lit, dict) or list(lit) != list(HELD_MEMBERS):
+        return [f"[held_after] {where}: members are not {list(HELD_MEMBERS)}"]
+    for member in HELD_MEMBERS:
+        if lit[member] != want[member]:
+            out.append(f"[held_after:{member}] {where}: {json.dumps(lit[member])[:120]} is not "
+                       f"{json.dumps(want[member])[:120]}")
+    return out
+
+
+CASE_KEYS = ("name", "artifact_type", "note", "receiver_now_ms", "held_before", "artifact",
+             "canonical_hex", "authenticator", "store_fault", "expected", "reject_reason",
+             "applied_sequences", "held_after")
+
+
+def check_case(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
+    where = case.get("name", "?")
+    if set(case) != set(CASE_KEYS):
+        return [f"[shape] {where}: keys are not {sorted(CASE_KEYS)}"]
+    if not isinstance(case["name"], str) or not isinstance(case["note"], str) \
+            or type(case["receiver_now_ms"]) is not int \
+            or case["expected"] not in ("accept", "reject", "undecided") \
+            or not (case["applied_sequences"] is None or (
+                isinstance(case["applied_sequences"], list)
+                and all(type(x) is int for x in case["applied_sequences"]))):
+        return [(f"[shape] {where}: name, note, receiver_now_ms, expected or applied_sequences "
+                 "has the wrong type or value")]
+    out = verify(case, corpus, rules, mat)
+    out += check_state(case["held_before"], corpus, where + " held_before", rules["projection"])
+    out += check_state(case["held_after"], corpus, where + " held_after", rules["projection"])
+    if out:
+        return out
+    if case["reject_reason"] is not None and case["reject_reason"] not in rules["reasons"]:
+        out.append(f"[reason] {where}: {case['reject_reason']!r} is outside the vocabulary")
+    try:
+        got = decide(case, corpus, rules)
+    except Failure as error:
+        text = str(error)
+        return out + [text if text.startswith("[store_fault]") else f"[model] {text}"]
+    if case["expected"] != got["expected"]:
+        out.append(f"[answer] {where}: expected {case['expected']!r}, the text gives "
+                   f"{got['expected']!r}")
+    if case["reject_reason"] != got["reason"]:
+        out.append(f"[reason] {where}: reject_reason {case['reject_reason']!r}, the text gives "
+                   f"{got['reason']!r}")
+    if case["applied_sequences"] != got["applied"]:
+        out.append(f"[applied_sequences] {where}: {case['applied_sequences']!r}, the text gives "
+                   f"{got['applied']!r}")
+    return out + compare_after(case, got, where)
+
+
+# --- coverage -----------------------------------------------------------------------------
+
+def _held(case: dict) -> Any:
+    return restates(case["artifact_type"], case["artifact"], case["held_before"])
+
+
+def _kind(name: str) -> Callable[[dict], bool]:
+    return lambda c: c["artifact_type"] == name
+
+
+def _plain(c: dict) -> bool:
+    return c["store_fault"] is None
+
+
+def _custody_gen(corpus: dict, key_id: str) -> str | None:
+    return next((s for s, g in corpus["custody_registry"].items() if g["key_id"] == key_id), None)
+
+
+def _redelivery(corpus: dict, kind: str) -> Callable[[dict], bool]:
+    def test(c: dict) -> bool:
+        return c["artifact_type"] == kind and _plain(c) and c["expected"] == "accept" and any(
+            f["artifact"] == c["artifact"] and f["store_fault"] is not None
+            and f["expected"] == "undecided" and f["held_after"] == c["held_before"]
+            for f in corpus["cases"])
+    return test
+
+
+def coverage_classes(corpus: dict) -> dict[str, Callable[[dict], bool]]:
+    """Every case class the Test vectors paragraph names, as a property of a case."""
+    cus, rec, con, dis = (_kind(k) for k in ARTIFACT_TITLES)
+    sealing = corpus["device"]["sealing_epoch"]
+
+    def gen(c: dict) -> str | None:
+        return _custody_gen(corpus, c["artifact"]["key_id"])
+
+    def held_gen(c: dict) -> str | None:
+        h = _held(c)
+        return _custody_gen(corpus, h["key_id"]) if h else None
+
+    def custody_restates(c: dict, same: bool, recorded: bool | None = None) -> bool:
+        h = _held(c)
+        return cus(c) and _plain(c) and h is not None \
+            and (h["custody_at_ms"] == c["artifact"]["custody_at_ms"]) is same \
+            and (recorded is None or (h["recorded_at_ms"] is not None) is recorded)
+
+    def receipt_union(c: dict, where: str) -> bool:
+        if not (rec(c) and _plain(c)):
+            return False
+        a = c["artifact"]
+        span = list(range(a["from_seq"], a["to_seq"] + 1))
+        have = {r["local_seq"] for r in c["held_before"]["receipts"]} & set(span)
+        if not have or have == set(span):
+            return False
+        held_part = [s for s in span if s in have]
+        if where == "prefix":
+            return held_part == span[:len(held_part)]
+        return held_part == span[-len(held_part):]
+
+    def confirmation_differs(c: dict, field: str) -> bool:
+        h = _held(c)
+        return con(c) and _plain(c) and h is not None and [
+            f for f in ("confirmed_at_ms", "actor", "key_id") if h[f] != c["artifact"][f]] == [field]
+
+    def earlier_restated(c: dict, agrees: bool) -> bool:
+        h, before = _held(c), c["held_before"]
+        return con(c) and _plain(c) and h is not None \
+            and c["artifact"]["anchor_epoch_id"] != sealing \
+            and any(r["anchor_epoch_id"] == sealing for r in before["epoch_confirmations"]) \
+            and (before["active_epoch"] or {}).get("anchor_epoch_id") == sealing \
+            and all(h[f] == c["artifact"][f] for f in ("confirmed_at_ms", "actor", "key_id")) is agrees
+
+    def fault(kind: Callable[[dict], bool], point: str) -> Callable[[dict], bool]:
+        return lambda c: kind(c) and c["store_fault"] == point
+
+    return {
+        "custody: a first acceptance": lambda c: cus(c) and _plain(c) and _held(c) is None,
+        "custody: a byte-identical repeat": lambda c: custody_restates(c, True, True)
+        and _held(c)["key_id"] == c["artifact"]["key_id"],
+        "custody: the held time under the verify_only generation, held under the active": lambda c:
+        custody_restates(c, True) and held_gen(c) == "active" and gen(c) == "verify_only",
+        "custody: the held time under the active generation, held under the verify_only": lambda c:
+        custody_restates(c, True) and held_gen(c) == "verify_only" and gen(c) == "active",
+        "custody: a different time under the active generation": lambda c:
+        custody_restates(c, False) and gen(c) == "active",
+        "custody: a different time under the verify_only generation": lambda c:
+        custody_restates(c, False) and gen(c) == "verify_only",
+        "custody: an agreeing restatement of custody held without a record time": lambda c:
+        custody_restates(c, True, False),
+        "custody: a conflicting restatement of custody held without a record time": lambda c:
+        custody_restates(c, False, False),
+        "custody: a store fault at commit": fault(cus, "at_commit"),
+        "custody: a conflicting restatement whose refusal record cannot be written": lambda c:
+        fault(cus, REFUSAL_RECORD)(c) and _held(c) is not None
+        and _held(c)["custody_at_ms"] != c["artifact"]["custody_at_ms"],
+        "custody: a store fault on reading the held record": lambda c:
+        fault(cus, "at_read")(c) and _held(c) is not None,
+        "receipt: an identical repeat": lambda c: rec(c) and _plain(c) and len(_held(c) or []) == (
+            c["artifact"]["to_seq"] - c["artifact"]["from_seq"] + 1) and all(
+            r["accepted_at_ms"] == c["artifact"]["accepted_at_ms"]
+            and r["key_id"] == c["artifact"]["key_id"] for r in _held(c)),
+        "receipt: a union over a held prefix": lambda c: receipt_union(c, "prefix"),
+        "receipt: a union over a held suffix": lambda c: receipt_union(c, "suffix"),
+        "receipt: a union whose held sequences were receipted under a verify_only key": lambda c:
+        rec(c) and _plain(c) and bool(_held(c))
+        and len(_held(c)) < c["artifact"]["to_seq"] - c["artifact"]["from_seq"] + 1
+        and all(corpus_key_status(corpus, r["key_id"]) == "verify_only" for r in _held(c))
+        and corpus_key_status(corpus, c["artifact"]["key_id"]) == "active",
+        "receipt: a store fault after the first sequence's write": fault(rec, "after_first_write"),
+        "receipt: a store fault at commit": fault(rec, "at_commit"),
+        "receipt: the redelivery after a fault": _redelivery(corpus, "delivery_receipt"),
+        "confirmation: an identical restatement": lambda c: con(c) and _plain(c)
+        and _held(c) is not None and all(_held(c)[f] == c["artifact"][f]
+                                         for f in ("confirmed_at_ms", "actor", "key_id")),
+        "confirmation: differing in confirmed_at_ms alone": lambda c:
+        confirmation_differs(c, "confirmed_at_ms"),
+        "confirmation: differing in actor alone": lambda c: confirmation_differs(c, "actor"),
+        "confirmation: differing in key_id alone": lambda c: confirmation_differs(c, "key_id"),
+        "confirmation: an agreeing restatement of an earlier epoch while the sealing epoch is "
+        "confirmed": lambda c: earlier_restated(c, True),
+        "confirmation: a conflicting restatement of an earlier epoch while the sealing epoch is "
+        "confirmed": lambda c: earlier_restated(c, False),
+        "confirmation: the sealing epoch while only an earlier epoch is confirmed": lambda c:
+        con(c) and _plain(c) and c["artifact"]["anchor_epoch_id"] == sealing and _held(c) is None
+        and bool(c["held_before"]["epoch_confirmations"]),
+        "confirmation: a store fault after the first write": fault(con, "after_first_write"),
+        "confirmation: a store fault at commit": fault(con, "at_commit"),
+        "disposition: a first application": lambda c: dis(c) and _plain(c) and _held(c) is None
+        and not c["held_before"]["stops"],
+        "disposition: a byte-identical repeat": lambda c: dis(c) and _plain(c) and _held(c) is not None,
+        "disposition: a superseded refusal": lambda c: dis(c) and _plain(c) and _held(c) is None
+        and any(s["scope"] == c["artifact"]["scope"] for s in c["held_before"]["stops"]),
+        "disposition: a store fault after the first write": fault(dis, "after_first_write"),
+        "disposition: a store fault at commit": fault(dis, "at_commit"),
+        "disposition: the redelivery after a fault": _redelivery(corpus, "evidence_disposition"),
+        "at_commit: a delivery receipt": fault(rec, "at_commit"),
+        "at_commit: an epoch confirmation": fault(con, "at_commit"),
+        "at_commit: an evidence disposition": fault(dis, "at_commit"),
+        "after_first_write: an epoch confirmation": fault(con, "after_first_write"),
+        "after_first_write: an evidence disposition": fault(dis, "after_first_write"),
+        "signal: a store fault while it is raised keeps it raised": lambda c:
+        c["store_fault"] is not None and c["held_before"]["application_storage_fault"] is True,
+        "signal: a refusal leaves it raised": lambda c: _plain(c)
+        and c["held_before"]["application_storage_fault"] is True and c["expected"] == "reject",
+        "signal: an agreeing restatement answered as applied clears it": lambda c: _plain(c)
+        and c["held_before"]["application_storage_fault"] is True and c["expected"] == "accept"
+        and _held(c) is not None,
+    }
+
+
+def corpus_key_status(corpus: dict, key_id: str) -> str | None:
+    return next((k["status"] for k in corpus["authority_key_registry"]["keys"]
+                 if k["key_id"] == key_id), None)
+
+
+def coverage(corpus: dict) -> list[str]:
+    out = [f"[coverage] not covered: {label}"
+           for label, test in coverage_classes(corpus).items()
+           if not any(_safe(test, c) for c in corpus["cases"])]
+    # The text: "The corpus exercises `at_read` and `at_refusal_record` once each, for custody".
+    for point in ("at_read", REFUSAL_RECORD):
+        hits = [c for c in corpus["cases"] if isinstance(c, dict) and c.get("store_fault") == point]
+        if len(hits) != 1 or hits[0].get("artifact_type") != "custody_acknowledgement":
+            out.append(f"[coverage] {point} is exercised {len(hits)} times, not once for custody")
+    return out
+
+
+def _safe(test: Callable[[dict], bool], case: dict) -> bool:
+    try:
+        return bool(test(case))
+    except (KeyError, TypeError, AttributeError, IndexError):
+        return False
+
+
+# --- the corpus ---------------------------------------------------------------------------
+
+TOP_KEYS = (
+    "contract", "device", "sealed_envelopes", "sealed_registrations", "sealed_artifacts",
+    "domains", "custody_registry", "authority_key_registry", "authority_seeds", "cases",
+)
+LABEL = "ori-specs evidence-exchange/v3 restated records"
+
+
+def check_corpus(corpus: dict, rules: dict) -> list[str]:
+    """Every disagreement; a corpus too malformed to read is one, never a crash."""
+    try:
+        return _check_corpus(corpus, rules)
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        return [(f"[malformed] the corpus cannot be read as this contract's: "
+                 f"{error.__class__.__name__} {error}")]
+
+
+def _check_corpus(corpus: dict, rules: dict) -> list[str]:
+    out: list[str] = []
+    if not isinstance(corpus, dict):
+        return ["[file] the corpus is not an object"]
+    # The text names the shared state and material; every other member is descriptive text.
+    if not set(TOP_KEYS) <= set(corpus) or any(
+            not isinstance(corpus[k], str) for k in set(corpus) - set(TOP_KEYS)):
+        return [(f"[file] top-level members lack {sorted(set(TOP_KEYS) - set(corpus))} or carry "
+                 "a non-descriptive member the text does not name")]
+    if corpus["contract"] != "evidence-exchange/v3":
+        out.append("[file] contract is not evidence-exchange/v3")
+    if {k: v.encode() + b"\0" for k, v in corpus["domains"].items()} != rules["domain"]:
+        out.append("[file] domains are not the contract's")
+    for env in corpus["sealed_envelopes"]:
+        for member, label in (("chain_row_digest", "chain row"), ("envelope_digest", "envelope")):
+            want = "sha256:" + hashlib.sha256(f"{LABEL} {label} {env['local_seq']}".encode()).hexdigest()
+            if env[member] != want:
+                out.append(f"[file] sealed envelope {env['local_seq']} {member}")
+    for i, art in enumerate(corpus["sealed_artifacts"], 1):
+        if art["digest"] != "sha256:" + hashlib.sha256(f"{LABEL} checkpoint {i}".encode()).hexdigest():
+            out.append(f"[file] sealed artifact {i} digest")
+    if corpus["device"]["sealing_epoch"] not in [r["anchor_epoch_id"]
+                                                 for r in corpus["sealed_registrations"]]:
+        out.append("[file] the sealing epoch is no sealed registration")
+    mat = material(corpus, rules, out)
+    names = [c.get("name") for c in corpus["cases"]]
+    if len(set(names)) != len(names):
+        out.append("[file] case names repeat")
+    for case in corpus["cases"]:
+        out += check_case(case, corpus, rules, mat)
+    out += coverage(corpus)
+    return out
+
+
+# --- mutations ----------------------------------------------------------------------------
+
+def _resign(case: dict, corpus: dict, rules: dict) -> None:
+    kind, art = case["artifact_type"], case["artifact"]
+    tag = AUTHENTICATOR.get(kind, "signature")
+    body = {k: v for k, v in art.items() if k != tag}
+    preimage = rules["domain"][kind] + canonical(body)
+    case["canonical_hex"] = preimage.hex()
+    if kind == "custody_acknowledgement":
+        secret = next(bytes.fromhex(g["secret_hex"]) for g in corpus["custody_registry"].values()
+                      if g["key_id"] == art["key_id"])
+        art["mac"] = "hmac-sha256:" + hmac.new(secret, preimage, hashlib.sha256).hexdigest()
+    else:
+        seed = bytes.fromhex(corpus["authority_seeds"][art["key_id"]])
+        art["signature"] = "ed25519:" + base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(seed).sign(preimage)).decode()
+
+
+def _flip_char(value: str) -> str:
+    """One character of an authenticator's body changed, its shape kept."""
+    k = len(value) // 2
+    return value[:k] + ("B" if value[k] != "B" else "C") + value[k + 1:] if value.startswith(
+        "ed25519:") else value[:-1] + ("0" if value[-1] != "0" else "1")
+
+
+def _first(corpus: dict, kind: str) -> int:
+    return next(i for i, c in enumerate(corpus["cases"]) if c["artifact_type"] == kind
+                and c["store_fault"] is None)
+
+
+def vocabulary_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """Each defect the vocabulary names, introduced into one re-signed artifact: it must be
+    refused for that reason, as this script reads the text, and for no other."""
+    rec, cus = _first(corpus, "delivery_receipt"), _first(corpus, "custody_acknowledgement")
+    con, dis = _first(corpus, "epoch_confirmation"), _first(corpus, "evidence_disposition")
+    receipt_key = next(k["key_id"] for k in corpus["authority_key_registry"]["keys"]
+                       if k["purpose"] == "evidence_authority_receipt" and k["status"] == "active")
+
+    def resigned(i: int, **changes: Any) -> Callable[[dict], Any]:
+        return lambda c: (c["cases"][i]["artifact"].update(changes), _resign(c["cases"][i], c, rules))
+
+    edits = [
+        ("receipt from_seq below 1", "non_contiguous_range", resigned(rec, from_seq=0)),
+        ("receipt to_seq below from_seq", "non_contiguous_range", resigned(rec, from_seq=3, to_seq=2)),
+        ("receipt range past the sealed sequences", "unknown_sequence", resigned(rec, to_seq=9)),
+        ("receipt range_digest over other rows", "binding_mismatch",
+         resigned(rec, range_digest="sha256:" + "0" * 64)),
+        ("receipt v 2", "unrecognised_version", resigned(rec, v=2)),
+        ("custody v 2", "unrecognised_version", resigned(cus, v=2)),
+        ("confirmation v 2", "unrecognised_version", resigned(con, v=2)),
+        ("disposition v 2", "malformed", resigned(dis, v=2)),
+        ("disposition widened to identity", "malformed", resigned(dis, scope="identity")),
+        ("custody local_seq not sealed", "unknown_sequence", resigned(cus, local_seq=9)),
+        ("custody for another device", "binding_mismatch", resigned(cus, device_id="other-device")),
+        ("confirmation for an unsealed epoch", "binding_mismatch",
+         resigned(con, anchor_epoch_id="sha256:" + "1" * 64)),
+        ("disposition for an unsealed artifact", "binding_mismatch",
+         resigned(dis, triggering_digest="sha256:" + "2" * 64)),
+        ("confirmation under the receipt key", "wrong_purpose", resigned(con, key_id=receipt_key)),
+        ("receipt key_id unknown", "unknown_key", lambda c: c["cases"][rec]["artifact"].update(
+            key_id="sha256:" + "3" * 64)),
+        ("custody mac shape", "malformed", lambda c: c["cases"][cus]["artifact"].update(
+            mac="hmac-sha256:" + "A" * 64)),
+    ]
+    return [(f"vocabulary: {label}", f"[refused:{reason}]", edit) for label, reason, edit in edits]
+
+
+DECISION = ("[answer]", "[reason]", "[applied_sequences]", "[held_after")
+
+
+def resigned_value(case: dict, corpus: dict) -> tuple[str, Any] | None:
+    """A value for one signed field that changes what the text decides, or None."""
+    if case["store_fault"] is not None:
+        return None
+    kind, art = case["artifact_type"], case["artifact"]
+    held = restates(kind, art, case["held_before"])
+    if kind == "custody_acknowledgement":
+        if held is not None and held["custody_at_ms"] != art["custody_at_ms"]:
+            return "custody_at_ms", held["custody_at_ms"]
+        return "custody_at_ms", art["custody_at_ms"] + 7
+    if kind == "epoch_confirmation":
+        differs = [f for f in ("confirmed_at_ms", "actor", "key_id")
+                   if held is not None and held[f] != art[f]]
+        if held is not None and len(differs) == 1:
+            return differs[0], held[differs[0]]
+        return ("confirmed_at_ms", art["confirmed_at_ms"] + 7) if not differs else None
+    if kind == "delivery_receipt":
+        return ("accepted_at_ms", art["accepted_at_ms"] + 7) if case["applied_sequences"] else None
+    if case["reject_reason"] == "superseded":
+        return None
+    return "decided_at_ms", art["decided_at_ms"] + 7
+
+
+def corpus_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """(label, the failure tag that must newly appear, edit)."""
+    out: list[tuple[str, Any, Callable[[dict], Any]]] = []
+    for i, case in enumerate(corpus["cases"]):
+        n = case["name"]
+        kind = case["artifact_type"]
+        flips = {"accept": "reject", "reject": "accept", "undecided": "accept"}
+        out.append((f"{n}: answer flipped", "[answer]",
+                    lambda c, i=i, f=flips: c["cases"][i].update(expected=f[c["cases"][i]["expected"]])))
+        out.append((f"{n}: reason changed", "[reason]", lambda c, i=i: c["cases"][i].update(
+            reject_reason="binding_mismatch" if c["cases"][i]["reject_reason"] else "restatement_conflict")))
+        if case["reject_reason"] == "restatement_conflict":
+            out.append((f"{n}: superseded for a conflict", "[reason]",
+                        lambda c, i=i: c["cases"][i].update(reject_reason="superseded")))
+        if case["reject_reason"] == "superseded":
+            out.append((f"{n}: restatement_conflict for superseded", "[reason]",
+                        lambda c, i=i: c["cases"][i].update(reject_reason="restatement_conflict")))
+        out.append((f"{n}: signal after flipped", "[held_after:application_storage_fault]",
+                    lambda c, i=i: c["cases"][i]["held_after"].update(
+                        application_storage_fault=not c["cases"][i]["held_after"][
+                            "application_storage_fault"])))
+        for member in ("custody", "receipts", "epoch_confirmations", "dispositions"):
+            records = case["held_after"][member]
+            for j, record in enumerate(records):
+                for field, value in record.items():
+                    if field in ("local_seq", "anchor_epoch_id", "triggering_digest", "pubkey_hex"):
+                        continue
+                    other = (value + 1 if isinstance(value, int) else
+                             1787000000001 if value is None else value + "x")
+                    out.append((f"{n}: held_after {member}[{j}].{field} changed",
+                                f"[held_after:{member}]",
+                                lambda c, i=i, m=member, j=j, f=field, o=other:
+                                c["cases"][i]["held_after"][m][j].update({f: o})))
+            if records:
+                out.append((f"{n}: held_after {member} record dropped", f"[held_after:{member}]",
+                            lambda c, i=i, m=member: c["cases"][i]["held_after"][m].pop()))
+        # The held state the decision reads, changed: the answer, the applied sequences or the
+        # records after must move with it.
+        if case["held_before"]["receipts"]:
+            out.append((f"{n}: held_before receipts lose their first sequence", DECISION,
+                        lambda c, i=i: c["cases"][i]["held_before"]["receipts"].pop(0)))
+        if case["held_before"]["custody"]:
+            out.append((f"{n}: held_before custody time moved", DECISION,
+                        lambda c, i=i: c["cases"][i]["held_before"]["custody"][0].update(
+                            custody_at_ms=c["cases"][i]["held_before"]["custody"][0]["custody_at_ms"] + 1)))
+        for j, _ in enumerate(case["held_after"]["registration_obligations"]):
+            out.append((f"{n}: obligation {j} reopened or closed", "[held_after:registration_obligations]",
+                        lambda c, i=i, j=j: c["cases"][i]["held_after"]["registration_obligations"][j]
+                        .update(closed_at_ms=(c["cases"][i]["held_after"]["registration_obligations"][j]
+                                              ["closed_at_ms"] or 0) + 1)))
+        if case["held_after"]["active_epoch"] is not None:
+            out.append((f"{n}: projection moved", "[held_after:active_epoch]",
+                        lambda c, i=i: c["cases"][i]["held_after"].update(active_epoch=None)))
+        # The effective epoch is the projection's: moving it, or the projection losing a member,
+        # is a held-record change.
+        after_confirmed = case["held_after"]["epoch_confirmations"]
+        active = case["held_after"]["active_epoch"]
+        if kind == "epoch_confirmation" and _held(case) is not None \
+                and case["held_before"]["active_epoch"] is not None:
+            out.append((f"{n}: a disagreeing projection before is repaired after",
+                        "[held_after:active_epoch]",
+                        lambda c, i=i: c["cases"][i]["held_before"]["active_epoch"].update(
+                            actor="left-by-an-earlier-receiver")))
+        if active is not None:
+            out.append((f"{n}: projection loses device_id", "[held_after:active_epoch]",
+                        lambda c, i=i: c["cases"][i]["held_after"]["active_epoch"].pop("device_id")))
+            out.append((f"{n}: projection names another actor", "[held_after:active_epoch]",
+                        lambda c, i=i: c["cases"][i]["held_after"]["active_epoch"].update(
+                            actor="another@elsewhere")))
+        for j, record in enumerate(after_confirmed):
+            if active is None or record["anchor_epoch_id"] != active["anchor_epoch_id"]:
+                out.append((f"{n}: effective epoch moved to confirmation {j}",
+                            "[held_after:active_epoch]",
+                            lambda c, i=i, j=j: c["cases"][i]["held_after"].update(active_epoch={
+                                k: v for k, v in c["cases"][i]["held_after"]["epoch_confirmations"][j]
+                                .items() if k != "applied_at_ms"})))
+        # Store faults: on the read even a refusal is undecided; after_first_write needs an
+        # application of more than one record, and at_commit one of at least one.
+        if case["store_fault"] is None:
+            out.append((f"{n}: a fault on the read", DECISION,
+                        lambda c, i=i: c["cases"][i].update(store_fault="at_read")))
+            # A refusal record that cannot be written: on a refusal the signal must rise; on
+            # anything else the point cannot occur.
+            # A refusal with the signal already raised is equivalent: the answer and every
+            # record stay, and the signal stays raised.
+            if not (case["expected"] == "reject" and case["held_before"]["application_storage_fault"]):
+                out.append((f"{n}: its refusal record unwritable",
+                            DECISION if case["expected"] == "reject" else "[store_fault]",
+                            lambda c, i=i: c["cases"][i].update(store_fault=REFUSAL_RECORD)))
+        elif case["store_fault"] == REFUSAL_RECORD:
+            out.append((f"{n}: answered undecided", ("[answer]", "[reason]"),
+                        lambda c, i=i: c["cases"][i].update(expected="undecided", reject_reason=None)))
+            out.append((f"{n}: the failed write leaves the signal down",
+                        "[held_after:application_storage_fault]",
+                        lambda c, i=i: c["cases"][i]["held_after"].update(
+                            application_storage_fault=False)))
+        else:
+            underlying = decide({**case, "store_fault": None}, corpus, rules)["expected"]
+            out.append((f"{n}: {REFUSAL_RECORD} where the decision is {underlying}",
+                        DECISION if underlying == "reject" else "[store_fault]",
+                        lambda c, i=i: c["cases"][i].update(store_fault=REFUSAL_RECORD)))
+            writes = decide({**case, "store_fault": None}, corpus, rules)
+            written = writes["writes"] if writes["expected"] == "accept" else 0
+            for point, least in rules["fault_min_writes"].items():
+                if written < least:
+                    out.append((f"{n}: {point} where it cannot occur", "[store_fault]",
+                                lambda c, i=i, p=point: c["cases"][i].update(store_fault=p)))
+        if case["held_after"]["stops"]:
+            out.append((f"{n}: stop lifted", "[held_after:stops]",
+                        lambda c, i=i: c["cases"][i]["held_after"]["stops"].clear()))
+        tag = AUTHENTICATOR.get(kind, "signature")
+        out.append((f"{n}: authenticator corrupted", "[refused:bad_authenticator]",
+                    lambda c, i=i, t=tag: c["cases"][i]["artifact"].update(
+                        {t: _flip_char(c["cases"][i]["artifact"][t])})))
+        out.append((f"{n}: canonical_hex not the preimage", "[canonical]",
+                    lambda c, i=i: c["cases"][i].update(
+                        canonical_hex=c["cases"][i]["canonical_hex"][2:])))
+        if kind == "delivery_receipt":
+            out.append((f"{n}: applied_sequences dropped one", "[applied_sequences]",
+                        lambda c, i=i: c["cases"][i].update(applied_sequences=(
+                            c["cases"][i]["applied_sequences"] or [9])[:-1] or [1, 2, 3, 4])))
+            out.append((f"{n}: range_digest re-signed over other rows", "[refused:binding_mismatch]",
+                        lambda c, i=i, r=rules, cc=corpus: (
+                            c["cases"][i]["artifact"].update(
+                                range_digest="sha256:" + hashlib.sha256(b"other").hexdigest()),
+                            _resign(c["cases"][i], c, r))))
+        else:
+            out.append((f"{n}: applied_sequences invented", "[applied_sequences]",
+                        lambda c, i=i: c["cases"][i].update(applied_sequences=[1])))
+        out.append((f"{n}: store_fault point swapped", (*DECISION, "[store_fault]"),
+                    lambda c, i=i: c["cases"][i].update(store_fault=None if c["cases"][i]["store_fault"]
+                                                        else "at_commit")))
+        # A re-signed artifact that says something else, chosen so the text's rule moves the
+        # decision: the literal answer or held records must then be refused.
+        moved = resigned_value(case, corpus)
+        if moved is not None:
+            field, value = moved
+            out.append((f"{n}: {field} re-signed to move the decision", DECISION,
+                        lambda c, i=i, f=field, v=value, r=rules: (
+                            c["cases"][i]["artifact"].update({f: v}),
+                            _resign(c["cases"][i], c, r))))
+    out += vocabulary_mutants(corpus, rules)
+    for label in coverage_classes(corpus):
+        out.append((f"without {label}", "[coverage]",
+                    lambda c, label=label: c.update(cases=[
+                        x for x in c["cases"] if not _safe(coverage_classes(c)[label], x)])))
+    return out
+
+
+# Each rule changed in the text as if re-pinned: the corpus that contradicts it must be refused.
+REPINS = (
+    ("the projection drops device_id",
+     "Its members are `device_id`, `anchor_epoch_id`,", "Its members are `anchor_epoch_id`,",
+     "`{device_id, anchor_epoch_id, pubkey_hex, actor, confirmed_at_ms, key_id}`, or `null`",
+     "`{anchor_epoch_id, pubkey_hex, actor, confirmed_at_ms, key_id}`, or `null`"),
+    ("confirmation agreement ignores key_id",
+     "| Epoch confirmation | Its `confirmed_at_ms`, `actor` and `key_id` each equal",
+     "| Epoch confirmation | Its `confirmed_at_ms` and `actor` each equal"),
+    ("confirmation agreement ignores actor",
+     "| Epoch confirmation | Its `confirmed_at_ms`, `actor` and `key_id` each equal",
+     "| Epoch confirmation | Its `confirmed_at_ms` and `key_id` each equal"),
+    ("custody agreement adds the generation",
+     "| Custody acknowledgement | Its `custody_at_ms` equals the held one",
+     "| Custody acknowledgement | Its `custody_at_ms` and `key_id` each equal the held one",
+     "| Its `custody_at_ms` differs from the held one, under either generation. |",
+     "| Its `custody_at_ms` or `key_id` differs from the held one, under either generation. |"),
+    ("custody agreement compares the envelope only",
+     "| Custody acknowledgement | Its `custody_at_ms` equals the held one",
+     "| Custody acknowledgement | Its `envelope_digest` equals the held one",
+     "| Its `custody_at_ms` differs from the held one, under either generation. |",
+     "| Its `envelope_digest` differs from the held one, under either generation. |"),
+    ("custody domain renamed", "`ori.evidence_custody_ack.v1\\0`", "`ori.evidence_custody_ack.v2\\0`"),
+    ("receipt purpose swapped",
+     "| `ori.evidence_delivery_receipt.v1\\0` | Ed25519 | `evidence_authority_receipt` |",
+     "| `ori.evidence_delivery_receipt.v1\\0` | Ed25519 | `evidence_authority_epoch` |"),
+    ("epoch_reprovisioning_required widened to identity",
+     "| `epoch_reprovisioning_required` | `epoch` | yes |",
+     "| `epoch_reprovisioning_required` | `identity` | yes |"),
+    ("restatement_conflict dropped from the vocabulary",
+     "| `restatement_conflict` | A verified artifact conflicts", "| `conflict` | A verified artifact conflicts"),
+)
+
+
+# Each restatement of a rule elsewhere in the contract, reworded to say something else. Each must
+# fail both the pin and the rule the model reads.
+REWORDINGS = (
+    ("what changed", "and neither answer changes\n  the held record.",
+     "and an agreeing answer\n  may update the held record."),
+    ("custody pointer", "a restatement, decided under [Restated records](#restated-records).\n\n### Delivery receipt",
+     "a restatement, and replaces the held record.\n\n### Delivery receipt"),
+    ("receipt pointer", "receipted applies it as [Restated records](#restated-records) says.",
+     "receipted replaces their receipt records."),
+    ("confirmation pointer", ("verified confirmation for an epoch already confirmed is a restatement, "
+                              "decided\nunder [Restated records](#restated-records)."),
+     "verified confirmation for an epoch already confirmed replaces the held confirmation."),
+    ("invariant", "- The first record of a fact is final.", "- The latest record of a fact is final."),
+    ("superseded third answer", "It neither agrees nor conflicts, and it changes nothing.",
+     "It conflicts, and it changes nothing."),
+    ("projection repaired", "is left as found: neither answer to a restatement repairs or rewrites it.",
+     "is repaired from the confirmation record by an agreeing restatement."),
+    ("store constraint", "is a defect in the receiver, never a store fault:",
+     "is a store fault, not a defect in the receiver:"),
+    ("refusal record", "it still answers the refusal with its reason, every held record stays",
+     "it leaves the artifact undecided, every held record stays"),
+    ("refusal unacknowledged", "is acknowledged as that refusal.", "is not acknowledged."),
+    ("invariant drops the exception", "every held record as it was and still answers that refusal.",
+     "the artifact undecided."),
+    ("refusal record not a store fault",
+     "committing an application, or writing the record of a refusal it has decided.",
+     "committing an application."),
+    ("refusal-record point", "The corpus calls this point `at_refusal_record`.",
+     "The corpus calls this point `at_commit`."),
+)
+
+
+def text_mutants(texts: dict) -> list[tuple[str, dict]]:
+    out = []
+    for source, start_marker, end_marker in TEXT_BLOCKS:
+        body = texts[source]
+        start, end = _block(body, start_marker, end_marker, source)
+        block = body[start:end]
+        for unit in _block_units(block):
+            pattern = r"\s+".join(re.escape(w) for w in unit.split())
+            edited_block, count = re.subn(pattern, "", block, count=1)
+            if count != 1:
+                out.append((f"unit not removable from its block: {unit[:60]}", {}))
+                continue
+            edited = dict(texts)
+            edited[source] = body[:start] + edited_block + body[end:]
+            out.append((f"unit removed: {unit[:60]}", edited))
+    return out
+
+
+def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tuple[int, list[str]]:
+    survived: list[str] = []
+    count = 0
+    for label, edited in text_mutants(texts):
+        count += 1
+        if not edited:
+            survived.append(label)
+            continue
+        try:
+            check_contract_text(edited)
+        except Failure:
+            continue
+        survived.append(label)
+    for key, sentence in REQUIRED_SENTENCES.items():
+        count += 1
+        edited = dict(texts)
+        source = CONTRACT if _norm(sentence) in _norm(texts[CONTRACT]) else HEALTH
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        edited[source], n = re.subn(pattern, sentence.rsplit(" ", 1)[0].replace("\\", "\\\\"),
+                                    texts[source], count=1)
+        if n != 1:
+            survived.append(f"re-pin mutant for {key!r} matches nothing")
+            continue
+        try:
+            contract_rules(edited)
+        except Failure:
+            continue
+        survived.append(f"re-pin: {key} reworded")
+    for label, old, new in REWORDINGS:
+        count += 1
+        pattern = r"\s+".join(re.escape(w) for w in old.split())
+        changed, hits = re.subn(pattern, lambda _m, new=new: new, texts[CONTRACT])
+        if hits != 1:
+            survived.append(f"rewording {label!r} matches {hits} places")
+            continue
+        edited = {**texts, CONTRACT: changed}
+        try:
+            check_contract_text(edited)
+            survived.append(f"rewording {label!r} passes the pin")
+            continue
+        except Failure:
+            pass
+        try:
+            contract_rules(edited)
+        except Failure:
+            continue
+        survived.append(f"rewording {label!r} passes the rules")
+    base_set = set(base)
+    for label, *pairs in REPINS:
+        count += 1
+        edited = dict(texts)
+        body = texts[CONTRACT]
+        missing = [old for old in pairs[::2] if body.count(old) != 1]
+        if missing:
+            survived.append(f"re-pin mutant {label!r} does not match once: {missing[0][:60]}")
+            continue
+        for old, new in zip(pairs[::2], pairs[1::2], strict=True):
+            body = body.replace(old, new)
+        edited[CONTRACT] = body
+        # A re-pin must still read as a contract: the corpus, not the parser, refuses it.
+        try:
+            found = check_corpus(corpus, contract_rules(edited))
+        except Failure as error:
+            survived.append(f"re-pin: {label} unreadable ({error})")
+            continue
+        if set(found) - base_set:
+            continue
+        survived.append(f"re-pin: {label}")
+    for label, wanted, edit in corpus_mutants(corpus, rules):
+        count += 1
+        bad = copy.deepcopy(corpus)
+        try:
+            edit(bad)
+        except (KeyError, TypeError, StopIteration, IndexError) as error:
+            survived.append(f"{label}: mutant not constructible ({error.__class__.__name__})")
+            continue
+        if bad == corpus:
+            survived.append(f"{label}: mutant changes nothing")
+            continue
+        try:
+            found = check_corpus(bad, rules)
+        except Failure as error:
+            found = [f"[model] {error}"]
+        new = [f for f in found if f not in base_set]
+        tags = wanted if isinstance(wanted, tuple) else (wanted,)
+        other = [f for f in new if f.startswith("[refused:") and not f.startswith(tags)]
+        if other:
+            survived.append(f"{label}: refused for {other[0]}, not {wanted}")
+            continue
+        if any(f.startswith(tags) or ("[held_after" in tags or any(
+                t.startswith("[held_after") for t in tags))
+               and f.startswith("[state]") and " held_after:" in f for f in new):
+            continue
+        survived.append(f"{label}: refused for {new[:1] or 'nothing'}, not {wanted}")
+    return count, survived
+
+
+def main(argv: list[str]) -> int:
+    texts = read_texts()
+    if argv == ["--print-units"]:
+        print(json.dumps(units_of(texts), indent=2, ensure_ascii=False))
+        return 0
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        check_contract_text(texts)
+        rules = contract_rules(texts)
+        corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+        found = check_corpus(corpus, rules)
+    except (Failure, ValueError, OSError) as failure:
+        print(f"{NAME}: {failure}", file=sys.stderr)
+        return 1
+    status = 0
+    if found:
+        print(f"{NAME}: {len(found)} disagreement(s) between the corpus and the contract:",
+              file=sys.stderr)
+        for line in found:
+            print(f"  {line}", file=sys.stderr)
+        status = 1
+    if argv == ["--mutations"]:
+        count, survived = run_mutations(texts, corpus, rules, found)
+        if survived:
+            for line in survived:
+                print(f"mutant survived: {line[:160]}", file=sys.stderr)
+            return 1
+        print(f"{NAME}: {count} mutants refused, each for its intended reason")
+    if status == 0:
+        print(f"{NAME}: corpus agrees with the contract ({len(corpus['cases'])} cases, "
+              f"{len(coverage_classes(corpus))} case classes covered)")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

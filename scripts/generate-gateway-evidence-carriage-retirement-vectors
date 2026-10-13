@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-evidence-carriage/v1 inbound retirement corpus.
+
+Writes gateway-evidence-carriage/vectors/inbound-retirement-v1.json: what a
+courier does with the head of a device's return lane for each ingest
+acknowledgement a runtime can send, for an unrecognised reason, and for no
+acknowledgement at all. Expected values come from a small model of the
+retirement rule; each case quotes the carriage/v1 clause that decides it, and
+generation stops when a quoted clause is no longer in the text. The checker is
+written separately and shares no code with this file.
+
+    python3 scripts/generate-gateway-evidence-carriage-retirement-vectors          # write
+    python3 scripts/generate-gateway-evidence-carriage-retirement-vectors --check  # compare
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-evidence-carriage" / "v1.md"
+OUT = ROOT / "gateway-evidence-carriage" / "vectors" / "inbound-retirement-v1.json"
+NAME = "generate-gateway-evidence-carriage-retirement-vectors"
+
+# The evidence-exchange/v3 receiver rejection vocabulary, each with whether a
+# refusal for it retires and the carriage/v1 table cell that says why.
+REASONS = [
+    ("malformed", True,
+     "The bytes. They are not a well-formed artifact and will not become one."),
+    ("bad_authenticator", True,
+     "The bytes and the named key. The authenticator does not verify, and resending cannot change that."),
+    ("binding_mismatch", True,
+     "The bytes. The artifact is about another device, another key, or an artifact this runtime never "
+     "sealed, or a receipt's range digest does not match the chain rows sealed for its range."),
+    ("non_contiguous_range", True, "The bytes. The claimed range is not a closed interval."),
+    ("unrecognised_version", False,
+     "Receiver capability. A later release may interpret that version."),
+    ("wrong_purpose", False,
+     "Receiver state. The purpose a `key_id` is held under is registry state, not something readable "
+     "from the artifact."),
+    ("unknown_key", False, "Receiver state. A later release may ship the authority key."),
+    ("retired_key", False, "Receiver state, resolved by operator action."),
+    ("unknown_sequence", False, "Receiver state. The envelope may not be sealed yet."),
+    ("superseded", True,
+     "The runtime's durable resolution of the disposition's subject, which never reverts."),
+    ("restatement_conflict", True,
+     "The bytes against a final record the runtime holds, verified and immutable, which never reverts."),
+]
+
+APPLIED_CLAUSE = ("The runtime therefore publishes an ingest acknowledgement, and the gateway retires an "
+                  "artifact from its durable queue only on receiving one.")
+UNKNOWN_CLAUSE = ("A gateway accepts and retires on a reason before any runtime it serves sends it; a "
+                  "gateway that does not recognise a reason cannot retire the artifact, and holds it at "
+                  "the head of that device's lane as a non-retiring refusal.")
+NO_ACK_CLAUSE = ("The courier keeps the artifact, as it keeps any artifact it holds no acknowledgement for, "
+                 "and redelivers it in a newly signed envelope.")
+
+
+def norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def case(name: str, acknowledgement: dict | None, retire: bool, redelivery: str | None,
+         clause: str, note: str) -> dict:
+    return {
+        "name": name,
+        "note": note,
+        "acknowledgement": acknowledgement,
+        "retire": retire,
+        "head": "retired" if retire else "kept",
+        "redelivery": redelivery,
+        "clause": clause,
+    }
+
+
+def build() -> str:
+    text = norm(CONTRACT.read_text(encoding="utf-8"))
+    cases = [case("applied", {"outcome": "applied", "reason": ""}, True, None, APPLIED_CLAUSE,
+                  "An acknowledgement that the runtime applied the artifact retires it.")]
+    for reason, retire, clause in REASONS:
+        cases.append(case(
+            f"refused_{reason}", {"outcome": "refused", "reason": reason}, retire,
+            None if retire else "on_state_change", clause,
+            f"A refusal for {reason} "
+            + ("retires the artifact." if retire else
+               "keeps the artifact at the head of its lane until a relevant runtime state change.")))
+    cases.append(case(
+        "refused_unrecognised_reason", {"outcome": "refused", "reason": "not_a_contract_reason"}, False,
+        "on_state_change", UNKNOWN_CLAUSE,
+        "A refusal naming a reason outside the vocabulary is held as a non-retiring refusal."))
+    cases.append(case(
+        "no_acknowledgement_after_store_fault", None, False, "fresh_envelope", NO_ACK_CLAUSE,
+        "The runtime's store faulted: it released the broker message and sent no acknowledgement. The "
+        "head stays and is redelivered in a newly signed envelope."))
+    for c in cases:
+        if norm(c["clause"]) not in text:
+            raise SystemExit(f"{NAME}: the clause for {c['name']} is not in {CONTRACT.relative_to(ROOT)}")
+    vocabulary = [r for r, _, _ in REASONS]
+    assert len(set(vocabulary)) == len(vocabulary)
+    corpus = {
+        "vector_set": "gateway-evidence-carriage/v1 inbound retirement",
+        "contract": "gateway-evidence-carriage/v1",
+        "vocabulary": vocabulary,
+        "vocabulary_source": "evidence-exchange/v3 receiver rejection vocabulary",
+        "cases": cases,
+    }
+    return json.dumps(corpus, indent=2, ensure_ascii=False) + "\n"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args != ["--check"]:
+        print(__doc__)
+        return 0 if args[0] in ("-h", "--help") else 2
+    text = build()
+    if args == ["--check"]:
+        if not OUT.exists() or OUT.read_text(encoding="utf-8") != text:
+            print(f"{NAME}: {OUT.relative_to(ROOT)} is not what the generator produces", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    OUT.write_text(text, encoding="utf-8")
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

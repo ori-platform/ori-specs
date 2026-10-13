@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the evidence-exchange/v3 restated-records receiver-state corpus.
+
+Writes evidence-exchange/vectors/receiver-state/restated-records-v3.json. Each
+case is the runtime's held records before an inbound artifact, the artifact,
+an optional injected store fault, the answer, and the held records after.
+Expected values come from a small model of evidence-exchange/v3 Restated
+records, All or nothing and Store faults, and of runtime-health/v4's
+application-storage fault signal. Signing material is read from the published
+v2 corpora; nothing new is minted. The checker is written separately and
+shares no code with this file.
+
+Run from the repository root:
+
+    python3 scripts/generate-evidence-exchange-receiver-state-vectors-v3          # write
+    python3 scripts/generate-evidence-exchange-receiver-state-vectors-v3 --check  # compare
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import sys
+from typing import Any
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VECTORS = ROOT / "evidence-exchange" / "vectors"
+OUT = VECTORS / "receiver-state" / "restated-records-v3.json"
+NAME = "generate-evidence-exchange-receiver-state-vectors-v3"
+
+CUSTODY_DOMAIN = "ori.evidence_custody_ack.v1"
+RECEIPT_DOMAIN = "ori.evidence_delivery_receipt.v1"
+EPOCH_DOMAIN = "ori.evidence_epoch_confirmation.v1"
+DISPOSITION_DOMAIN = "ori.evidence_disposition.v1"
+
+DEVICE_ID = "energy-monitor-ikeja-01"
+T0 = 1787000000000
+
+
+def load(name: str) -> dict:
+    return json.loads((VECTORS / name).read_text(encoding="utf-8"))
+
+
+def canonical(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False).encode("utf-8")
+
+
+def sha(label: str) -> str:
+    return "sha256:" + hashlib.sha256(label.encode("utf-8")).hexdigest()
+
+
+def public_hex(seed_hex: str) -> str:
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex))
+    return key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+
+
+def authority_key_id(public: str) -> str:
+    return "sha256:" + hashlib.sha256(bytes.fromhex(public)).hexdigest()
+
+
+def custody_key_id(secret: bytes) -> str:
+    derived = HKDF(algorithm=hashes.SHA256(), length=16,
+                   salt=b"ori.evidence_custody_key_id.v1",
+                   info=b"gateway_custody").derive(secret)
+    return "hkdf-sha256:" + derived.hex()
+
+
+def preimage(domain: str, artifact: dict, authenticator: str) -> bytes:
+    body = {k: v for k, v in artifact.items() if k != authenticator}
+    return domain.encode("ascii") + b"\x00" + canonical(body)
+
+
+# --- published material ---------------------------------------------------------------
+
+_custody = load("custody-acknowledgement.json")
+ACTIVE_SECRET = bytes.fromhex(_custody["gateway_secret_hex"])
+PREVIOUS_SECRET = bytes.fromhex(_custody["previous_gateway_secret_hex"])
+CUSTODY_ACTIVE = custody_key_id(ACTIVE_SECRET)
+CUSTODY_PREVIOUS = custody_key_id(PREVIOUS_SECRET)
+assert CUSTODY_ACTIVE == _custody["registry_state"]["active"]["key_id"]
+assert CUSTODY_PREVIOUS == _custody["registry_state"]["verify_only"]["key_id"]
+
+_receipt = load("delivery-receipt-v2.json")
+_registry_corpus = load("authority-key-registry-v2.json")
+_test_keys = {k["name"]: k["seed_hex"] for k in _registry_corpus["test_keys"]}
+_disposition = load("evidence-disposition-v2.json")
+_envelope = load("delivery-envelope.json")
+
+SEEDS = {
+    "receipt_active": _receipt["authority_receipt_seed_hex"],
+    "receipt_verify_only": _test_keys["test key 0"],
+    "epoch_active": _receipt["epoch_authority_seed_hex"],
+    "epoch_verify_only": _test_keys["test key 3"],
+    "disposition_active": _disposition["signing_key_seed_hex"],
+}
+PURPOSE = {
+    "receipt_active": ("evidence_authority_receipt", "active"),
+    "receipt_verify_only": ("evidence_authority_receipt", "verify_only"),
+    "epoch_active": ("evidence_authority_epoch", "active"),
+    "epoch_verify_only": ("evidence_authority_epoch", "verify_only"),
+    "disposition_active": ("evidence_authority_disposition", "active"),
+}
+KEY_ID = {name: authority_key_id(public_hex(seed)) for name, seed in SEEDS.items()}
+
+DEVICE_PUBKEY = _envelope["signing_key_public_hex"]
+PREVIOUS_PUBKEY = public_hex(_envelope["previous_generation_seed_hex"])
+EPOCH_CURRENT = next(c for c in _envelope["cases"] if c["name"] == "valid")["artifact"][
+    "anchor_epoch_id"]
+EPOCH_EARLIER = next(c for c in _envelope["cases"] if c["name"] == "superseded_epoch")[
+    "artifact"]["anchor_epoch_id"]
+
+SEALED_ENVELOPES = [
+    {
+        "local_seq": seq,
+        "anchor_epoch_id": EPOCH_CURRENT,
+        "chain_row_digest": sha(f"ori-specs evidence-exchange/v3 restated records chain row {seq}"),
+        "envelope_digest": sha(f"ori-specs evidence-exchange/v3 restated records envelope {seq}"),
+    }
+    for seq in (1, 2, 3, 4)
+]
+SEALED_REGISTRATIONS = [
+    {"anchor_epoch_id": EPOCH_EARLIER, "pubkey_hex": PREVIOUS_PUBKEY},
+    {"anchor_epoch_id": EPOCH_CURRENT, "pubkey_hex": DEVICE_PUBKEY},
+]
+SEALED_ARTIFACTS = [
+    {"artifact_type": "checkpoint", "anchor_epoch_id": EPOCH_CURRENT,
+     "digest": sha(f"ori-specs evidence-exchange/v3 restated records checkpoint {n}")}
+    for n in (1, 2)
+]
+
+# --- artifacts -------------------------------------------------------------------------
+
+
+def custody(seq: int, at_ms: int, generation: str) -> dict:
+    secret = ACTIVE_SECRET if generation == "active" else PREVIOUS_SECRET
+    artifact = {
+        "v": 1, "device_id": DEVICE_ID, "local_seq": seq,
+        "envelope_digest": SEALED_ENVELOPES[seq - 1]["envelope_digest"],
+        "custody_at_ms": at_ms, "key_id": custody_key_id(secret),
+    }
+    mac = hmac.new(secret, preimage(CUSTODY_DOMAIN, artifact, "mac"), hashlib.sha256)
+    artifact["mac"] = "hmac-sha256:" + mac.hexdigest()
+    return artifact
+
+
+def sign(artifact: dict, domain: str, key: str) -> dict:
+    artifact = dict(artifact, key_id=KEY_ID[key])
+    private = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SEEDS[key]))
+    signature = private.sign(preimage(domain, artifact, "signature"))
+    artifact["signature"] = "ed25519:" + base64.b64encode(signature).decode("ascii")
+    return artifact
+
+
+def receipt(first: int, last: int, at_ms: int, key: str = "receipt_active") -> dict:
+    raw = b"".join(bytes.fromhex(e["chain_row_digest"][7:])
+                   for e in SEALED_ENVELOPES if first <= e["local_seq"] <= last)
+    return sign({
+        "v": 1, "device_id": DEVICE_ID, "from_seq": first, "to_seq": last,
+        "range_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "accepted_at_ms": at_ms,
+    }, RECEIPT_DOMAIN, key)
+
+
+def confirmation(epoch: str, actor: str, at_ms: int, key: str = "epoch_active") -> dict:
+    pubkey = next(r["pubkey_hex"] for r in SEALED_REGISTRATIONS if r["anchor_epoch_id"] == epoch)
+    return sign({
+        "v": 1, "device_id": DEVICE_ID, "anchor_epoch_id": epoch, "pubkey_hex": pubkey,
+        "actor": actor, "confirmed_at_ms": at_ms,
+    }, EPOCH_DOMAIN, key)
+
+
+def disposition(trigger: int, at_ms: int) -> dict:
+    return sign({
+        "v": 1, "device_id": DEVICE_ID, "anchor_epoch_id": EPOCH_CURRENT,
+        "triggering_digest": SEALED_ARTIFACTS[trigger - 1]["digest"],
+        "scope": "epoch", "disposition": "epoch_reprovisioning_required",
+        "decided_at_ms": at_ms,
+    }, DISPOSITION_DOMAIN, "disposition_active")
+
+
+# --- held records ----------------------------------------------------------------------
+
+
+def held(**members: Any) -> dict:
+    state = {
+        "custody": [], "receipts": [], "epoch_confirmations": [], "active_epoch": None,
+        "registration_obligations": [
+            {"anchor_epoch_id": r["anchor_epoch_id"], "pubkey_hex": r["pubkey_hex"],
+             "state": "open", "closed_at_ms": None} for r in SEALED_REGISTRATIONS],
+        "dispositions": [], "stops": [],
+        "application_storage_fault": False,
+    }
+    for key, value in members.items():
+        assert key in state, key
+        state[key] = value
+    return state
+
+
+def held_custody(seq: int, at_ms: int, generation: str, recorded: int | None) -> dict:
+    return {"local_seq": seq, "custody_at_ms": at_ms,
+            "key_id": CUSTODY_ACTIVE if generation == "active" else CUSTODY_PREVIOUS,
+            "recorded_at_ms": recorded}
+
+
+def held_receipts(first: int, last: int, at_ms: int, key: str = "receipt_active") -> list:
+    return [{"local_seq": s, "accepted_at_ms": at_ms, "key_id": KEY_ID[key]}
+            for s in range(first, last + 1)]
+
+
+PROJECTION = ("device_id", "anchor_epoch_id", "pubkey_hex", "actor", "confirmed_at_ms", "key_id")
+
+
+def confirmed(epoch: str, actor: str, at_ms: int, applied: int,
+              key: str = "epoch_active") -> dict:
+    """The held records of one applied confirmation of *epoch*."""
+    pubkey = next(r["pubkey_hex"] for r in SEALED_REGISTRATIONS if r["anchor_epoch_id"] == epoch)
+    record = {"device_id": DEVICE_ID, "anchor_epoch_id": epoch, "pubkey_hex": pubkey,
+              "actor": actor,
+              "confirmed_at_ms": at_ms, "key_id": KEY_ID[key], "applied_at_ms": applied}
+    state = held(epoch_confirmations=[record])
+    state["registration_obligations"] = [
+        dict(o, state="confirmed", closed_at_ms=applied) if o["anchor_epoch_id"] == epoch else o
+        for o in state["registration_obligations"]]
+    if epoch == EPOCH_CURRENT:
+        state["active_epoch"] = {k: record[k] for k in PROJECTION}
+    return state
+
+
+def earlier_epoch_confirmed() -> dict:
+    """An earlier epoch confirmed while it was the sealing epoch; the current one open."""
+    state = confirmed(EPOCH_EARLIER, "commissioning@site", T0 + 1000, T0 + 1100)
+    record = state["epoch_confirmations"][0]
+    state["active_epoch"] = {k: record[k] for k in PROJECTION}
+    return state
+
+
+def both_epochs_confirmed() -> dict:
+    """The earlier epoch confirmed, then the current one; the current is active and effective."""
+    state = earlier_epoch_confirmed()
+    current = confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100)
+    state["epoch_confirmations"] += current["epoch_confirmations"]
+    state["registration_obligations"] = [
+        dict(o, state="confirmed", closed_at_ms=T0 + 2100) if o["anchor_epoch_id"] == EPOCH_CURRENT else o
+        for o in state["registration_obligations"]]
+    state["active_epoch"] = current["active_epoch"]
+    return state
+
+
+# --- the model -------------------------------------------------------------------------
+
+
+class StoreFault(Exception):
+    pass
+
+
+class Transaction:
+    """Writes against a copy; a fault point raises before the copy is kept."""
+
+    def __init__(self, state: dict, fault: str | None) -> None:
+        assert fault in (None, "at_read", "after_first_write", "at_commit", "at_refusal_record"), fault
+        if fault == "at_read":
+            raise StoreFault
+        self.state = copy.deepcopy(state)
+        self.fault = fault
+        self.writes = 0
+
+    def write(self) -> None:
+        self.writes += 1
+        if self.fault == "after_first_write" and self.writes == 2:
+            raise StoreFault
+
+    def commit(self) -> dict:
+        if self.fault == "at_commit" and self.writes == 0:
+            raise AssertionError("at_commit needs an application that writes")
+        if self.fault == "at_commit":
+            raise StoreFault
+        if self.fault == "after_first_write":
+            raise AssertionError("after_first_write needs a second write to fault on")
+        return self.state
+
+
+def decide(kind: str, before: dict, artifact: dict, now: int,
+           fault: str | None) -> tuple[str, str | None, dict, list | None]:
+    """The answer, with the refusal-record point applied after the decision."""
+    expected, reason, after, applied = decide_once(
+        kind, before, artifact, now, None if fault == "at_refusal_record" else fault)
+    if fault == "at_refusal_record":
+        assert expected == "reject", "at_refusal_record applies only to a decided refusal"
+        after = dict(copy.deepcopy(before), application_storage_fault=True)
+    return expected, reason, after, applied
+
+
+def decide_once(kind: str, before: dict, artifact: dict, now: int,
+                fault: str | None) -> tuple[str, str | None, dict, list | None]:
+    applied: list | None = None
+    try:
+        tx = Transaction(before, fault)
+        s = tx.state
+        if kind == "custody_acknowledgement":
+            current = next((c for c in s["custody"] if c["local_seq"] == artifact["local_seq"]), None)
+            if current is None:
+                s["custody"].append({"local_seq": artifact["local_seq"],
+                                     "custody_at_ms": artifact["custody_at_ms"],
+                                     "key_id": artifact["key_id"], "recorded_at_ms": now})
+                s["custody"].sort(key=lambda c: c["local_seq"])
+                tx.write()
+            elif current["custody_at_ms"] != artifact["custody_at_ms"]:
+                return "reject", "restatement_conflict", before, None
+            elif current["recorded_at_ms"] is None:
+                current["recorded_at_ms"] = now
+                tx.write()
+        elif kind == "delivery_receipt":
+            held_seqs = {r["local_seq"] for r in s["receipts"]}
+            applied = [q for q in range(artifact["from_seq"], artifact["to_seq"] + 1)
+                       if q not in held_seqs]
+            for q in applied:
+                s["receipts"].append({"local_seq": q, "accepted_at_ms": artifact["accepted_at_ms"],
+                                      "key_id": artifact["key_id"]})
+                tx.write()
+            s["receipts"].sort(key=lambda r: r["local_seq"])
+        elif kind == "epoch_confirmation":
+            epoch = artifact["anchor_epoch_id"]
+            current = next((c for c in s["epoch_confirmations"]
+                            if c["anchor_epoch_id"] == epoch), None)
+            if current is not None:
+                if any(current[k] != artifact[k] for k in ("confirmed_at_ms", "actor", "key_id")):
+                    return "reject", "restatement_conflict", before, None
+            else:
+                s["epoch_confirmations"].append(
+                    dict({k: artifact[k] for k in PROJECTION}, applied_at_ms=now))
+                tx.write()
+                if epoch == EPOCH_CURRENT:
+                    s["active_epoch"] = {k: artifact[k] for k in PROJECTION}
+                    tx.write()
+                for o in s["registration_obligations"]:
+                    if (o["anchor_epoch_id"], o["pubkey_hex"], o["state"]) == (
+                            epoch, artifact["pubkey_hex"], "open"):
+                        o["state"], o["closed_at_ms"] = "confirmed", now
+                        tx.write()
+        elif kind == "evidence_disposition":
+            record = {k: artifact[k] for k in ("triggering_digest", "anchor_epoch_id", "scope",
+                                               "disposition", "decided_at_ms", "key_id")}
+            stop = {"scope": "epoch", "anchor_epoch_id": artifact["anchor_epoch_id"]}
+            if record in s["dispositions"]:
+                pass
+            elif stop in s["stops"]:
+                return "reject", "superseded", before, None
+            else:
+                s["dispositions"].append(record)
+                tx.write()
+                s["stops"].append(stop)
+                tx.write()
+        else:
+            raise AssertionError(kind)
+        after = tx.commit()
+    except StoreFault:
+        return "undecided", None, dict(copy.deepcopy(before), application_storage_fault=True), None
+    after["application_storage_fault"] = False
+    return "accept", None, after, applied
+
+
+# --- cases -----------------------------------------------------------------------------
+
+NOW = T0 + 9000
+CUSTODY_AT = T0 + 900
+RECEIPT_AT = T0 + 1000
+CONFIRMED_AT = T0 + 2000
+ACTOR = "commissioning@site"
+
+
+def held_one_custody(generation: str = "active", recorded: int | None = T0 + 950, **extra) -> dict:
+    return held(custody=[held_custody(1, CUSTODY_AT, generation, recorded)], **extra)
+
+
+CASES: list[tuple[str, str, str, dict, dict, str | None]] = [
+    # custody
+    ("custody_first_acceptance", "custody_acknowledgement",
+     "Nothing is held for local_seq 1. Not a restatement: custody is recorded with this acknowledgement's time and generation, and the receiver's record time.",
+     held(), custody(1, CUSTODY_AT, "active"), None),
+    ("custody_identical_repeat", "custody_acknowledgement",
+     "Byte-identical to the acknowledgement whose custody is held. Agrees: accepted, and the custody record is unchanged.",
+     held_one_custody(), custody(1, CUSTODY_AT, "active"), None),
+    ("custody_same_time_previous_generation", "custody_acknowledgement",
+     "Custody was first recorded under the active generation; this names the same custody_at_ms under the verify_only generation. Agrees: the generation is not part of agreement, and the held key_id stays the first.",
+     held_one_custody(), custody(1, CUSTODY_AT, "previous"), None),
+    ("custody_same_time_active_generation", "custody_acknowledgement",
+     "Custody was first recorded under the verify_only generation; this names the same custody_at_ms under the active one. Agrees, and the held key_id stays the verify_only generation's.",
+     held_one_custody("previous"), custody(1, CUSTODY_AT, "active"), None),
+    ("custody_different_time_active_generation", "custody_acknowledgement",
+     "Names a custody_at_ms other than the held one, under the active generation. Conflicts: refused restatement_conflict, and nothing is written.",
+     held_one_custody(), custody(1, CUSTODY_AT + 100, "active"), None),
+    ("custody_different_time_previous_generation", "custody_acknowledgement",
+     "Names a custody_at_ms other than the held one, under the verify_only generation. Conflicts: refused restatement_conflict, and nothing is written.",
+     held_one_custody(), custody(1, CUSTODY_AT - 100, "previous"), None),
+    ("custody_agreeing_fills_missing_record_time", "custody_acknowledgement",
+     "Custody is held without a record time, as a receiver that kept none recorded it. An agreeing restatement supplies the record time from the receiver's clock and nothing else.",
+     held_one_custody(recorded=None), custody(1, CUSTODY_AT, "active"), None),
+    ("custody_conflicting_supplies_no_record_time", "custody_acknowledgement",
+     "Custody is held without a record time. A conflicting restatement is refused and supplies no record time.",
+     held_one_custody(recorded=None), custody(1, CUSTODY_AT + 100, "active"), None),
+    ("custody_store_fault_at_commit", "custody_acknowledgement",
+     "The store fails at commit while first recording custody for local_seq 1. Rolled back: nothing is held, the artifact is neither applied nor refused, and the application-storage fault signal is raised.",
+     held(), custody(1, CUSTODY_AT, "active"), "at_commit"),
+    ("custody_conflict_refusal_record_unwritable", "custody_acknowledgement",
+     "A restatement whose custody_at_ms conflicts with the held one. The refusal is decided, and then the store fails writing the record of that refusal. The refusal is still answered restatement_conflict, every held record is unchanged, and the failed write raises the signal.",
+     held_one_custody(), custody(1, CUSTODY_AT + 100, "active"), "at_refusal_record"),
+    ("custody_store_fault_reading_held_record", "custody_acknowledgement",
+     "A restatement whose custody_at_ms conflicts with the held one, but the store fails reading the held custody record the decision needs. A read fault is a store fault even where the decision would have been a refusal: undecided, no rejection reason, nothing changes, and the signal is raised.",
+     held_one_custody(), custody(1, CUSTODY_AT + 100, "active"), "at_read"),
+    ("custody_conflict_leaves_fault_signal_raised", "custody_acknowledgement",
+     "The fault signal is raised from an earlier fault. A refusal is not a successful application, so it stays raised.",
+     held_one_custody(application_storage_fault=True), custody(1, CUSTODY_AT + 100, "active"), None),
+    ("custody_agreeing_restatement_clears_fault_signal", "custody_acknowledgement",
+     "The fault signal is raised from an earlier fault. An agreeing restatement is answered as applied, and its application completes, so the signal clears.",
+     held_one_custody(application_storage_fault=True), custody(1, CUSTODY_AT, "active"), None),
+    # receipts
+    ("receipt_identical_repeat", "delivery_receipt",
+     "Identical to the receipt that applied 1..2. Every sequence is held: nothing is applied, it is answered as applied, and nothing changes.",
+     held(receipts=held_receipts(1, 2, RECEIPT_AT)), receipt(1, 2, RECEIPT_AT), None),
+    ("receipt_union_over_held_prefix", "delivery_receipt",
+     "1 is receipted; this receipt covers 1..3 at a later accepted_at_ms. Not a conflict: 2 and 3 are applied with this receipt's time and key, and 1 keeps its first time.",
+     held(receipts=held_receipts(1, 1, RECEIPT_AT)), receipt(1, 3, RECEIPT_AT + 5000), None),
+    ("receipt_union_over_held_suffix", "delivery_receipt",
+     "3 is receipted; this receipt covers 1..3 at a later accepted_at_ms. 1 and 2 are applied with this receipt's time and key, and 3 keeps its first time.",
+     held(receipts=held_receipts(3, 3, RECEIPT_AT)), receipt(1, 3, RECEIPT_AT + 5000), None),
+    ("receipt_union_over_sequences_receipted_under_another_key", "delivery_receipt",
+     "1..2 were receipted under the receipt key the registry now holds verify_only; this receipt covers 1..3 under the active key. 3 takes the active key; 1 and 2 keep the verify_only key and their first time.",
+     held(receipts=held_receipts(1, 2, RECEIPT_AT, "receipt_verify_only")),
+     receipt(1, 3, RECEIPT_AT + 5000), None),
+    ("receipt_store_fault_after_first_sequence_write", "delivery_receipt",
+     "The union over 1..3 applies 2 and 3. The store fails on the write after the first sequence it applies. Rolled back: no sequence of the range is written, the artifact is undecided, and the signal is raised.",
+     held(receipts=held_receipts(1, 1, RECEIPT_AT)), receipt(1, 3, RECEIPT_AT + 5000),
+     "after_first_write"),
+    ("receipt_store_fault_while_signal_raised", "delivery_receipt",
+     "The signal is already raised from an earlier fault, and the store fails again at commit. Every store fault raises the signal whether or not it is raised: it stays raised, and nothing else changes.",
+     held(receipts=held_receipts(1, 1, RECEIPT_AT), application_storage_fault=True),
+     receipt(1, 3, RECEIPT_AT + 5000), "at_commit"),
+    ("receipt_store_fault_at_commit", "delivery_receipt",
+     "The same union, with the store failing at commit. Rolled back as above.",
+     held(receipts=held_receipts(1, 1, RECEIPT_AT)), receipt(1, 3, RECEIPT_AT + 5000),
+     "at_commit"),
+    ("receipt_redelivered_after_store_fault", "delivery_receipt",
+     "The receipt the faulted attempt left undecided, delivered again once the store recovers. Decided afresh: 2 and 3 are applied, and the signal clears.",
+     held(receipts=held_receipts(1, 1, RECEIPT_AT), application_storage_fault=True),
+     receipt(1, 3, RECEIPT_AT + 5000), None),
+    # epoch confirmations
+    ("confirmation_identical", "epoch_confirmation",
+     "Identical to the confirmation held for the current epoch. Agrees: accepted, and the confirmation record, the active-epoch projection, the obligation and the effective epoch are unchanged.",
+     confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100),
+     confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT), None),
+    ("confirmation_different_confirmed_at", "epoch_confirmation",
+     "The current epoch is confirmed; this confirms it again at another confirmed_at_ms. Conflicts: refused restatement_conflict, and no record of the epoch changes.",
+     confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100),
+     confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT + 60000), None),
+    ("confirmation_different_actor", "epoch_confirmation",
+     "The current epoch is confirmed; this names another actor. Conflicts: refused restatement_conflict, and no record of the epoch changes.",
+     confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100),
+     confirmation(EPOCH_CURRENT, "another-actor@site", CONFIRMED_AT), None),
+    ("confirmation_different_key_id", "epoch_confirmation",
+     "The current epoch is confirmed under the active epoch key; this is signed under the verify_only epoch key, with the same actor and time. Conflicts: refused restatement_conflict, and no record of the epoch changes.",
+     confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100),
+     confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, "epoch_verify_only"), None),
+    ("confirmation_earlier_epoch_agreeing_restatement", "epoch_confirmation",
+     "Both epochs are confirmed and the current one is active and effective. This restates the earlier epoch's confirmation exactly. Agrees: accepted, every confirmation record, the projection, every obligation and the effective epoch are unchanged; the projection does not move to the earlier epoch.",
+     both_epochs_confirmed(), confirmation(EPOCH_EARLIER, "commissioning@site", T0 + 1000), None),
+    ("confirmation_earlier_epoch_conflicting_restatement", "epoch_confirmation",
+     "Both epochs are confirmed and the current one is active and effective. This restates the earlier epoch's confirmation with another actor. Conflicts: refused restatement_conflict, and no record of any epoch changes.",
+     both_epochs_confirmed(), confirmation(EPOCH_EARLIER, "another-actor@site", T0 + 1000), None),
+    ("confirmation_for_another_epoch", "epoch_confirmation",
+     "An earlier epoch is confirmed and effective; the current epoch, the one the receiver seals under, is open. Not a restatement: its confirmation is recorded, the projection and the effective epoch move to it, and its obligation closes.",
+     earlier_epoch_confirmed(), confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT), None),
+    ("confirmation_store_fault_after_first_write", "epoch_confirmation",
+     "As confirmation_for_another_epoch, with the store failing on the write after the confirmation record. Rolled back: the confirmation record, the projection, the obligation and the effective epoch are as before, and the signal is raised.",
+     earlier_epoch_confirmed(), confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT),
+     "after_first_write"),
+    ("confirmation_store_fault_at_commit", "epoch_confirmation",
+     "As confirmation_for_another_epoch, with the store failing at commit. Rolled back as above.",
+     earlier_epoch_confirmed(), confirmation(EPOCH_CURRENT, ACTOR, CONFIRMED_AT),
+     "at_commit"),
+    ("confirmation_conflict_leaves_fault_signal_raised", "epoch_confirmation",
+     "A conflicting confirmation while the signal is raised. Refused, and the signal stays raised.",
+     dict(confirmed(EPOCH_CURRENT, ACTOR, CONFIRMED_AT, T0 + 2100), application_storage_fault=True),
+     confirmation(EPOCH_CURRENT, "another-actor@site", CONFIRMED_AT), None),
+    # dispositions
+    ("disposition_first_application", "evidence_disposition",
+     "An epoch-scoped epoch_reprovisioning_required for the current epoch, triggered by a sealed checkpoint. Applied: the disposition and its epoch stop are recorded.",
+     held(), disposition(1, T0 + 3000), None),
+    ("disposition_byte_identical_repeat", "evidence_disposition",
+     "Byte-identical to the applied disposition. v2's rule: applied again with no new state.",
+     held(dispositions=[{"triggering_digest": SEALED_ARTIFACTS[0]["digest"],
+                         "anchor_epoch_id": EPOCH_CURRENT, "scope": "epoch",
+                         "disposition": "epoch_reprovisioning_required",
+                         "decided_at_ms": T0 + 3000, "key_id": KEY_ID["disposition_active"]}],
+          stops=[{"scope": "epoch", "anchor_epoch_id": EPOCH_CURRENT}]),
+     disposition(1, T0 + 3000), None),
+    ("disposition_no_new_effect_is_superseded", "evidence_disposition",
+     "Another epoch-scoped disposition for the current epoch, triggered by another sealed checkpoint, while that epoch's stop is in force. v2's rule: refused superseded, never restatement_conflict; nothing changes.",
+     held(dispositions=[{"triggering_digest": SEALED_ARTIFACTS[0]["digest"],
+                         "anchor_epoch_id": EPOCH_CURRENT, "scope": "epoch",
+                         "disposition": "epoch_reprovisioning_required",
+                         "decided_at_ms": T0 + 3000, "key_id": KEY_ID["disposition_active"]}],
+          stops=[{"scope": "epoch", "anchor_epoch_id": EPOCH_CURRENT}]),
+     disposition(2, T0 + 4000), None),
+    ("disposition_store_fault_after_first_write", "evidence_disposition",
+     "As disposition_first_application, with the store failing on the write after the disposition record. Rolled back: no disposition and no stop is held, the artifact is undecided, and the signal is raised.",
+     held(), disposition(1, T0 + 3000), "after_first_write"),
+    ("disposition_store_fault_at_commit", "evidence_disposition",
+     "As disposition_first_application, with the store failing at commit. Rolled back as above.",
+     held(), disposition(1, T0 + 3000), "at_commit"),
+    ("disposition_redelivered_after_store_fault", "evidence_disposition",
+     "The disposition the faulted attempt left undecided, delivered again. Nothing of the faulted attempt is held, so it is not a repetition under v2's rule: it is applied as a first application, and the signal clears.",
+     held(application_storage_fault=True), disposition(1, T0 + 3000), None),
+]
+
+AUTHENTICATOR = {"custody_acknowledgement": "mac"}
+DOMAIN = {
+    "custody_acknowledgement": CUSTODY_DOMAIN,
+    "delivery_receipt": RECEIPT_DOMAIN,
+    "epoch_confirmation": EPOCH_DOMAIN,
+    "evidence_disposition": DISPOSITION_DOMAIN,
+}
+
+
+def build() -> str:
+    cases = []
+    for name, kind, note, before, artifact, fault in CASES:
+        expected, reason, after, applied = decide(kind, before, artifact, NOW, fault)
+        cases.append({
+            "name": name,
+            "artifact_type": kind,
+            "note": note,
+            "receiver_now_ms": NOW,
+            "held_before": before,
+            "artifact": artifact,
+            "canonical_hex": preimage(DOMAIN[kind], artifact,
+                                      AUTHENTICATOR.get(kind, "signature")).hex(),
+            "authenticator": "valid",
+            "store_fault": fault,
+            "expected": expected,
+            "reject_reason": reason,
+            "applied_sequences": applied,
+            "held_after": after,
+        })
+    names = [c["name"] for c in cases]
+    assert len(set(names)) == len(names)
+    # A refusal changes nothing, and a store fault changes nothing but the signal.
+    for c in cases:
+        if c["expected"] == "reject" and c["store_fault"] is None:
+            assert c["held_after"] == c["held_before"], c["name"]
+        if c["store_fault"] == "at_refusal_record":
+            assert c["held_after"] == dict(c["held_before"], application_storage_fault=True), \
+                c["name"]
+        if c["expected"] == "undecided":
+            assert c["held_after"] == dict(c["held_before"], application_storage_fault=True), \
+                c["name"]
+    corpus = {
+        "vector_set": "evidence-exchange/v3 restated records",
+        "contract": "evidence-exchange/v3",
+        "artifact": "restated_records_state",
+        "canonicalisation": "json.dumps(obj, sort_keys=True, separators=(',',':'), ensure_ascii=False).encode('utf-8')",
+        "domain_note": "Authenticated bytes are the ASCII domain, one NUL byte, then the canonical payload with signature or mac removed; canonical_hex is that preimage.",
+        "domains": DOMAIN,
+        "warning": "Every secret and seed here is a published test value from the evidence-exchange/v2 corpora and must never sign anything real.",
+        "why_this_file_exists": "Whether a verified artifact is applied, accepted with no change, refused restatement_conflict, or left undecided by a store fault depends on the records the receiver already holds, which no wire artifact can express. Each case states every held record before, the artifact, any injected store fault, the answer, and every held record after.",
+        "device": {"device_id": DEVICE_ID, "pubkey_hex": DEVICE_PUBKEY,
+                   "sealing_epoch": EPOCH_CURRENT},
+        "sealed_envelopes": SEALED_ENVELOPES,
+        "sealed_registrations": SEALED_REGISTRATIONS,
+        "sealed_artifacts": SEALED_ARTIFACTS,
+        "sealed_note": "Receiver state shared by every case. chain_row_digest and envelope_digest are SHA-256 of the UTF-8 labels 'ori-specs evidence-exchange/v3 restated records chain row N' and '... envelope N', and each sealed checkpoint digest of '... checkpoint N'; they stand for the bytes the receiver sealed. A receipt's range_digest is taken over these chain_row_digest values.",
+        "custody_registry": {
+            "active": {"key_id": CUSTODY_ACTIVE, "secret_hex": ACTIVE_SECRET.hex()},
+            "verify_only": {"key_id": CUSTODY_PREVIOUS, "secret_hex": PREVIOUS_SECRET.hex()},
+        },
+        "authority_key_registry": {
+            "schema": "ori.evidence_authority_keys.v1",
+            "keys": [{"key_id": KEY_ID[n], "public_key_hex": public_hex(SEEDS[n]),
+                      "purpose": PURPOSE[n][0], "status": PURPOSE[n][1]} for n in SEEDS],
+        },
+        "authority_seeds": {KEY_ID[n]: SEEDS[n] for n in SEEDS},
+        "material_note": "The custody secrets are custody-acknowledgement.json's gateway_secret_hex and previous_gateway_secret_hex. The active receipt and epoch keys are delivery-receipt-v2.json's; the verify_only receipt and epoch keys are authority-key-registry-v2.json's test keys 0 and 3; the disposition key is evidence-disposition-v2.json's. The earlier epoch and its key are delivery-envelope.json's superseded_epoch case and previous_generation_seed_hex.",
+        "state_note": "held_before and held_after carry exactly the members custody, receipts, epoch_confirmations, active_epoch, registration_obligations, dispositions, stops and application_storage_fault, as evidence-exchange/v3 Test vectors defines them.",
+        "answer_note": "expected is accept (answered as applied), reject with reject_reason, or undecided (a store fault at any point but at_refusal_record: reject_reason and applied_sequences null). store_fault is null, at_read, after_first_write, at_commit or at_refusal_record, as evidence-exchange/v3 Test vectors defines them.",
+        "cases": cases,
+    }
+    return json.dumps(corpus, indent=2, ensure_ascii=False) + "\n"
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args != ["--check"]:
+        print(__doc__)
+        return 0 if args[0] in ("-h", "--help") else 2
+    text = build()
+    if args == ["--check"]:
+        if not OUT.exists() or OUT.read_text(encoding="utf-8") != text:
+            print(f"{NAME}: {OUT.relative_to(ROOT)} is not what the generator produces",
+                  file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    OUT.write_text(text, encoding="utf-8")
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
