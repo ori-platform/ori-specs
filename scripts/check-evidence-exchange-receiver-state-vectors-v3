@@ -469,6 +469,10 @@ def contract_rules(texts: dict) -> dict:
     rules["hkdf"] = (salt.group(1).encode(), info.group(1).encode(), int(length.group(1)))
     schema(text, rules)
     rules["defects"] = defect_reasons(text)
+    integers = re.search(r"Integers\s+satisfy `\|n\| <= (\d+)`", text)
+    if integers is None:
+        fail("the contract no longer states the integer domain as this checker reads it")
+    rules["int_max"] = int(integers.group(1))
     if set(rules["defects"].values()) - set(rules["reasons"]):
         fail("a defect's reason is outside the vocabulary")
     return rules
@@ -674,6 +678,8 @@ def verify(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
         if (typ == "int") is not (type(art[name]) is int) or (typ == "string") is not isinstance(
                 art[name], str):
             out.append(refused("malformed", f"{name} is not {typ}"))
+    if any(type(art[f]) is int and abs(art[f]) > rules["int_max"] for f in fields):
+        out.append(refused("malformed", "an integer outside the canonical domain"))
     if out:
         return out
     if art["v"] != 1:
@@ -759,7 +765,89 @@ def projection_of(record: dict, members: set[str]) -> dict:
     return {k: record[k] for k in sorted(members)}
 
 
-def check_state(state: Any, corpus: dict, where: str, projection: set[str]) -> list[str]:
+SHA256_ID = re.compile(r"sha256:[0-9a-f]{64}")
+CUSTODY_ID = re.compile(r"hkdf-sha256:[0-9a-f]{32}")
+PUBKEY = re.compile(r"[0-9a-f]{64}")
+
+
+def held_values(state: dict, corpus: dict, rules: dict, where: str) -> list[str]:
+    """Every held field's type and domain, every held key one the material holds for the
+    artifact's purpose, and every held record bound to this receiver."""
+    out: list[str] = []
+    top = rules["int_max"]
+
+    def bad(member: str, field: str, value: Any) -> None:
+        out.append(f"[state] {where}: {member}.{field} {value!r} is outside its domain")
+
+    def integer(member: str, field: str, value: Any, least: int = -top, null: bool = False) -> None:
+        if (value is None and null) or (type(value) is int and least <= value <= top):
+            return
+        bad(member, field, value)
+
+    def authority_key(member: str, value: Any, kind: str) -> None:
+        purpose = rules["purpose"][kind]
+        if not (isinstance(value, str) and SHA256_ID.fullmatch(value) and any(
+                k["key_id"] == value and k["purpose"] == purpose
+                for k in corpus["authority_key_registry"]["keys"])):
+            bad(member, "key_id", value)
+
+    def epoch(member: str, field: str, value: Any, sealed_only: bool = True) -> None:
+        if not (isinstance(value, str) and SHA256_ID.fullmatch(value)) or (
+                sealed_only and value not in {r["anchor_epoch_id"] for r in corpus["sealed_registrations"]}):
+            bad(member, field, value)
+
+    custody_ids = {g["key_id"] for g in corpus["custody_registry"].values()}
+    for r in state["custody"]:
+        integer("custody", "local_seq", r["local_seq"], 1)
+        integer("custody", "custody_at_ms", r["custody_at_ms"])
+        integer("custody", "recorded_at_ms", r["recorded_at_ms"], null=True)
+        if not (isinstance(r["key_id"], str) and CUSTODY_ID.fullmatch(r["key_id"])
+                and r["key_id"] in custody_ids):
+            bad("custody", "key_id", r["key_id"])
+    for r in state["receipts"]:
+        integer("receipts", "local_seq", r["local_seq"], 1)
+        integer("receipts", "accepted_at_ms", r["accepted_at_ms"])
+        authority_key("receipts", r["key_id"], "delivery_receipt")
+    device = corpus["device"]["device_id"]
+    for member, records in (("epoch_confirmations", state["epoch_confirmations"]),
+                            ("active_epoch", [state["active_epoch"]] if state["active_epoch"] else [])):
+        for r in records:
+            if r.get("device_id") != device:
+                bad(member, "device_id", r.get("device_id"))
+            epoch(member, "anchor_epoch_id", r.get("anchor_epoch_id"))
+            if not (isinstance(r.get("pubkey_hex"), str) and PUBKEY.fullmatch(r["pubkey_hex"])):
+                bad(member, "pubkey_hex", r.get("pubkey_hex"))
+            if not (isinstance(r.get("actor"), str) and r["actor"]):
+                bad(member, "actor", r.get("actor"))
+            integer(member, "confirmed_at_ms", r.get("confirmed_at_ms"))
+            if "applied_at_ms" in r:
+                integer(member, "applied_at_ms", r["applied_at_ms"])
+            authority_key(member, r.get("key_id"), "epoch_confirmation")
+    for o in state["registration_obligations"]:
+        epoch("registration_obligations", "anchor_epoch_id", o["anchor_epoch_id"])
+        if o["state"] not in ("open", "confirmed"):
+            bad("registration_obligations", "state", o["state"])
+        integer("registration_obligations", "closed_at_ms", o["closed_at_ms"], null=True)
+    sealed = {e["envelope_digest"] for e in corpus["sealed_envelopes"]} | {
+        a["digest"] for a in corpus["sealed_artifacts"]}
+    for r in state["dispositions"]:
+        if r["triggering_digest"] not in sealed:
+            bad("dispositions", "triggering_digest", r["triggering_digest"])
+        epoch("dispositions", "anchor_epoch_id", r["anchor_epoch_id"])
+        if rules["values"].get(r["disposition"]) != r["scope"]:
+            bad("dispositions", "scope", (r["scope"], r["disposition"]))
+        integer("dispositions", "decided_at_ms", r["decided_at_ms"])
+        authority_key("dispositions", r["key_id"], "evidence_disposition")
+    for r in state["stops"]:
+        if not isinstance(r, dict) or set(r) != STOP_MEMBERS or r["scope"] not in ("epoch", "identity"):
+            bad("stops", "scope", r)
+        else:
+            epoch("stops", "anchor_epoch_id", r["anchor_epoch_id"])
+    return out
+
+
+def check_state(state: Any, corpus: dict, where: str, projection: set[str],
+                rules: dict | None = None) -> list[str]:
     """A held state these rules can reach."""
     if not isinstance(state, dict) or list(state) != list(HELD_MEMBERS):
         return [f"[state] {where}: members are not {list(HELD_MEMBERS)}"]
@@ -769,6 +857,10 @@ def check_state(state: Any, corpus: dict, where: str, projection: set[str]) -> l
         if not isinstance(records, list) or any(
                 not isinstance(r, dict) or set(r) != wanted for r in records):
             out.append(f"[state] {where}: {member} records are not {sorted(wanted)}")
+            return out
+    if rules is not None:
+        out += held_values(state, corpus, rules, where)
+        if out:
             return out
     sealed = {e["local_seq"] for e in corpus["sealed_envelopes"]}
     for member in ("custody", "receipts"):
@@ -946,6 +1038,7 @@ def check_case(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
         return [f"[shape] {where}: keys are not {sorted(CASE_KEYS)}"]
     if not isinstance(case["name"], str) or not isinstance(case["note"], str) \
             or type(case["receiver_now_ms"]) is not int \
+            or abs(case["receiver_now_ms"]) > rules["int_max"] \
             or case["expected"] not in ("accept", "reject", "undecided") \
             or not (case["applied_sequences"] is None or (
                 isinstance(case["applied_sequences"], list)
@@ -953,8 +1046,8 @@ def check_case(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
         return [(f"[shape] {where}: name, note, receiver_now_ms, expected or applied_sequences "
                  "has the wrong type or value")]
     out = verify(case, corpus, rules, mat)
-    out += check_state(case["held_before"], corpus, where + " held_before", rules["projection"])
-    out += check_state(case["held_after"], corpus, where + " held_after", rules["projection"])
+    out += check_state(case["held_before"], corpus, where + " held_before", rules["projection"], rules)
+    out += check_state(case["held_after"], corpus, where + " held_after", rules["projection"], rules)
     if out:
         return out
     if case["reject_reason"] is not None and case["reject_reason"] not in rules["reasons"]:
@@ -1231,6 +1324,74 @@ def _first(corpus: dict, kind: str) -> int:
                 and c["store_fault"] is None)
 
 
+# For each held field kind, values its domain refuses: altered identically in held_before and
+# held_after, so every relationship between the two still holds and only the value is wrong.
+INVALID_VALUES: dict[str, tuple[Any, ...]] = {
+    "local_seq": (False, 0, 99),
+    "time": (False, -9007199254740992, "1787000000000"),
+    "custody_key": ("unheld-key", "hkdf-sha256:" + "0" * 32, "HKDF-SHA256:" + "a" * 32),
+    "authority_key": ("unheld-key", "sha256:" + "0" * 64),
+    "device_id": ("another-device",),
+    "epoch": ("sha256:" + "f" * 64, "not-an-epoch"),
+    "pubkey_hex": ("ZZ", 5),
+    "actor": ("", 7),
+    "digest": ("sha256:" + "e" * 64,),
+    "scope": ("galaxy",),
+    "disposition": ("not_a_disposition",),
+    "state": ("closed", None),
+}
+FIELD_KINDS = {
+    "local_seq": "local_seq", "custody_at_ms": "time", "recorded_at_ms": "time",
+    "accepted_at_ms": "time", "confirmed_at_ms": "time", "applied_at_ms": "time",
+    "closed_at_ms": "time", "decided_at_ms": "time", "device_id": "device_id",
+    "anchor_epoch_id": "epoch", "pubkey_hex": "pubkey_hex", "actor": "actor",
+    "triggering_digest": "digest", "scope": "scope", "disposition": "disposition",
+    "state": "state",
+}
+
+
+def retained_value_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    out: list[tuple[str, Any, Callable[[dict], Any]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for i, case in enumerate(corpus["cases"]):
+        before, after = case["held_before"], case["held_after"]
+        for member in ("custody", "receipts", "epoch_confirmations", "registration_obligations",
+                       "dispositions", "stops", "active_epoch"):
+            pairs = ([(None, before[member])] if member == "active_epoch" else
+                     list(enumerate(before[member])))
+            for j, record in pairs:
+                if not isinstance(record, dict):
+                    continue
+                twin = after[member] if j is None else (
+                    after[member][j] if j < len(after[member]) else None)
+                if twin is None or twin != record and any(record[k] != twin.get(k) for k in record
+                                                          if k not in ("recorded_at_ms",)):
+                    continue
+                for field in record:
+                    kind = ("custody_key" if member == "custody" else "authority_key") \
+                        if field == "key_id" else FIELD_KINDS.get(field)
+                    if kind is None or record[field] is None and kind == "time":
+                        continue
+                    for value in INVALID_VALUES[kind]:
+                        key = (member, field, repr(value))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+
+                        def edit(c: dict, i: int = i, m: str = member, j: int | None = j,
+                                 f: str = field, v: Any = value) -> None:
+                            for side in ("held_before", "held_after"):
+                                target = c["cases"][i][side][m]
+                                (target if j is None else target[j])[f] = v
+                        label = f"{case['name']}: retained {member}.{field} = {value!r} in both"
+                        out.append((label, "[state]", edit))
+    for value in (1, None, "true"):
+        out.append((f"retained application_storage_fault = {value!r} in both", "[state]",
+                    lambda c, v=value: [c["cases"][0][side].update(application_storage_fault=v)
+                                        for side in ("held_before", "held_after")]))
+    return out
+
+
 def vocabulary_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
     """Each defect the vocabulary names, introduced into one re-signed artifact: it must be
     refused for that reason, as this script reads the text, and for no other."""
@@ -1436,6 +1597,7 @@ def corpus_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[
                             c["cases"][i]["artifact"].update({f: v}),
                             _resign(c["cases"][i], c, r))))
     out += vocabulary_mutants(corpus, rules)
+    out += retained_value_mutants(corpus)
     for label in coverage_classes(corpus):
         out.append((f"without {label}", "[coverage]",
                     lambda c, label=label: c.update(cases=[
