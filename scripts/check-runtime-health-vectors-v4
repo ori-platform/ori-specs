@@ -748,9 +748,9 @@ AGE_INSTANTS = {
         ("c", "custody_at_ms", "first", False),
     ("record time `r`", "the runtime's wall clock, Unix milliseconds", "when the runtime made the "
      "first acceptance it recorded a time for: the first acceptance, or, for custody recorded by a "
-     "runtime that kept no record time, the first later acceptance", "stored with the envelope; "
+     "runtime that kept no record time, the first later acceptance that records a time", "stored with the envelope; "
      "never changes once set; absent until an acceptance records it"):
-        ("r", "accepted_at_ms", "first", True),
+        ("r", "received_at_ms", "first", True),
     ("snapshot time `t`", "the runtime's wall clock, Unix milliseconds", "when the runtime builds "
      "the snapshot", "not stored"):
         ("t", "snapshot_time_ms", None, False),
@@ -832,12 +832,18 @@ def age_model(v4: dict[str, str], ee: str, m: dict) -> None:
          "and supplies no `r`, including where no `r` is stored. Only an acceptance that agrees "
          "with `c` can supply `r`.", "Awaiting-receipt age")
     m["age_agreeing_only"] = True
-    need(sec, "The first later acceptance supplies `r`.", "Awaiting-receipt age")
+    need(sec, "Agreement is on the custody time alone: the key generation that signed the "
+         "acknowledgement does not decide it, so an acknowledgement under another generation "
+         "that evidence-exchange/v2 accepts, and that names `c`, is an acceptance.",
+         "Awaiting-receipt age")
+    m["age_agree_on"] = ("custody_at_ms",)
+    need(sec, "The first later acceptance that records a time supplies `r`.",
+         "Awaiting-receipt age")
     m["age_r_supplied_later"] = True
     # The row may carry its own bound only as a derived diagnostic deciding no severity
     # (Representation): no condition reads it, and the evidence section says it gates nothing.
     need(flat(v4["## Representation"]), "A bound is part of a value only when that row's own "
-         "definition states it and the row is a derived diagnostic that decides no severity",
+         "definition states it and the row is a derived diagnostic that no condition reads",
          "Representation")
     need(flat(v4["## Health Payload > ### `evidence` object"]), "`awaiting_receipt_count` and its "
          "age are diagnostics: they contribute no condition, and they gate nothing.", "evidence")
@@ -857,7 +863,8 @@ def age_model(v4: dict[str, str], ee: str, m: dict) -> None:
     m["age_count_receipted"] = False
     if rows.get(AGE_ROW) != ("The greatest [awaiting-receipt age](#awaiting-receipt-age) over "
                              "the envelopes `awaiting_receipt_count` counts; `null` when "
-                             "`awaiting_receipt_count` is `0`."):
+                             "`awaiting_receipt_count` is `0`. It can under-read after the "
+                             "runtime's clock steps back."):
         raise Failure("oldest_awaiting_receipt_age_ms reworded")
     # c's domain: any evidence-exchange/v2 integer.
     dom = re.search(r"Integers satisfy `\|n\| <= (\d+)`\.", flat(ee))
@@ -869,9 +876,8 @@ def age_model(v4: dict[str, str], ee: str, m: dict) -> None:
 
 def acceptances(m: dict, acks: list[dict]) -> list[dict]:
     """The first verified acknowledgement and every later one that is an acceptance."""
-    c = m["age_instant"]["c"]["member"]
-    return [a for i, a in enumerate(acks)
-            if i == 0 or not m["age_agreeing_only"] or a[c] == acks[0][c]]
+    return [a for i, a in enumerate(acks) if i == 0 or not m["age_agreeing_only"]
+            or all(a[k] == acks[0][k] for k in m["age_agree_on"])]
 
 
 def _instant(m: dict, name: str, acks: list[dict]) -> int | None:
@@ -882,7 +888,8 @@ def _instant(m: dict, name: str, acks: list[dict]) -> int | None:
     acc = acceptances(m, acks)
     v = acc[0][member]
     if v is None and name == "r" and m["age_r_supplied_later"]:
-        later = [x[member] for x in acc[1:] if x[member] is not None]
+        later = [x[member] for x in acc[1:]
+                 if x[member] is not None or which == "first_later_untimed"]
         if later:
             v = later[-1] if which == "latest_supplies" else later[0]
     if v is None and not spec["optional"]:
@@ -950,9 +957,10 @@ def age_case_faults(m: dict, case: dict) -> list[str]:
             out.append(f"envelope {i} malformed")
             continue
         for a in e["acknowledgements"]:
-            if not isinstance(a, dict) or set(a) != {"custody_at_ms", "accepted_at_ms"} \
+            if not isinstance(a, dict) or set(a) != {"custody_at_ms", "key_id", "received_at_ms"} \
+                    or not isinstance(a["key_id"], str) \
                     or not is_i(a["custody_at_ms"]) \
-                    or not (a["accepted_at_ms"] is None or is_i(a["accepted_at_ms"])):
+                    or not (a["received_at_ms"] is None or is_i(a["received_at_ms"])):
                 out.append(f"envelope {i}: acknowledgement malformed {a}")
             elif not lo <= a["custody_at_ms"] <= hi:
                 out.append(f"envelope {i}: custody_at_ms {a['custody_at_ms']} outside "
@@ -3110,7 +3118,7 @@ def age_coverage(corpus: dict, m: dict) -> list[str]:
         "a later acknowledgement naming an earlier c": lambda c: any(
             e["acknowledgements"][-1]["custody_at_ms"] < cr(e)[0] for e in envs(c)),
         "a later acknowledgement offering r where none is stored": lambda c: any(
-            cr(e)[1] is None and any(a["accepted_at_ms"] is not None
+            cr(e)[1] is None and any(a["received_at_ms"] is not None
                                      for a in e["acknowledgements"]) for e in envs(c)),
         # decisive: the value would differ had the rule been otherwise
         "a later acknowledgement's c decisive": lambda c: differs(c, age_instant={
@@ -3122,10 +3130,18 @@ def age_coverage(corpus: dict, m: dict) -> list[str]:
         "the first, not the latest, later acceptance supplies r, decisive": lambda c: differs(
             c, age_instant={**m["age_instant"], "r": {**m["age_instant"]["r"],
                                                      "from": "latest_supplies"}}),
+        "an untimed later acceptance before a timed one, decisive": lambda c: differs(
+            c, age_instant={**m["age_instant"], "r": {**m["age_instant"]["r"],
+                                                     "from": "first_later_untimed"}}),
+        "only the key generation differs, decisive": lambda c: differs(
+            c, age_agree_on=("custody_at_ms", "key_id")),
+        "another key generation naming another custody time": lambda c: any(
+            a["key_id"] != e["acknowledgements"][0]["key_id"] and a["custody_at_ms"] != cr(e)[0]
+            for e in envs(c) for a in e["acknowledgements"]),
         "a disagreeing acknowledgement offering r where none is stored, decisive": lambda c:
             differs(c, age_agreeing_only=False),
         "an r supplied later that c still outweighs": lambda c: any(
-            e["acknowledgements"][0]["accepted_at_ms"] is None and cr(e)[1] is not None
+            e["acknowledgements"][0]["received_at_ms"] is None and cr(e)[1] is not None
             and cr(e)[0] < cr(e)[1] for e in envs(c)),
         "a disagreeing acknowledgement while r is stored": lambda c: any(
             cr(e)[1] is not None and any(a["custody_at_ms"] != cr(e)[0]
@@ -3628,26 +3644,42 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                          "r": {**inst["r"], "from": "last"}}))),
         ("age: a later acceptance never supplies a missing r", because(
             "awaiting no_record_time_then_redelivered:", model_mutant(age_r_supplied_later=False))),
-        ("age: the latest later acceptance supplies r", because(
+        ("age: the latest timed acceptance supplies r", because(
             "awaiting no_record_time_then_redelivered_twice:", model_mutant(age_instant={
                 **inst, "r": {**inst["r"], "from": "latest_supplies"}}))),
         ("age: a disagreeing acknowledgement is an acceptance", because(
             "awaiting no_record_time_then_acknowledgement_naming_another_custody_time:",
             model_mutant(age_agreeing_only=False))),
+        ("age: the key generation decides agreement", because(
+            "awaiting no_record_time_then_redelivered_under_other_key_generation:",
+            model_mutant(age_agree_on=("custody_at_ms", "key_id")))),
+        ("age: an untimed acceptance supplies r", because(
+            "awaiting no_record_time_twice_then_record_time:", model_mutant(age_instant={
+                **inst, "r": {**inst["r"], "from": "first_later_untimed"}}))),
+        ("corpus: a key generation not a string", because("acknowledgement malformed",
+                                                          corpus_mutant(lambda c: ac(
+            c, "clocks_equal")["envelopes"][0]["acknowledgements"][0].update(key_id=None)))),
+        ("text: agreement no longer on the custody time alone", because(
+            "Awaiting-receipt age no longer says", age_text_mutant(
+                "Agreement is on the custody\n  time alone: ", "Agreement: "))),
+        ("text: an untimed later acceptance supplies r", because(
+            "no model for awaiting-receipt instant", age_text_mutant(
+                "the first later acceptance that records a time |",
+                "the first later acceptance |"))),
         ("corpus: a missing r never supplied", because(
             "awaiting no_record_time_then_redelivered:", corpus_mutant(lambda c: ac(
                 c, "no_record_time_then_redelivered")["expected"].update(
                     oldest_awaiting_receipt_age_ms=0)))),
         ("text: a later acceptance no longer supplies r", because(
             "Awaiting-receipt age no longer says", age_text_mutant(
-                " The first later acceptance\n  supplies `r`.", ""))),
+                " The first later acceptance\n  that records a time supplies `r`.", ""))),
         ("text: a disagreeing acknowledgement may supply r", because(
             "Awaiting-receipt age no longer says", age_text_mutant(
                 "It moves\n  nothing and supplies no `r`, including where no `r` is stored.",
                 "It moves\n  nothing."))),
         ("text: the row's bound open to a severity member", because(
             "Representation no longer says", age_text_mutant(
-                "and the row is a derived\n  diagnostic that decides no severity, as", ", as"))),
+                "and the row is a derived\n  diagnostic that no condition reads, as", ", as"))),
         ("age: receipted envelopes counted", because("awaiting held_and_receipted:",
                                                     model_mutant(age_count_receipted=True))),
         ("age: the least age over envelopes", because(
@@ -3678,7 +3710,7 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                     custody_at_ms=-(2**53))))),
         ("corpus: a boolean record time", because("acknowledgement malformed", corpus_mutant(
             lambda c: ac(c, "clocks_equal")["envelopes"][0]["acknowledgements"][0].update(
-                accepted_at_ms=True)))),
+                received_at_ms=True)))),
         ("text: A2 takes the lesser", because("no model for awaiting-receipt step A2",
                                               age_text_mutant("`a` is the greater of `a` and `t − r`",
                                                           "`a` is the lesser of `a` and `t − r`"))),
@@ -3801,10 +3833,11 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('A producer never clamps, wraps or rounds a value into range: a value '
              'outside it is `internal_error`, and no snapshot is served.'),
             ("A bound is part of a value only when that row's own definition states it and "
-             'the row is a derived diagnostic that decides no severity, as the '
-             '[awaiting-receipt age](#awaiting-receipt-age) is; a producer-supplied member, '
-             'and any member that decides severity, is never bounded and stays under this '
-             'rule.'),
+             'the row is a derived diagnostic that no condition reads, as the '
+             '[awaiting-receipt age](#awaiting-receipt-age) is.'),
+            ('A value another party, such as a courier, a device or a gateway, supplied and '
+             'the runtime carries as given, and a member a condition reads, is never bounded '
+             'and stays under this rule.'),
             ('A consumer refuses a snapshot carrying an `int` member outside its range or '
              'not in integer form.'),
             '**Floats.** A member typed `float` is a finite JSON number, at least `0`.',
@@ -4173,7 +4206,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| `oldest_awaiting_receipt_age_ms` | `int \\| null` | delivery ledger | '
              'The greatest [awaiting-receipt age](#awaiting-receipt-age) over the envelopes '
              '`awaiting_receipt_count` counts;'),
-            '`null` when `awaiting_receipt_count` is `0`. |',
+            '`null` when `awaiting_receipt_count` is `0`.',
+            "It can under-read after the runtime's clock steps back. |",
             '`status_counts` maps each attestation status, a `string`, to an `int`.',
             ('`last_disposition` is `{disposition, scope, observed_at_ms}`, typed '
              "`string`, `string`, `int`; its values are evidence-exchange/v2's."),
@@ -4201,7 +4235,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ("| record time `r` | the runtime's wall clock, Unix milliseconds | when the "
              'runtime made the first acceptance it recorded a time for: the first acceptance, '
              'or, for custody recorded by a runtime that kept no record time, the first later '
-             'acceptance | stored with the envelope; never changes once set; absent until an '
+             'acceptance that records a time | stored with the envelope; never changes once set; absent until an '
              'acceptance records it |'),
             ("| snapshot time `t` | the runtime's wall clock, Unix milliseconds | when the "
              'runtime builds the snapshot | not stored |'),
@@ -4229,9 +4263,13 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'this rule, whatever the runtime answers it with.'),
             'It moves nothing and supplies no `r`, including where no `r` is stored.',
             'Only an acceptance that agrees with `c` can supply `r`.',
+            ('Agreement is on the custody time alone: the key generation that signed the '
+             'acknowledgement does not decide it, so an acknowledgement under another '
+             'generation that evidence-exchange/v2 accepts, and that names `c`, is an '
+             'acceptance.'),
             ('**No record time.** Custody recorded by a runtime that kept no record time is '
              'aged by `c` alone until a later acceptance.'),
-            'The first later acceptance supplies `r`.',
+            'The first later acceptance that records a time supplies `r`.',
             ('Any acceptance proves that the courier held custody at that instant, so `r` is '
              'a true lower bound on the wait, and supplying it can only raise the age.'),
             ("**A clock that steps backwards.** When the runtime's clock steps back past "
@@ -5168,7 +5206,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('`awaiting_receipt_age_cases`: a snapshot time `snapshot_time_ms` and the '
              'envelopes of a delivery ledger, each with `acknowledgements`, the custody '
              'acknowledgements that verified for it, in the order the runtime received them, '
-             'each `{custody_at_ms, accepted_at_ms}`, where `accepted_at_ms` is the '
+             'each `{custody_at_ms, key_id, received_at_ms}`, where `key_id` names the custody '
+             'key generation that signed it, and `received_at_ms` is the '
              "runtime's clock when it received that acknowledgement and `null` when the "
              'runtime kept no record time, and `receipted`, whether a receipt for it has '
              'verified; and the `awaiting_receipt_count` and '
