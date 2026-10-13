@@ -150,6 +150,7 @@ V4_SECTIONS = (
     ('## Health Payload > ### `gateway_broker_posture` object', False),
     ('## Health Payload > ### `state_store_encryption` object', False),
     ('## Health Payload > ### `evidence` object', True),
+    ('## Health Payload > ### `evidence` object > #### Awaiting-receipt age', True),
     ('## Health Payload > ### `evidence` object > #### `action_records` object', True),
     ('## Health Payload > ### `action_log_records` object', True),
     ('## Health Payload > ### `commissioning` object', True),
@@ -734,10 +735,245 @@ def vocabularies(body: str) -> dict[str, list[str]]:
     return out
 
 
+# --- the awaiting-receipt age, by the exact wording of its tables ----------------------------
+
+AGE_SECTION = "## Health Payload > ### `evidence` object > #### Awaiting-receipt age"
+AGE_ROW = "`oldest_awaiting_receipt_age_ms`"
+# Each instant's row, cell for cell, and what this model reads from it: the corpus member
+# the instant is, and which accepted acknowledgement supplies it. A reworded row has no
+# model until this script is reviewed.
+AGE_INSTANTS = {
+    ("custody time `c`", "the courier's", "`custody_at_ms` of the first custody acknowledgement "
+     "the runtime accepted for the envelope", "stored with the envelope; never moves"):
+        ("c", "custody_at_ms", "first", False),
+    ("record time `r`", "the runtime's wall clock, Unix milliseconds", "when the runtime made the "
+     "first acceptance it recorded a time for: the first acceptance, or, for custody recorded by a "
+     "runtime that kept no record time, the first later acceptance", "stored with the envelope; "
+     "never changes once set; absent until an acceptance records it"):
+        ("r", "accepted_at_ms", "first", True),
+    ("snapshot time `t`", "the runtime's wall clock, Unix milliseconds", "when the runtime builds "
+     "the snapshot", "not stored"):
+        ("t", "snapshot_time_ms", None, False),
+}
+NEG_INF = float("-inf")
+
+
+def _a1(a: Any, c: int, r: int | None, t: int, k: Any) -> Any:
+    return t - c
+
+
+def _a2(a: Any, c: int, r: int | None, t: int, k: Any) -> Any:
+    return a if r is None else max(a, t - r)
+
+
+def _floor(a: Any, c: int, r: int | None, t: int, k: Any) -> Any:
+    return k if a < k else a
+
+
+def _cap(a: Any, c: int, r: int | None, t: int, k: Any) -> Any:
+    return k if a > k else a
+
+
+# Each step by its exact wording; A3 and A4 by their shape, their bound read from the cell.
+AGE_STEPS: dict[str, Callable[..., Any]] = {
+    "`a` is `t − c`.": _a1,
+    "When `r` is stored, `a` is the greater of `a` and `t − r`. When it is not, `a` is "
+    "unchanged.": _a2,
+}
+AGE_BOUND_STEPS = (
+    (re.compile(r"When `a` is less than `(-?\d+)`, `a` is `(-?\d+)`\."), _floor, "floor"),
+    (re.compile(r"When `a` is greater than `(-?\d+)`, `a` is `(-?\d+)`\."), _cap, "cap"),
+)
+
+
+def age_model(v4: dict[str, str], ee: str, m: dict) -> None:
+    """The instants, steps and fold of the awaiting-receipt age, read from its section."""
+    body = v4[AGE_SECTION]
+    m["age_instant"] = {}
+    for row in table(body, ["Instant", "Clock", "What it is", "Kept"]):
+        if tuple(row) not in AGE_INSTANTS:
+            raise Failure(f"no model for awaiting-receipt instant as worded: {row}")
+        name, member, which, optional = AGE_INSTANTS[tuple(row)]
+        m["age_instant"][name] = {"member": member, "from": which, "optional": optional}
+    if sorted(m["age_instant"]) != ["c", "r", "t"]:
+        raise Failure(f"the awaiting-receipt instants are {sorted(m['age_instant'])}, not c, r, t")
+    m["age_steps"] = []
+    for label, rule in table(body, ["Step", "Rule"]):
+        if rule in AGE_STEPS:
+            m["age_steps"].append((label, AGE_STEPS[rule], None))
+            continue
+        for pattern, fn, kind in AGE_BOUND_STEPS:
+            hit = pattern.fullmatch(rule)
+            if hit and hit.group(1) == hit.group(2):
+                m["age_steps"].append((label, fn, int(hit.group(1))))
+                m[f"age_{kind}"] = int(hit.group(1))
+                break
+        else:
+            raise Failure(f"no model for awaiting-receipt step {label} as worded: {rule!r}")
+    if [s for s, _, _ in m["age_steps"]] != ["A1", "A2", "A3", "A4"] \
+            or [f for _, f, _ in m["age_steps"]] != [_a1, _a2, _floor, _cap]:
+        raise Failure("the awaiting-receipt steps are not A1 to A4 in order")
+    # The row gives no range, so its bounds are the default range (Representation).
+    if (m.get("age_floor"), m.get("age_cap")) != m["int_range"]:
+        raise Failure(f"A3 and A4 bound the age to {m.get('age_floor')}..{m.get('age_cap')}, "
+                      f"not the integer range {m['int_range']}")
+    sec = flat(body)
+    need(sec, "`oldest_awaiting_receipt_age_ms` is the greatest age over the envelopes awaiting "
+         "a receipt.", "Awaiting-receipt age")
+    m["age_fold"] = "max"
+    need(sec, "It equals `t` less the least of every `c` and every stored `r` among those "
+         "envelopes, bounded by A3 and A4.", "Awaiting-receipt age")
+    m["age_identity"] = True
+    need(sec, "A later acknowledgement for the same envelope, redelivered or naming another "
+         "custody time, never moves `c`, and never changes an `r` that is stored.",
+         "Awaiting-receipt age")
+    need(sec, "Once custody is held, an acknowledgement naming a custody time other than `c` is "
+         "not an acceptance for this rule, whatever the runtime answers it with. It moves nothing "
+         "and supplies no `r`, including where no `r` is stored. Only an acceptance that agrees "
+         "with `c` can supply `r`.", "Awaiting-receipt age")
+    m["age_agreeing_only"] = True
+    need(sec, "The first later acceptance supplies `r`.", "Awaiting-receipt age")
+    m["age_r_supplied_later"] = True
+    # The row may carry its own bound only as a derived diagnostic deciding no severity
+    # (Representation): no condition reads it, and the evidence section says it gates nothing.
+    need(flat(v4["## Representation"]), "A bound is part of a value only when that row's own "
+         "definition states it and the row is a derived diagnostic that decides no severity",
+         "Representation")
+    need(flat(v4["## Health Payload > ### `evidence` object"]), "`awaiting_receipt_count` and its "
+         "age are diagnostics: they contribute no condition, and they gate nothing.", "evidence")
+    holds = " ".join(r[2] for r in table(v4["## Severity > ### Conditions"],
+                                         ["Token", "Severity", "Holds when"]))
+    if "awaiting_receipt" in holds:
+        raise Failure("a condition reads the awaiting-receipt age, which carries its own bound")
+    need(sec, "**`awaiting_receipt_count`** is unchanged by this rule.", "Awaiting-receipt age")
+    held = table(v4["## Health Payload > ### `evidence` object"],
+                 ["Field", "Type", "Present", "Notes"])
+    rows = {r[0]: r[3] for r in held}
+    if rows.get("`awaiting_receipt_count`") != (
+            "Envelopes held in a courier's custody under a verified custody acknowledgement and "
+            "not yet receipted. Distinct from `pending_export_count`, which counts envelopes not "
+            "yet in custody."):
+        raise Failure("awaiting_receipt_count reworded")
+    m["age_count_receipted"] = False
+    if rows.get(AGE_ROW) != ("The greatest [awaiting-receipt age](#awaiting-receipt-age) over "
+                             "the envelopes `awaiting_receipt_count` counts; `null` when "
+                             "`awaiting_receipt_count` is `0`."):
+        raise Failure("oldest_awaiting_receipt_age_ms reworded")
+    # c's domain: any evidence-exchange/v2 integer.
+    dom = re.search(r"Integers satisfy `\|n\| <= (\d+)`\.", flat(ee))
+    low = re.search(r"`c` is any evidence-exchange/v2 integer, down to −(\d+),", sec)
+    if dom is None or low is None or dom.group(1) != low.group(1):
+        raise Failure("c's domain is not evidence-exchange/v2's integer range")
+    m["age_c_domain"] = (-int(dom.group(1)), int(dom.group(1)))
+
+
+def acceptances(m: dict, acks: list[dict]) -> list[dict]:
+    """The first verified acknowledgement and every later one that is an acceptance."""
+    c = m["age_instant"]["c"]["member"]
+    return [a for i, a in enumerate(acks)
+            if i == 0 or not m["age_agreeing_only"] or a[c] == acks[0][c]]
+
+
+def _instant(m: dict, name: str, acks: list[dict]) -> int | None:
+    spec = m["age_instant"][name]
+    which, member = spec["from"], spec["member"]
+    if which == "last":
+        return acks[-1][member]
+    acc = acceptances(m, acks)
+    v = acc[0][member]
+    if v is None and name == "r" and m["age_r_supplied_later"]:
+        later = [x[member] for x in acc[1:] if x[member] is not None]
+        if later:
+            v = later[-1] if which == "latest_supplies" else later[0]
+    if v is None and not spec["optional"]:
+        raise Failure(f"instant {name} absent and the text gives it no absence")
+    return v
+
+
+def awaiting(m: dict, env: dict) -> bool:
+    return bool(env["acknowledgements"]) and (m["age_count_receipted"] or not env["receipted"])
+
+
+def envelope_age(m: dict, t: int, env: dict, skip: tuple[str, ...] = ()) -> Any:
+    acks = env["acknowledgements"]
+    c, r = _instant(m, "c", acks), _instant(m, "r", acks)
+    a: Any = NEG_INF
+    for label, fn, k in m["age_steps"]:
+        if label not in skip:
+            a = fn(a, c, r, t, k)
+    return a
+
+
+def age_row(m: dict, case: dict, skip: tuple[str, ...] = ()) -> dict:
+    """The `awaiting_receipt_count` and `oldest_awaiting_receipt_age_ms` a case's snapshot carries."""
+    t = case[m["age_instant"]["t"]["member"]]
+    held = [e for e in case["envelopes"] if awaiting(m, e)]
+    ages = [envelope_age(m, t, e, skip) for e in held]
+    if not ages:
+        value = None
+    elif m["age_fold"] == "max":
+        value = max(ages)
+    elif m["age_fold"] == "min":
+        value = min(ages)
+    else:  # the envelope with the least c, aged by both clocks
+        value = envelope_age(m, t, min(held, key=lambda e: _instant(m, "c", e["acknowledgements"])),
+                             skip)
+    return {"awaiting_receipt_count": len(held), "oldest_awaiting_receipt_age_ms": value}
+
+
+def age_identity(m: dict, case: dict) -> int | None:
+    """The section's second statement of the row: `t` less the least instant, bounded."""
+    t = case[m["age_instant"]["t"]["member"]]
+    held = [e for e in case["envelopes"] if awaiting(m, e)]
+    if not held:
+        return None
+    least = min(v for e in held for v in (_instant(m, "c", e["acknowledgements"]),
+                                          _instant(m, "r", e["acknowledgements"])) if v is not None)
+    return min(max(t - least, m["age_floor"]), m["age_cap"])
+
+
+def age_case_faults(m: dict, case: dict) -> list[str]:
+    """Why a case is not a delivery ledger the section describes."""
+    def is_i(v: Any) -> bool:
+        return type(v) is int
+
+    out = []
+    if set(case) != {"name", "snapshot_time_ms", "envelopes", "expected"}:
+        out.append(f"members {sorted(case)}")
+        return out
+    if not is_i(case["snapshot_time_ms"]):
+        out.append("snapshot_time_ms not an integer")
+    lo, hi = m["age_c_domain"]
+    for i, e in enumerate(case["envelopes"]):
+        if not isinstance(e, dict) or set(e) != {"acknowledgements", "receipted"} \
+                or type(e["receipted"]) is not bool or not isinstance(e["acknowledgements"], list):
+            out.append(f"envelope {i} malformed")
+            continue
+        for a in e["acknowledgements"]:
+            if not isinstance(a, dict) or set(a) != {"custody_at_ms", "accepted_at_ms"} \
+                    or not is_i(a["custody_at_ms"]) \
+                    or not (a["accepted_at_ms"] is None or is_i(a["accepted_at_ms"])):
+                out.append(f"envelope {i}: acknowledgement malformed {a}")
+            elif not lo <= a["custody_at_ms"] <= hi:
+                out.append(f"envelope {i}: custody_at_ms {a['custody_at_ms']} outside "
+                           f"evidence-exchange/v2's integers")
+    exp = case["expected"]
+    if not isinstance(exp, dict) or set(exp) != {"awaiting_receipt_count",
+                                                 "oldest_awaiting_receipt_age_ms"}:
+        out.append("expected malformed")
+    else:
+        v = exp["oldest_awaiting_receipt_age_ms"]
+        if not (v is None or (is_i(v) and is_int(v, m))) \
+                or not (is_i(exp["awaiting_receipt_count"]) and is_int(exp["awaiting_receipt_count"], m)):
+            out.append("expected outside the integer range")  # snapshot check 3
+    return out
+
+
 def contract_texts() -> dict[str, str]:
     return {"v4": HEALTH_V4.read_text(encoding="utf-8"),
             "gw": GATEWAY_V2.read_text(encoding="utf-8"),
-            "v3": (ROOT / "runtime-health" / "v3.md").read_text(encoding="utf-8")}
+            "v3": (ROOT / "runtime-health" / "v3.md").read_text(encoding="utf-8"),
+            "ee": (ROOT / "evidence-exchange" / "v2.md").read_text(encoding="utf-8")}
 
 
 def contract_model(texts: dict[str, str] | None = None) -> dict:
@@ -1078,6 +1314,7 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
          "did not open), `authority_keys_missing`", "runtime-health/v3 posture_problems")
     for word in POSTURE_PROBLEMS:
         need(texts["v3"], f"`{word}` (", "runtime-health/v3 posture_problems")
+    age_model(v4, texts["ee"], m)
     return m
 
 
@@ -2136,7 +2373,8 @@ def load(corpus_bytes: bytes) -> dict:
 
 SETS = ("fold_cases", "snapshot_cases", "served_cases", "heartbeat_cases", "response_cases",
         "projection_cases", "heartbeat_snapshot_cases", "unrepresentable_cases",
-        "gateway_reason_cases", "request_cases", "integer_cases", "expiry_cases")
+        "gateway_reason_cases", "request_cases", "integer_cases", "expiry_cases",
+        "awaiting_receipt_age_cases")
 
 
 def check(corpus: dict, m: dict) -> list[str]:
@@ -2273,6 +2511,18 @@ def check(corpus: dict, m: dict) -> list[str]:
         got = expiry_verdict(m, c["device_policy"])
         if c["expected"] != got:
             out.append(f"expiry {c['device_policy']}: corpus {c['expected']}, text {got}")
+
+    for c in corpus["awaiting_receipt_age_cases"]:
+        bad = age_case_faults(m, c)
+        if bad:
+            out.append(f"awaiting {c.get('name')}: malformed {bad}")
+            continue
+        got = age_row(m, c)
+        if c["expected"] != got:
+            out.append(f"awaiting {c['name']}: corpus {c['expected']}, text {got}")
+        if m["age_identity"] and age_identity(m, c) != got["oldest_awaiting_receipt_age_ms"]:
+            out.append(f"awaiting {c['name']}: the steps give {got['oldest_awaiting_receipt_age_ms']}, "
+                       f"the section's least-instant statement {age_identity(m, c)}")
     return out
 
 
@@ -2802,6 +3052,92 @@ def coverage(corpus: dict, m: dict,
     for label, test in rules.items():
         if not any(test(d, expiry_verdict(m, d)) for d in exps):
             gaps.append(f"expiry: {label}")
+
+    gaps += age_coverage(corpus, m)
+    return gaps
+
+
+def age_coverage(corpus: dict, m: dict) -> list[str]:
+    """What the awaiting-receipt age section names that no case exercises."""
+    gaps: list[str] = []
+    ac = [c for c in corpus["awaiting_receipt_age_cases"] if not age_case_faults(m, c)]
+    val = "oldest_awaiting_receipt_age_ms"
+
+    def differs(c: dict, **knobs: Any) -> bool:
+        return age_row({**m, **knobs}, c)[val] != age_row(m, c)[val]
+
+    for label, _, _ in m["age_steps"]:
+        if not any(age_row(m, c, skip=(label,))[val] != age_row(m, c)[val] for c in ac):
+            gaps.append(f"awaiting: step {label} decisive")
+    lo, hi = m["age_floor"], m["age_cap"]
+    raw = [age_row(m, c, skip=("A3", "A4"))[val] for c in ac]
+    for at in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1):
+        if at not in raw:
+            gaps.append(f"awaiting: the row's value before A3 and A4 at {at}")
+
+    def envs(c: dict) -> list[dict]:
+        return [e for e in c["envelopes"] if awaiting(m, e)]
+
+    def cr(e: dict) -> tuple[int, int | None]:
+        return _instant(m, "c", e["acknowledgements"]), _instant(m, "r", e["acknowledgements"])
+
+    props: dict[str, Callable[[dict], bool]] = {
+        "no envelope": lambda c: not c["envelopes"],
+        "c absent: an envelope with no accepted acknowledgement": lambda c: any(
+            not e["acknowledgements"] for e in c["envelopes"]),
+        "c and r present, held and receipted": lambda c: any(
+            e["acknowledgements"] and e["receipted"] and cr(e)[1] is not None
+            for e in c["envelopes"]),
+        "r absent on an awaiting envelope": lambda c: any(cr(e)[1] is None for e in envs(c)),
+        "r present on an awaiting envelope": lambda c: any(cr(e)[1] is not None for e in envs(c)),
+        "r present on one awaiting envelope and absent on another": lambda c: {
+            cr(e)[1] is None for e in envs(c)} == {True, False},
+        "c equal to r": lambda c: any(cr(e)[0] == cr(e)[1] for e in envs(c)),
+        "c ahead of t": lambda c: any(cr(e)[0] > c["snapshot_time_ms"] for e in envs(c)),
+        "t stepped back past r, above c": lambda c: any(
+            cr(e)[1] is not None and cr(e)[0] < c["snapshot_time_ms"] < cr(e)[1]
+            for e in envs(c)),
+        "t stepped back past both r and c": lambda c: any(
+            cr(e)[1] is not None and c["snapshot_time_ms"] < min(cr(e)) for e in envs(c)),
+        "c at the bottom of evidence-exchange/v2's integers": lambda c: any(
+            cr(e)[0] == m["age_c_domain"][0] for e in envs(c)),
+        "two or more awaiting envelopes": lambda c: len(envs(c)) >= 2,
+        "a later acknowledgement with the same c": lambda c: any(
+            len(e["acknowledgements"]) > 1 and e["acknowledgements"][-1]["custody_at_ms"] == cr(e)[0]
+            for e in envs(c)),
+        "a later acknowledgement naming a later c": lambda c: any(
+            e["acknowledgements"][-1]["custody_at_ms"] > cr(e)[0] for e in envs(c)),
+        "a later acknowledgement naming an earlier c": lambda c: any(
+            e["acknowledgements"][-1]["custody_at_ms"] < cr(e)[0] for e in envs(c)),
+        "a later acknowledgement offering r where none is stored": lambda c: any(
+            cr(e)[1] is None and any(a["accepted_at_ms"] is not None
+                                     for a in e["acknowledgements"]) for e in envs(c)),
+        # decisive: the value would differ had the rule been otherwise
+        "a later acknowledgement's c decisive": lambda c: differs(c, age_instant={
+            **m["age_instant"], "c": {**m["age_instant"]["c"], "from": "last"}}),
+        "a later acknowledgement's r decisive": lambda c: differs(c, age_instant={
+            **m["age_instant"], "r": {**m["age_instant"]["r"], "from": "last"}}),
+        "a missing r supplied by a later acceptance, decisive": lambda c: differs(
+            c, age_r_supplied_later=False),
+        "the first, not the latest, later acceptance supplies r, decisive": lambda c: differs(
+            c, age_instant={**m["age_instant"], "r": {**m["age_instant"]["r"],
+                                                     "from": "latest_supplies"}}),
+        "a disagreeing acknowledgement offering r where none is stored, decisive": lambda c:
+            differs(c, age_agreeing_only=False),
+        "an r supplied later that c still outweighs": lambda c: any(
+            e["acknowledgements"][0]["accepted_at_ms"] is None and cr(e)[1] is not None
+            and cr(e)[0] < cr(e)[1] for e in envs(c)),
+        "a disagreeing acknowledgement while r is stored": lambda c: any(
+            cr(e)[1] is not None and any(a["custody_at_ms"] != cr(e)[0]
+                                         for a in e["acknowledgements"]) for e in envs(c)),
+        "a receipted envelope decisive": lambda c: differs(c, age_count_receipted=True),
+        "the greatest age, not the least, decisive": lambda c: differs(c, age_fold="min"),
+        "the greatest age is not that of the envelope with the least c": lambda c: differs(
+            c, age_fold="least_c"),
+    }
+    for label, test in props.items():
+        if not any(test(c) for c in ac):
+            gaps.append(f"awaiting: {label}")
     return gaps
 
 
@@ -3228,6 +3564,147 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("text: posture vocabulary in v3", text_mutant(
             "v3", "`custody_unconfigured` (", "`custody_missing` (")),
     ]
+    # The awaiting-receipt age: each mutant must be refused naming the case or rule it
+    # breaks, not merely refused.
+    def because(reason: str, mutant: Callable[[], None]) -> Callable[[], None]:
+        def go() -> None:
+            try:
+                mutant()
+            except Failure as refused:
+                if reason not in str(refused):
+                    print(f"WRONG REASON: wanted {reason!r}, got {str(refused)[:200]!r}")
+                    return
+                raise
+        return go
+
+    steps = model["age_steps"]
+    inst = model["age_instant"]
+
+    def without(label: str) -> list:
+        return [x for x in steps if x[0] != label]
+
+    def lesser(a: Any, c: int, r: int | None, t: int, k: Any) -> Any:
+        return a if r is None else min(a, t - r)
+
+    def ac(c: dict, name: str) -> dict:
+        return named(c, "awaiting_receipt_age_cases", name)
+
+    def age_text_mutant(old: str, new: str) -> Callable[[], None]:
+        """The section's parser fed a changed text past the held-sentence guard, which
+        `text: the age section reworded` exercises on its own."""
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts["v4"]:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            texts["v4"] = texts["v4"].replace(old, new, 1)
+            mutated = dict(model)
+            age_model(dict(markdown.section_bodies(texts["v4"])), texts["ee"], mutated)
+            run(corpus_bytes, mutated, coverage_model=model, coverage_cache=coverage_cache)
+        return go
+
+    cases += [
+        ("age: the record-time term dropped (A2)", because(
+            "awaiting courier_clock_ahead:", model_mutant(age_steps=without("A2")))),
+        ("age: the lesser interval taken at A2", because(
+            "awaiting courier_clock_behind:", model_mutant(age_steps=[
+                (lb, lesser if lb == "A2" else fn, k) for lb, fn, k in steps]))),
+        ("age: the courier's time dropped (A1)", because(
+            "awaiting courier_clock_behind:", model_mutant(age_steps=without("A1")))),
+        ("age: no floor (A3)", because(
+            "awaiting runtime_clock_stepped_back_past_both:", model_mutant(age_steps=without("A3")))),
+        ("age: no cap (A4)", because(
+            "awaiting bound_exceeded_by_one:", model_mutant(age_steps=without("A4")))),
+        ("age: the floor at 1", because("awaiting snapshot_at_earlier_instant:", model_mutant(
+            age_steps=[(lb, fn, 1 if lb == "A3" else k) for lb, fn, k in steps]))),
+        ("age: the cap one lower", because("awaiting bound_exact:", model_mutant(age_steps=[
+            (lb, fn, model["age_cap"] - 1 if lb == "A4" else k) for lb, fn, k in steps]))),
+        ("age: a redelivery moves c", because(
+            "awaiting redelivered_naming_earlier_custody_time:", model_mutant(age_instant={
+                **inst, "c": {**inst["c"], "from": "last"}}))),
+        ("age: a redelivery moves r", because("awaiting redelivered_later:", model_mutant(
+            age_instant={**inst, "r": {**inst["r"], "from": "last"}}))),
+        ("age: a redelivery moves c and r", because("awaiting redelivered_later:", model_mutant(
+            age_instant={**inst, "c": {**inst["c"], "from": "last"},
+                         "r": {**inst["r"], "from": "last"}}))),
+        ("age: a later acceptance never supplies a missing r", because(
+            "awaiting no_record_time_then_redelivered:", model_mutant(age_r_supplied_later=False))),
+        ("age: the latest later acceptance supplies r", because(
+            "awaiting no_record_time_then_redelivered_twice:", model_mutant(age_instant={
+                **inst, "r": {**inst["r"], "from": "latest_supplies"}}))),
+        ("age: a disagreeing acknowledgement is an acceptance", because(
+            "awaiting no_record_time_then_acknowledgement_naming_another_custody_time:",
+            model_mutant(age_agreeing_only=False))),
+        ("corpus: a missing r never supplied", because(
+            "awaiting no_record_time_then_redelivered:", corpus_mutant(lambda c: ac(
+                c, "no_record_time_then_redelivered")["expected"].update(
+                    oldest_awaiting_receipt_age_ms=0)))),
+        ("text: a later acceptance no longer supplies r", because(
+            "Awaiting-receipt age no longer says", age_text_mutant(
+                " The first later acceptance\n  supplies `r`.", ""))),
+        ("text: a disagreeing acknowledgement may supply r", because(
+            "Awaiting-receipt age no longer says", age_text_mutant(
+                "It moves\n  nothing and supplies no `r`, including where no `r` is stored.",
+                "It moves\n  nothing."))),
+        ("text: the row's bound open to a severity member", because(
+            "Representation no longer says", age_text_mutant(
+                "and the row is a derived\n  diagnostic that decides no severity, as", ", as"))),
+        ("age: receipted envelopes counted", because("awaiting held_and_receipted:",
+                                                    model_mutant(age_count_receipted=True))),
+        ("age: the least age over envelopes", because(
+            "awaiting least_record_time_sets_age_on_envelope_without_least_courier_time:", model_mutant(age_fold="min"))),
+        ("age: the envelope with the least c, aged by both clocks", because(
+            "awaiting least_record_time_sets_age_on_envelope_without_least_courier_time:",
+            model_mutant(age_fold="least_c"))),
+        # Equivalent, not listed: dropping the least-instant statement (age_identity). It is a
+        # theorem of A1 to A4 and the greatest-age fold, so no corpus can refuse its absence;
+        # it is held to catch a model mutant or a text change that splits the two.
+        ("corpus: an age one more", because("awaiting clocks_equal:", corpus_mutant(
+            lambda c: ac(c, "clocks_equal")["expected"].update(
+                oldest_awaiting_receipt_age_ms=4601)))),
+        ("corpus: the cap as 2^53", because("awaiting bound_exceeded_by_one:", corpus_mutant(
+            lambda c: ac(c, "bound_exceeded_by_one")["expected"].update(
+                oldest_awaiting_receipt_age_ms=2**53)))),
+        ("corpus: a receipted envelope counted", because("awaiting held_and_receipted:",
+                                                         corpus_mutant(lambda c: ac(
+            c, "held_and_receipted")["expected"].update(awaiting_receipt_count=1,
+                                                        oldest_awaiting_receipt_age_ms=9000)))),
+        ("corpus: acknowledgements out of acceptance order", because(
+            "awaiting redelivered_naming_earlier_custody_time:", corpus_mutant(
+                lambda c: ac(c, "redelivered_naming_earlier_custody_time")[
+                    "envelopes"][0]["acknowledgements"].reverse()))),
+        ("corpus: c below evidence-exchange/v2's integers", because(
+            "outside evidence-exchange/v2's integers", corpus_mutant(lambda c: ac(
+                c, "bound_exceeded_by_one")["envelopes"][0]["acknowledgements"][0].update(
+                    custody_at_ms=-(2**53))))),
+        ("corpus: a boolean record time", because("acknowledgement malformed", corpus_mutant(
+            lambda c: ac(c, "clocks_equal")["envelopes"][0]["acknowledgements"][0].update(
+                accepted_at_ms=True)))),
+        ("text: A2 takes the lesser", because("no model for awaiting-receipt step A2",
+                                              age_text_mutant("`a` is the greater of `a` and `t − r`",
+                                                          "`a` is the lesser of `a` and `t − r`"))),
+        ("text: A4 bound one lower", because("not the integer range", age_text_mutant(
+            "| A4 | When `a` is greater than `9007199254740991`, `a` is `9007199254740991`. |",
+            "| A4 | When `a` is greater than `9007199254740990`, `a` is `9007199254740990`. |"))),
+        ("text: c from the latest acknowledgement", because(
+            "no model for awaiting-receipt instant", age_text_mutant(
+                "`custody_at_ms` of the first custody acknowledgement",
+                "`custody_at_ms` of the latest custody acknowledgement"))),
+        ("text: r never absent", because("no model for awaiting-receipt instant", age_text_mutant(
+            "never changes once set; absent until an acceptance records it |",
+            "never changes once set |"))),
+        ("text: steps reordered", because("not A1 to A4 in order", age_text_mutant(
+            "| A3 | When `a` is less than `0`, `a` is `0`. |\n"
+            "| A4 | When `a` is greater than `9007199254740991`, `a` is `9007199254740991`. |",
+            "| A4 | When `a` is greater than `9007199254740991`, `a` is `9007199254740991`. |\n"
+            "| A3 | When `a` is less than `0`, `a` is `0`. |"))),
+        ("text: the age section reworded", because(
+            "sentence changed in v4 ## Health Payload > ### `evidence` object > #### Awaiting-receipt",
+            text_mutant("v4", "`a` is the greater of `a` and `t − r`",
+                        "`a` is the lesser of `a` and `t − r`"))),
+        ("text: evidence-exchange/v2 integers widened", because(
+            "c's domain", text_mutant("ee", "satisfy `|n| <= 9007199254740991`",
+                                      "satisfy `|n| <= 9007199254740992`"))),
+    ]
     for kind in SETS:
         for c in base[kind]:
             if "name" in c:
@@ -3237,7 +3714,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
     # Cases whose every covered property another case also shows.
     redundant_ok = re.compile(r"^case (fold_cases|request_cases|snapshot_cases|served_cases|"
                               r"heartbeat_cases|gateway_reason_cases|response_cases|"
-                              r"unrepresentable_cases|projection_cases|heartbeat_snapshot_cases)/")
+                              r"unrepresentable_cases|projection_cases|heartbeat_snapshot_cases|"
+                              r"awaiting_receipt_age_cases)/")
     survived = 0
     dropped_survivors = []
     for label, mutant in cases:
@@ -3322,6 +3800,11 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             'A row that gives no range means `0` to `9007199254740991` (2^53−1).',
             ('A producer never clamps, wraps or rounds a value into range: a value '
              'outside it is `internal_error`, and no snapshot is served.'),
+            ("A bound is part of a value only when that row's own definition states it and "
+             'the row is a derived diagnostic that decides no severity, as the '
+             '[awaiting-receipt age](#awaiting-receipt-age) is; a producer-supplied member, '
+             'and any member that decides severity, is never bounded and stays under this '
+             'rule.'),
             ('A consumer refuses a snapshot carrying an `int` member outside its range or '
              'not in integer form.'),
             '**Floats.** A member typed `float` is a finite JSON number, at least `0`.',
@@ -3688,7 +4171,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              "courier's custody under a verified custody acknowledgement and not yet receipted."),
             'Distinct from `pending_export_count`, which counts envelopes not yet in custody. |',
             ('| `oldest_awaiting_receipt_age_ms` | `int \\| null` | delivery ledger | '
-             'Snapshot time less the custody time of the oldest such envelope, at least `0`;'),
+             'The greatest [awaiting-receipt age](#awaiting-receipt-age) over the envelopes '
+             '`awaiting_receipt_count` counts;'),
             '`null` when `awaiting_receipt_count` is `0`. |',
             '`status_counts` maps each attestation status, a `string`, to an `int`.',
             ('`last_disposition` is `{disposition, scope, observed_at_ms}`, typed '
@@ -3702,6 +4186,73 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'means unknown" for a registration row is replaced by `registration_available`.'),
             ('`awaiting_receipt_count` and its age are diagnostics: they contribute no '
              'condition, and they gate nothing.'),
+        ),
+        '## Health Payload > ### `evidence` object > #### Awaiting-receipt age': (
+            'An envelope awaiting a receipt has two custody instants, read from two clocks.',
+            ("A courier's clock may run ahead of the runtime's, and the courier's time alone "
+             'would then make the envelope look as if it had waited less than it has.'),
+            'The age takes the greater of the two intervals.',
+            ("The courier's time may make an envelope look older than the runtime's record "
+             'does, and never newer.'),
+            '| Instant | Clock | What it is | Kept |',
+            ("| custody time `c` | the courier's | `custody_at_ms` of the first custody "
+             'acknowledgement the runtime accepted for the envelope | stored with the '
+             'envelope; never moves |'),
+            ("| record time `r` | the runtime's wall clock, Unix milliseconds | when the "
+             'runtime made the first acceptance it recorded a time for: the first acceptance, '
+             'or, for custody recorded by a runtime that kept no record time, the first later '
+             'acceptance | stored with the envelope; never changes once set; absent until an '
+             'acceptance records it |'),
+            ("| snapshot time `t` | the runtime's wall clock, Unix milliseconds | when the "
+             'runtime builds the snapshot | not stored |'),
+            ('The runtime accepts a custody acknowledgement when it verifies under '
+             'evidence-exchange/v2 and the runtime records custody from it.'),
+            'A refused acknowledgement records nothing.',
+            ("Each envelope's age is computed when the snapshot is built, never stored, by "
+             'these steps in order:'),
+            '| Step | Rule |',
+            '| A1 | `a` is `t − c`. |',
+            '| A2 | When `r` is stored, `a` is the greater of `a` and `t − r`.',
+            'When it is not, `a` is unchanged. |',
+            '| A3 | When `a` is less than `0`, `a` is `0`. |',
+            '| A4 | When `a` is greater than `9007199254740991`, `a` is `9007199254740991`. |',
+            ('`oldest_awaiting_receipt_age_ms` is the greatest age over the envelopes '
+             'awaiting a receipt.'),
+            ('It equals `t` less the least of every `c` and every stored `r` among those '
+             'envelopes, bounded by A3 and A4.'),
+            'When the two intervals are equal, either gives the age.',
+            ('**The first acceptance is final.** A later acknowledgement for the same '
+             'envelope, redelivered or naming another custody time, never moves `c`, and never '
+             'changes an `r` that is stored.'),
+            ('**Only an agreeing acknowledgement is an acceptance.** Once custody is held, an '
+             'acknowledgement naming a custody time other than `c` is not an acceptance for '
+             'this rule, whatever the runtime answers it with.'),
+            'It moves nothing and supplies no `r`, including where no `r` is stored.',
+            'Only an acceptance that agrees with `c` can supply `r`.',
+            ('**No record time.** Custody recorded by a runtime that kept no record time is '
+             'aged by `c` alone until a later acceptance.'),
+            'The first later acceptance supplies `r`.',
+            ('Any acceptance proves that the courier held custody at that instant, so `r` is '
+             'a true lower bound on the wait, and supplying it can only raise the age.'),
+            ("**A clock that steps backwards.** When the runtime's clock steps back past "
+             '`r`, `t − r` is negative and `c` decides the age; when it steps back past both, '
+             'the age is `0`.'),
+            'Neither clock is corrected.',
+            ('A runtime has no monotonic source that survives a restart, and a runtime clock '
+             'that steps back can make an envelope look younger than its wait.'),
+            ('**The bound.** `c` is any evidence-exchange/v2 integer, down to '
+             '−9007199254740991, so `t − c` can exceed the integer range.'),
+            "A4 reports such an envelope at the bound; it never makes the snapshot `internal_error`.",
+            '**`awaiting_receipt_count`** is unchanged by this rule.',
+            'The snapshot carries the age, and neither `c` nor `r`.',
+            'No snapshot check can confirm the rule; snapshot check 3 judges only the range.',
+            ('The rule is enforced in ori-runtime, by its delivery ledger, which stores `c` '
+             'and `r` and keeps both final, and by its health snapshot builder, which '
+             'computes the age.'),
+            ('The [behavioural checks](#behavioural-checks) and `awaiting_receipt_age_cases` '
+             'confirm it.'),
+            ('The remote health projection carries the age as the snapshot gives it, and the '
+             'gateway does not recompute it.'),
         ),
         '## Health Payload > ### `evidence` object > #### `action_records` object': (
             'Tier C action-outcome records per [tier-c-approval/v1.md](../tier-c-approval/v1.md).',
@@ -4557,6 +5108,19 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'them and their counts in place. |'),
             ('| A heartbeat with evidence `unavailable`, or its attestation summary not '
              'read | No `evidence` block in the heartbeat. |'),
+            ('| A custody acknowledgement accepted through the real ingest route with the '
+             "courier's time behind the runtime's clock, and one with it ahead | "
+             '`oldest_awaiting_receipt_age_ms` is `t − c` for the first and `t − r` for the '
+             'second. |'),
+            ('| The same acknowledgement redelivered later, and one for the same envelope '
+             'naming another custody time | `oldest_awaiting_receipt_age_ms` at the same `t` '
+             'is unchanged. |'),
+            ('| Custody held in a ledger written by a runtime that kept no record time, then '
+             'redelivered, then redelivered again | `oldest_awaiting_receipt_age_ms` is `t − c` '
+             "before the first redelivery; after it, the greater of `t − c` and `t` less the "
+             "first redelivery's acceptance time, unchanged by the second. |"),
+            ("| The runtime's clock set back past `r`, and past both `r` and `c` | The age "
+             'from `c`; then `0`. |'),
         ),
         '## Vectors': (
             ('`runtime-health/health-vectors-v4.json`, written by '
@@ -4600,7 +5164,15 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'that fails (`null` when it passes), and the exact heartbeat it maps to, '
              "with the runtime's `device_id`, clock and authentication setting given;"),
             '`expiry_cases`:',
-            '`device_policy` expiry members, and whether they are accepted.',
+            '`device_policy` expiry members, and whether they are accepted;',
+            ('`awaiting_receipt_age_cases`: a snapshot time `snapshot_time_ms` and the '
+             'envelopes of a delivery ledger, each with `acknowledgements`, the custody '
+             'acknowledgements that verified for it, in the order the runtime received them, '
+             'each `{custody_at_ms, accepted_at_ms}`, where `accepted_at_ms` is the '
+             "runtime's clock when it received that acknowledgement and `null` when the "
+             'runtime kept no record time, and `receipted`, whether a receipt for it has '
+             'verified; and the `awaiting_receipt_count` and '
+             '`oldest_awaiting_receipt_age_ms` the snapshot carries.'),
             ('A `snapshot_cases` or `served_cases` snapshot carries the members the '
              'condition table reads, and any block whose state the case exercises, each '
              'present exactly as the Present column and section flags say; the rest of '
