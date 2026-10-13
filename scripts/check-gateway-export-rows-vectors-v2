@@ -209,6 +209,14 @@ HELD = {
         "`next_page_token` names a position in that order, never a count of rows to skip: the next "
         "page begins with the first row stored when it is requested whose position is after the "
         "last row returned, whether or not that row is still stored.",
+        "with the export type, window and `params` it was given under. The runtime answers a token "
+        "it did not issue, including an offset from a runtime that paged by count, or one sent with "
+        "other filters, with an error envelope",
+        "A gateway that receives it begins the traversal again once, with an empty token, and "
+        "discards the rows it had collected; a second `page_token_invalid` in one traversal, or any "
+        "other error, fails the export.",
+        "A duplicate the traversal does not reach, outside its window or `tier` filter, cannot be "
+        "seen, and a consumer then resolves to the one row it holds.",
         "`record_key` is the row's own key, a non-empty string, and `null`, never the empty "
         "string, on a row the runtime assigned no key.",
         "a store can hold keys duplicated before keys were constrained, and the runtime exports "
@@ -286,6 +294,11 @@ def contract_model(text: str | None = None) -> dict:
     if (int(consumer.group(1)), int(consumer.group(2))) != receipt_bounds:
         raise Failure(f"{SEC_SH}: the consumer reads receipts in {consumer.groups()}, "
                       f"step 2 in {receipt_bounds}")
+    te = re.search(r"with an error envelope whose `error` is exactly `([a-z_]+)`, a value it gives "
+                   r"no other failure\.", flat(bodies[SEC_AL]))
+    if te is None:
+        raise Failure(f"{SEC_AL}: the refused token's error is no longer stated")
+    token_error = te.group(1)
     match = re.search(r"exported as one row for each, in the order ((?:`[a-z_]+`, )+)after "
                       r"ordering by `start_ms`", flat(bodies[SEC_SH]))
     if match is None:
@@ -306,6 +319,8 @@ def contract_model(text: str | None = None) -> dict:
         "receipt_bounds": receipt_bounds, "receipt_form": True, "receipt_equal": False,
         "weighted": True, "receipt_agg": max, "bucket_by": "timestamp", "split_basis": True,
         "ties_latest_first": True, "token": "position",
+        "token_error": token_error, "token_bound": True, "foreign_ok": False,
+        "token_match": "exact", "restart_on": "refusal", "max_restarts": 1, "discard_rows": True,
         "holder_kinds": ("dispatch",), "duplicates": "unresolved", "resolve_scope": "traversal",
     }
 
@@ -482,6 +497,8 @@ CONVENTIONS = {
     "expected.read_as": ["null for a row that fails a check"],
     "paging.between_pages": ["entry i changes the store after page i+1 is returned and before the "
                              "next is requested", "stored is the order the runtime stored the rows"],
+    "tokens.gateway.answers": ["the runtime's answers to one traversal's requests in order: rows "
+                               "with whether a next page follows, or an error envelope's error"],
     "buckets.expected": ["every member of a bucketed row except sensor_id, sensor_type and unit"],
 }
 
@@ -507,7 +524,7 @@ def same(a: Any, b: Any) -> bool:
 
 def check(corpus: dict, m: dict) -> list[str]:
     problems: list[str] = []
-    if set(corpus) != {"vector_set", "contract", "sections", "conventions", *SETS}:
+    if set(corpus) != {"vector_set", "contract", "sections", "conventions", "tokens", *SETS}:
         problems.append(f"corpus members {sorted(corpus)}")
     if corpus.get("contract") != "gateway-api/v2.md":
         problems.append(f"corpus names contract {corpus.get('contract')!r}")
@@ -577,6 +594,68 @@ def check(corpus: dict, m: dict) -> list[str]:
         if not same(case["expected"], got):
             problems.append(f"resolution {case['name']!r}: holders declared {case['expected']}, "
                             f"recomputed {got}")
+    problems += check_tokens(corpus, m)
+    return problems
+
+
+TOKEN_SHAPES = {
+    "runtime": ({"name", "issued_by_this_runtime", "same_filters", "expected"}, {"refused", "error"}),
+    "gateway": ({"name", "answers", "expected"}, {"outcome", "restarts", "rows"}),
+}
+
+
+def runtime_answer(m: dict, case: dict) -> dict:
+    """Page order: a token the runtime did not issue, or one sent with other
+    filters, is answered with an error envelope whose `error` is the refusal."""
+    ok = case["issued_by_this_runtime"] and (case["same_filters"] or not m["token_bound"])
+    if m["foreign_ok"]:
+        ok = case["same_filters"] or not m["token_bound"]
+    return {"refused": not ok, "error": None if ok else m["token_error"]}
+
+
+def gateway_traversal(m: dict, case: dict) -> tuple[dict, int]:
+    """(outcome, answers consumed). One restart on the exact refusal, rows
+    discarded; a second refusal or any other error fails the export."""
+    rows: list[str] = []
+    restarts = 0
+    for used, answer in enumerate(case["answers"], 1):
+        if "error" in answer:
+            refusal = answer["error"] == m["token_error"] or (
+                m["token_match"] == "prefix" and str(answer["error"]).startswith(m["token_error"]))
+            if (refusal or m["restart_on"] == "any") and restarts < m["max_restarts"]:
+                restarts += 1
+                rows = [] if m["discard_rows"] else rows
+                continue
+            return {"outcome": "failed", "restarts": restarts, "rows": []}, used
+        rows += answer["rows"]
+        if not answer["next"]:
+            return {"outcome": "complete", "restarts": restarts, "rows": rows}, used
+    return {"outcome": "unfinished", "restarts": restarts, "rows": rows}, len(case["answers"])
+
+
+def check_tokens(corpus: dict, m: dict) -> list[str]:
+    problems: list[str] = []
+    tokens = corpus["tokens"]
+    if not isinstance(tokens, dict) or set(tokens) != set(TOKEN_SHAPES):
+        return [f"corpus tokens members {sorted(tokens) if isinstance(tokens, dict) else tokens}"]
+    for kind, (members, expected) in TOKEN_SHAPES.items():
+        names = [c.get("name") for c in tokens[kind]]
+        if len(set(names)) != len(names):
+            problems.append(f"tokens.{kind}: case names repeat")
+        for case in tokens[kind]:
+            if set(case) != members or set(case["expected"]) != expected:
+                problems.append(f"tokens.{kind} {case.get('name')!r}: members {sorted(case)}")
+                continue
+            if kind == "runtime":
+                got = runtime_answer(m, case)
+            else:
+                got, used = gateway_traversal(m, case)
+                if used != len(case["answers"]):
+                    problems.append(f"tokens.gateway {case['name']!r}: {len(case['answers']) - used} "
+                                    "answer(s) after the traversal ended")
+            if not same(case["expected"], got):
+                problems.append(f"tokens.{kind} {case['name']!r}: token outcome declared "
+                                f"{case['expected']}, recomputed {got}")
     return problems
 
 
@@ -730,6 +809,32 @@ def coverage(corpus: dict, m: dict) -> list[str]:
     for want in ("later page", "missing", "another kind", "carried by two rows"):
         if want not in seen:
             gaps.append(f"resolution: no contributor whose holder is {want}")
+    seen = set()
+    for c in corpus["tokens"]["runtime"]:
+        seen.add(("runtime", c["issued_by_this_runtime"], c["same_filters"]))
+    for issued in (True, False):
+        for same_f in (True, False):
+            if ("runtime", issued, same_f) not in seen:
+                gaps.append(f"tokens.runtime: no case issued_by_this_runtime={issued}, "
+                            f"same_filters={same_f}")
+    kinds = set()
+    for c in corpus["tokens"]["gateway"]:
+        errors = [a["error"] for a in c["answers"] if "error" in a]
+        exact = [e for e in errors if e == m["token_error"]]
+        rows_before = any("rows" in a for a in c["answers"][:next(
+            (i for i, a in enumerate(c["answers"]) if "error" in a), 0)])
+        if len(exact) == 1 and c["expected"]["outcome"] == "complete" and rows_before:
+            kinds.add("one refusal after rows, then complete")
+        if len(exact) >= 2:
+            kinds.add("second refusal")
+        if any(e != m["token_error"] and m["token_error"] not in str(e) for e in errors):
+            kinds.add("another error")
+        if any(e != m["token_error"] and str(e).startswith(m["token_error"]) for e in errors):
+            kinds.add("an error that begins with the refusal")
+    for want in ("one refusal after rows, then complete", "second refusal", "another error",
+                 "an error that begins with the refusal"):
+        if want not in kinds:
+            gaps.append(f"tokens.gateway: no case with {want}")
     return gaps
 
 
@@ -938,6 +1043,54 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
         ("holder looked up on its own page", model_mutant("holders", resolve_scope="page")),
     ]
 
+    cases += [
+        ("a foreign token accepted", model_mutant("token outcome", foreign_ok=True)),
+        ("a token not bound to its filters", model_mutant("token outcome", token_bound=False)),
+        ("refusal matched by prefix", model_mutant("token outcome", token_match="prefix")),
+        ("any error restarts", model_mutant("token outcome", restart_on="any")),
+        ("two restarts allowed", model_mutant("token outcome", max_restarts=2)),
+        ("no restart", model_mutant("token outcome", max_restarts=0)),
+        ("rows kept across a restart", model_mutant("token outcome", discard_rows=False)),
+        ("refusal named otherwise", model_mutant("token outcome", token_error="token_invalid")),
+    ]
+    for kind in ("runtime", "gateway"):
+        for idx, case in enumerate(base["tokens"][kind]):
+            def flip(c: dict, k=kind, i=idx) -> None:
+                e = c["tokens"][k][i]["expected"]
+                if k == "runtime":
+                    e["refused"] = not e["refused"]
+                else:
+                    e["outcome"] = "complete" if e["outcome"] == "failed" else "failed"
+            cases.append((f"token outcome flipped: {case['name']}", corpus_mutant(flip, "token outcome")))
+            if kind == "gateway":
+                def restarts(c: dict, i=idx) -> None:
+                    c["tokens"]["gateway"][i]["expected"]["restarts"] += 1
+                cases.append((f"restarts changed: {case['name']}", corpus_mutant(restarts, "token outcome")))
+
+                def extra(c: dict, i=idx) -> None:
+                    c["tokens"]["gateway"][i]["answers"].append({"rows": ["z"], "next": False})
+                cases.append((f"answer after the end: {case['name']}", corpus_mutant(extra, "after the traversal")))
+
+    def drop_tokens(pred: Callable[[dict], bool], kind: str) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            c["tokens"][kind] = [x for x in c["tokens"][kind] if not pred(x)]
+        return edit
+    cases += [
+        ("foreign token cases dropped", corpus_mutant(drop_tokens(
+            lambda x: not x["issued_by_this_runtime"], "runtime"), "issued_by_this_runtime=False")),
+        ("other-filter cases dropped", corpus_mutant(drop_tokens(
+            lambda x: not x["same_filters"], "runtime"), "same_filters=False")),
+        ("second-refusal cases dropped", corpus_mutant(drop_tokens(
+            lambda x: sum(a.get("error") == "page_token_invalid" for a in x["answers"]) >= 2,
+            "gateway"), "second refusal")),
+        ("prefix-error cases dropped", corpus_mutant(drop_tokens(
+            lambda x: any(str(a.get("error", "")).startswith("page_token_invalid") and
+                          a["error"] != "page_token_invalid" for a in x["answers"]), "gateway"),
+            "begins with the refusal")),
+        ("text: refusal token renamed", text_mutant(
+            "exactly `page_token_invalid`", "exactly `token_refused`", "token outcome")),
+    ]
+
     # Contract text: the tables and sentences the model reads.
     cases += [
         ("text: step 1 verdict renamed", text_mutant(
@@ -984,8 +1137,8 @@ NOT_PROVED = ("not proved: that the runtime's closed per-path producer_time tabl
               "contract does not enumerate it), that a runtime emits these rows, that a gateway "
               "presents not_reported/unknown times as the contract requires, the Tier 3 prompt "
               "wording, "
-              "or a token's binding to its filters and refusal of a foreign token, which no case "
-              "exercises")
+              "or how a runtime recognises a token it issued or the filters bound to it (the corpus "
+              "states both as booleans)")
 
 
 def main(argv: list[str]) -> int:
@@ -999,7 +1152,8 @@ def main(argv: list[str]) -> int:
         return 1
     corpus_bytes = CORPUS.read_bytes()
     corpus = json.loads(corpus_bytes)
-    total = sum(len(corpus.get(k, [])) for k in SETS)
+    total = sum(len(corpus.get(k, [])) for k in SETS) + sum(
+        len(v) for v in corpus.get("tokens", {}).values())
     problems = problems_of(corpus_bytes, model)
     status = 0
     if problems:
