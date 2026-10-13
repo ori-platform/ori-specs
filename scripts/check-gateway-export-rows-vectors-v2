@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 export-rows corpus against the contract text.
+
+Shares no code with scripts/generate-gateway-export-rows-vectors-v2, and was
+written without reading it. Every expected value is recomputed by this
+script's own model, built from gateway-api/v2.md: `## Producer Time`,
+the `sensor_history` and `action_log` export sections.
+
+Read from the text, not from literals here: the `producer_time` and
+`record_kind` vocabularies (their tables), the export row checks (step
+numbers, family, verdict tokens, order; each check is looked up by its exact
+wording, so a reworded check has no model until this script is reviewed), and
+the basis order of a split bucket. The sentences the model relies on are held
+word for word.
+
+Held to:
+
+- each case's declared outcome equals the recomputed one: a reading's verdict
+  and time basis, an action_log row's verdict, reading and act count, every
+  bucketed row, every page of a traversal, every contributor's holder;
+- a reject case's verdict is the first failing step in the contract's order;
+- coverage, as properties of the cases: every verdict, every step-order pair
+  inside a family (a case whose first failure is step i and that also fails
+  step i+1), every `producer_time` and `record_kind` value in a valid case, a
+  row from an older runtime in each family, the bucket, paging and
+  resolution behaviours the text names.
+
+    python3 scripts/check-gateway-export-rows-vectors-v2
+    python3 scripts/check-gateway-export-rows-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's own
+model in turn; each mutant must add a problem the unmutated run does not have,
+of the kind the mutant targets.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+import types
+from collections.abc import Callable
+from fractions import Fraction
+from typing import Any
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "gateway-api" / "vectors" / "export-rows-v2.json"
+GATEWAY_V2 = ROOT / "gateway-api" / "v2.md"
+
+SEC_PT = "## Producer Time"
+SEC_SH = "### `sensor_history`"
+SEC_AL = "### `action_log`"
+SETS = ("readings", "action_log", "buckets", "paging", "resolution")
+WHERE = ("sensor_history", "history_point", "reasoning_reading")
+
+
+class Failure(Exception):
+    pass
+
+
+# --- contract text ------------------------------------------------------------------
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def need(text: str, sentence: str, where: str) -> None:
+    if flat(sentence) not in flat(text):
+        raise Failure(f"{where} no longer says: {sentence!r}")
+
+
+def cells(row: str) -> list[str]:
+    inner = row.strip()
+    if not (inner.startswith("|") and inner.endswith("|")):
+        raise Failure(f"not a table row: {row!r}")
+    return [flat(p) for p in re.split(r"(?<!\\)\|", inner[1:-1])]
+
+
+def table(body: str, header: list[str], where: str) -> list[list[str]]:
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("|") and cells(line) == header:
+            if i + 1 >= len(lines) or not re.fullmatch(r"\|(?: *:?-+:? *\|)+", lines[i + 1].strip()):
+                raise Failure(f"{where}: table {header} has no separator row")
+            rows = []
+            for row in lines[i + 2:]:
+                if not row.strip().startswith("|"):
+                    break
+                got = cells(row)
+                if len(got) != len(header):
+                    raise Failure(f"{where}: row {row!r} has {len(got)} cells, header has {len(header)}")
+                rows.append(got)
+            if not rows:
+                raise Failure(f"{where}: table {header} is empty")
+            return rows
+    raise Failure(f"{where}: no table headed {header}")
+
+
+def token(cell: str, where: str) -> str:
+    match = re.fullmatch(r"`([a-z_]+)`", cell)
+    if match is None:
+        raise Failure(f"{where}: {cell!r} is not one backticked token")
+    return match.group(1)
+
+
+def listed(phrase: str, where: str) -> list[str]:
+    """`a`, `b` or `c`  ->  [a, b, c]; refuses any other shape."""
+    match = re.fullmatch(r"((?:`[a-z_]+`, )*`[a-z_]+`) or (`[a-z_]+`)", phrase)
+    if match is None:
+        raise Failure(f"{where}: {phrase!r} is not a closed list of tokens")
+    return re.findall(r"`([a-z_]+)`", phrase)
+
+
+# Each check of the step table, by its exact wording, and the predicate that
+# models it. A {vocab} cell is matched as a template and its list is read.
+CHECKS = {
+    "`producer_time`, when present, is {vocab}": "pt_member",
+    "a history point, or an unbucketed row whose `tier` is `raw`, whose `producer_time` is "
+    "`not_reported` carries `received_at_ms`, a positive integer equal to its `timestamp`": "receipt",
+    "`record_kind`, when present, is {vocab}": "rk_member",
+    "`record_key` is `null` or a non-empty string": "key",
+    "`contributed_to` is a non-empty string on a `contributor` row, other than the row's own "
+    "`record_key`, and `null` on a `dispatch` or `contributor_legacy` row": "holder",
+    "a `contributor` or `contributor_legacy` row has `action_taken` `coalesced`, and a "
+    "`dispatch` row does not": "action_taken",
+    "a `contributor` row has `executed` `false`": "executed",
+}
+
+HELD = {
+    SEC_PT: [
+        "A record with no `producer_time`, from a runtime that predates the member, is read as "
+        "`unknown`, and so is a value outside the three or of another JSON type.",
+    ],
+    SEC_SH: [
+        "A bucketed or compacted row aggregates only readings of one `producer_time`, and carries it.",
+        "Each row is computed over the rows it aggregates alone: `sample_count` is their sum, "
+        "`value` and `avg_value` their mean weighted by `sample_count`, `min_value` and "
+        "`max_value` the least and greatest of their `value`, and `received_at_ms` the greatest "
+        "of their receipts.",
+        "A bucketed row's `timestamp` is its `start_ms`, `end_ms` is `start_ms` plus `bucket_ms`, "
+        "`tier` is `bucketed` and `quality` is `null`.",
+        "A row falls in the bucket whose `start_ms` is its `timestamp` rounded down to a multiple "
+        "of `bucket_ms`.",
+        "A raw `not_reported` reading is therefore bucketed by its receipt, and a compacted row by "
+        "the start of its own bucket.",
+        "A consumer reads an absent, non-positive or fractional value as no receipt, never as an "
+        "instant, and never fills it from `timestamp`.",
+    ],
+    SEC_AL: [
+        "A consumer that finds a row failing one classifies the row by the first that fails.",
+        "It reads a failing reading's `timestamp` as of unstated basis, and counts a failing "
+        "`action_log` row as no act and resolves nothing from it.",
+        "*Readings* are `sensor_history` rows and the reading and history points of a Tier 3 "
+        "reasoning request.",
+        "Each check applies only to its family, and the checks of a family are made in this order.",
+        "A reading with no `producer_time`, and an `action_log` row with no `record_kind`, are from "
+        "a runtime that predates them: step 1 passes the first and step 2 does not apply to it, "
+        "and steps 3 to 7 pass the second.",
+        "An `action_log` row that carries `record_kind` and omits `record_key` fails step 4, and "
+        "one that omits `contributed_to` fails step 5.",
+        "A reading whose `producer_time` is `not_reported` and that omits `received_at_ms` fails step 2.",
+        "A `contributor_legacy` row may carry `executed` `true`: that is what the earlier release "
+        "recorded, and step 7 does not apply to it.",
+        "A member whose value is `null` is present.",
+        "A row is an act when, and only when, its `record_kind` is `dispatch`, whether or not it "
+        "executed: `executed` says which.",
+        "A `contributor` or `contributor_legacy` row is never counted as an act or an execution, "
+        "whatever its `executed`.",
+        "A row from a runtime that sends no `record_kind` is read as `contributor_legacy` when its "
+        "`action_taken` is `coalesced` and as `dispatch` otherwise",
+        "A consumer resolves it across a complete traversal of the pages.",
+        "The holder is a `dispatch` row: a key the consumer does not find, or one that names a row "
+        "of another kind, is unresolved, which is not an error in the export and not an act.",
+        "Rows are ordered by `timestamp` descending, and rows with equal `timestamp` by the order "
+        "the runtime stored them, latest first, so that no two rows share a position.",
+        "`next_page_token` names a position in that order, never a count of rows to skip: the next "
+        "page begins with the first row stored when it is requested whose position is after the "
+        "last row returned, whether or not that row is still stored.",
+        "`record_key` is the row's own key, a non-empty string no other row of the device carries, "
+        "and `null` on a row written before the runtime assigned keys.",
+    ],
+}
+
+
+def contract_model(text: str | None = None) -> dict:
+    text = GATEWAY_V2.read_text() if text is None else text
+    # gateway-api/v2.md uses `---` thematic breaks, so it is not held to
+    # contract-markdown's restriction; only its canonical headings are read.
+    try:
+        bodies = {s: markdown.own_body(text, s) for s in (SEC_PT, SEC_SH, SEC_AL)}
+    except ValueError as error:
+        raise Failure(str(error)) from None
+    for section, sentences in HELD.items():
+        for sentence in sentences:
+            need(bodies[section], sentence, section)
+
+    pt_rows = table(bodies[SEC_PT], ["`producer_time`", "`timestamp` is"], SEC_PT)
+    pt_vocab = [token(r[0], SEC_PT) for r in pt_rows]
+    rk_rows = table(bodies[SEC_AL], ["`record_kind`", "The row records", "`contributed_to`"], SEC_AL)
+    rk_vocab = [token(r[0], SEC_AL) for r in rk_rows]
+    for vocab, where in ((pt_vocab, SEC_PT), (rk_vocab, SEC_AL)):
+        if len(set(vocab)) != len(vocab):
+            raise Failure(f"{where}: vocabulary repeats a value: {vocab}")
+
+    step_rows = table(bodies[SEC_AL], ["Step", "Family", "Check", "Verdict on failure"], SEC_AL)
+    steps = []
+    for index, (num, family, check, verdict) in enumerate(step_rows, 1):
+        if num != str(index):
+            raise Failure(f"step table: row {index} is numbered {num!r}; steps must run 1, 2, 3 ...")
+        fam = family.strip("`")
+        if fam not in ("readings", "action_log"):
+            raise Failure(f"step table: step {num} names family {family!r}")
+        key, vocab = None, None
+        for template, name in CHECKS.items():
+            if "{vocab}" in template:
+                head = template.split("{vocab}")[0]
+                if check.startswith(head):
+                    key, vocab = name, listed(check[len(head):], f"step {num}")
+            elif check == template:
+                key = name
+        if key is None:
+            raise Failure(f"step table: step {num} check {check!r} has no model in this checker")
+        if key == "pt_member" and vocab != pt_vocab:
+            raise Failure(f"step {num} lists {vocab}, the producer_time table {pt_vocab}")
+        if key == "rk_member" and vocab != rk_vocab:
+            raise Failure(f"step {num} lists {vocab}, the record_kind table {rk_vocab}")
+        steps.append({"step": index, "family": fam, "pred": key,
+                      "verdict": token(verdict, f"step {num} verdict")})
+    if len({s["verdict"] for s in steps}) != len(steps):
+        raise Failure("step table: two steps share a verdict")
+    if len({s["pred"] for s in steps}) != len(steps):
+        raise Failure("step table: two steps make the same check")
+    # A family's steps are contiguous; the text says each family is checked in order.
+    fams = [s["family"] for s in steps]
+    if fams != sorted(fams, key=lambda f: fams.index(f)):
+        raise Failure(f"step table: a family's steps are not contiguous: {fams}")
+
+    match = re.search(r"exported as one row for each, in the order ((?:`[a-z_]+`, )+)after "
+                      r"ordering by `start_ms`", flat(bodies[SEC_SH]))
+    if match is None:
+        raise Failure(f"{SEC_SH}: the basis order of a split bucket is no longer stated")
+    bucket_order = re.findall(r"`([a-z_]+)`", match.group(1))
+    if sorted(bucket_order) != sorted(pt_vocab):
+        raise Failure(f"bucket basis order {bucket_order} is not the vocabulary {pt_vocab}")
+
+    return {
+        "pt_vocab": pt_vocab, "rk_vocab": rk_vocab, "steps": steps,
+        "bucket_order": bucket_order,
+        # Behaviours the held sentences state; named so the mutations can replace them.
+        "present": lambda row, member: member in row,
+        "failing_basis": "unknown",
+        "receipt_where": ("history_point",),     # where step 2 applies regardless of tier
+        "older_read": lambda row: "contributor_legacy" if row.get("action_taken") == "coalesced"
+        else "dispatch",
+        "receipt_integer": True, "receipt_positive": True,
+        "weighted": True, "receipt_agg": max, "bucket_by": "timestamp", "split_basis": True,
+        "ties_latest_first": True, "token": "position",
+        "holder_kinds": ("dispatch",), "resolve_scope": "traversal",
+    }
+
+
+# --- the model ------------------------------------------------------------------------
+
+def is_receipt(value: Any, m: dict | None = None) -> bool:
+    """A receipt: a positive integer. Absent, non-positive or fractional is none."""
+    integer = m["receipt_integer"] if m else True
+    positive = m["receipt_positive"] if m else True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return (isinstance(value, int) or not integer) and (value > 0 or not positive)
+
+
+def pred_fails(m: dict, key: str, row: dict, where: str | None) -> bool:
+    present = m["present"]
+    if key == "pt_member":
+        return present(row, "producer_time") and not (
+            isinstance(row["producer_time"], str) and row["producer_time"] in m["pt_vocab"])
+    if key == "receipt":
+        if not (present(row, "producer_time") and row["producer_time"] == "not_reported"):
+            return False
+        applies = where in m["receipt_where"] or (
+            where == "sensor_history" and row.get("tier") == "raw" and not row.get("bucket_ms"))
+        if not applies:
+            return False
+        return not (is_receipt(row.get("received_at_ms"), m)
+                    and row.get("received_at_ms") == row.get("timestamp"))
+    # action_log: a row with no record_kind passes steps 3 to 7.
+    if not present(row, "record_kind"):
+        return False
+    kind = row["record_kind"]
+    if key == "rk_member":
+        return not (isinstance(kind, str) and kind in m["rk_vocab"])
+    if key == "key":
+        return not ("record_key" in row and (row["record_key"] is None or (
+            isinstance(row["record_key"], str) and row["record_key"] != "")))
+    if key == "holder":
+        if "contributed_to" not in row:
+            return kind in ("contributor", "dispatch", "contributor_legacy")
+        ct = row["contributed_to"]
+        if kind == "contributor":
+            return not (isinstance(ct, str) and ct != "" and ct != row.get("record_key"))
+        if kind in ("dispatch", "contributor_legacy"):
+            return ct is not None
+        return False
+    if key == "action_taken":
+        if kind in ("contributor", "contributor_legacy"):
+            return row.get("action_taken") != "coalesced"
+        if kind == "dispatch":
+            return row.get("action_taken") == "coalesced"
+        return False
+    if key == "executed":
+        return kind == "contributor" and row.get("executed") is not False
+    raise Failure(f"no predicate {key}")
+
+
+def failing(m: dict, family: str, row: dict, where: str | None = None) -> list[dict]:
+    return [s for s in m["steps"] if s["family"] == family and pred_fails(m, s["pred"], row, where)]
+
+
+def reading_outcome(m: dict, case: dict) -> dict:
+    fails = failing(m, "readings", case["row"], case["where"])
+    verdict = fails[0]["verdict"] if fails else None
+    row = case["row"]
+    if verdict is not None:
+        basis = m["failing_basis"] if m["failing_basis"] != "as_sent" else row.get("producer_time")
+    else:
+        basis = row["producer_time"] if m["present"](row, "producer_time") else "unknown"
+    return {"verdict": verdict, "time_basis": basis}
+
+
+def action_outcome(m: dict, row: dict) -> dict:
+    fails = failing(m, "action_log", row)
+    if fails:
+        return {"verdict": fails[0]["verdict"], "read_as": None, "is_act": False}
+    read = row["record_kind"] if m["present"](row, "record_kind") else m["older_read"](row)
+    return {"verdict": None, "read_as": read, "is_act": read == "dispatch"}
+
+
+def buckets_of(m: dict, case: dict) -> list[dict]:
+    width = case["bucket_ms"]
+    groups: dict[tuple[int, str], list[dict]] = {}
+    for row in case["rows"]:
+        start = (row[m["bucket_by"]] // width) * width
+        basis = row["producer_time"] if m["split_basis"] else "*"
+        groups.setdefault((start, basis), []).append(row)
+    order = {b: i for i, b in enumerate(m["bucket_order"])}
+    out = []
+    for (start, basis), rows in sorted(groups.items(), key=lambda g: (g[0][0], order.get(g[0][1], -1))):
+        n = sum(r["sample_count"] for r in rows)
+        if m["weighted"]:
+            mean = sum(Fraction(r["value"]) * r["sample_count"] for r in rows) / n
+        else:
+            mean = sum(Fraction(r["value"]) for r in rows) / len(rows)
+        out.append({
+            "start_ms": start, "end_ms": start + width, "timestamp": start,
+            "bucket_ms": width, "tier": "bucketed", "quality": None,
+            "producer_time": basis if basis != "*" else rows[0]["producer_time"],
+            "sample_count": n, "avg_value": float(mean), "value": float(mean),
+            "min_value": min(r["value"] for r in rows), "max_value": max(r["value"] for r in rows),
+            "received_at_ms": m["receipt_agg"](r["received_at_ms"] for r in rows),
+        })
+    return out
+
+
+def traverse(m: dict, case: dict) -> list[list[str]]:
+    stored = {r["id"]: r for r in case["stored"]}
+
+    def pos(r: dict) -> tuple[int, int]:
+        return (r["timestamp"], r["stored"] if m["ties_latest_first"] else -r["stored"])
+
+    pages: list[list[str]] = []
+    last: tuple[int, int] | None = None
+    skipped = 0
+    for index in range(10_000):
+        ordered = sorted(stored.values(), key=pos, reverse=True)
+        cursor_gone = last is not None and pages and pages[-1][-1] not in stored
+        if m["token"] == "position" or (m["token"] == "position_if_stored" and not cursor_gone):
+            rest = ordered if last is None else [r for r in ordered if pos(r) < last]
+        else:
+            rest = ordered[skipped:]
+        page = rest[:case["page_size"]]
+        if not page:
+            return pages
+        pages.append([r["id"] for r in page])
+        last = pos(page[-1])
+        skipped += len(page)
+        if index < len(case["between_pages"]):
+            change = case["between_pages"][index]
+            for r in change.get("store", []):
+                if r["id"] in stored:
+                    raise Failure(f"paging {case['name']!r}: {r['id']} stored twice")
+                stored[r["id"]] = r
+            for rid in change.get("remove", []):
+                if rid not in stored:
+                    raise Failure(f"paging {case['name']!r}: removes {rid}, not stored")
+                del stored[rid]
+    raise Failure(f"paging {case['name']!r}: traversal does not end")
+
+
+def resolve(m: dict, case: dict) -> list[dict]:
+    out = []
+    for p, page in enumerate(case["pages"]):
+        scope = [r for pg in case["pages"] for r in pg] if m["resolve_scope"] == "traversal" else page
+        index = {r["record_key"]: r for r in scope if r.get("record_key") is not None}
+        for row in page:
+            if row.get("record_kind") != "contributor":
+                continue
+            holder = index.get(row["contributed_to"])
+            ok = holder is not None and holder.get("record_kind") in m["holder_kinds"] \
+                and not failing(m, "action_log", holder)
+            out.append({"record_key": row["record_key"], "holder": row["contributed_to"] if ok else None})
+    return out
+
+
+# Pairs of checks no row can fail together, so their order is unobservable: step 2
+# applies only where `producer_time` is `not_reported`, a value step 1 accepts.
+EXCLUSIVE = {("pt_member", "receipt")}
+
+
+# --- checking -------------------------------------------------------------------------
+
+# The corpus's stated encodings, each the phrase this checker's model relies on.
+CONVENTIONS = {
+    "readings.where": ["sensor_history row", "history_point of a Tier 3 request",
+                       "reasoning_reading: the Tier 3 request's own reading"],
+    "expected.read_as": ["null for a row that fails a check"],
+    "paging.between_pages": ["entry i changes the store after page i+1 is returned and before the "
+                             "next is requested", "stored is the order the runtime stored the rows"],
+    "buckets.expected": ["every member of a bucketed row except sensor_id, sensor_type and unit"],
+}
+
+SHAPES = {
+    "readings": ({"name", "where", "row", "expected"}, {"verdict", "time_basis"}),
+    "action_log": ({"name", "row", "expected"}, {"verdict", "read_as", "is_act"}),
+    "buckets": ({"name", "bucket_ms", "rows", "expected"}, None),
+    "paging": ({"name", "stored", "page_size", "between_pages", "expected_pages"}, None),
+    "resolution": ({"name", "pages", "expected"}, None),
+}
+
+
+def same(a: Any, b: Any) -> bool:
+    """JSON equality that does not let true stand for 1."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return type(a) is type(b) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    return a == b and (a is None) == (b is None)
+
+
+def check(corpus: dict, m: dict) -> list[str]:
+    problems: list[str] = []
+    if set(corpus) != {"vector_set", "contract", "sections", "conventions", *SETS}:
+        problems.append(f"corpus members {sorted(corpus)}")
+    if corpus.get("contract") != "gateway-api/v2.md":
+        problems.append(f"corpus names contract {corpus.get('contract')!r}")
+    if corpus.get("sections") != ["Producer Time", "sensor_history", "action_log"]:
+        problems.append(f"corpus names sections {corpus.get('sections')!r}")
+    conv = corpus.get("conventions")
+    if not isinstance(conv, dict) or set(conv) != set(CONVENTIONS):
+        problems.append(f"corpus conventions name {sorted(conv) if isinstance(conv, dict) else conv}")
+    else:
+        for k, phrases in CONVENTIONS.items():
+            for phrase in phrases:
+                if phrase not in conv[k]:
+                    problems.append(f"corpus conventions {k} no longer says {phrase!r}: "
+                                    "the encoding this checker models")
+    for kind in SETS:
+        names = [c.get("name") for c in corpus.get(kind, [])]
+        if len(set(names)) != len(names):
+            problems.append(f"{kind}: case names repeat")
+        members, expected = SHAPES[kind]
+        for case in corpus.get(kind, []):
+            if set(case) != members:
+                problems.append(f"{kind} {case.get('name')!r}: members {sorted(case)}")
+            elif expected is not None and set(case["expected"]) != expected:
+                problems.append(f"{kind} {case['name']!r}: expected members {sorted(case['expected'])}")
+    if problems:
+        return problems
+
+    for case in corpus["readings"]:
+        if case["where"] not in WHERE:
+            problems.append(f"readings {case['name']!r}: where {case['where']!r} is not a reading")
+            continue
+        got = reading_outcome(m, case)
+        for k, v in got.items():
+            if not same(case["expected"][k], v):
+                problems.append(f"readings {case['name']!r}: {k} declared "
+                                f"{case['expected'][k]!r}, recomputed {v!r}")
+    for case in corpus["action_log"]:
+        got = action_outcome(m, case["row"])
+        for k, v in got.items():
+            if not same(case["expected"][k], v):
+                problems.append(f"action_log {case['name']!r}: {k} declared "
+                                f"{case['expected'][k]!r}, recomputed {v!r}")
+    for case in corpus["buckets"]:
+        for row in case["rows"]:
+            if row.get("producer_time") not in m["pt_vocab"] or not is_receipt(row.get("sample_count")):
+                problems.append(f"buckets {case['name']!r}: input row {row} is not a valid runtime row")
+        got = buckets_of(m, case)
+        if not same(case["expected"], got):
+            problems.append(f"buckets {case['name']!r}: aggregate declared {case['expected']}, "
+                            f"recomputed {got}")
+    for case in corpus["paging"]:
+        positions = [(r["timestamp"], r["stored"]) for r in case["stored"]]
+        if len(set(positions)) != len(positions):
+            problems.append(f"paging {case['name']!r}: two rows share a position")
+        got = traverse(m, case)
+        if got != case["expected_pages"]:
+            problems.append(f"paging {case['name']!r}: pages declared {case['expected_pages']}, "
+                            f"recomputed {got}")
+    for case in corpus["resolution"]:
+        rows = [r for page in case["pages"] for r in page]
+        keys = [r["record_key"] for r in rows if r.get("record_key") is not None]
+        if len(set(keys)) != len(keys):
+            problems.append(f"resolution {case['name']!r}: a record_key repeats on the device")
+        for r in rows:
+            for s in failing(m, "action_log", r):
+                problems.append(f"resolution {case['name']!r}: row {r} fails step {s['step']} "
+                                f"({s['verdict']})")
+        got = resolve(m, case)
+        if not same(case["expected"], got):
+            problems.append(f"resolution {case['name']!r}: holders declared {case['expected']}, "
+                            f"recomputed {got}")
+    return problems
+
+
+def coverage(corpus: dict, m: dict) -> list[str]:
+    gaps = []
+    readings = [(c, failing(m, "readings", c["row"], c["where"])) for c in corpus["readings"]]
+    actions = [(c, failing(m, "action_log", c["row"])) for c in corpus["action_log"]]
+    first = {f[0]["verdict"] for _, f in readings + actions if f}
+    for s in m["steps"]:
+        if s["verdict"] not in first:
+            gaps.append(f"verdict {s['verdict']}: no case fails first at step {s['step']}")
+    for fam, cases in (("readings", readings), ("action_log", actions)):
+        fam_steps = [s for s in m["steps"] if s["family"] == fam]
+        for a, b in zip(fam_steps, fam_steps[1:]):
+            if (a["pred"], b["pred"]) in EXCLUSIVE:
+                continue
+            if not any(f and f[0] is a and b in f for _, f in cases):
+                gaps.append(f"step order {a['step']} before {b['step']}: no case fails both, "
+                            f"so the order of {a['verdict']} and {b['verdict']} is unproved")
+    for what, bad in (("non-positive", lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v <= 0),
+                      ("fractional", lambda v: isinstance(v, float) and v > 0 and v != int(v))):
+        if not any(f and f[0]["pred"] == "receipt" and bad(c["row"].get("received_at_ms"))
+                   and c["row"].get("received_at_ms") == c["row"].get("timestamp")
+                   for c, f in readings):
+            gaps.append(f"step 2: no case whose receipt equals its timestamp and is refused only "
+                        f"for being {what}")
+    valid_pt = {c["row"]["producer_time"] for c, f in readings if not f and "producer_time" in c["row"]}
+    for v in m["pt_vocab"]:
+        if v not in valid_pt:
+            gaps.append(f"producer_time {v}: in no valid case")
+    valid_rk = {c["row"]["record_kind"] for c, f in actions if not f and "record_kind" in c["row"]}
+    for v in m["rk_vocab"]:
+        if v not in valid_rk:
+            gaps.append(f"record_kind {v}: in no valid case")
+    if not any(not f and "producer_time" not in c["row"] for c, f in readings):
+        gaps.append("readings: no valid row from a runtime that predates producer_time")
+    if not any(not f and "record_kind" not in c["row"] for c, f in actions):
+        gaps.append("action_log: no valid row from a runtime that predates record_kind")
+    older = {action_outcome(m, c["row"])["read_as"] for c, f in actions
+             if not f and "record_kind" not in c["row"]}
+    for v in ("dispatch", "contributor_legacy"):
+        if v not in older:
+            gaps.append(f"action_log: no older-runtime row read as {v}")
+
+    # Buckets: a bucket split three ways; weighting that differs from a plain mean;
+    # a receipt taken from a row other than the one latest in timestamp; rows
+    # supplied out of output order.
+    split3 = weighted = receipt = reordered = compacted_across = False
+    for case in corpus["buckets"]:
+        width = case["bucket_ms"]
+        by_start: dict[int, list[dict]] = {}
+        for r in case["rows"]:
+            by_start.setdefault(r["timestamp"] // width, []).append(r)
+        split3 |= any(len({r["producer_time"] for r in rs}) >= 3 for rs in by_start.values())
+        for rs in by_start.values():
+            for basis in {r["producer_time"] for r in rs}:
+                g = [r for r in rs if r["producer_time"] == basis]
+                if len(g) > 1:
+                    w = sum(Fraction(r["value"]) * r["sample_count"] for r in g) / sum(
+                        r["sample_count"] for r in g)
+                    weighted |= w != sum(Fraction(r["value"]) for r in g) / len(g)
+                    receipt |= max(g, key=lambda r: r["timestamp"])["received_at_ms"] != max(
+                        r["received_at_ms"] for r in g)
+        compacted_across |= any(r["timestamp"] != r["received_at_ms"] and
+                                r["received_at_ms"] // width != r["timestamp"] // width
+                                for r in case["rows"])
+        bases = [r["producer_time"] for r in case["rows"]]
+        reordered |= bases != sorted(bases, key=m["bucket_order"].index)
+    for flag, what in ((split3, "a bucket holding all three bases"),
+                       (weighted, "a weighted mean that differs from the plain mean"),
+                       (receipt, "a receipt not from the row latest in timestamp"),
+                       (reordered, "input rows out of basis order"),
+                       (compacted_across, "an input whose receipt falls in another bucket")):
+        if not flag:
+            gaps.append(f"buckets: {what}")
+
+    # Paging: ties; a row stored ahead of and behind the cursor; a returned row,
+    # an unreturned row and the cursor row itself removed between pages.
+    seen = set()
+    for case in corpus["paging"]:
+        ts = [r["timestamp"] for r in case["stored"]]
+        if len(set(ts)) < len(ts):
+            seen.add("ties")
+        pages = case["expected_pages"]
+        by_id = {r["id"]: r for r in case["stored"]}
+        for i, change in enumerate(case["between_pages"]):
+            if i >= len(pages):
+                continue
+            returned = [x for p in pages[:i + 1] for x in p]
+            cursor = by_id.get(pages[i][-1])
+            for r in change.get("store", []):
+                by_id[r["id"]] = r
+                if cursor and (r["timestamp"], r["stored"]) > (cursor["timestamp"], cursor["stored"]):
+                    seen.add("stored ahead")
+                else:
+                    seen.add("stored behind")
+            for rid in change.get("remove", []):
+                if rid == pages[i][-1]:
+                    seen.add("cursor removed")
+                elif rid in returned:
+                    seen.add("returned removed")
+                else:
+                    seen.add("unreturned removed")
+    for want in ("ties", "stored ahead", "stored behind", "returned removed",
+                 "unreturned removed", "cursor removed"):
+        if want not in seen:
+            gaps.append(f"paging: no case with {want}"
+                        + (" (the last row returned removed before the next page)"
+                           if want == "cursor removed" else ""))
+
+    # Resolution: holder on a later page, missing, of another kind.
+    seen = set()
+    for case in corpus["resolution"]:
+        where = {r["record_key"]: (p, r) for p, pg in enumerate(case["pages"]) for r in pg
+                 if r.get("record_key") is not None}
+        for p, pg in enumerate(case["pages"]):
+            for r in pg:
+                if r.get("record_kind") != "contributor":
+                    continue
+                hit = where.get(r["contributed_to"])
+                if hit is None:
+                    seen.add("missing")
+                elif hit[1].get("record_kind") != "dispatch":
+                    seen.add("another kind")
+                elif hit[0] > p:
+                    seen.add("later page")
+    for want in ("later page", "missing", "another kind"):
+        if want not in seen:
+            gaps.append(f"resolution: no contributor whose holder is {want}")
+    return gaps
+
+
+def problems_of(corpus_bytes: bytes, m: dict) -> list[str]:
+    corpus = json.loads(corpus_bytes)
+    found = check(corpus, m)
+    if not any(p.startswith("corpus ") or ": members" in p or "expected members" in p
+               or "case names repeat" in p for p in found):
+        found += [f"not covered: {g}" for g in coverage(corpus, m)]
+    return found
+
+
+# --- mutations ---------------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[int, int]:
+    base = json.loads(corpus_bytes)
+    before = set(baseline)
+
+    def refused(new: list[str], expect: str) -> bool:
+        return any(expect in p for p in set(new) - before)
+
+    def corpus_mutant(edit: Callable[[dict], None], expect: str) -> Callable[[], bool]:
+        def go() -> bool:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            return refused(problems_of(json.dumps(mutated).encode(), model), expect)
+        return go
+
+    def model_mutant(expect: str, **changes: Any) -> Callable[[], bool]:
+        def go() -> bool:
+            return refused(problems_of(corpus_bytes, {**model, **changes}), expect)
+        return go
+
+    def text_mutant(old: str, new: str, expect: str) -> Callable[[], bool]:
+        def go() -> bool:
+            text = GATEWAY_V2.read_text()
+            if old not in text:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            try:
+                m = contract_model(text.replace(old, new, 1))
+            except Failure as failure:
+                return expect in str(failure)
+            return refused(problems_of(corpus_bytes, m), expect)
+        return go
+
+    def set_(kind: str, name: str, path: list, value: Any) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            target = next(x for x in c[kind] if x["name"] == name)
+            for p in path[:-1]:
+                target = target[p]
+            target[path[-1]] = value
+        return edit
+
+    verdicts = [s["verdict"] for s in model["steps"]]
+    cases: list[tuple[str, Callable[[], bool]]] = []
+
+    # Corpus: every declared outcome flipped.
+    for case in base["readings"]:
+        v = case["expected"]["verdict"]
+        alt = None if v is not None else verdicts[0]
+        cases.append((f"verdict flipped: {case['name']}",
+                      corpus_mutant(set_("readings", case["name"], ["expected", "verdict"], alt), "verdict")))
+        if v is not None:
+            other = next(x for x in verdicts if x != v)
+            cases.append((f"verdict moved to {other}: {case['name']}", corpus_mutant(
+                set_("readings", case["name"], ["expected", "verdict"], other), "verdict")))
+        tb = case["expected"]["time_basis"]
+        cases.append((f"time basis changed: {case['name']}", corpus_mutant(set_(
+            "readings", case["name"], ["expected", "time_basis"],
+            "reported" if tb != "reported" else "unknown"), "time_basis")))
+    for case in base["action_log"]:
+        e = case["expected"]
+        alt = None if e["verdict"] is not None else verdicts[2]
+        cases.append((f"verdict flipped: {case['name']}",
+                      corpus_mutant(set_("action_log", case["name"], ["expected", "verdict"], alt), "verdict")))
+        if e["verdict"] is not None:
+            others = [x for x in verdicts[2:] if x != e["verdict"]]
+            cases.append((f"verdict moved to {others[0]}: {case['name']}", corpus_mutant(
+                set_("action_log", case["name"], ["expected", "verdict"], others[0]), "verdict")))
+        cases.append((f"act count flipped: {case['name']}", corpus_mutant(
+            set_("action_log", case["name"], ["expected", "is_act"], not e["is_act"]), "is_act")))
+        cases.append((f"reading changed: {case['name']}", corpus_mutant(set_(
+            "action_log", case["name"], ["expected", "read_as"],
+            "contributor" if e["read_as"] != "contributor" else "dispatch"), "read_as")))
+    for case in base["buckets"]:
+        for member in ("sample_count", "avg_value", "value", "min_value", "max_value",
+                       "received_at_ms", "start_ms", "end_ms", "timestamp"):
+            def edit(c: dict, n=case["name"], k=member) -> None:
+                row = next(x for x in c["buckets"] if x["name"] == n)["expected"][0]
+                row[k] = row[k] + 1
+            cases.append((f"bucket {member} changed: {case['name']}", corpus_mutant(edit, "aggregate")))
+        if len(case["expected"]) > 1:
+            def swap(c: dict, n=case["name"]) -> None:
+                e = next(x for x in c["buckets"] if x["name"] == n)["expected"]
+                e[0], e[1] = e[1], e[0]
+            cases.append((f"bucket rows swapped: {case['name']}", corpus_mutant(swap, "aggregate")))
+    for case in base["paging"]:
+        def swap_pages(c: dict, n=case["name"]) -> None:
+            p = next(x for x in c["paging"] if x["name"] == n)["expected_pages"]
+            p[0], p[1] = p[1], p[0]
+        cases.append((f"pages swapped: {case['name']}", corpus_mutant(swap_pages, "pages")))
+
+        def drop_last(c: dict, n=case["name"]) -> None:
+            next(x for x in c["paging"] if x["name"] == n)["expected_pages"][-1].pop()
+        cases.append((f"last row dropped: {case['name']}", corpus_mutant(drop_last, "pages")))
+    for case in base["resolution"]:
+        for i in range(len(case["expected"])):
+            def flip(c: dict, n=case["name"], i=i) -> None:
+                e = next(x for x in c["resolution"] if x["name"] == n)["expected"][i]
+                e["holder"] = None if e["holder"] else "00000000000000000000000000000001"
+            cases.append((f"holder {i} flipped: {case['name']}", corpus_mutant(flip, "holders")))
+
+    for key in CONVENTIONS:
+        def conv(c: dict, k=key) -> None:
+            c["conventions"][k] = "changed"
+        cases.append((f"convention {key} changed", corpus_mutant(conv, "conventions")))
+
+    def broken_holder(c: dict) -> None:
+        for page in c["resolution"][0]["pages"]:
+            for r in page:
+                if r.get("record_kind") == "dispatch":
+                    r["action_taken"] = "coalesced"
+    cases.append(("resolution holder fails step 6", corpus_mutant(broken_holder, "fails step 6")))
+
+    # Corpus: the cases carrying a coverage obligation dropped.
+    for s in model["steps"]:
+        def drop(c: dict, v=s["verdict"]) -> None:
+            for k in ("readings", "action_log"):
+                c[k] = [x for x in c[k] if x["expected"]["verdict"] != v]
+        cases.append((f"cases failing with {s['verdict']} dropped",
+                      corpus_mutant(drop, f"verdict {s['verdict']}")))
+    for v in model["pt_vocab"]:
+        def drop(c: dict, v=v) -> None:
+            c["readings"] = [x for x in c["readings"] if not (
+                x["expected"]["verdict"] is None and x["row"].get("producer_time") == v)]
+        cases.append((f"valid {v} readings dropped", corpus_mutant(drop, f"producer_time {v}")))
+    for v in model["rk_vocab"]:
+        def drop(c: dict, v=v) -> None:
+            c["action_log"] = [x for x in c["action_log"] if not (
+                x["expected"]["verdict"] is None and x["row"].get("record_kind") == v)]
+        cases.append((f"valid {v} rows dropped", corpus_mutant(drop, f"record_kind {v}")))
+
+    def drop_old_readings(c: dict) -> None:
+        c["readings"] = [x for x in c["readings"] if "producer_time" in x["row"]]
+
+    def drop_old_actions(c: dict) -> None:
+        c["action_log"] = [x for x in c["action_log"] if "record_kind" in x["row"]]
+    cases += [("older-runtime readings dropped", corpus_mutant(drop_old_readings, "predates producer_time")),
+              ("older-runtime action rows dropped", corpus_mutant(drop_old_actions, "predates record_kind"))]
+
+    # Model: rules reordered, dropped or misread.
+    steps = model["steps"]
+    for i, a in enumerate(steps):
+        for b in steps[i + 1:]:
+            if a["family"] != b["family"]:
+                continue
+            if (a["pred"], b["pred"]) in EXCLUSIVE:
+                print(f"  equivalent: steps {a['step']} and {b['step']} reordered "
+                      "(no row can fail both; see EXCLUSIVE)")
+                continue
+            swapped = list(steps)
+            ia, ib = steps.index(a), steps.index(b)
+            swapped[ia], swapped[ib] = b, a
+            cases.append((f"steps {a['step']} and {b['step']} reordered",
+                          model_mutant("verdict", steps=swapped)))
+    for s in steps:
+        cases.append((f"step {s['step']} dropped",
+                      model_mutant("verdict", steps=[x for x in steps if x is not s])))
+    for v in model["pt_vocab"]:
+        cases.append((f"producer_time {v} dropped from the vocabulary",
+                      model_mutant("verdict", pt_vocab=[x for x in model["pt_vocab"] if x != v])))
+    for v in model["rk_vocab"]:
+        cases.append((f"record_kind {v} dropped from the vocabulary",
+                      model_mutant("verdict", rk_vocab=[x for x in model["rk_vocab"] if x != v])))
+    cases += [
+        ("producer_time 'received' added", model_mutant("verdict", pt_vocab=[*model["pt_vocab"], "received"])),
+        ("record_kind 'act' added", model_mutant("verdict", rk_vocab=[*model["rk_vocab"], "act"])),
+        ("a null member read as absent",
+         model_mutant("verdict", present=lambda row, k: row.get(k) is not None)),
+        ("a failing reading keeps its sent basis", model_mutant("time_basis", failing_basis="as_sent")),
+        ("a fractional receipt accepted", model_mutant("verdict", receipt_integer=False)),
+        ("a non-positive receipt accepted", model_mutant("verdict", receipt_positive=False)),
+        ("step 2 skips history points", model_mutant("verdict", receipt_where=())),
+        ("step 2 applies to every reading",
+         model_mutant("verdict", receipt_where=WHERE)),
+        ("older rows all read as dispatch", model_mutant("read_as", older_read=lambda r: "dispatch")),
+        ("unweighted bucket mean", model_mutant("aggregate", weighted=False)),
+        ("least receipt kept", model_mutant("aggregate", receipt_agg=min)),
+        ("bucketed by receipt", model_mutant("aggregate", bucket_by="received_at_ms")),
+        ("bases not split", model_mutant("aggregate", split_basis=False)),
+        ("basis order reversed", model_mutant("aggregate", bucket_order=model["bucket_order"][::-1])),
+        ("ties earliest first", model_mutant("pages", ties_latest_first=False)),
+        ("token counts rows to skip", model_mutant("pages", token="offset")),
+        ("a removed cursor row falls back to a count",
+         model_mutant("pages", token="position_if_stored")),
+        ("holder of any kind", model_mutant("holders", holder_kinds=tuple(model["rk_vocab"]))),
+        ("holder looked up on its own page", model_mutant("holders", resolve_scope="page")),
+    ]
+
+    # Contract text: the tables and sentences the model reads.
+    cases += [
+        ("text: step 1 verdict renamed", text_mutant(
+            "| `producer_time_invalid` |", "| `receipt_not_timestamp_x` |", "verdict")),
+        ("text: step rows 3 and 4 renumbered", text_mutant(
+            "| 3 | `action_log`", "| 9 | `action_log`", "numbered")),
+        ("text: a check reworded", text_mutant(
+            "a `contributor` row has `executed` `false`", "a `contributor` row has `executed` unset",
+            "no model")),
+        ("text: step table header changed", text_mutant(
+            "| Step | Family | Check | Verdict on failure |", "| Step | Family | Check | Verdict |",
+                                                        "no table headed")),
+        ("text: unknown dropped from the producer_time table", text_mutant(
+            "| `unknown` | one of the two", "| `unsure` | one of the two", "lists")),
+        ("text: a record_kind table value changed", text_mutant(
+            "| `contributor_legacy` | a request", "| `legacy` | a request", "lists")),
+        ("text: bucket basis order changed", text_mutant(
+            "in the order `reported`,\n`not_reported`, `unknown`",
+            "in the order `unknown`,\n`not_reported`, `reported`", "aggregate")),
+        ("text: ties earliest first", text_mutant("latest first, so that", "earliest first, so that",
+                                                   "no longer says")),
+        ("text: older-runtime reading reversed", text_mutant(
+            "is read as `contributor_legacy` when its `action_taken` is\n`coalesced`",
+            "is read as `dispatch` when its `action_taken` is\n`coalesced`", "no longer says")),
+    ]
+
+    survived = 0
+    for name, go in cases:
+        try:
+            ok = go()
+        except (Failure, KeyError, TypeError, ValueError, StopIteration, IndexError) as error:
+            ok = False
+            name += f" (raised {type(error).__name__}: {error})"
+        if not ok:
+            survived += 1
+            print(f"  survived: {name}")
+    return len(cases), survived
+
+
+NOT_PROVED = ("not proved: that the runtime's closed per-path producer_time table is right (this "
+              "contract does not enumerate it), that a runtime emits these rows, that a gateway "
+              "presents not_reported/unknown times as the contract requires, the Tier 3 prompt "
+              "wording, "
+              "or record_key uniqueness across a real device")
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        model = contract_model()
+    except Failure as failure:
+        print(f"gateway-api/v2 export rows contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    corpus = json.loads(corpus_bytes)
+    total = sum(len(corpus.get(k, [])) for k in SETS)
+    problems = problems_of(corpus_bytes, model)
+    status = 0
+    if problems:
+        print(f"gateway-api/v2 export rows corpus: {len(problems)} problem(s):\n  "
+              + "\n  ".join(problems))
+        status = 1
+    else:
+        print(f"gateway-api/v2 export rows corpus: {total} cases held, recomputed from "
+              f"gateway-api/v2; {NOT_PROVED}")
+    if argv == ["--mutations"]:
+        count, survived = mutations(corpus_bytes, model, problems)
+        print(f"{count} mutants, {count - survived} refused for their intended reason, "
+              f"{survived} survived")
+        if survived:
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
