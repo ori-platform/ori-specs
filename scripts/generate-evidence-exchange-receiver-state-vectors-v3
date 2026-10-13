@@ -135,9 +135,9 @@ SEALED_REGISTRATIONS = [
     {"anchor_epoch_id": EPOCH_CURRENT, "pubkey_hex": DEVICE_PUBKEY},
 ]
 SEALED_ARTIFACTS = [
-    {"artifact_type": "checkpoint", "anchor_epoch_id": EPOCH_CURRENT,
+    {"artifact_type": "checkpoint", "anchor_epoch_id": epoch,
      "digest": sha(f"ori-specs evidence-exchange/v3 restated records checkpoint {n}")}
-    for n in (1, 2)
+    for n, epoch in ((1, EPOCH_CURRENT), (2, EPOCH_CURRENT), (3, EPOCH_EARLIER))
 ]
 
 # --- artifacts -------------------------------------------------------------------------
@@ -181,13 +181,33 @@ def confirmation(epoch: str, actor: str, at_ms: int, key: str = "epoch_active") 
     }, EPOCH_DOMAIN, key)
 
 
-def disposition(trigger: int, at_ms: int) -> dict:
+DISPOSITION_BY_SCOPE = {"artifact": "artifact_terminal",
+                        "epoch": "epoch_reprovisioning_required",
+                        "identity": "identity_replacement_required"}
+
+
+def disposition(trigger: int, at_ms: int, scope: str = "epoch") -> dict:
+    """A disposition triggered by sealed artifact *trigger*, under the epoch that artifact names."""
+    sealed = SEALED_ARTIFACTS[trigger - 1]
     return sign({
-        "v": 1, "device_id": DEVICE_ID, "anchor_epoch_id": EPOCH_CURRENT,
-        "triggering_digest": SEALED_ARTIFACTS[trigger - 1]["digest"],
-        "scope": "epoch", "disposition": "epoch_reprovisioning_required",
+        "v": 1, "device_id": DEVICE_ID, "anchor_epoch_id": sealed["anchor_epoch_id"],
+        "triggering_digest": sealed["digest"],
+        "scope": scope, "disposition": DISPOSITION_BY_SCOPE[scope],
         "decided_at_ms": at_ms,
     }, DISPOSITION_DOMAIN, "disposition_active")
+
+
+def stop_of(artifact: dict) -> dict | None:
+    """The stop record a disposition's effect produces; an identity stop names no epoch."""
+    if artifact["scope"] == "artifact":
+        return None
+    return {"scope": artifact["scope"],
+            "anchor_epoch_id": artifact["anchor_epoch_id"] if artifact["scope"] == "epoch" else ""}
+
+
+def applied_disposition(artifact: dict) -> dict:
+    return {k: artifact[k] for k in ("triggering_digest", "anchor_epoch_id", "scope",
+                                     "disposition", "decided_at_ms", "key_id")}
 
 
 # --- held records ----------------------------------------------------------------------
@@ -350,12 +370,19 @@ def decide_once(kind: str, before: dict, artifact: dict, now: int,
                         o["state"], o["closed_at_ms"] = "confirmed", now
                         tx.write()
         elif kind == "evidence_disposition":
-            record = {k: artifact[k] for k in ("triggering_digest", "anchor_epoch_id", "scope",
-                                               "disposition", "decided_at_ms", "key_id")}
-            stop = {"scope": "epoch", "anchor_epoch_id": artifact["anchor_epoch_id"]}
+            record = applied_disposition(artifact)
+            stop = stop_of(artifact)
+            identity_stopped = any(x["scope"] == "identity" for x in s["stops"])
             if record in s["dispositions"]:
                 pass
-            elif stop in s["stops"]:
+            elif stop is None:
+                # Artifact scope, on a sealed checkpoint: recorded, with no
+                # delivery effect and no stop, whatever stop is in force.
+                s["dispositions"].append(record)
+                tx.write()
+            elif identity_stopped or stop in s["stops"]:
+                # Step 6: an epoch or identity disposition whose stop is in
+                # force has no new effect. An identity stop covers every epoch.
                 return "reject", "superseded", before, None
             else:
                 s["dispositions"].append(record)
@@ -513,6 +540,31 @@ CASES: list[tuple[str, str, str, dict, dict, str | None]] = [
                          "decided_at_ms": T0 + 3000, "key_id": KEY_ID["disposition_active"]}],
           stops=[{"scope": "epoch", "anchor_epoch_id": EPOCH_CURRENT}]),
      disposition(2, T0 + 4000), None),
+    ("disposition_epoch_under_identity_stop_same_epoch", "evidence_disposition",
+     "An identity stop is in force. An epoch-scoped disposition for the current epoch has no new effect, since the identity stop already covers every epoch: refused superseded, and nothing changes.",
+     held(dispositions=[applied_disposition(disposition(2, T0 + 3000, "identity"))],
+          stops=[stop_of(disposition(2, T0 + 3000, "identity"))]),
+     disposition(1, T0 + 4000), None),
+    ("disposition_epoch_under_identity_stop_other_epoch", "evidence_disposition",
+     "An identity stop is in force. An epoch-scoped disposition for the earlier epoch, triggered by a checkpoint sealed under it, is likewise covered: refused superseded, and nothing changes.",
+     held(dispositions=[applied_disposition(disposition(2, T0 + 3000, "identity"))],
+          stops=[stop_of(disposition(2, T0 + 3000, "identity"))]),
+     disposition(3, T0 + 4000), None),
+    ("disposition_identity_under_epoch_stop", "evidence_disposition",
+     "An epoch stop for the current epoch is in force. An identity-scoped disposition has a new effect, stopping every other epoch too: applied, and an identity stop is added beside the epoch stop, which stays.",
+     held(dispositions=[applied_disposition(disposition(1, T0 + 3000))],
+          stops=[stop_of(disposition(1, T0 + 3000))]),
+     disposition(2, T0 + 4000, "identity"), None),
+    ("disposition_identity_byte_identical_repeat", "evidence_disposition",
+     "Byte-identical to the applied identity disposition. v2's rule: applied again with no new state.",
+     held(dispositions=[applied_disposition(disposition(2, T0 + 3000, "identity"))],
+          stops=[stop_of(disposition(2, T0 + 3000, "identity"))]),
+     disposition(2, T0 + 3000, "identity"), None),
+    ("disposition_artifact_scope_under_identity_stop", "evidence_disposition",
+     "An identity stop is in force. An artifact-scoped artifact_terminal on a sealed checkpoint is not an epoch or identity disposition, so step 6 does not supersede it: applied, its record is added, no stop is added, and the identity stop is unchanged.",
+     held(dispositions=[applied_disposition(disposition(2, T0 + 3000, "identity"))],
+          stops=[stop_of(disposition(2, T0 + 3000, "identity"))]),
+     disposition(1, T0 + 4000, "artifact"), None),
     ("disposition_store_fault_after_first_write", "evidence_disposition",
      "As disposition_first_application, with the store failing on the write after the disposition record. Rolled back: no disposition and no stop is held, the artifact is undecided, and the signal is raised.",
      held(), disposition(1, T0 + 3000), "after_first_write"),

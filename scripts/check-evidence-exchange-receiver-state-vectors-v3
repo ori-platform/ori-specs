@@ -769,6 +769,14 @@ def verify(case: dict, corpus: dict, rules: dict, mat: dict) -> list[str]:
 
 # --- held state ---------------------------------------------------------------------------
 
+def stop_in_force(disposition: dict, stops: list[dict]) -> bool:
+    """Step 6's stop already in force. An identity stop covers every epoch of the identity, so it
+    is in force for any epoch or identity disposition; an epoch stop only for its own epoch."""
+    if any(s["scope"] == "identity" for s in stops):
+        return True
+    return disposition["scope"] == "epoch" and stop_of(disposition) in stops
+
+
 def stop_of(disposition: dict) -> dict:
     """The stop record an epoch or identity disposition produces, as the schema gives it."""
     return {"scope": disposition["scope"],
@@ -931,6 +939,15 @@ def check_state(state: Any, corpus: dict, where: str, projection: set[str],
             stops.append(stop_of(record))
     if state["stops"] != stops:
         out.append(f"[state] {where}: stops are not those the held dispositions produce")
+    # In application order, nothing stop-producing follows an identity stop: once it is in force
+    # every later epoch or identity disposition is superseded and records nothing.
+    after_identity = False
+    for record in state["stops"]:
+        if isinstance(record, dict) and after_identity:
+            out.append(f"[state] {where}: a {record.get('scope')} stop applied after an identity stop")
+            break
+        if isinstance(record, dict) and record.get("scope") == "identity":
+            after_identity = True
     # Every record is final and of one fact: a repeat is applied with no new state, and a
     # second disposition whose stop is in force is `superseded`, so no record repeats.
     for member, key in (("dispositions", lambda r: json.dumps(r, sort_keys=True)),
@@ -1022,12 +1039,17 @@ def decide(case: dict, corpus: dict, rules: dict) -> dict:
             fail("the disposition rule is no longer v2's byte-identical repeat")
         if held is not None:
             pass
-        elif art["scope"] in ("epoch", "identity") and stop_of(art) in before["stops"]:
+        elif art["scope"] in ("epoch", "identity") and stop_in_force(art, before["stops"]):
             expected, reason = "reject", "superseded"
         elif art["scope"] in ("epoch", "identity"):
             after["dispositions"].append(disposition_record(art))
             after["stops"].append(stop_of(art))
             writes = 2
+        elif art["scope"] == "artifact" and art["disposition"] == "artifact_terminal":
+            # Bound to an artifact other than a registration, it is recorded and has no delivery
+            # effect, whatever stop is in force: step 6 supersedes only epoch and identity ones.
+            after["dispositions"].append(disposition_record(art))
+            writes = 1
         else:
             fail(f"{case['name']}: a {art['scope']} {art['disposition']} first application is "
                  "not modelled; extend this checker from the text before adding it")
@@ -1248,6 +1270,26 @@ def coverage_classes(corpus: dict) -> dict[str, Callable[[dict], bool]]:
         "disposition: a byte-identical repeat": lambda c: dis(c) and _plain(c) and _held(c) is not None,
         "disposition: a superseded refusal": lambda c: dis(c) and _plain(c) and _held(c) is None
         and any(s["scope"] == c["artifact"]["scope"] for s in c["held_before"]["stops"]),
+        "disposition: an epoch disposition for the identity stop's epoch, superseded": lambda c:
+        dis(c) and _plain(c) and c["artifact"]["scope"] == "epoch"
+        and c["reject_reason"] == "superseded" and any(
+            s["scope"] == "identity" for s in c["held_before"]["stops"])
+        and any(d["scope"] == "identity" and d["anchor_epoch_id"] == c["artifact"]["anchor_epoch_id"]
+                for d in c["held_before"]["dispositions"]),
+        "disposition: an epoch disposition for another epoch under an identity stop, superseded":
+        lambda c: dis(c) and _plain(c) and c["artifact"]["scope"] == "epoch"
+        and c["reject_reason"] == "superseded"
+        and any(s["scope"] == "identity" for s in c["held_before"]["stops"])
+        and not any(d["anchor_epoch_id"] == c["artifact"]["anchor_epoch_id"]
+                    for d in c["held_before"]["dispositions"]),
+        "disposition: an identity disposition applied beside an epoch stop": lambda c:
+        dis(c) and _plain(c) and c["artifact"]["scope"] == "identity" and c["expected"] == "accept"
+        and _held(c) is None and any(s["scope"] == "epoch" for s in c["held_before"]["stops"]),
+        "disposition: an identity disposition's byte-identical repeat": lambda c:
+        dis(c) and _plain(c) and c["artifact"]["scope"] == "identity" and _held(c) is not None,
+        "disposition: an artifact-scoped disposition recorded under an identity stop": lambda c:
+        dis(c) and _plain(c) and c["artifact"]["scope"] == "artifact" and c["expected"] == "accept"
+        and _held(c) is None and any(s["scope"] == "identity" for s in c["held_before"]["stops"]),
         "disposition: a store fault after the first write": fault(dis, "after_first_write"),
         "disposition: a store fault at commit": fault(dis, "at_commit"),
         "disposition: the redelivery after a fault": _redelivery(corpus, "evidence_disposition"),
@@ -1439,6 +1481,49 @@ def retained_value_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict]
         out.append((f"retained application_storage_fault = {value!r} in both", "[state]",
                     lambda c, v=value: [c["cases"][0][side].update(application_storage_fault=v)
                                         for side in ("held_before", "held_after")]))
+    return out
+
+
+def cross_scope_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """An identity stop covers every epoch: each way of letting an epoch stop past it."""
+    out: list[tuple[str, Any, Callable[[dict], Any]]] = []
+    for i, case in enumerate(corpus["cases"]):
+        art = case["artifact"]
+        if case["artifact_type"] != "evidence_disposition" or case["store_fault"] is not None \
+                or art["scope"] != "epoch" or case["reject_reason"] != "superseded" \
+                or not any(s["scope"] == "identity" for s in case["held_before"]["stops"]):
+            continue
+
+        def applied(c: dict, i: int = i) -> None:
+            x = c["cases"][i]
+            x.update(expected="accept", reject_reason=None)
+            x["held_after"]["dispositions"].append(disposition_record(x["artifact"]))
+            x["held_after"]["stops"].append(stop_of(x["artifact"]))
+            x["held_after"]["application_storage_fault"] = False
+
+        def held(c: dict, i: int = i) -> None:
+            x = c["cases"][i]
+            for side in ("held_before", "held_after"):
+                x[side]["dispositions"].append({**disposition_record(x["artifact"]),
+                                                "decided_at_ms": 1})
+                x[side]["stops"].append(stop_of(x["artifact"]))
+        out.append((f"{case['name']}: applied after the identity stop instead of superseded",
+                    ("[answer]", "[reason]", "[held_after", "[state]"), applied))
+        out.append((f"{case['name']}: an epoch stop appended after the identity stop in held state",
+                    "[state]|after an identity stop", held))
+    for i, case in enumerate(corpus["cases"]):
+        if case["artifact_type"] == "evidence_disposition" and case["store_fault"] is None \
+                and case["artifact"]["scope"] == "artifact" and case["expected"] == "accept" \
+                and any(s["scope"] == "identity" for s in case["held_before"]["stops"]):
+            def superseded(c: dict, i: int = i) -> None:
+                x = c["cases"][i]
+                x.update(expected="reject", reject_reason="superseded")
+                x["held_after"] = copy.deepcopy(x["held_before"])
+            out.append((f"{case['name']}: superseded under the identity stop instead of recorded",
+                        ("[answer]", "[reason]", "[held_after"), superseded))
+    if len(out) < 5:
+        fail("the corpus no longer carries an epoch disposition superseded under an identity stop "
+             "for the same and for another epoch, and an artifact-scoped one recorded under it")
     return out
 
 
@@ -1822,6 +1907,7 @@ def corpus_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[
     out += retained_value_mutants(corpus)
     out += relationship_mutants(corpus)
     out += subject_mutants(corpus, rules)
+    out += cross_scope_mutants(corpus)
     for label in coverage_classes(corpus):
         out.append((f"without {label}", "[coverage]",
                     lambda c, label=label: c.update(cases=[
@@ -1982,8 +2068,8 @@ def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tu
             continue
         survived.append(f"re-pin: {label}")
     # States the text permits, held in both before and after: each must still pass.
-    for label, edit in permitted_states(corpus):
-        count += 1
+    permitted = permitted_states(corpus)
+    for label, edit in permitted:
         good = copy.deepcopy(corpus)
         edit(good)
         new = [f for f in check_corpus(good, rules) if f not in base_set]
@@ -2053,7 +2139,8 @@ def main(argv: list[str]) -> int:
             for line in survived:
                 print(f"mutant survived: {line[:160]}", file=sys.stderr)
             return 1
-        print(f"{NAME}: {count} mutants refused, each for its intended reason")
+        print(f"{NAME}: {count} mutants refused, each for its intended reason; "
+              f"{len(permitted_states(corpus))} permitted states pass")
     if status == 0:
         print(f"{NAME}: corpus agrees with the contract ({len(corpus['cases'])} cases, "
               f"{len(coverage_classes(corpus))} case classes covered)")
