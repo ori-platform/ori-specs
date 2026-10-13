@@ -746,11 +746,12 @@ AGE_INSTANTS = {
     ("custody time `c`", "the courier's", "`custody_at_ms` of the first custody acknowledgement "
      "the runtime accepted for the envelope", "stored with the envelope; never moves"):
         ("c", "custody_at_ms", "first", False),
-    ("record time `r`", "the runtime's wall clock, Unix milliseconds", "when the runtime made the "
+    ("record time `r`", "the runtime's wall clock, Unix milliseconds, read once the runtime has "
+     "verified and judged the acknowledgement, never when it arrived", "when the runtime made the "
      "first acceptance it recorded a time for: the first acceptance, or, for custody recorded by a "
      "runtime that kept no record time, the first later acceptance that records a time", "stored with the envelope; "
      "never changes once set; absent until an acceptance records it"):
-        ("r", "received_at_ms", "first", True),
+        ("r", "judged_at_ms", "first", True),
     ("snapshot time `t`", "the runtime's wall clock, Unix milliseconds", "when the runtime builds "
      "the snapshot", "not stored"):
         ("t", "snapshot_time_ms", None, False),
@@ -957,10 +958,13 @@ def age_case_faults(m: dict, case: dict) -> list[str]:
             out.append(f"envelope {i} malformed")
             continue
         for a in e["acknowledgements"]:
-            if not isinstance(a, dict) or set(a) != {"custody_at_ms", "key_id", "received_at_ms"} \
+            if not isinstance(a, dict) or set(a) != {"custody_at_ms", "key_id", "received_at_ms",
+                                                   "judged_at_ms"} \
                     or not isinstance(a["key_id"], str) \
                     or not is_i(a["custody_at_ms"]) \
-                    or not (a["received_at_ms"] is None or is_i(a["received_at_ms"])):
+                    or not all(a[k] is None or is_i(a[k]) for k in ("received_at_ms",
+                                                                     "judged_at_ms")) \
+                    or (a["received_at_ms"] is None) != (a["judged_at_ms"] is None):
                 out.append(f"envelope {i}: acknowledgement malformed {a}")
             elif not lo <= a["custody_at_ms"] <= hi:
                 out.append(f"envelope {i}: custody_at_ms {a['custody_at_ms']} outside "
@@ -3118,7 +3122,7 @@ def age_coverage(corpus: dict, m: dict) -> list[str]:
         "a later acknowledgement naming an earlier c": lambda c: any(
             e["acknowledgements"][-1]["custody_at_ms"] < cr(e)[0] for e in envs(c)),
         "a later acknowledgement offering r where none is stored": lambda c: any(
-            cr(e)[1] is None and any(a["received_at_ms"] is not None
+            cr(e)[1] is None and any(a["judged_at_ms"] is not None
                                      for a in e["acknowledgements"]) for e in envs(c)),
         # decisive: the value would differ had the rule been otherwise
         "a later acknowledgement's c decisive": lambda c: differs(c, age_instant={
@@ -3133,6 +3137,9 @@ def age_coverage(corpus: dict, m: dict) -> list[str]:
         "an untimed later acceptance before a timed one, decisive": lambda c: differs(
             c, age_instant={**m["age_instant"], "r": {**m["age_instant"]["r"],
                                                      "from": "first_later_untimed"}}),
+        "arrival, not judgement, would give another age": lambda c: differs(
+            c, age_instant={**m["age_instant"], "r": {**m["age_instant"]["r"],
+                                                     "member": "received_at_ms"}}),
         "only the key generation differs, decisive": lambda c: differs(
             c, age_agree_on=("custody_at_ms", "key_id")),
         "another key generation naming another custody time": lambda c: any(
@@ -3141,7 +3148,7 @@ def age_coverage(corpus: dict, m: dict) -> list[str]:
         "a disagreeing acknowledgement offering r where none is stored, decisive": lambda c:
             differs(c, age_agreeing_only=False),
         "an r supplied later that c still outweighs": lambda c: any(
-            e["acknowledgements"][0]["received_at_ms"] is None and cr(e)[1] is not None
+            e["acknowledgements"][0]["judged_at_ms"] is None and cr(e)[1] is not None
             and cr(e)[0] < cr(e)[1] for e in envs(c)),
         "a disagreeing acknowledgement while r is stored": lambda c: any(
             cr(e)[1] is not None and any(a["custody_at_ms"] != cr(e)[0]
@@ -3650,6 +3657,17 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("age: a disagreeing acknowledgement is an acceptance", because(
             "awaiting no_record_time_then_acknowledgement_naming_another_custody_time:",
             model_mutant(age_agreeing_only=False))),
+        ("age: arrival supplies r", because("awaiting arrival_and_judgement_differ:", model_mutant(
+            age_instant={**inst, "r": {**inst["r"], "member": "received_at_ms"}}))),
+        ("text: r read when the acknowledgement arrived", because(
+            "no model for awaiting-receipt instant", age_text_mutant(
+                ", read once the runtime has verified and judged the acknowledgement, never when "
+                "it arrived |", ", read once the runtime has verified and judged the "
+                "acknowledgement |"))),
+        ("text: a behavioural age expectation unbounded", because(
+            "sentence changed in v4 ## Conformance > ### Behavioural checks", text_mutant(
+                "v4", "with `r` the redelivery's acceptance time, bounded by A3 and A4. |",
+                "with `r` the redelivery's acceptance time. |"))),
         ("age: the key generation decides agreement", because(
             "awaiting no_record_time_then_redelivered_under_other_key_generation:",
             model_mutant(age_agree_on=("custody_at_ms", "key_id")))),
@@ -3747,8 +3765,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                         "(#behavioural-checks) and\n`awaiting_receipt_age_cases` confirm it."))),
         ("text: the key-generation row's age only includes t − r", because(
             "sentence changed in v4 ## Conformance > ### Behavioural checks",
-            text_mutant("v4", "| The age is `t − r`, with `r` the redelivery's acceptance time. |",
-                        "| The age includes `t − r`, with `r` the redelivery's acceptance time. |"))),
+            text_mutant("v4", "| The age is `t − r`, with `r` the redelivery's acceptance time,",
+                        "| The age includes `t − r`, with `r` the redelivery's acceptance time,"))),
         ("text: a key-generation rejection no longer non-conforming", because(
             "sentence changed in v4 ## Health Payload > ### `evidence` object > #### Awaiting-receipt",
             text_mutant("v4", "supplies no `r` from it, and does not conform.",
@@ -4243,8 +4261,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         '## Health Payload > ### `evidence` object > #### Awaiting-receipt age': (
             'An envelope awaiting a receipt has two custody instants, read from two clocks.',
-            ("A courier's clock may run ahead of the runtime's, and the courier's time alone "
-             'would then make the envelope look as if it had waited less than it has.'),
+            ("A courier's clock may run ahead of the runtime's, and the courier's time "
+             'alone would then make the envelope look as if it had waited less than it has.'),
             'The age takes the greater of the two intervals.',
             ("The courier's time may make an envelope look older than the runtime's record "
              'does, and never newer.'),
@@ -4252,11 +4270,12 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ("| custody time `c` | the courier's | `custody_at_ms` of the first custody "
              'acknowledgement the runtime accepted for the envelope | stored with the '
              'envelope; never moves |'),
-            ("| record time `r` | the runtime's wall clock, Unix milliseconds | when the "
-             'runtime made the first acceptance it recorded a time for: the first acceptance, '
-             'or, for custody recorded by a runtime that kept no record time, the first later '
-             'acceptance that records a time | stored with the envelope; never changes once set; absent until an '
-             'acceptance records it |'),
+            ("| record time `r` | the runtime's wall clock, Unix milliseconds, read once "
+             'the runtime has verified and judged the acknowledgement, never when it '
+             'arrived | when the runtime made the first acceptance it recorded a time for: '
+             'the first acceptance, or, for custody recorded by a runtime that kept no '
+             'record time, the first later acceptance that records a time | stored with the '
+             'envelope; never changes once set; absent until an acceptance records it |'),
             ("| snapshot time `t` | the runtime's wall clock, Unix milliseconds | when the "
              'runtime builds the snapshot | not stored |'),
             ('The runtime accepts a custody acknowledgement when it verifies under '
@@ -4269,18 +4288,19 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| A2 | When `r` is stored, `a` is the greater of `a` and `t − r`.',
             'When it is not, `a` is unchanged. |',
             '| A3 | When `a` is less than `0`, `a` is `0`. |',
-            '| A4 | When `a` is greater than `9007199254740991`, `a` is `9007199254740991`. |',
+            ('| A4 | When `a` is greater than `9007199254740991`, `a` is '
+             '`9007199254740991`. |'),
             ('`oldest_awaiting_receipt_age_ms` is the greatest age over the envelopes '
              'awaiting a receipt.'),
             ('It equals `t` less the least of every `c` and every stored `r` among those '
              'envelopes, bounded by A3 and A4.'),
             'When the two intervals are equal, either gives the age.',
             ('**The first acceptance is final.** A later acknowledgement for the same '
-             'envelope, redelivered or naming another custody time, never moves `c`, and never '
-             'changes an `r` that is stored.'),
-            ('**Only an agreeing acknowledgement is an acceptance.** Once custody is held, an '
-             'acknowledgement naming a custody time other than `c` is not an acceptance for '
-             'this rule, whatever the runtime answers it with.'),
+             'envelope, redelivered or naming another custody time, never moves `c`, and '
+             'never changes an `r` that is stored.'),
+            ('**Only an agreeing acknowledgement is an acceptance.** Once custody is held, '
+             'an acknowledgement naming a custody time other than `c` is not an acceptance '
+             'for this rule, whatever the runtime answers it with.'),
             'It moves nothing and supplies no `r`, including where no `r` is stored.',
             'Only an acceptance that agrees with `c` can supply `r`.',
             ('Agreement is on the custody time alone: the key generation that signed the '
@@ -4290,29 +4310,31 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('**No record time.** Custody recorded by a runtime that kept no record time is '
              'aged by `c` alone until a later acceptance.'),
             'The first later acceptance that records a time supplies `r`.',
-            ('Any acceptance proves that the courier held custody at that instant, so `r` is '
-             'a true lower bound on the wait, and supplying it can only raise the age.'),
+            ('Any acceptance proves that the courier held custody at that instant, so `r` '
+             'is a true lower bound on the wait, and supplying it can only raise the age.'),
             ("**A clock that steps backwards.** When the runtime's clock steps back past "
-             '`r`, `t − r` is negative and `c` decides the age; when it steps back past both, '
-             'the age is `0`.'),
+             '`r`, `t − r` is negative and `c` decides the age; when it steps back past '
+             'both, the age is `0`.'),
             'Neither clock is corrected.',
-            ('A runtime has no monotonic source that survives a restart, and a runtime clock '
-             'that steps back can make an envelope look younger than its wait.'),
+            ('A runtime has no monotonic source that survives a restart, and a runtime '
+             'clock that steps back can make an envelope look younger than its wait.'),
             ('**The bound.** `c` is any evidence-exchange/v2 integer, down to '
              '−9007199254740991, so `t − c` can exceed the integer range.'),
-            "A4 reports such an envelope at the bound; it never makes the snapshot `internal_error`.",
+            ('A4 reports such an envelope at the bound; it never makes the snapshot '
+             '`internal_error`.'),
             '**`awaiting_receipt_count`** is unchanged by this rule.',
             'The snapshot carries the age, and neither `c` nor `r`.',
-            'No snapshot check can confirm the rule; snapshot check 3 judges only the range.',
-            ('Enforcement lives in ori-runtime, in its delivery ledger, which stores `c` and '
-             '`r`, and in its health snapshot builder, which computes the age.'),
+            ('No snapshot check can confirm the rule; snapshot check 3 judges only the '
+             'range.'),
+            ('Enforcement lives in ori-runtime, in its delivery ledger, which stores `c` '
+             'and `r`, and in its health snapshot builder, which computes the age.'),
             ('A runtime whose ledger rejects an agreeing acknowledgement because its key '
-             "generation differs from the held custody's supplies no `r` from it, and does not "
-             'conform.'),
-            ('The [behavioural checks](#behavioural-checks) and `awaiting_receipt_age_cases` '
-             'are how a runtime is judged against the rule.'),
-            ('The remote health projection carries the age as the snapshot gives it, and the '
-             'gateway does not recompute it.'),
+             "generation differs from the held custody's supplies no `r` from it, and does "
+             'not conform.'),
+            ('The [behavioural checks](#behavioural-checks) and '
+             '`awaiting_receipt_age_cases` are how a runtime is judged against the rule.'),
+            ('The remote health projection carries the age as the snapshot gives it, and '
+             'the gateway does not recompute it.'),
         ),
         '## Health Payload > ### `evidence` object > #### `action_records` object': (
             'Tier C action-outcome records per [tier-c-approval/v1.md](../tier-c-approval/v1.md).',
@@ -5084,8 +5106,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'repeated `incident_id`.'),
         ),
         '## Conformance > ### Behavioural checks': (
-            ("Each row is driven through the runtime's real snapshot builder or its "
-             'socket, and is observed in the served snapshot.'),
+            ("Each row is driven through the runtime's real snapshot builder or its socket, "
+             'and is observed in the served snapshot.'),
             '| Stimulus | Observation |',
             ('| Each request of [Request](#request), including the refused classes, split '
              'writes, bytes after the LF, a 1000 + 25 byte split, the 1024-byte boundary, '
@@ -5094,7 +5116,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| Nothing wrong | `status:',
             '"ok"`, `critical: false`, `degradation_reasons:',
             '[]`. |',
-            '| Each condition alone | Its token, its severity, and only the companions it implies:',
+            ('| Each condition alone | Its token, its severity, and only the companions it '
+             'implies:'),
             ('`firmware_liveness_degraded` for a liveness condition, and '
              '`safety_zone_active_unprotected` for `safety_zone_trip_unresolved`, whose '
              'unresolved trip leaves the pair unprotected. |'),
@@ -5106,23 +5129,24 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              '`subsystem_starting`. |'),
             ('| A known critical condition beside an unreadable critical-capable block | '
              'Both tokens, `critical`; the known condition is still named. |'),
-            ('| A lost decision record together with a commissioning problem and an '
-             'active unprotected pair, in each order the builder can raise them | `status:'),
+            ('| A lost decision record together with a commissioning problem and an active '
+             'unprotected pair, in each order the builder can raise them | `status:'),
             '"critical"`, `critical: true`, all three tokens. |',
             ('| A liveness loop that stopped after starting, not by shutdown | '
              '`firmware_liveness_stopped`, `firmware_liveness_degraded`, `critical`. |'),
             ('| A liveness tick age equal to the expiry window, and one millisecond under '
              'it | `firmware_liveness_tick_stale` at the window; not under it. |'),
-            ('| Supervision over capacity, with every device in window | `degraded`, '
-             'never `critical`. |'),
+            ('| Supervision over capacity, with every device in window | `degraded`, never '
+             '`critical`. |'),
             ('| A subsystem whose conditions decide severity, before it has started and '
              'within the startup deadline | `subsystem_starting`, `degraded`; with a lost '
              'decision record beside it, `critical`. |'),
-            '| A degraded-only subsystem still not ready once the startup deadline passes | `state:',
+            ('| A degraded-only subsystem still not ready once the startup deadline passes '
+             '| `state:'),
             ('"unavailable"`, `subsystem_state_unknown`, not `subsystem_starting`; with a '
              'lost decision record beside it, `critical`. |'),
-            ('| A degraded-only subsystem whose state cannot be read '
-             '| `subsystem_state_unknown`, `degraded`. |'),
+            ('| A degraded-only subsystem whose state cannot be read | '
+             '`subsystem_state_unknown`, `degraded`. |'),
             ('| A configured sensor before and after a failed connection | '
              '`subsystem_starting`, then `sensor_unconnected`. |'),
             '| Evidence disabled | `evidence.state:',
@@ -5132,11 +5156,11 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('"never"`, `valid_until: null`; no integer outside its range, by default `0` '
              'to 2^53−1, anywhere. |'),
             '| An integer the snapshot cannot represent | `internal_error`; no snapshot. |',
-            ('| Each kind of malformed snapshot triple fed to the heartbeat | The '
-             'fallback heartbeat, exactly; a local log entry naming the failing step; the '
-             'next snapshot that passes resumes normal reporting. |'),
-            ('| A snapshot holding an integer the socket would refuse, fed to the '
-             'heartbeat | The fallback heartbeat, failing step `snapshot_unservable`. |'),
+            ('| Each kind of malformed snapshot triple fed to the heartbeat | The fallback '
+             'heartbeat, exactly; a local log entry naming the failing step; the next '
+             'snapshot that passes resumes normal reporting. |'),
+            ('| A snapshot holding an integer the socket would refuse, fed to the heartbeat '
+             '| The fallback heartbeat, failing step `snapshot_unservable`. |'),
             ('| A negative or oversized number inside `diagnostics` | The snapshot is '
              'served; the heartbeat is mapped normally. |'),
             ('| An eligible zone refused at activation, in development posture | '
@@ -5147,12 +5171,13 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'trip attempt was not delayed. |'),
             ('| The sensor of an active pair stops reporting past its silence bound | '
              '`sensor_stale` and `safety_zone_active_unprotected`. |'),
-            ('| A Tier D notification unconfirmed at its attempt threshold, and one at '
-             'its age bound | `tier_d_alert_delivery_unconfirmed`, `critical`; the '
-             'physical act was neither delayed nor retried. |'),
-            '| A Tier D notification confirmed by its failover channel | Resolved: no condition. |',
-            ('| Another alert unconfirmed past `overdue_bound_ms`; a large backlog of '
-             'young alerts | `alert_delivery_overdue`; then nothing. |'),
+            ('| A Tier D notification unconfirmed at its attempt threshold, and one at its '
+             'age bound | `tier_d_alert_delivery_unconfirmed`, `critical`; the physical act '
+             'was neither delayed nor retried. |'),
+            ('| A Tier D notification confirmed by its failover channel | Resolved: no '
+             'condition. |'),
+            ('| Another alert unconfirmed past `overdue_bound_ms`; a large backlog of young '
+             'alerts | `alert_delivery_overdue`; then nothing. |'),
             ('| A lost decision record, then a restart | `decision_record_lost`, '
              '`critical`, before and after the restart, the same `incident_id`, '
              '`decision_records_lost` unchanged. |'),
@@ -5164,26 +5189,28 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             'Tier D runs. |',
             ('| The gateway `health` export of a snapshot carrying senders, expiring '
              'devices, reading-age devices, alarm channels, refused documents, trigger '
-             'timestamps and diagnostics | The remote health projection, with none of '
-             'them and their counts in place. |'),
+             'timestamps and diagnostics | The remote health projection, with none of them '
+             'and their counts in place. |'),
             ('| A heartbeat with evidence `unavailable`, or its attestation summary not '
              'read | No `evidence` block in the heartbeat. |'),
             ('| A custody acknowledgement accepted through the real ingest route with the '
              "courier's time behind the runtime's clock, and one with it ahead | "
              '`oldest_awaiting_receipt_age_ms` is `t − c` for the first and `t − r` for the '
-             'second. |'),
+             'second, each bounded by A3 and A4. |'),
             ('| The same acknowledgement redelivered later, and one for the same envelope '
-             'naming another custody time | `oldest_awaiting_receipt_age_ms` at the same `t` '
-             'is unchanged. |'),
-            ('| Custody held in a ledger written by a runtime that kept no record time, then '
-             'redelivered, then redelivered again | `oldest_awaiting_receipt_age_ms` is `t − c` '
-             "before the first redelivery; after it, the greater of `t − c` and `t` less the "
-             "first redelivery's acceptance time, unchanged by the second. |"),
+             'naming another custody time | `oldest_awaiting_receipt_age_ms` at the same '
+             '`t` is unchanged. |'),
+            ('| Custody held in a ledger written by a runtime that kept no record time, '
+             'then redelivered, then redelivered again | `oldest_awaiting_receipt_age_ms` '
+             'is `t − c` before the first redelivery; after it, the greater of `t − c` and '
+             "`t` less the first redelivery's acceptance time, unchanged by the second; "
+             'each bounded by A3 and A4. |'),
             ('| Custody held under one key generation without a record time, with `c` later '
-             "than the redelivery's acceptance time, redelivered naming `c` under the other | "
-             "The age is `t − r`, with `r` the redelivery's acceptance time. |"),
+             "than the redelivery's acceptance time, redelivered naming `c` under the other "
+             "| The age is `t − r`, with `r` the redelivery's acceptance time, bounded by "
+             'A3 and A4. |'),
             ("| The runtime's clock set back past `r`, and past both `r` and `c` | The age "
-             'from `c`; then `0`. |'),
+             '`t − c`, bounded by A3 and A4; then `0`. |'),
         ),
         '## Vectors': (
             ('`runtime-health/health-vectors-v4.json`, written by '
@@ -5196,9 +5223,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('`snapshot_cases`: the blocks the condition table reads, and the reasons and '
              '`status` they give, including each liveness condition alone and combined, '
              'disabled, starting and unavailable subsystems and every boundary.'),
-            ("A case with `startup` gives the producer's inputs, the blocks not yet "
-             'ready, the time since the process started and the startup deadline, and its '
-             'snapshot shows the states they resolve to;'),
+            ("A case with `startup` gives the producer's inputs, the blocks not yet ready, "
+             'the time since the process started and the startup deadline, and its snapshot '
+             'shows the states they resolve to;'),
             ('`served_cases`: those blocks with a served triple, and the verdict of '
              'snapshot checks 6 to 10;'),
             ("`heartbeat_cases`: a snapshot's triple, as JSON values, judged by T1 to T4 "
@@ -5212,8 +5239,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ("`unrepresentable_cases`: an integer member's path and the value the runtime "
              'holds for it, as JSON text, and whether the runtime serves the snapshot or '
              'answers `internal_error`;'),
-            ("`gateway_reason_cases`: a heartbeat's `status` and `degradation_reasons`, "
-             'and the gateway-api/v2 verdict of its validation steps;'),
+            ("`gateway_reason_cases`: a heartbeat's `status` and `degradation_reasons`, and "
+             'the gateway-api/v2 verdict of its validation steps;'),
             ('`request_cases`: a request as the writes that deliver it, each in hex, and '
              'how the stream then behaves:'),
             ('`eof` (the client half-closes after the last write) or `silent` (the client '
@@ -5224,25 +5251,29 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'gives, and strings from its local-only members that the projection must not '
              'contain;'),
             ('`heartbeat_snapshot_cases`: a whole snapshot, judged by T1 to T5, the step '
-             'that fails (`null` when it passes), and the exact heartbeat it maps to, '
-             "with the runtime's `device_id`, clock and authentication setting given;"),
+             'that fails (`null` when it passes), and the exact heartbeat it maps to, with '
+             "the runtime's `device_id`, clock and authentication setting given;"),
             '`expiry_cases`:',
             '`device_policy` expiry members, and whether they are accepted;',
             ('`awaiting_receipt_age_cases`: a snapshot time `snapshot_time_ms` and the '
              'envelopes of a delivery ledger, each with `acknowledgements`, the custody '
-             'acknowledgements that verified for it, in the order the runtime received them, '
-             'each `{custody_at_ms, key_id, received_at_ms}`, where `key_id` names the custody '
-             'key generation that signed it, and `received_at_ms` is the '
-             "runtime's clock when it received that acknowledgement and `null` when the "
-             'runtime kept no record time, and `receipted`, whether a receipt for it has '
-             'verified; and the `awaiting_receipt_count` and '
+             'acknowledgements that verified for it, in the order the runtime received '
+             'them, each `{custody_at_ms, key_id, received_at_ms, judged_at_ms}`, where '
+             '`key_id` names the custody key generation that signed it, `received_at_ms` is '
+             "the runtime's clock when the acknowledgement reached it, which the rule never "
+             "reads, and `judged_at_ms` is the runtime's clock when it verified and judged "
+             'it; both are `null` where the runtime kept no record time.'),
+            '`r` is the `judged_at_ms` of the first agreeing acceptance that has one.',
+            'Each envelope also has `receipted`, whether a receipt for it has verified.',
+            ('Each case gives the `awaiting_receipt_count` and '
              '`oldest_awaiting_receipt_age_ms` the snapshot carries.'),
             ('A `snapshot_cases` or `served_cases` snapshot carries the members the '
              'condition table reads, and any block whose state the case exercises, each '
-             'present exactly as the Present column and section flags say; the rest of '
-             'the payload is out of scope there.'),
+             'present exactly as the Present column and section flags say; the rest of the '
+             'payload is out of scope there.'),
             'A `response_cases` response is a whole served response.',
-            'A checker recomputes every expected value from this text and gateway-api/v2 alone.',
+            ('A checker recomputes every expected value from this text and gateway-api/v2 '
+             'alone.'),
         ),
     },
     'gw': {
