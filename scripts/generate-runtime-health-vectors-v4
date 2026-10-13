@@ -4,10 +4,10 @@
 """Generate the runtime-health/v4 corpus: severity, reasons, heartbeat mapping, framing.
 
 Every expected value is computed here by a small model of runtime-health/v4
-Severity, Heartbeat Mapping, Request and Representation, and of the
-gateway-api/v2 degradation_reasons validation order. Nothing here is shared
-with a checker, which recomputes every expected value from the contracts'
-text.
+Severity, Heartbeat Mapping, Request, Representation and the awaiting-receipt
+age, and of the gateway-api/v2 degradation_reasons validation order. Nothing
+here is shared with a checker, which recomputes every expected value from the
+contracts' text.
 
     python3 scripts/generate-runtime-health-vectors-v4          # write
     python3 scripts/generate-runtime-health-vectors-v4 --check  # reproduce
@@ -1478,6 +1478,76 @@ def unrepresentable_cases() -> list[dict]:
             for m, v in specs]
 
 
+# ── the awaiting-receipt age ──────────────────────────────────────────────────
+
+def awaiting_receipt(t: int, envelopes: list[dict]) -> dict:
+    """Model of the evidence awaiting-receipt rows: the first accepted
+    acknowledgement fixes c and r, A1 to A4 age each envelope, the greatest wins."""
+    ages = []
+    for env in envelopes:
+        acks = env["acknowledgements"]
+        if not acks or env["receipted"]:
+            continue
+        c, r = acks[0]["custody_at_ms"], acks[0]["accepted_at_ms"]
+        a = t - c
+        if r is not None:
+            a = max(a, t - r)
+        ages.append(min(INT_MAX, max(0, a)))
+    return {"awaiting_receipt_count": len(ages),
+            "oldest_awaiting_receipt_age_ms": max(ages) if ages else None}
+
+
+def ack(c: int, r: int | None) -> dict:
+    return {"custody_at_ms": c, "accepted_at_ms": r}
+
+
+def held(*acks: dict, receipted: bool = False) -> dict:
+    return {"acknowledgements": list(acks), "receipted": receipted}
+
+
+def awaiting_receipt_age_cases() -> list[dict]:
+    T = 1_787_000_005_000
+    specs = [
+        ("empty_ledger", T, []),
+        ("sealed_not_held", T, [held()]),
+        ("held_and_receipted", T, [held(ack(T - 9_000, T - 8_000), receipted=True)]),
+        ("courier_clock_behind", T, [held(ack(T - 9_000, T - 4_600))]),
+        ("courier_clock_ahead", T, [held(ack(T - 100, T - 4_600))]),
+        ("courier_clock_ahead_of_snapshot", T, [held(ack(T + 60_000, T - 4_600))]),
+        ("clocks_equal", T, [held(ack(T - 4_600, T - 4_600))]),
+        ("no_record_time", T, [held(ack(T - 100, None))]),
+        ("no_record_time_courier_ahead_of_snapshot", T, [held(ack(T + 60_000, None))]),
+        ("no_record_time_then_redelivered", T,
+         [held(ack(T + 2_000, None), ack(T + 2_000, T - 3_000))]),
+        ("redelivered_later", T, [held(ack(T - 100, T - 4_600), ack(T - 100, T - 100))]),
+        ("redelivered_naming_later_custody_time", T,
+         [held(ack(T - 9_000, T - 8_000), ack(T - 50, T - 40))]),
+        ("redelivered_naming_earlier_custody_time", T,
+         [held(ack(T - 100, T - 4_600), ack(T - 900_000, T - 50))]),
+        ("runtime_clock_stepped_back_past_record", T - 5_000,
+         [held(ack(T - 9_000, T - 4_600))]),
+        ("runtime_clock_stepped_back_past_both", T - 10_000,
+         [held(ack(T - 9_000, T - 4_600))]),
+        ("runtime_clock_stepped_back_between_acceptances", T,
+         [held(ack(T - 100, T + 30_000)), held(ack(T - 200, T - 1_000))]),
+        ("snapshot_at_earlier_instant", T, [held(ack(T, T + 500))]),
+        ("one_ms_after_earlier_instant", T, [held(ack(T - 1, T + 500))]),
+        ("one_ms_before_earlier_instant", T, [held(ack(T + 1, T + 500))]),
+        ("oldest_by_courier_and_oldest_by_record_differ", 1_000,
+         [held(ack(700, 710)), held(ack(300, 900)), held(ack(800, 500))]),
+        ("receipted_envelope_was_oldest", 1_000,
+         [held(ack(100, 100), receipted=True), held(ack(400, 400))]),
+        ("with_and_without_record_time", 10_000,
+         [held(ack(6_000, None)), held(ack(9_000, 7_000))]),
+        ("bound_minus_one", INT_MAX - 1, [held(ack(0, None))]),
+        ("bound_exact", INT_MAX, [held(ack(0, None))]),
+        ("bound_exceeded_by_courier_time", 1_000, [held(ack(-INT_MAX, 200))]),
+        ("bound_exceeded_by_one", 1, [held(ack(-INT_MAX, 1))]),
+    ]
+    return [{"name": n, "snapshot_time_ms": t, "envelopes": envs,
+             "expected": awaiting_receipt(t, envs)} for n, t, envs in specs]
+
+
 # ── the remote health projection and whole-snapshot heartbeats ────────────────
 
 def evidence_available() -> dict:
@@ -1767,6 +1837,7 @@ def build() -> bytes:
         "request_cases": request_cases(),
         "integer_cases": integer_cases(),
         "expiry_cases": expiry_cases(),
+        "awaiting_receipt_age_cases": awaiting_receipt_age_cases(),
     }
     return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
