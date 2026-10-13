@@ -47,6 +47,8 @@ import copy
 import difflib
 import hashlib
 import json
+import multiprocessing
+import os
 import pathlib
 import re
 import shutil
@@ -55,6 +57,7 @@ import sys
 import tempfile
 import textwrap
 from collections.abc import Callable
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -1998,6 +2001,33 @@ def _first(records: dict, pred: Callable[[dict], bool]) -> str:
     raise SystemExit("mutation precondition: no record fits")
 
 
+def _in_order(count: int, one: Callable[[int], Any]) -> list[Any]:
+    """one(i) for each i below count, in order, on forked worker processes.
+
+    Every mutation case copies the tree into its own temporary directory and
+    sets this module's globals only for itself, and a forked worker holds its
+    own copy of those globals, so no case reads what another writes, and the
+    results come back in the order the cases were listed. ORI_MUTATION_JOBS=1
+    runs every case in this process instead, which is how a parallel run is
+    shown to report exactly what a serial one does.
+    """
+    jobs = int(os.environ.get("ORI_MUTATION_JOBS") or os.cpu_count() or 1)
+    if jobs <= 1 or count < 2:
+        return [one(i) for i in range(count)]
+    global _ONE
+    _ONE = one
+    with multiprocessing.get_context("fork").Pool(min(jobs, count)) as pool:
+        return pool.map(_call_one, range(count), chunksize=1)
+
+
+_ONE: Callable[[int], Any] | None = None
+
+
+def _call_one(i: int) -> Any:
+    assert _ONE is not None
+    return _ONE(i)
+
+
 def mutations() -> int:
     findings: list[Finding] = []
     records = load_records(ROOT, findings)
@@ -2981,7 +3011,8 @@ def mutations() -> int:
     # Codes a case must not produce: a valid span citation is accepted, not refused.
     forbidden = {"a heading-plus-item span is a valid citation, so the claim freezes":
                  {"claim-without-citation", "claim-citation-unqualified"}}
-    for name, code, mutate in cases:
+    def one(i: int) -> tuple[str, bool]:
+        name, code, mutate = cases[i]
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp) / "specs"
             shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
@@ -3009,9 +3040,12 @@ def mutations() -> int:
                 good = any(f.code == want and fragment in f.message + f.where for f in got) \
                     and not codes & forbidden.get(name, set())
                 detail = "" if good else f"got {sorted(codes) or 'no finding'}"
-            print(f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") +
-                  (f" ({detail})" if detail else ""))
-            failed += not good
+            return (f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") +
+                    (f" ({detail})" if detail else ""), not good)
+
+    for line, bad in _in_order(len(cases), one):
+        print(line)
+        failed += bad
     total, bad_sibling = sibling_mutations(impl_only)
     failed += bad_sibling
     total += len(cases)
@@ -3197,7 +3231,8 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
          lambda e, a, b: e["claim"]["claim_citation"].update(text=f"Nothing here implements {rel}.")),
     ]
     failed = 0
-    for name, code, mutate in cases:
+    def one(i: int) -> tuple[str, bool]:
+        name, code, mutate = cases[i]
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = pathlib.Path(tmp)
             siblings, a, b = build(tmpdir)
@@ -3218,8 +3253,11 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
                 want, _, fragment = code.partition(":")
                 good = any(f.code == want and fragment in f.message for f in got)
             detail = "" if good else f" (got {[str(f)[:120] for f in got] or 'no finding'})"
-            print(f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") + detail)
-            failed += not good
+            return f"{'ok  ' if good else 'FAIL'} {name}" + (f" -> {code}" if code else "") + detail, not good
+
+    for line, bad in _in_order(len(cases), one):
+        print(line)
+        failed += bad
     return len(cases), failed
 
 

@@ -62,10 +62,13 @@ import hashlib
 import itertools
 import json
 import math
+import multiprocessing
+import os
 import pathlib
 import re
 import sys
 from collections.abc import Callable
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "firmware-telemetry" / "manifest-vectors-v2.json"
@@ -988,6 +991,33 @@ def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset(),
 
 # --- mutations -------------------------------------------------------------
 
+
+def _in_order(count: int, one: Callable[[int], Any]) -> list[Any]:
+    """one(i) for each i below count, in order, on forked worker processes.
+
+    Every mutant builds its own state from what it was given and writes
+    nothing another mutant reads, so the workers share nothing a mutant
+    changes, and the results come back in the order the mutants were listed.
+    ORI_MUTATION_JOBS=1 runs every mutant in this process instead, which is
+    how a parallel run is shown to report exactly what a serial one does.
+    """
+    jobs = int(os.environ.get("ORI_MUTATION_JOBS") or os.cpu_count() or 1)
+    if jobs <= 1 or count < 2:
+        return [one(i) for i in range(count)]
+    global _ONE
+    _ONE = one
+    with multiprocessing.get_context("fork").Pool(min(jobs, count)) as pool:
+        return pool.map(_call_one, range(count), chunksize=max(1, count // (jobs * 8)))
+
+
+_ONE: Callable[[int], Any] | None = None
+
+
+def _call_one(i: int) -> Any:
+    assert _ONE is not None
+    return _ONE(i)
+
+
 def mutations(corpus_bytes: bytes, model: dict) -> int:
     base = json.loads(corpus_bytes)
     profiles = json.loads(PROFILES.read_bytes())
@@ -1422,10 +1452,16 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "  another JSON type (recommended error `invalid_device_mode`);")),
     ]
     survived = 0
-    for label, mutant in cases:
+
+    def one(i: int) -> str | None:
         try:
-            mutant()
+            cases[i][1]()
         except (Failure, KeyError, StopIteration, ValueError) as refused:
+            return str(refused)
+        return None
+
+    for (label, _), refused in zip(cases, _in_order(len(cases), one), strict=True):
+        if refused is not None:
             print(f"refused  {label}: {refused}")
         else:
             print(f"SURVIVED {label}")
