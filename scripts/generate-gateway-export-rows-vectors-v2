@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 export-rows corpus: producer time, contributor records, page order.
+
+Every expected value is computed here by a small model of gateway-api/v2
+Producer Time, `sensor_history` and `action_log`. Nothing here is shared with
+a checker, which recomputes every expected value from the contract's text.
+
+    python3 scripts/generate-gateway-export-rows-vectors-v2          # write
+    python3 scripts/generate-gateway-export-rows-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "export-rows-v2.json"
+
+BASES = ("reported", "not_reported", "unknown")
+KINDS = ("dispatch", "contributor", "contributor_legacy")
+T0 = 1717000000000
+B0 = 1716998400000  # a multiple of every bucket width used below
+ABSENT = object()
+MAX_INT = 2**53 - 1
+
+
+def key(n: int) -> str:
+    return f"{n:032x}"
+
+
+# --- the model -------------------------------------------------------------
+
+
+def reading_verdict(row: dict) -> str | None:
+    """Steps 1 and 2: the first failing check's verdict, or None."""
+    if "producer_time" in row and not (isinstance(row["producer_time"], str) and row["producer_time"] in BASES):
+        return "producer_time_invalid"
+    if row.get("producer_time") == "not_reported" and (row.get("_point") or (
+            row.get("tier") == "raw" and "bucket_ms" not in row)):
+        receipt = row.get("received_at_ms")
+        if not isinstance(receipt, int) or isinstance(receipt, bool) or not 1 <= receipt <= MAX_INT:
+            return "receipt_missing"
+    return None
+
+
+def action_verdict(row: dict) -> str | None:
+    """Steps 3 to 7."""
+    if "record_kind" not in row:
+        return None
+    kind = row["record_kind"]
+    if not (isinstance(kind, str) and kind in KINDS):
+        return "record_kind_invalid"
+    rk = row.get("record_key", ABSENT)
+    if rk is not None and not (isinstance(rk, str) and rk != ""):
+        return "record_key_invalid"
+    ct = row.get("contributed_to", ABSENT)
+    if kind == "contributor":
+        if not (isinstance(ct, str) and ct != "" and ct != rk):
+            return "contributed_to_invalid"
+    elif ct is not None:
+        return "contributed_to_invalid"
+    coalesced = row.get("action_taken") == "coalesced"
+    if (kind == "dispatch") == coalesced:
+        return "action_taken_mismatch"
+    if kind == "contributor" and row.get("executed") is not False:
+        return "contributor_executed"
+    return None
+
+
+def time_basis(row: dict, verdict: str | None) -> str:
+    if verdict is not None:
+        return "unknown"
+    pt = row.get("producer_time")
+    return pt if pt in BASES else "unknown"
+
+
+def read_kind(row: dict, verdict: str | None) -> str | None:
+    if verdict is not None:
+        return None
+    if "record_kind" in row:
+        return row["record_kind"]
+    return "contributor_legacy" if row.get("action_taken") == "coalesced" else "dispatch"
+
+
+def bucket(rows: list[dict], bucket_ms: int) -> list[dict]:
+    groups: dict[tuple[int, int], list[dict]] = {}
+    for r in rows:
+        start = (r["timestamp"] // bucket_ms) * bucket_ms
+        groups.setdefault((start, BASES.index(r["producer_time"])), []).append(r)
+    out = []
+    for (start, b), members in sorted(groups.items()):
+        n = sum(m["sample_count"] for m in members)
+        mean = sum(m["value"] * m["sample_count"] for m in members) / n
+        out.append({
+            "start_ms": start, "end_ms": start + bucket_ms, "timestamp": start, "bucket_ms": bucket_ms,
+            "tier": "bucketed", "quality": None,
+            "producer_time": BASES[b], "sample_count": n, "avg_value": mean, "value": mean,
+            "min_value": min(m["value"] for m in members), "max_value": max(m["value"] for m in members),
+            "received_at_ms": max(m["received_at_ms"] for m in members),
+        })
+    return out
+
+
+def traverse(stored: list[dict], page_size: int, between: list[dict]) -> list[list[str]]:
+    """Keyset paging by (timestamp desc, stored order desc). `between[i]` changes the store before page i+1."""
+    store = list(stored)
+    pages: list[list[str]] = []
+    cursor = None
+    i = 0
+    while True:
+        ordered = sorted(store, key=lambda r: (r["timestamp"], r["stored"]), reverse=True)
+        if cursor is not None:
+            ordered = [r for r in ordered if (r["timestamp"], r["stored"]) < cursor]
+        page = ordered[:page_size]
+        if not page:
+            break
+        pages.append([r["id"] for r in page])
+        cursor = (page[-1]["timestamp"], page[-1]["stored"])
+        if i < len(between):
+            ch = between[i]
+            store = [r for r in store if r["id"] not in ch.get("remove", [])] + ch.get("store", [])
+        i += 1
+    return pages
+
+
+# --- cases -----------------------------------------------------------------
+
+
+def reading_rows() -> list[dict]:
+    raw = {"sensor_id": "panel-feed-ch0", "sensor_type": "current", "unit": "ampere", "quality": 1.0,
+           "sample_count": 1, "tier": "raw", "value": 8.21}
+    cases = [
+        ("firmware reading: reached the runtime, then stored 3 ms later",
+         {**raw, "timestamp": T0 + 480, "received_at_ms": T0 + 483,
+                                                     "producer_time": "not_reported"}),
+        ("polled reading, measured and received apart", {**raw, "timestamp": T0, "received_at_ms": T0 + 480,
+                                                          "producer_time": "reported"}),
+        ("polled reading whose measurement equals its receipt", {**raw, "timestamp": T0, "received_at_ms": T0,
+                                                                  "producer_time": "reported"}),
+        ("compacted row from before the basis was recorded", {**raw, "tier": "hourly", "sample_count": 12,
+                                                               "timestamp": T0, "received_at_ms": T0 + 3599900,
+                                                               "producer_time": "unknown"}),
+        ("compacted not_reported row with no receipt is not held to the raw receipt rule",
+         {**raw, "tier": "5min", "sample_count": 3, "timestamp": T0, "producer_time": "not_reported"}),
+        ("bucketed not_reported row with no receipt is not held to the raw receipt rule",
+         {**raw, "tier": "bucketed", "bucket_ms": 3600000, "start_ms": T0, "end_ms": T0 + 3600000,
+          "timestamp": T0, "producer_time": "not_reported"}),
+        ("row from a runtime that predates producer_time", {**raw, "timestamp": T0, "received_at_ms": T0 + 480}),
+        ("row from a runtime that predates the receipt", {**raw, "timestamp": T0}),
+        ("stored before the basis: a LoRaWAN network server's received_at kept as stored",
+         {**raw, "timestamp": T0 - 2000, "received_at_ms": T0 + 15, "producer_time": "unknown"}),
+        ("stored before the basis: a Zigbee coordinator's last_seen kept as stored",
+         {**raw, "timestamp": T0 - 90000, "received_at_ms": T0 + 4, "producer_time": "unknown"}),
+        ("history point, not_reported", {"_point": True, "value": 8.21, "timestamp": T0 + 480,
+                                         "received_at_ms": T0 + 480, "producer_time": "not_reported"}),
+        ("history point, reported", {"_point": True, "value": 8.21, "timestamp": T0, "received_at_ms": T0 + 9,
+                                     "producer_time": "reported"}),
+        ("reasoning reading with no receipt member, not_reported", {"_current": True, "value": 8.21,
+                                                                    "unit": "ampere", "timestamp": T0 + 480,
+                                                                    "producer_time": "not_reported"}),
+        # rejects
+        ("producer_time outside the closed set", {**raw, "timestamp": T0, "received_at_ms": T0,
+                                                  "producer_time": "received"}),
+        ("producer_time of another JSON type", {**raw, "timestamp": T0, "received_at_ms": T0,
+                                                "producer_time": None}),
+        ("producer_time differs only in case", {**raw, "timestamp": T0, "received_at_ms": T0,
+                                                "producer_time": "Reported"}),
+        ("cached subscription value stored again long after it arrived",
+         {**raw, "timestamp": T0, "received_at_ms": T0 + 600000,
+                                                        "producer_time": "not_reported"}),
+        ("not_reported raw row with no receipt", {**raw, "timestamp": T0, "producer_time": "not_reported"}),
+        ("not_reported raw row with a null receipt", {**raw, "timestamp": T0, "received_at_ms": None,
+                                                      "producer_time": "not_reported"}),
+        ("not_reported history point with no receipt", {"_point": True, "value": 1.0, "timestamp": T0,
+                                                              "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is zero",
+         {**raw, "timestamp": 0, "received_at_ms": 0, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is fractional",
+         {**raw, "timestamp": T0, "received_at_ms": T0 + 0.5, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is integral but written with a fraction",
+         {**raw, "timestamp": T0, "received_at_ms": float(T0 + 3), "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is one past the integer bound",
+         {**raw, "timestamp": T0, "received_at_ms": MAX_INT + 1, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is the lower bound",
+         {**raw, "timestamp": T0, "received_at_ms": 1, "producer_time": "not_reported"}),
+        ("not_reported raw row whose receipt is the integer bound",
+         {**raw, "timestamp": T0, "received_at_ms": MAX_INT, "producer_time": "not_reported"}),
+    ]
+    out = []
+    for name, row in cases:
+        verdict = reading_verdict(row)
+        where = "history_point" if row.pop("_point", False) else (
+            "reasoning_reading" if row.pop("_current", False) else "sensor_history")
+        out.append({"name": name, "where": where, "row": row,
+                    "expected": {"verdict": verdict, "time_basis": time_basis(row, verdict)}})
+    return out
+
+
+def action_rows() -> list[dict]:
+    base = {"action_name": "trip_relay", "tier": "D", "timestamp": T0 + 950}
+    act = {**base, "executed": True, "action_taken": "trip_relay"}
+    joined = {**base, "executed": False, "action_taken": "coalesced"}
+    cases = [
+        ("dispatch", {**act, "record_kind": "dispatch", "record_key": key(1), "contributed_to": None}),
+        ("dispatch that did not execute", {**act, "executed": False, "record_kind": "dispatch",
+                                           "record_key": key(2), "contributed_to": None}),
+        ("dispatch written before keys", {**act, "record_kind": "dispatch", "record_key": None,
+                                          "contributed_to": None}),
+        ("contributor", {**joined, "record_kind": "contributor", "record_key": key(3),
+                         "contributed_to": key(1)}),
+        ("contributor written before keys still names its holder",
+         {**joined, "record_kind": "contributor", "record_key": None, "contributed_to": key(1)}),
+        ("legacy contributor that the earlier release marked executed",
+         {**joined, "executed": True, "record_kind": "contributor_legacy", "record_key": None,
+          "contributed_to": None}),
+        ("legacy contributor, not executed", {**joined, "record_kind": "contributor_legacy",
+                                              "record_key": None, "contributed_to": None}),
+        ("older runtime: an act", {**act}),
+        ("older runtime: a coalesced row executed is legacy", {**joined, "executed": True}),
+        ("older runtime: a coalesced row", {**joined}),
+        # rejects
+        ("record_kind outside the closed set", {**act, "record_kind": "act", "record_key": key(4),
+                                                "contributed_to": None}),
+        ("record_kind of another JSON type", {**act, "record_kind": None, "record_key": key(4),
+                                              "contributed_to": None}),
+        ("record_key empty string", {**act, "record_kind": "dispatch", "record_key": "", "contributed_to": None}),
+        ("record_key of another JSON type", {**act, "record_kind": "dispatch", "record_key": 7,
+                                             "contributed_to": None}),
+        ("record_key absent beside record_kind", {**act, "record_kind": "dispatch", "contributed_to": None}),
+        ("contributor with no holder", {**joined, "record_kind": "contributor", "record_key": key(5),
+                                        "contributed_to": None}),
+        ("contributor with an empty holder", {**joined, "record_kind": "contributor", "record_key": key(5),
+                                              "contributed_to": ""}),
+        ("contributor naming itself", {**joined, "record_kind": "contributor", "record_key": key(5),
+                                       "contributed_to": key(5)}),
+        ("contributor with contributed_to absent", {**joined, "record_kind": "contributor",
+                                                    "record_key": key(5)}),
+        ("dispatch naming a holder", {**act, "record_kind": "dispatch", "record_key": key(6),
+                                      "contributed_to": key(1)}),
+        ("legacy contributor naming a holder", {**joined, "record_kind": "contributor_legacy",
+                                                "record_key": None, "contributed_to": key(1)}),
+        ("dispatch recorded as coalesced", {**joined, "executed": True, "record_kind": "dispatch",
+                                            "record_key": key(7), "contributed_to": None}),
+        ("contributor that acted", {**act, "executed": False, "record_kind": "contributor",
+                                    "record_key": key(8), "contributed_to": key(1)}),
+        ("legacy contributor that acted", {**act, "record_kind": "contributor_legacy", "record_key": None,
+                                           "contributed_to": None}),
+        ("contributor marked executed", {**joined, "executed": True, "record_kind": "contributor",
+                                         "record_key": key(9), "contributed_to": key(1)}),
+        ("contributor with executed absent", {**{k: v for k, v in joined.items() if k != "executed"},
+                                              "record_kind": "contributor", "record_key": key(9),
+                                              "contributed_to": key(1)}),
+        ("bad kind and bad key: step 3 first", {**act, "record_kind": "act", "record_key": "",
+                                                "contributed_to": None}),
+        ("contributor that acted and is marked executed: step 6 first",
+         {**act, "record_kind": "contributor", "record_key": key(12), "contributed_to": key(1)}),
+        ("bad key and bad holder: step 4 first", {**joined, "record_kind": "contributor", "record_key": "",
+                                                  "contributed_to": None}),
+        ("bad holder and executed: step 5 first", {**joined, "executed": True, "record_kind": "contributor",
+                                                   "record_key": key(10), "contributed_to": None}),
+        ("coalesced dispatch that also names a holder: step 5 first",
+         {**joined, "record_kind": "dispatch", "record_key": key(11), "contributed_to": key(1)}),
+    ]
+    out = []
+    for name, row in cases:
+        verdict = action_verdict(row)
+        kind = read_kind(row, verdict)
+        out.append({"name": name, "row": row, "expected": {
+            "verdict": verdict, "read_as": kind, "is_act": kind == "dispatch"}})
+    return out
+
+
+def bucket_cases() -> list[dict]:
+    H = 3600000
+
+    def r(ts, rec, v, pt, n=1):
+        return {"timestamp": ts, "received_at_ms": rec, "value": v, "producer_time": pt, "sample_count": n}
+
+    cases = [
+        ("one bucket, three bases", H, [
+            r(B0 + 10, B0 + 20, 4.0, "reported"), r(B0 + 30, B0 + 30, 6.0, "not_reported"),
+            r(B0 + 40, B0 + 50, 5.0, "reported", 3), r(B0, B0 + 3599000, 2.0, "unknown", 12),
+            r(B0 + 70, B0 + 70, 9.0, "not_reported")]),
+        ("raw rows at a boundary: not_reported by when it reached the runtime, reported by its measurement", H, [
+            r(B0 + H - 1, B0 + H - 1, 1.0, "reported"), r(B0 + H, B0 + H, 2.0, "not_reported"),
+            r(B0 + H - 5, B0 + H + 7, 3.0, "reported")]),
+        ("bases interleave across buckets", H, [
+            r(B0 + 2 * H + 5, B0 + 2 * H + 5, 7.0, "not_reported"), r(B0 + 1, B0 + 2, 1.5, "reported"),
+            r(B0 + 2 * H + 9, B0 + 2 * H + 20, 8.5, "reported"), r(B0 + 3, B0 + 3, 2.5, "not_reported")]),
+        ("a compacted not_reported row is bucketed by its own bucket start, not its receipt", H, [
+            r(B0 + H - 300000, B0 + H + 299000, 5.0, "not_reported", 3),
+            r(B0 + H + 10, B0 + H + 10, 6.0, "not_reported")]),
+        ("weights by sample_count within one basis", 300000, [
+            r(B0, B0 + 1, 10.0, "reported", 1), r(B0 + 1000, B0 + 1001, 20.0, "reported", 3)]),
+    ]
+    return [{"name": n, "bucket_ms": b, "rows": rows, "expected": bucket(rows, b)} for n, b, rows in cases]
+
+
+def paging_cases() -> list[dict]:
+    def a(i, ts, stored):
+        return {"id": i, "timestamp": ts, "stored": stored}
+
+    stored = [a("a", T0 + 5, 1), a("b", T0 + 5, 2), a("c", T0 + 5, 3), a("d", T0 + 4, 4),
+              a("e", T0 + 9, 5), a("f", T0 + 1, 6), a("g", T0 + 4, 7)]
+    cases = [
+        ("ties broken by stored order, latest first", stored, 2, []),
+        ("a row stored after the first page does not shift the traversal", stored, 2,
+         [{"store": [a("h", T0 + 10, 8)]}]),
+        ("a row already returned is removed and nothing is skipped", stored, 2, [{"remove": ["e"]}]),
+        ("a removed row not yet returned is not returned", stored, 3, [{"remove": ["g"]}]),
+        ("a row stored behind the cursor during the traversal is returned", stored, 3,
+         [{"store": [a("i", T0 + 2, 9)]}]),
+        ("the last row returned is removed before the next page", stored, 2, [{"remove": ["c"]}]),
+        ("one row per page", stored[:3], 1, []),
+    ]
+    return [{"name": n, "stored": s, "page_size": p, "between_pages": bt,
+             "expected_pages": traverse(s, p, bt)} for n, s, p, bt in cases]
+
+
+def resolution_cases() -> list[dict]:
+    def row(k, kind, holder):
+        coalesced = kind != "dispatch"
+        return {"action_name": "trip_relay", "tier": "D", "timestamp": T0 + 950,
+                "executed": not coalesced, "action_taken": "coalesced" if coalesced else "trip_relay",
+                "record_kind": kind, "record_key": k, "contributed_to": holder}
+
+    pages = [
+        [row(key(4), "contributor", key(5)), row(key(1), "dispatch", None), row(key(2), "contributor", key(1))],
+        [row(key(3), "contributor", key(99)), row(None, "contributor_legacy", None)],
+        [row(key(5), "dispatch", None), row(key(6), "contributor", key(2)), row(key(7), "dispatch", None)],
+        [row(key(8), "contributor", key(7)), row(key(7), "dispatch", None)],
+    ]
+    rows = [r for p in pages for r in p]
+    assert all(action_verdict(r) is None for r in rows)
+    carried = [r["record_key"] for r in rows if r["record_key"] is not None]
+    keys = {r["record_key"] for r in rows if r["record_kind"] == "dispatch" and carried.count(r["record_key"]) == 1}
+    expected = [{"record_key": r["record_key"],
+                 "holder": r["contributed_to"] if r["contributed_to"] in keys else None}
+                for r in rows if r["record_kind"] == "contributor"]
+    return [{"name": "contributors resolved across a complete traversal: holder on the same page, "
+                     "on a later page, missing, not a dispatch, or carried by two rows",
+             "pages": pages, "expected": expected}]
+
+
+def token_cases() -> dict:
+    def refused(issued_here: bool, same_filters: bool) -> bool:
+        return not (issued_here and same_filters)
+
+    runtime = [
+        ("a token this runtime issued, with its own filters", True, True),
+        ("an offset from a runtime that paged by count", False, True),
+        ("a token this runtime issued, sent with another window", True, False),
+        ("a token another runtime issued, with other params", False, False),
+    ]
+
+    def gateway(answers: list[dict]) -> dict:
+        rows: list[str] = []
+        seen: set[str] = set()
+        restarts = 0
+        for a in answers:
+            if "error" in a:
+                if a["error"] == "page_token_invalid" and restarts == 0:
+                    restarts += 1
+                    rows, seen = [], set()
+                    continue
+                return {"outcome": "failed", "restarts": restarts, "rows": []}
+            rows += a["rows"]
+            if a.get("token") is not None:
+                if a["token"] in seen:
+                    return {"outcome": "failed", "restarts": restarts, "rows": []}
+                seen.add(a["token"])
+            if not a["next"]:
+                return {"outcome": "complete", "restarts": restarts, "rows": rows}
+        raise AssertionError("a gateway case must end")
+
+    traversals = [
+        ("refused once mid-traversal: one restart, earlier rows discarded",
+         [{"rows": ["a", "b"], "next": True}, {"error": "page_token_invalid"},
+          {"rows": ["a", "b"], "next": True}, {"rows": ["c"], "next": False}]),
+        ("refused twice in one traversal: the export fails",
+         [{"rows": ["a"], "next": True}, {"error": "page_token_invalid"},
+          {"rows": ["a"], "next": True}, {"error": "page_token_invalid"}]),
+        ("any other error fails the export without a restart",
+         [{"rows": ["a"], "next": True}, {"error": "until_ms must be >= since_ms"}]),
+        ("a restarted traversal is issued a token it saw before the restart",
+         [{"rows": ["a"], "next": True, "token": "p1"}, {"error": "page_token_invalid"},
+          {"rows": ["a"], "next": True, "token": "p1"}, {"rows": ["b"], "next": False}]),
+        ("a token repeated within one traversal fails the export",
+         [{"rows": ["a"], "next": True, "token": "p1"}, {"rows": ["b"], "next": True, "token": "p1"}]),
+        ("an error that merely mentions the token is not the refusal",
+         [{"rows": ["a"], "next": True}, {"error": "page_token_invalid: offset"}]),
+    ]
+    return {
+        "runtime": [{"name": n, "issued_by_this_runtime": i, "same_filters": f,
+                     "expected": {"refused": refused(i, f),
+                                  "error": "page_token_invalid" if refused(i, f) else None}}
+                    for n, i, f in runtime],
+        "gateway": [{"name": n, "answers": a, "expected": gateway(a)} for n, a in traversals],
+    }
+
+
+def corpus() -> dict:
+    return {
+        "vector_set": "gateway-api/v2 export rows",
+        "contract": "gateway-api/v2.md",
+        "sections": ["Producer Time", "sensor_history", "action_log"],
+        "conventions": {
+            "readings.where": "sensor_history row, history_point of a Tier 3 request, or reasoning_reading: "
+                              "the Tier 3 request's own reading",
+            "expected.read_as": "the record_kind a consumer reads the row as; null for a row that fails a check",
+            "paging.between_pages": "entry i changes the store after page i+1 is returned and before the next "
+                                    "is requested; stored is the order the runtime stored the rows",
+            "tokens.gateway.answers": "the runtime's answers to one traversal's requests in order: rows with "
+                                      "whether a next page follows and, where given, the next_page_token "
+                                      "issued, or an error envelope's error",
+            "buckets.expected": "every member of a bucketed row except sensor_id, sensor_type and unit, "
+                                "which the input rows here do not carry",
+        },
+        "readings": reading_rows(),
+        "action_log": action_rows(),
+        "buckets": bucket_cases(),
+        "paging": paging_cases(),
+        "resolution": resolution_cases(),
+        "tokens": token_cases(),
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(corpus(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if not OUT.is_file() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
