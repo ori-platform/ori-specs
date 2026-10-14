@@ -46,6 +46,7 @@ import argparse
 import copy
 import difflib
 import hashlib
+import html
 import json
 import multiprocessing
 import os
@@ -54,6 +55,7 @@ import posixpath
 import re
 import shutil
 import subprocess
+import urllib.parse
 import sys
 import tempfile
 import textwrap
@@ -1369,7 +1371,8 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                     "to that, so the hunk is semantic and moves to a successor; reference syntax the check cannot "
                     "read is refused rather than passed. Limits: it reads the hunk's added lines only, and not a "
                     "document named in prose without a path, a bare file name other than a .md document, a path that "
-                    "leaves the repository, a URL to another site, "
+                    "leaves the repository, a URL to another site, a path under a directory this repository does not "
+                    "have and written without an extension the check reads, "
                     "additive hunks, or a "
                     "rule added later inside a section that existed at the freeze revision. A later version of this "
                     "contract, by number, is exempt, so an erratum may point at its successor and, through that "
@@ -1401,8 +1404,8 @@ _REPO_PATH_VERBS = {"blob", "tree", "raw", "blame", "edit", "commits", "history"
 _REPO_OTHER_VERBS = {"issues", "pull", "pulls", "actions", "releases", "commit", "compare", "discussions", "wiki",
                      "security", "tags", "branches", "milestones", "labels", "projects", "pulse", "graphs", "network",
                      "settings", "archive", "tree-commit"}
-_PATH_TOKEN = re.compile(r"(?<![\w.@/-])((?:\.{1,2}/)*(?:[\w-]+/)*[\w.-]+\.(?:md|json|ya?ml|txt|csv|png|svg|jpe?g|"
-                         r"gif|pdf|html?)(?:#[\w-]*)?)(?![\w/-])", re.I)
+_PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9.@/-])((?:\.{1,2}/)*(?:[\w.-]+/)*[\w.-]+\.(?:md|json|ya?ml|txt|csv|png|svg|jpe?g|"
+                         r"gif|pdf|html?)(?:#[\w-]*)?)(?![A-Za-z0-9/-])", re.I)
 _LINE_PREFIX = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*")
 _ANGLE_PATH = re.compile(r"<([^<>\s][^<>\n]*)>")
 _CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
@@ -1515,6 +1518,18 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
             targets.append((rest.split("/", 1)[1] if "/" in rest else "", "repo-path"))
         elif verb and verb not in _REPO_OTHER_VERBS:
             unread.append(m.group(0)[:60])
+    # The widest backstop: in the text decoded (entities, percent-encoding), with inline HTML tags and emphasis
+    # markers removed, every occurrence of one of this repository's top-level directories followed by a path names
+    # that path, whatever surrounds it: a URL on any host, an API path, a path split by markup, any extension or
+    # none. Each must exist at the freeze revision, as a file or a directory.
+    decoded = html.unescape(urllib.parse.unquote(urllib.parse.unquote(added)))
+    decoded = re.sub(r"<[^<>\n]*>", "", decoded)
+    decoded = re.sub(r"(?<![A-Za-z0-9])[_*]+|[_*]+(?![A-Za-z0-9])", " ", decoded)
+    tops = sorted((p.name for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")), key=len, reverse=True)
+    if tops:
+        scan = re.compile(r"(?<![A-Za-z0-9-])((?:" + "|".join(map(re.escape, tops)) + r")/[A-Za-z0-9._/-]*[A-Za-z0-9_/-])")
+        for m in scan.finditer(decoded):
+            targets.append((m.group(1).rstrip("/") or m.group(1), "rootscan"))
     for m in _PATH_TOKEN.finditer(added):
         token = m.group(1)
         # A bare file name with no directory is another repository's file as often as this one's (gateway.yaml,
@@ -1559,7 +1574,7 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
             else:
                 targets.append((raw, "either"))
             continue
-        if base == "repo-path":
+        if base in ("repo-path", "rootscan"):
             targets.append((raw, "root"))
             continue
         if base != "tick":
@@ -2964,6 +2979,21 @@ def mutations() -> int:
                        complete_audit(root, last_hunk_erratum))),
         ('an erratum naming a file through CSS', "erratum-imports-later-document",
          lambda root: (append_normative(root, audited, '<style>@import "../no-such-contract/v1.md";</style>'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an underscore-emphasised path', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See _gaps/no-such-file.md_ for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a path climbing back through its own directory', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See gaps/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a file through the GitHub API', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'https://api.github.com/repos/ori-platform/ori-specs/contents/gaps/no-such-file.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path split by markup', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See gaps/<em>no-such</em>-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a script with no extension', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'Run scripts/no-such-script first.'),
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum linking an issue of this repository by URL passes", None,
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
