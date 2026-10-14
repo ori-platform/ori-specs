@@ -2276,8 +2276,9 @@ def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, 
         files = m.get("files") if isinstance(m.get("files"), dict) else {}
         for name in files:
             rel = name if name.startswith(f"{contract}/") else f"{base}/{name}" if base and base != "." else name
-            # An earlier name counts only at the bytes the audit recorded for it: the same name at another
-            # revision is the earlier version's own file.
+            # An earlier name counts only where the manifest declares the digest the audit recorded for it: the
+            # same name at another revision is the earlier version's own file. The declared digest is read, not
+            # the vendored copy's bytes; that the copy matches its manifest is the consumer's own check.
             if (earlier and rel in earlier and files[name] == earlier[rel]) or (
                     rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version):
                 pins.add(m["source_commit"][:7])
@@ -2302,11 +2303,12 @@ def check_transcriptions(rec: dict, where: str, repos: dict, findings: list[Find
             findings.append(Finding("sibling-transcription", w,
                                     f"the corrected ID {old.get('commit')} resolves to a commit; a transcription "
                                     "correction replaces an ID that names nothing, never a real commit"))
-        tag = _git(repo, "rev-parse", "--verify", "--quiet", f"{new.get('release')}^{{commit}}")
+        # The release must be a tag: a branch of that name, a full ref or a raw commit is not a release.
+        tag = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{new.get('release')}^{{commit}}")
         resolved = tag.stdout.decode("utf-8", "replace").strip() if tag.returncode == 0 else ""
         if not (resolved and str(new.get("commit")) and resolved.startswith(str(new.get("commit")))):
             findings.append(Finding("sibling-transcription", w,
-                                    f"release {new.get('release')} does not resolve to the corrected commit "
+                                    f"release tag {new.get('release')} does not resolve to the corrected commit "
                                     f"{new.get('commit')} ({resolved[:12] or 'no such tag'})"))
 
 
@@ -2325,9 +2327,17 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
     records = load_records(root, findings)
     for (c, v), rec in sorted(records.items()):
         versions = versions_in(root, c)
-        ba_rec = rec.get("baseline_audit") or {}
-        ba_files, ba_vectors = ba_rec.get("baseline_files"), ba_rec.get("vectors") or {}
-        earlier = {old: ba_vectors.get(cur) for cur, old in ba_files.items()} if isinstance(ba_files, dict) else {}
+        ba_rec = rec.get("baseline_audit") if isinstance(rec.get("baseline_audit"), dict) else {}
+        ba_files, ba_vectors = ba_rec.get("baseline_files"), ba_rec.get("vectors")
+        earlier: dict = {}
+        if ba_files is not None or ba_rec.get("baseline_path") is not None:
+            if not (isinstance(ba_files, dict) and isinstance(ba_vectors, dict)
+                    and all(isinstance(k, str) and isinstance(v, str) for k, v in ba_files.items())):
+                findings.append(Finding("bad-value", f"status/{c}/{v}.json",
+                                        "baseline_files and vectors must be {path: path} and {path: sha256} before "
+                                        "an earlier name's pin can be checked"))
+            else:
+                earlier = {old: ba_vectors.get(cur) for cur, old in ba_files.items()}
         check_transcriptions(rec, f"status/{c}/{v}.json", repos, findings)
         for i, e in enumerate(rec.get("adoption") or []):
             where = f"status/{c}/{v}.json adoption[{i}] {e.get('role')} ({e.get('repository')})"
@@ -3950,6 +3960,7 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
         git(repo, "add", "impl.go", "MANIFEST.json", "old/MANIFEST.json")
         git(repo, "commit", "-q", "-m", "implement")
         git(repo, "tag", "v1")
+        git(repo, "branch", "v7")
         a = git(repo, "rev-parse", "--short=12", "HEAD")
         git(repo, "checkout", "-q", "-b", "side")
         (repo / "side.txt").write_text("x\n")
@@ -3996,6 +4007,16 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
          lambda e, a, b: e.update(_corrections=[transcription(b, a, "v1")])),
         ("sibling: a transcription correction whose tag resolves elsewhere", "sibling-transcription:does not resolve",
          lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v0")])),
+        ("sibling: a transcription correction whose release tag does not exist", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v9")])),
+        ("sibling: a transcription correction whose release is a branch, not a tag", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v7")])),
+        ("sibling: a transcription correction whose release is a raw commit", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, a)])),
+        ("sibling: a transcription correction whose release is a full branch ref", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "refs/heads/main")])),
+        ("sibling: malformed baseline fields are a named finding, not a crash", "bad-value:baseline_files and vectors",
+         lambda e, a, b: e.update(_baseline={"baseline_files": {"x": []}, "vectors": [1]})),
         ("sibling: an earlier-name pin at the recorded bytes passes", None,
          lambda e, a, b: (e["implementation"].update(vendored_revision="ccccccc"),
                           e["current"].update(vendored_revision="ccccccc"),
