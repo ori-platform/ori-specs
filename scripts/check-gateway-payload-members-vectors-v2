@@ -275,9 +275,9 @@ HELD = (
     'A producer MUST NOT emit a payload this rule refuses.',
     ("A gateway that carries an object it did not author, as it carries an inbound `artifact` "
      "from the evidence authority, applies the rule when it receives the object to the "
-     "payload it would forward carrying it, on that payload's topic, and does not queue an "
-     "object whose payload the rule refuses: it could not then forward the object unchanged "
-     "without emitting a payload this rule refuses."),
+     "payload it would forward carrying the object exactly as it received it, on that "
+     "payload's topic, and does not queue an object whose payload the rule refuses: it could "
+     "not then forward the object unchanged without emitting a payload this rule refuses."),
     ('Judging the object alone would not do, since the payload around it adds a level of '
      'depth and the members its topic defines.'),
     ('It records that refusal, which is not a failure to stage, and does for the rest of the '
@@ -285,7 +285,9 @@ HELD = (
     ('[`vectors/payload-members-v2.json`](vectors/payload-members-v2.json) carries the '
      'payloads as exact bytes, each with the reason a receiver MUST name or the admission it '
      'MUST give.'),
-    'Each case names the topic whose sections give its defined members, or none.',
+    ("Each case names the topic whose sections give its defined members, or none, and the "
+     "corpus lists every topic's defined members so an implementation can compare its own "
+     "with them."),
     'An envelope adds members to a payload:',
     ('`auth` to an authenticated payload, and `encrypted` and `encryption` to an encrypted '
      'export response, whose routing members stay outside.'),
@@ -345,6 +347,7 @@ DEFAULTS: dict[str, Any] = {
     "f4_takes_90": False,         # True: F4 accepts 90 as second byte
     "defined_top_only": False,    # True: family members apply to the root object only
     "intake_alone": False,        # True: a carried object is judged alone
+    "intake_reencoded": frozenset(),  # {"dup", "lone"}: what re-encoding a carried object hides
     "trailing_depth": False,      # True: judge depth after the first value
     "cut_escape_lone": False,     # True: a cut-short high-surrogate escape is a lone one
 }
@@ -457,6 +460,8 @@ FAMILY_CONVENTION = ("the topic whose sections give the payload's defined member
                      "example keys and Field table names, with the Envelope Members keys), which "
                      "hold for every object of the payload; null for a payload that names no "
                      "family")
+FAMILIES_CONVENTION = ("every topic's defined members, sorted, for an implementation to compare "
+                       "its own with")
 FAMILY_HEADER = ["Topic", "Sections that give the members"]
 ENVELOPE = "### Envelope Members"
 
@@ -1247,6 +1252,22 @@ def _assess(data: bytes, defined: frozenset, m: dict) -> Assessment:
     return a
 
 
+def reencoded(a: Assessment, span: tuple[int, int], m: dict) -> Assessment:
+    """The defect of judging a carried object after decoding and re-encoding it: what that
+    loses inside the object (a duplicate, read last-wins; a lone surrogate, replaced) is no
+    longer seen. Only the outcome is recomputed; the rest of the assessment is shared."""
+    lone_offs = {x["off"] for x in a.lone}
+    inside = range(*span)
+    kept = [(r, o) for r, o in a.violations if not (o in inside and (
+        (r == "duplicate_member" and "dup" in m["intake_reencoded"])
+        or (r == "invalid_unicode" and o in lone_offs and "lone" in m["intake_reencoded"])))]
+    out = copy.copy(a)
+    out.violations = kept
+    out.reasons = {r for r, _ in kept}
+    out.outcome = (min(kept, key=lambda v: m["reasons"].index(v[0]))[0] if kept else "accept")
+    return out
+
+
 def carried_span(a: Assessment, m: dict) -> tuple[int, int] | None:
     """The byte span of the object the root carries under the intake sentence's member."""
     if not isinstance(a.root, Node) or a.root.kind != "obj":
@@ -1281,6 +1302,16 @@ def check(corpus: dict, m: dict) -> tuple[list[str], dict[str, Assessment]]:
         problems.append(f"corpus reasons {corpus.get('reasons')} differ from the table {m['reasons']}")
     if corpus.get("conventions", {}).get("family") != FAMILY_CONVENTION:
         problems.append("corpus conventions: family is not described as the contract defines it")
+    if corpus.get("conventions", {}).get("families") != FAMILIES_CONVENTION:
+        problems.append("corpus conventions: families is not described as the contract does")
+    listed = corpus.get("families")
+    derived = {k: sorted(v) for k, v in m["families"].items()}
+    if not isinstance(listed, dict) or listed != derived:
+        listed = listed if isinstance(listed, dict) else {}
+        diff = {k: (sorted(set(listed.get(k, [])) - set(derived.get(k, []))),
+                    sorted(set(derived.get(k, [])) - set(listed.get(k, []))))
+                for k in set(listed) | set(derived) if listed.get(k) != derived.get(k)}
+        problems.append(f"corpus families differ from the text (topic: extra, missing): {diff}")
     conv = corpus.get("conventions", {}).get("payload_text", "")
     lm = re.search(r"longer than (\d+) bytes", conv)
     limit = int(lm.group(1)) if lm else None
@@ -1318,6 +1349,8 @@ def check(corpus: dict, m: dict) -> tuple[list[str], dict[str, Assessment]]:
         span = carried_span(a, m)
         if m["intake_alone"] and family is not None and span is not None:
             a = assess(data[span[0]:span[1]], frozenset(), m)
+        elif m["intake_reencoded"] and family is not None and span is not None:
+            a = reencoded(a, span, m)
         done[name] = a
         if a.outcome != case["expected"]:
             problems.append(f"{name}: outcome: corpus expects {case['expected']}, model gives "
@@ -1609,6 +1642,16 @@ def properties(m: dict) -> list[tuple[str, Callable[[dict, Assessment], bool]]]:
           lambda c, a, reason=reason: exp(c, reason) and c["family"] is not None
           and carried_span(a, m) is not None and assess(
               a.data[slice(*carried_span(a, m))], frozenset(), m).outcome == "accept")
+    def inside_carried(c: dict, a: Assessment) -> range | None:
+        span = carried_span(a, m) if c["family"] is not None else None
+        return range(*span) if span else None
+
+    p("a duplicate inside a carried object refused as received",
+      lambda c, a: exp(c, dup) and a.reasons == {dup} and inside_carried(c, a) is not None
+      and any(y.off in inside_carried(c, a) for _, _, y in a.dups))
+    p("a lone surrogate inside a carried object refused as received",
+      lambda c, a: exp(c, inv) and a.reasons == {inv} and inside_carried(c, a) is not None
+      and bool(a.lone) and all(x["off"] in inside_carried(c, a) for x in a.lone))
     p("a case variant on Z", lambda c, a: var_only(c, a) and any(
         isinstance(o, Name) and {0x5A, 0x7A} <= set(x.key) | set(o.key) for _, x, o in a.cases))
     for cp in (0x09, 0x0D):
@@ -1824,6 +1867,18 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
             lambda c: c["conventions"].__setitem__(
                 "family", "the topic whose JSON examples give the payload's defined members"),
             "family is not described")),
+        ("corpus: families drops a name", corpus_mutant(
+            lambda c: c["families"][min(c["families"])].pop(), "corpus families differ")),
+        ("corpus: families adds a name", corpus_mutant(
+            lambda c: c["families"][max(c["families"])].append("zzz_extra"),
+            "corpus families differ")),
+        ("corpus: families drops a topic", corpus_mutant(
+            lambda c: c["families"].pop(min(c["families"])), "corpus families differ")),
+        ("corpus: families unsorted", corpus_mutant(
+            lambda c: c["families"][min(c["families"])].reverse(), "corpus families differ")),
+        ("corpus: families convention reworded", corpus_mutant(
+            lambda c: c["conventions"].__setitem__("families", "the members"),
+            "families is not described")),
         ("corpus: expected names no reason", corpus_mutant(set_(accept, "expected", "refused"),
                                                            "no reason in the table")),
         ("corpus: an extra key", corpus_mutant(set_(accept, "note", "x"), "keys")),
@@ -1906,6 +1961,10 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
         ("model: family members applied to the root only",
          model_mutant("outcome", defined_top_only=True)),
         ("model: a carried object judged alone", model_mutant("outcome", intake_alone=True)),
+        ("model: a carried object re-encoded, duplicates read last-wins",
+         model_mutant("outcome", intake_reencoded=frozenset({"dup"}))),
+        ("model: a carried object re-encoded, lone surrogates replaced",
+         model_mutant("outcome", intake_reencoded=frozenset({"lone"}))),
         ("model: the fold ends at Y", model_mutant("outcome", fold_top=0x59)),
         ("model: a raw TAB admitted in a string",
          model_mutant("outcome", control_allowed=frozenset({0x09}))),
@@ -2109,6 +2168,8 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
 
     permitted += [
         ("corpus: cases reversed", perm_corpus(lambda c: c["cases"].reverse())),
+        ("corpus: families topics reordered", perm_corpus(lambda c: c.__setitem__(
+            "families", dict(reversed(list(c["families"].items())))))),
         ("corpus: a description reworded", perm_corpus(set_(accept, "description", "Reworded."))),
         ("corpus: re-indented", lambda: quiet(problems_of(
             json.dumps(base, indent=7).encode(), model))),
