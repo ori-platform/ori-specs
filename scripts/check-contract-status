@@ -1354,6 +1354,18 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
         return
     bpath = ba.get("baseline_path") or where
     lineage = ba.get("baseline_files") if isinstance(ba.get("baseline_files"), dict) else {}
+    if bpath != where and git_blob(ba["freeze_revision"], where) is not None:
+        findings.append(Finding("baseline-path-unneeded", where,
+                                f"baseline_path names {bpath}, but this version's own text exists at "
+                                f"{ba['freeze_revision']}; a baseline under another path is admitted only for a "
+                                "version whose own file did not exist there"))
+        return
+    for renamed in sorted(lineage):
+        if git_blob(ba["freeze_revision"], renamed) is not None:
+            findings.append(Finding("baseline-path-unneeded", renamed,
+                                    f"baseline_files traces {renamed} to {lineage[renamed]}, but {renamed} exists at "
+                                    f"{ba['freeze_revision']}; an earlier name is admitted only for a file absent "
+                                    "there under its current one"))
     base = git_blob(ba["freeze_revision"], bpath)
     if base is None:
         if bpath != where and git_blob(ba["freeze_revision"], where) is None and \
@@ -2246,7 +2258,7 @@ def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, versions: list[str],
-                  earlier: frozenset[str] = frozenset()) -> set[str]:
+                  earlier: dict | None = None) -> set[str]:
     """ori-specs revisions pinned, at `commit`, by vector manifests covering this contract version: a file of the
     version, or one of `earlier`, the paths the audit's baseline_files says the version's files had at its freeze."""
     pins = set()
@@ -2264,7 +2276,10 @@ def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, 
         files = m.get("files") if isinstance(m.get("files"), dict) else {}
         for name in files:
             rel = name if name.startswith(f"{contract}/") else f"{base}/{name}" if base and base != "." else name
-            if rel in earlier or (rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version):
+            # An earlier name counts only at the bytes the audit recorded for it: the same name at another
+            # revision is the earlier version's own file.
+            if (earlier and rel in earlier and files[name] == earlier[rel]) or (
+                    rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version):
                 pins.add(m["source_commit"][:7])
                 break
     return pins
@@ -2310,8 +2325,9 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
     records = load_records(root, findings)
     for (c, v), rec in sorted(records.items()):
         versions = versions_in(root, c)
-        ba_files = (rec.get("baseline_audit") or {}).get("baseline_files")
-        earlier = frozenset(ba_files.values()) if isinstance(ba_files, dict) else frozenset()
+        ba_rec = rec.get("baseline_audit") or {}
+        ba_files, ba_vectors = ba_rec.get("baseline_files"), ba_rec.get("vectors") or {}
+        earlier = {old: ba_vectors.get(cur) for cur, old in ba_files.items()} if isinstance(ba_files, dict) else {}
         check_transcriptions(rec, f"status/{c}/{v}.json", repos, findings)
         for i, e in enumerate(rec.get("adoption") or []):
             where = f"status/{c}/{v}.json adoption[{i}] {e.get('role')} ({e.get('repository')})"
@@ -3273,6 +3289,12 @@ def mutations() -> int:
          lambda root: erratum_on_complete(root, later_complete, f"See [the successor](v{later_number + 1}.md#anything).")),
         ("a successor audit whose baseline path is absent at its freeze revision", "baseline-path-absent",
          rec_edit(CUT, lambda r: r["baseline_audit"].update(baseline_path="commissioned-safety-binding/v9.md"))),
+        ("an audit naming a baseline path though its own text exists at the freeze", "baseline-path-unneeded",
+         rec_edit(later_complete, lambda r: r["baseline_audit"].update(
+             baseline_path=f"{later_complete.split('/')[0]}/v{later_number - 1}.md"))),
+        ("an audit tracing a file to an earlier name though it exists at the freeze", "baseline-path-unneeded",
+         rec_edit("commissioned-safety-binding/v1", lambda r: r["baseline_audit"].update(baseline_files={
+             "commissioned-safety-binding/binding-vectors-v1.json": "commissioned-safety-binding/v1.md"}))),
         ("a successor audit whose baseline path is not a version document", "bad-value:baseline_path",
          rec_edit(CUT, lambda r: r["baseline_audit"].update(baseline_path="commissioned-safety-binding/notes.md"))),
         ("a successor audit with a wrong baseline digest", "baseline-hash-mismatch",
@@ -3922,7 +3944,10 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
         # The vector is named for its version, so it is attributed to it in a multi-version directory too.
         (repo / "MANIFEST.json").write_text(json.dumps({"source_commit": "a" * 40, "files": {
             f"{c}/vectors/x-{v}.json": "0" * 64}}))
-        git(repo, "add", "impl.go", "MANIFEST.json")
+        (repo / "old").mkdir()
+        (repo / "old" / "MANIFEST.json").write_text(json.dumps({"source_commit": "c" * 40, "files": {
+            f"{c}/vectors/earlier-name.md": "e" * 64}}))
+        git(repo, "add", "impl.go", "MANIFEST.json", "old/MANIFEST.json")
         git(repo, "commit", "-q", "-m", "implement")
         git(repo, "tag", "v1")
         a = git(repo, "rev-parse", "--short=12", "HEAD")
@@ -3971,6 +3996,16 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
          lambda e, a, b: e.update(_corrections=[transcription(b, a, "v1")])),
         ("sibling: a transcription correction whose tag resolves elsewhere", "sibling-transcription:does not resolve",
          lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v0")])),
+        ("sibling: an earlier-name pin at the recorded bytes passes", None,
+         lambda e, a, b: (e["implementation"].update(vendored_revision="ccccccc"),
+                          e["current"].update(vendored_revision="ccccccc"),
+                          e.update(_baseline={"baseline_files": {f"{c}/vectors/now-{v}.json": f"{c}/vectors/earlier-name.md"},
+                                              "vectors": {f"{c}/vectors/now-{v}.json": "e" * 64}}))),
+        ("sibling: an earlier-name pin at other bytes", "sibling-vendored:implementation",
+         lambda e, a, b: (e["implementation"].update(vendored_revision="ccccccc"),
+                          e["current"].update(vendored_revision="ccccccc"),
+                          e.update(_baseline={"baseline_files": {f"{c}/vectors/now-{v}.json": f"{c}/vectors/earlier-name.md"},
+                                              "vectors": {f"{c}/vectors/now-{v}.json": "f" * 64}}))),
         ("sibling: a citation whose text is not at its line", "sibling-citation",
          lambda e, a, b: e["claim"]["claim_citation"].update(text=f"Nothing here implements {rel}.")),
     ]
@@ -3990,8 +4025,10 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
             e = entry(a)
             mutate(e, a, b)
             corrections = e.pop("_corrections", None)
+            baseline = e.pop("_baseline", None)
             _edit_json(root, f"status/{rel}.json", lambda r: (r.update(adoption=[e]),
-                                                              corrections and r.update(corrections=corrections)))
+                                                              corrections and r.update(corrections=corrections),
+                                                              baseline and r.setdefault("baseline_audit", {}).update(baseline)))
             got = verify_siblings(root, siblings, {}, {})
             if code is None:
                 good = not got

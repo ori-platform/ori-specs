@@ -283,8 +283,8 @@ pending audit is never shown as `amendable`.
 | `pinned_sha256` | While `pending`: the SHA-256 of the contract text with its `Status:` paragraph removed (`--digest` prints it). |
 | `pinned_files` | While `pending`: `{path: sha256}` for every file of the version other than its `v<N>.md`, vectors and companion documents alike (`--digest` prints them). A file belongs to the version its name carries; a companion document to the version whose record lists it in `companion_files`; a file under a directory in the checker's attribution table to that directory's owner; and any other non-Markdown file to the only version of a single-version directory. |
 | `contract_sha256` | When `complete`: the SHA-256 of the contract file at `freeze_revision`. |
-| `baseline_path` | Optional: the path this version's text had at `freeze_revision`, when it is not the version's own `v<N>.md` there, as for a successor cut from its predecessor's text after the freeze. It names another version document of the same contract. The baseline, `contract_sha256` and every net hunk are then read from that path. |
-| `baseline_files` | Optional: `{current path: path at freeze_revision}` for each file in `vectors` whose bytes had another name at the freeze revision. Each recorded hash is checked against the earlier path, the erratum guard reads a link to the current name as present at the freeze, and `--verify-siblings` accepts a manifest pin of the earlier name. |
+| `baseline_path` | Optional, and admitted only when the version's own `v<N>.md` does not exist at `freeze_revision`: the path its text had there, as for a successor cut from its predecessor's text after the freeze. It names another version document of the same contract. The baseline, `contract_sha256`, every net hunk, and a correction's derivation of the contract revision in its history basis are then read from that path. |
+| `baseline_files` | Optional: `{current path: path at freeze_revision}` for each file in `vectors` absent at the freeze revision under its current path, whose bytes had the earlier name there. Each recorded hash is checked against the earlier path, the erratum guard reads a link to the current name as present at the freeze, and `--verify-siblings` accepts a manifest pin of the earlier name at the bytes recorded in `vectors`. |
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
@@ -305,7 +305,8 @@ the default branch, and refuses:
 - while the audit is pending, a change to `frozen_by`, `freeze_revision`,
   `pinned_sha256` or `pinned_files`;
 - once the audit is complete, a return to `pending`, a change to
-  `frozen_by`, `freeze_revision`, `contract_sha256` or `vectors`, or any change
+  `frozen_by`, `freeze_revision`, `contract_sha256`, `vectors`, `baseline_path`
+  or `baseline_files`, or any change
   to a recorded hunk or vector erratum (both may only be appended);
 - a shipped or claimed adoption entry removed or moved to an earlier
   lifecycle, a claim changed from `claimed` to `none`, an assessed conformance

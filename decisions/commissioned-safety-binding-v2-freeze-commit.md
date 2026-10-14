@@ -13,12 +13,17 @@ That release's tag resolves to runtime commit
 v2.5.0-rc.11"). The recorded ID shares its first seven characters, `332754b`,
 with it and then differs, so it is a transcription of the tag commit's ID.
 
-`frozen_by.commit` is corrected to `332754bec2bf` as a transcription, under
-[VERSIONING.md](../VERSIONING.md#corrections). Every other field of
-`frozen_by` stands: the event, the repository, the date, the release, the
-contract revision and the pinned revision. No event is replaced, so the
-correction names no history basis. The runtime adoption entry's
-`implementation.commit` carried the same ID and is corrected with it.
+`frozen_by.commit` is corrected to `332754bec2bf` as a transcription. The
+change that records this correction also introduces that class of correction
+into [VERSIONING.md](../VERSIONING.md#corrections), on the maintainer's ruling
+of 2026-10-14. Before it, a correction of `frozen_by` replaced the freeze event
+and could not touch a shipment, and a wrong release or repository needed a
+separately ratified schema change. A transcription replaces no event and
+corrects one field. Every other field of `frozen_by` stands: `event`,
+`repository`, `date`, `release`, `contract_revision`, `pinned_revision`,
+`branch_protection` and `conservative`. No event is replaced, so the correction
+names no history basis. The runtime adoption entry's `implementation.commit`
+carried the same ID and is corrected with it.
 
 ## Rederivation
 
