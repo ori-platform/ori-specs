@@ -101,7 +101,7 @@ FROZEN_KEYS = {"event", "repository", "commit", "date", "release", "contract_rev
                "branch_protection", "conservative", "reason"}
 AUDIT_STATES = ("pending", "complete")
 AUDIT_KEYS = {"status", "freeze_revision", "changes_since_freeze", "issue", "pinned_sha256", "pinned_files",
-              "contract_sha256",
+              "contract_sha256", "baseline_path", "baseline_files",
               "vectors", "role_commits", "hunks", "appended_files", "vector_errata"}
 # A file added to a frozen version after its freeze: recorded with its hash, its additive classification, why it is
 # additive, and the normative clause it exercises, which must exist at the freeze revision or inside a recorded
@@ -559,6 +559,8 @@ def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: d
         bad("bad-value", f"unknown fields {sorted(extra)}")
     for i, c in enumerate(rec.get("corrections", [])) if isinstance(rec.get("corrections", []), list) else [(0, None)]:
         check_correction_shape(root, f"corrections[{i}]", c, bad)
+        if isinstance(c, dict) and c.get("class") == "transcription" and "frozen_by" in (c.get("new") or {}):
+            check_transcription_adoption(rec, c, where, f"corrections[{i}]", findings)
     if rec.get("maturity") not in MATURITY:
         bad("bad-value", f"maturity must be one of {MATURITY}")
     if rec.get("compatibility") not in COMPATIBILITY:
@@ -794,10 +796,13 @@ def correctable(path: object) -> bool:
 def check_correction_shape(root: pathlib.Path, w: str, c: object, bad: Callable[[str, str], None]) -> None:
     """A correction is {date, decision, decision_sha256, evidence, old, new}, plus history_basis_revision when it
     names frozen_by: the same correctable paths in old and new, and the cited decision record unchanged."""
-    if not isinstance(c, dict) or not CORRECTION_KEYS <= set(c) <= CORRECTION_KEYS | {BASIS}:
-        bad("bad-value", f"{w} is an object of exactly {sorted(CORRECTION_KEYS)}, and {BASIS} where it names "
-                         "frozen_by")
+    if not isinstance(c, dict) or not CORRECTION_KEYS <= set(c) <= CORRECTION_KEYS | {BASIS, "class"}:
+        bad("bad-value", f"{w} is an object of exactly {sorted(CORRECTION_KEYS)}, with {BASIS} where it replaces "
+                         "frozen_by and class where it is a transcription")
         return
+    transcription = c.get("class") == "transcription"
+    if "class" in c and not transcription:
+        bad("bad-value", f"{w}.class, when present, is transcription")
     if not (isinstance(c["date"], str) and DATE.match(c["date"])):
         bad("bad-value", f"{w}.date must be YYYY-MM-DD")
     if not (isinstance(c["evidence"], str) and c["evidence"].strip()):
@@ -819,7 +824,9 @@ def check_correction_shape(root: pathlib.Path, w: str, c: object, bad: Callable[
     if not isinstance(old, dict) or not isinstance(new, dict) or not old or set(old) != set(new):
         bad("bad-value", f"{w}.old and {w}.new name the same fields, and at least one")
         return
-    if ("frozen_by" in old) != (BASIS in c):
+    if transcription:
+        check_transcription_shape(w, c, target, bad)
+    elif ("frozen_by" in old) != (BASIS in c):
         bad("bad-value", f"{w} names {BASIS}, the ori-specs state at the event, exactly when it corrects frozen_by")
     elif BASIS in c:
         basis = c[BASIS]
@@ -833,6 +840,48 @@ def check_correction_shape(root: pathlib.Path, w: str, c: object, bad: Callable[
         if not correctable(f):
             bad("bad-value", f"{w} names {f}, which no correction may change; a correction never unfreezes, "
                              "erases a shipment, removes a divergence or alters another field")
+
+
+def check_transcription_shape(w: str, c: dict, decision: pathlib.Path | None, bad: Callable[[str, str], None]) -> None:
+    """A transcription correction fixes frozen_by.commit and nothing else: an ID that names no commit, replaced by
+    the commit the event's release tag resolves to. It replaces no event, so it names no history basis. Whether the
+    old ID names nothing and the tag resolves to the new commit is in a sibling repository; --verify-siblings checks
+    it, and this check cannot."""
+    old, new = c["old"], c["new"]
+    if set(old) != {"frozen_by"} or BASIS in c:
+        bad("bad-value", f"{w} is a transcription, so it corrects frozen_by alone and names no {BASIS}")
+        return
+    o, n = old["frozen_by"], new["frozen_by"]
+    if not isinstance(o, dict) or not isinstance(n, dict) or set(o) != set(n) or \
+            {k for k in o if o[k] != n[k]} != {"commit"}:
+        bad("correction-refused", f"{w} is a transcription, so old and new frozen_by differ in commit and in "
+                                  "nothing else; any other change to the event is a replacement, never a transcription")
+        return
+    if not (isinstance(o["commit"], str) and HEX.match(o["commit"]) and isinstance(n["commit"], str)
+            and HEX.match(n["commit"])):
+        bad("bad-value", f"{w} replaces one commit ID with another")
+    if not (isinstance(n.get("release"), str) and n["release"]):
+        bad("correction-refused", f"{w} is a transcription, which needs the event's release tag to resolve the "
+                                  "corrected commit; an event with no release cannot be corrected this way")
+        return
+    text = decision.read_text(encoding="utf-8", errors="replace") if decision is not None else ""
+    for name, value in (("the recorded ID", o["commit"]), ("the corrected commit", n["commit"]),
+                        ("the release tag", n["release"])):
+        if decision is not None and str(value) not in text:
+            bad("correction-decision", f"{w}.decision does not name {name} {value}; the decision record shows the "
+                                       "release tag resolving to the corrected commit")
+
+
+def check_transcription_adoption(rec: dict, c: dict, where: str, w: str, findings: list[Finding]) -> None:
+    """The corrected commit is the one the freezing adoption entry records at that release."""
+    fb = rec.get("frozen_by") or {}
+    if not any(isinstance(e, dict) and e.get("repository") == fb.get("repository")
+               and (e.get("implementation") or {}).get("release") == fb.get("release")
+               and (e.get("implementation") or {}).get("commit") == fb.get("commit")
+               for e in rec.get("adoption") or []):
+        findings.append(Finding("correction-history", where,
+                                f"{w} corrects the freeze commit to {fb.get('commit')}, but no adoption entry of "
+                                f"{fb.get('repository')} records that commit at {fb.get('release')}"))
 
 
 def field_value(rec: dict, path: str) -> object:
@@ -885,11 +934,11 @@ def check_correction_history(key: tuple[str, str], rec: dict, basis: object, whe
                 full[f"correction {BASIS}"]) is None:
         refuse(f"has history basis {basis}, which does not contain its freeze revision; the event's ori-specs "
                "state includes the revision the event pins")
-    derived = (_git_out(ROOT, "log", "-1", "--format=%H", full[f"correction {BASIS}"], "--",
-                        f"{key[0]}/{key[1]}.md") or "").strip()
+    text_path = ba.get("baseline_path") or f"{key[0]}/{key[1]}.md"
+    derived = (_git_out(ROOT, "log", "-1", "--format=%H", full[f"correction {BASIS}"], "--", text_path) or "").strip()
     if derived != full["frozen_by.contract_revision"]:
         refuse(f"names contract revision {fb.get('contract_revision')}, which is not the last commit that changed "
-               f"{key[0]}/{key[1]}.md in history basis {basis} ({short(derived) if derived else 'none'})")
+               f"{text_path} in history basis {basis} ({short(derived) if derived else 'none'})")
     event, entries = fb.get("event"), [e for e in rec.get("adoption") or [] if isinstance(e, dict)
                                        and e.get("repository") == fb.get("repository")]
     impl = [e.get("implementation") or {} for e in entries]
@@ -927,8 +976,8 @@ def check_corrections(root: pathlib.Path, key: tuple[str, str], old: dict, new: 
                 findings.append(Finding("correction-forged", where, f"{w}.old {path} is not the merge-base value"))
             if field_value(new, path) != c["new"].get(path, ABSENT):
                 findings.append(Finding("correction-mismatch", where, f"{w}.new {path} is not the record's value"))
-            if path == "frozen_by" and isinstance(old.get("frozen_by"), dict) and \
-                    old["frozen_by"].get("event") == "shipment":
+            if path == "frozen_by" and isinstance(old.get("frozen_by"), dict) and c.get("class") != "transcription" \
+                    and old["frozen_by"].get("event") == "shipment":
                 findings.append(Finding("correction-refused", where, f"{w} replaces a shipment freeze event; a "
                                                                      "shipment is never erased"))
             m = CORRECTABLE_CLAIM.match(path)
@@ -936,7 +985,7 @@ def check_corrections(root: pathlib.Path, key: tuple[str, str], old: dict, new: 
                 findings.append(Finding("correction-refused", where, f"{w} may correct {path} only to "
                                                                      '{"status": "none"}'))
             named.add(path)
-        if "frozen_by" in c["old"]:
+        if "frozen_by" in c["old"] and c.get("class") != "transcription":
             check_correction_history(key, new, c.get(BASIS), where, findings)
     return named
 
@@ -1007,6 +1056,21 @@ def check_audit_record(rec: dict, adoption: list, bad: Callable[[str, str], None
         bad("bad-value", "baseline_audit.changes_since_freeze is a list of ori-specs commits")
     if ba.get("issue") is not None and not (isinstance(ba["issue"], str) and ISSUE.match(ba["issue"])):
         bad("bad-value", "baseline_audit.issue is null or the tracking issue's URL")
+    prefix_dir = f"{rec.get('contract')}/"
+    own = f"{rec.get('contract')}/{rec.get('version')}.md"
+    bp = ba.get("baseline_path")
+    if bp is not None and not (isinstance(bp, str) and bp.startswith(prefix_dir) and ".." not in bp.split("/")
+                               and bp != own and is_version_document(str(rec.get("contract")), bp)):
+        bad("bad-value", f"baseline_audit.baseline_path, when present, names another version document of this "
+                         f"contract, the path this version's text had at freeze_revision; without it the text is {own}")
+    bf = ba.get("baseline_files")
+    if bf is not None and not (isinstance(bf, dict) and bf and all(
+            isinstance(k, str) and isinstance(v, str) and k.startswith(prefix_dir) and v.startswith(prefix_dir)
+            and ".." not in k.split("/") + v.split("/") and k != v for k, v in bf.items())):
+        bad("bad-value", f"baseline_audit.baseline_files, when present, maps a file's current path to the different "
+                         f"path its bytes had at freeze_revision, each inside {prefix_dir}")
+    elif isinstance(bf, dict) and isinstance(ba.get("vectors"), dict) and not set(bf) <= set(ba["vectors"]):
+        bad("bad-value", "baseline_audit.baseline_files names only files the audit records in vectors")
     if ba["status"] == "pending":
         if not SHA256.match(str(ba.get("pinned_sha256", ""))):
             bad("audit-missing", "a pending audit pins the normative text as it stands: add "
@@ -1288,10 +1352,18 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                     "a file of this frozen version was added, removed or changed while its baseline audit is "
                     "pending; vector bytes stay with the version they exercised"))
         return
-    base = git_blob(ba["freeze_revision"], where)
+    bpath = ba.get("baseline_path") or where
+    lineage = ba.get("baseline_files") if isinstance(ba.get("baseline_files"), dict) else {}
+    base = git_blob(ba["freeze_revision"], bpath)
     if base is None:
+        if bpath != where and git_blob(ba["freeze_revision"], where) is None and \
+                _git_out(ROOT, "cat-file", "-e", f"{ba['freeze_revision']}^{{commit}}") is not None:
+            findings.append(Finding("baseline-path-absent", where,
+                                    f"baseline_path {bpath} does not exist at {ba['freeze_revision']}; it names the "
+                                    "file that held this version's text at the freeze revision"))
+            return
         findings.append(Finding("baseline-unverifiable", where,
-                                f"the complete audit's baseline {ba['freeze_revision']}:{where} is not in this "
+                                f"the complete audit's baseline {ba['freeze_revision']}:{bpath} is not in this "
                                 "checkout's history; the check needs full history (fetch-depth 0)"))
         return
     if hashlib.sha256(base).hexdigest() != ba["contract_sha256"]:
@@ -1329,10 +1401,13 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     "appended file proves nothing about text that does not exist, and a line "
                                     "inside a code fence is an example rather than a rule"))
     for path, digest in sorted(ba["vectors"].items()):
-        old = git_blob(ba["freeze_revision"], path)
+        source = lineage.get(path, path)
+        old = git_blob(ba["freeze_revision"], source)
         if old is None or hashlib.sha256(old).hexdigest() != digest:
             findings.append(Finding("baseline-hash-mismatch", path,
-                                    f"the recorded vector hash is not the file's hash at {ba['freeze_revision']}"))
+                                    f"the recorded vector hash is not the hash of {source} at "
+                                    f"{ba['freeze_revision']}" + ("" if source == path else
+                                                                 ", the path baseline_files gives its bytes there")))
         now = root / path
         chain = [e for e in ba.get("vector_errata", []) if isinstance(e, dict) and e.get("path") == path]
         now_digest = hashlib.sha256(now.read_bytes()).hexdigest() if now.is_file() else None
@@ -1362,7 +1437,8 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     f"hunk {digest[:12]} is classified semantic, so it belongs to "
                                     f"{h.get('destination')} and may not remain in this frozen version"))
         elif h["classification"] == "erratum":
-            for ref in absent_references(key[0], key[1], added_lines.get(digest, ""), str(ba["freeze_revision"])):
+            for ref in absent_references(key[0], key[1], added_lines.get(digest, ""), str(ba["freeze_revision"]),
+                                         {**lineage, where: bpath}):
                 findings.append(Finding(
                     "erratum-imports-later-document", where,
                     f"hunk {digest[:12]} is recorded erratum but points at {ref}, which the freeze revision "
@@ -1629,7 +1705,8 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
     return targets + [(t, "tick") for t in ticks], unread
 
 
-def absent_references(contract: str, version: str, added: str, revision: str) -> list[str]:
+def absent_references(contract: str, version: str, added: str, revision: str,
+                      lineage: dict | None = None) -> list[str]:
     """What an audited hunk points at that the freeze revision does not have: a repository path absent there, a
     path#anchor whose heading the document did not have there, or reference syntax this check cannot read.
 
@@ -1698,10 +1775,12 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
         label = f"{path}#{anchor}" if anchor else path
         if label in out or path in out:
             continue
-        if _git_out(ROOT, "cat-file", "-e", f"{revision}:{path}") is None:
+        # A file the audit records as renamed since the freeze is present at the freeze under its earlier path.
+        present_as = (lineage or {}).get(path, path)
+        if _git_out(ROOT, "cat-file", "-e", f"{revision}:{present_as}") is None:
             out.append(path)
         elif anchor and path.lower().endswith(".md"):
-            at = _git_out(ROOT, "show", f"{revision}:{path}")
+            at = _git_out(ROOT, "show", f"{revision}:{present_as}")
             problem = None if at is None else anchor_problem(at, anchor)
             if problem is not None:
                 out.append(label + problem)
@@ -1822,10 +1901,14 @@ def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, di
 def draft_audit(root: pathlib.Path, key: tuple[str, str], rec: dict) -> dict:
     """A complete-audit skeleton for a reviewer to classify: hashes at the freeze revision and every net hunk."""
     where = f"{key[0]}/{key[1]}.md"
-    rev = rec["baseline_audit"]["freeze_revision"]
-    base = git_blob(rev, where)
+    ba = rec["baseline_audit"]
+    rev = ba["freeze_revision"]
+    bpath = ba.get("baseline_path") or where
+    lineage = ba.get("baseline_files") if isinstance(ba.get("baseline_files"), dict) else {}
+    base = git_blob(rev, bpath)
     if base is None:
-        raise SystemExit(f"{rev}:{where} is not in this checkout's history")
+        raise SystemExit(f"{rev}:{bpath} is not in this checkout's history; a version cut from another version's "
+                         "text after its freeze names that file as baseline_audit.baseline_path")
     listing = subprocess.run(["git", "-C", str(ROOT), "ls-tree", "-r", "--name-only", rev, f"{key[0]}/"],
                              capture_output=True, text=True).stdout.split()
     vectors = {}
@@ -1836,6 +1919,10 @@ def draft_audit(root: pathlib.Path, key: tuple[str, str], rec: dict) -> dict:
             blob = git_blob(rev, path)
             if blob is not None:
                 vectors[path] = hashlib.sha256(blob).hexdigest()
+    for current, earlier in lineage.items():
+        blob = git_blob(rev, earlier)
+        if blob is not None:
+            vectors[current] = hashlib.sha256(blob).hexdigest()
     return {
         **rec["baseline_audit"], "status": "complete",
         "contract_sha256": hashlib.sha256(base).hexdigest(), "vectors": vectors,
@@ -1944,7 +2031,9 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                 for name, a, b in (("frozen_by", old.get("frozen_by"), new.get("frozen_by")),
                                    ("freeze_revision", oa.get("freeze_revision"), na.get("freeze_revision")),
                                    ("contract_sha256", oa.get("contract_sha256"), na.get("contract_sha256")),
-                                   ("vectors", oa.get("vectors"), na.get("vectors"))):
+                                   ("vectors", oa.get("vectors"), na.get("vectors")),
+                                   ("baseline_path", oa.get("baseline_path"), na.get("baseline_path")),
+                                   ("baseline_files", oa.get("baseline_files"), na.get("baseline_files"))):
                     if a != b and name not in named and f"baseline_audit.{name}" not in named:
                         findings.append(Finding("audit-regressed", where,
                                                 f"{name} of a complete baseline audit changed; the recorded baseline is "
@@ -2156,8 +2245,10 @@ def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, timeout=60)
 
 
-def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, versions: list[str]) -> set[str]:
-    """ori-specs revisions pinned, at `commit`, by vector manifests covering this contract version."""
+def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, versions: list[str],
+                  earlier: frozenset[str] = frozenset()) -> set[str]:
+    """ori-specs revisions pinned, at `commit`, by vector manifests covering this contract version: a file of the
+    version, or one of `earlier`, the paths the audit's baseline_files says the version's files had at its freeze."""
     pins = set()
     listing = _git(repo, "ls-tree", "-r", "--name-only", commit).stdout.decode("utf-8", "replace").split()
     for path in listing:
@@ -2173,10 +2264,35 @@ def manifest_pins(repo: pathlib.Path, commit: str, contract: str, version: str, 
         files = m.get("files") if isinstance(m.get("files"), dict) else {}
         for name in files:
             rel = name if name.startswith(f"{contract}/") else f"{base}/{name}" if base and base != "." else name
-            if rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version:
+            if rel in earlier or (rel.startswith(f"{contract}/") and version_of_file(contract, rel, versions) == version):
                 pins.add(m["source_commit"][:7])
                 break
     return pins
+
+
+def check_transcriptions(rec: dict, where: str, repos: dict, findings: list[Finding]) -> None:
+    """The sibling half of a transcription correction: the recorded ID names no commit in the freezing repository,
+    and the event's release tag resolves to the corrected commit. The ordinary check cannot read a sibling."""
+    for i, c in enumerate(rec.get("corrections") or []):
+        if not isinstance(c, dict) or c.get("class") != "transcription":
+            continue
+        old = (c.get("old") or {}).get("frozen_by") or {}
+        new = (c.get("new") or {}).get("frozen_by") or {}
+        repo = repos.get(new.get("repository"))
+        w = f"{where} corrections[{i}]"
+        if repo is None:
+            findings.append(Finding("sibling-unavailable", w, "no checkout given for the freezing repository"))
+            continue
+        if _git(repo, "cat-file", "-e", f"{old.get('commit')}^{{commit}}").returncode == 0:
+            findings.append(Finding("sibling-transcription", w,
+                                    f"the corrected ID {old.get('commit')} resolves to a commit; a transcription "
+                                    "correction replaces an ID that names nothing, never a real commit"))
+        tag = _git(repo, "rev-parse", "--verify", "--quiet", f"{new.get('release')}^{{commit}}")
+        resolved = tag.stdout.decode("utf-8", "replace").strip() if tag.returncode == 0 else ""
+        if not (resolved and str(new.get("commit")) and resolved.startswith(str(new.get("commit")))):
+            findings.append(Finding("sibling-transcription", w,
+                                    f"release {new.get('release')} does not resolve to the corrected commit "
+                                    f"{new.get('commit')} ({resolved[:12] or 'no such tag'})"))
 
 
 def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str, str],
@@ -2194,6 +2310,9 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
     records = load_records(root, findings)
     for (c, v), rec in sorted(records.items()):
         versions = versions_in(root, c)
+        ba_files = (rec.get("baseline_audit") or {}).get("baseline_files")
+        earlier = frozenset(ba_files.values()) if isinstance(ba_files, dict) else frozenset()
+        check_transcriptions(rec, f"status/{c}/{v}.json", repos, findings)
         for i, e in enumerate(rec.get("adoption") or []):
             where = f"status/{c}/{v}.json adoption[{i}] {e.get('role')} ({e.get('repository')})"
             repo = repos.get(e.get("repository"))
@@ -2227,7 +2346,7 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
                     if pre is not None and _git(repo, "cat-file", "-e", f"{impl['commit']}:{pre}{path.rstrip('/')}").returncode:
                         findings.append(Finding("sibling-missing", where,
                                                 f"implementation path {path} does not exist at {impl['commit']}"))
-                pins = manifest_pins(repo, impl["commit"], c, v, versions)
+                pins = manifest_pins(repo, impl["commit"], c, v, versions, earlier)
                 if impl.get("vendored_revision") not in (pins or {None}):
                     findings.append(Finding("sibling-vendored", where,
                                             f"implementation.vendored_revision is {impl.get('vendored_revision')}, the "
@@ -2238,7 +2357,7 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
                                             f"release {impl['release']} does not contain {impl['commit']}"))
             cur = e.get("current") or {}
             if cur.get("commit") and on_default(cur["commit"], "current.commit"):
-                pins = manifest_pins(repo, cur["commit"], c, v, versions)
+                pins = manifest_pins(repo, cur["commit"], c, v, versions, earlier)
                 if cur.get("vendored_revision") not in (pins or {None}):
                     findings.append(Finding("sibling-vendored", where,
                                             f"current.vendored_revision is {cur.get('vendored_revision')}, the "
@@ -2438,6 +2557,10 @@ def mutations() -> int:
                             and git_blob(r["baseline_audit"]["freeze_revision"],
                                          f'{r["contract"]}/v{int(r["version"][1:]) - 1}.md') is not None)
     later_number = int(later_complete.split("/")[1][1:])
+    # The successor cut from another version's text, with a transcription correction: the subject of the
+    # baseline-path and transcription cases.
+    CUT = _first(records, lambda r: bool(r.get("baseline_audit", {}).get("baseline_path"))
+                 and any(c.get("class") == "transcription" for c in r.get("corrections") or []))
     audited = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
                      and r["baseline_audit"].get("pinned_files")
                      and any(e["lifecycle"] != "unimplemented" for e in r["adoption"])
@@ -3148,6 +3271,35 @@ def mutations() -> int:
          lambda root: erratum_on_complete(root, later_complete, f"See [the rule](v{later_number}.md#no-such-rule-at-freeze).")),
         ("an erratum pointing at a later version of its contract passes", None,
          lambda root: erratum_on_complete(root, later_complete, f"See [the successor](v{later_number + 1}.md#anything).")),
+        ("a successor audit whose baseline path is absent at its freeze revision", "baseline-path-absent",
+         rec_edit(CUT, lambda r: r["baseline_audit"].update(baseline_path="commissioned-safety-binding/v9.md"))),
+        ("a successor audit whose baseline path is not a version document", "bad-value:baseline_path",
+         rec_edit(CUT, lambda r: r["baseline_audit"].update(baseline_path="commissioned-safety-binding/notes.md"))),
+        ("a successor audit with a wrong baseline digest", "baseline-hash-mismatch",
+         rec_edit(CUT, lambda r: r["baseline_audit"].update(contract_sha256="0" * 64))),
+        ("a successor audit missing one transformation hunk", "baseline-drift",
+         rec_edit(CUT, lambda r: r["baseline_audit"]["hunks"].pop(0))),
+        ("a successor audit tracing a file to the wrong earlier file", "baseline-hash-mismatch",
+         rec_edit(CUT, lambda r: r["baseline_audit"]["baseline_files"].update(
+             {"commissioned-safety-binding/binding-vectors-v2.json":
+              "commissioned-safety-binding/revision-misreadings-v1.json"}))),
+        ("a successor audit with a historical corpus digest that does not match", "baseline-hash-mismatch",
+         rec_edit(CUT, lambda r: r["baseline_audit"]["vectors"].update(
+             {"commissioned-safety-binding/binding-vectors-v2.json": "0" * 64}))),
+        ("a transcription that also changes another field of the event", "correction-refused:differ in commit",
+         rec_edit(CUT, lambda r: (r["corrections"][-1]["new"]["frozen_by"].update(date="2026-09-24"),
+                                  r["frozen_by"].update(date="2026-09-24")))),
+        ("a transcription of an event with no release", "correction-refused:release tag",
+         rec_edit(CUT, lambda r: (r["corrections"][-1]["old"]["frozen_by"].update(release=None),
+                                  r["corrections"][-1]["new"]["frozen_by"].update(release=None)))),
+        ("a transcription whose decision does not name the corrected commit", "correction-decision:corrected commit",
+         rec_edit(CUT, lambda r: (r["corrections"][-1]["new"]["frozen_by"].update(commit="aaaaaaaaaaaa"),
+                                  r["frozen_by"].update(commit="aaaaaaaaaaaa"),
+                                  r["adoption"][0]["implementation"].update(commit="aaaaaaaaaaaa")))),
+        ("a transcription the freezing adoption entry does not record", "correction-history:no adoption entry",
+         rec_edit(CUT, lambda r: r["adoption"][0]["implementation"].update(commit="332754b1f0a3"))),
+        ("a transcription naming a history basis", "bad-value:names no history_basis_revision",
+         rec_edit(CUT, lambda r: r["corrections"][-1].update(history_basis_revision="1b6f789"))),
         ("an additive hunk linking a document absent at the freeze revision passes", None,
          lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
                        complete_audit(root))),
@@ -3400,7 +3552,8 @@ def mutations() -> int:
         ("an issue reference in README.md", "issue-reference:README.md",
          lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
     ]
-    corrected = _first(records, lambda r: bool(r.get("corrections")) and r.get("compatibility") == "frozen")
+    corrected = _first(records, lambda r: bool(r.get("corrections")) and r.get("compatibility") == "frozen"
+                       and (r["corrections"][-1].get("class") != "transcription"))
     corrected_rec = f"status/{corrected}.json"
 
     def set_field(rec: dict, path: str, value: object) -> None:
@@ -3771,6 +3924,7 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
             f"{c}/vectors/x-{v}.json": "0" * 64}}))
         git(repo, "add", "impl.go", "MANIFEST.json")
         git(repo, "commit", "-q", "-m", "implement")
+        git(repo, "tag", "v1")
         a = git(repo, "rev-parse", "--short=12", "HEAD")
         git(repo, "checkout", "-q", "-b", "side")
         (repo / "side.txt").write_text("x\n")
@@ -3779,6 +3933,11 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
         b = git(repo, "rev-parse", "--short=12", "HEAD")
         git(repo, "checkout", "-q", "main")
         return tmp / "siblings", a, b
+
+    def transcription(old: str, new: str, release: str) -> dict:
+        fb = {"event": "shipment", "repository": "gateway", "release": release}
+        return {"class": "transcription", "old": {"frozen_by": {**fb, "commit": old}},
+                "new": {"frozen_by": {**fb, "commit": new}}}
 
     def entry(a: str) -> dict:
         return {"role": "gateway", "repository": "gateway", "lifecycle": "implemented-unreleased",
@@ -3806,6 +3965,12 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
          lambda e, a, b: (e.update(lifecycle="shipped"), e["implementation"].update(release="v0"))),
         ("sibling: a current pin the manifest does not carry", "sibling-vendored:current",
          lambda e, a, b: e["current"].update(vendored_revision="bbbbbbb")),
+        ("sibling: a transcription correction whose tag resolves to the corrected commit passes", None,
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v1")])),
+        ("sibling: a transcription correction replacing an ID that names a commit", "sibling-transcription:resolves to a",
+         lambda e, a, b: e.update(_corrections=[transcription(b, a, "v1")])),
+        ("sibling: a transcription correction whose tag resolves elsewhere", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "v0")])),
         ("sibling: a citation whose text is not at its line", "sibling-citation",
          lambda e, a, b: e["claim"]["claim_citation"].update(text=f"Nothing here implements {rel}.")),
     ]
@@ -3824,7 +3989,9 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
                     other.unlink()
             e = entry(a)
             mutate(e, a, b)
-            _edit_json(root, f"status/{rel}.json", lambda r: r.update(adoption=[e]))
+            corrections = e.pop("_corrections", None)
+            _edit_json(root, f"status/{rel}.json", lambda r: (r.update(adoption=[e]),
+                                                              corrections and r.update(corrections=corrections)))
             got = verify_siblings(root, siblings, {}, {})
             if code is None:
                 good = not got
