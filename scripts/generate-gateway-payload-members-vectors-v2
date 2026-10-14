@@ -29,6 +29,7 @@ REASONS = (
     "trailing_data",
     "duplicate_member",
     "case_variant_member",
+    "not_an_object",
 )
 ACCEPT = "accept"
 MAX_DEPTH = 32
@@ -42,7 +43,6 @@ class Stop(Exception):
     """The grammar broke: nothing after this point is read."""
 
 
-NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 LOW_ESCAPE = re.compile(r"\\u[dD][c-fC-F][0-9a-fA-F]{2}")
 SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
 WS = " \t\n\r"
@@ -73,6 +73,7 @@ class Model:
         self.lone = False
         self.deepest = 0
         self.objects: list[tuple[str, list[str]]] = []
+        self.top = ""
 
     def ws(self) -> None:
         while self.i < len(self.t) and self.t[self.i] in WS:
@@ -119,64 +120,110 @@ class Model:
             else:
                 out.append(chr(unit))
 
-    def value(self, ptr: str, depth: int) -> None:
+    def member_name(self, frame: list) -> str:
+        """After `{` or `,` in an object: read a name and its colon; the pointer to its value."""
         self.ws()
-        if self.i >= len(self.t):
+        if self.i >= len(self.t) or self.t[self.i] != '"':
             raise Stop
-        ch = self.t[self.i]
-        if ch == "{":
-            self.container(ptr, depth + 1, obj=True)
-        elif ch == "[":
-            self.container(ptr, depth + 1, obj=False)
-        elif ch == '"':
-            self.string()
-        else:
-            for word in ("true", "false", "null"):
-                if self.t.startswith(word, self.i):
-                    self.i += len(word)
-                    return
-            m = NUMBER.match(self.t, self.i)
-            if not m:
-                raise Stop
-            self.i = m.end()
-
-    def container(self, ptr: str, depth: int, obj: bool) -> None:
-        self.deepest = max(self.deepest, depth)
-        close = "}" if obj else "]"
+        name = self.string()
+        frame[2].append(name)
+        self.ws()
+        if self.i >= len(self.t) or self.t[self.i] != ":":
+            raise Stop
         self.i += 1
-        names: list[str] = []
-        if obj:
-            self.objects.append((ptr, names))
-        self.ws()
-        if self.i < len(self.t) and self.t[self.i] == close:
-            self.i += 1
-            return
-        index = 0
-        while True:
-            if obj:
-                self.ws()
-                if self.i >= len(self.t) or self.t[self.i] != '"':
-                    raise Stop
-                name = self.string()
-                names.append(name)
-                self.ws()
-                if self.i >= len(self.t) or self.t[self.i] != ":":
-                    raise Stop
-                self.i += 1
-                self.value(f"{ptr}/{pointer_token(name)}", depth)
-            else:
-                self.value(f"{ptr}/{index}", depth)
-                index += 1
-            self.ws()
-            if self.i >= len(self.t):
-                raise Stop
-            if self.t[self.i] == ",":
-                self.i += 1
-                continue
-            if self.t[self.i] == close:
-                self.i += 1
-                return
+        return f"{frame[1]}/{pointer_token(name)}"
+
+    def number(self) -> None:
+        """Every character that can continue a number is taken; a part begun and not completed breaks."""
+        t, i = self.t, self.i
+        if t[i] == "-":
+            i += 1
+        if i < len(t) and t[i] == "0":
+            i += 1
+        elif i < len(t) and "1" <= t[i] <= "9":
+            while i < len(t) and t[i].isascii() and t[i].isdigit():
+                i += 1
+        else:
             raise Stop
+        if i < len(t) and t[i] == ".":
+            i += 1
+            if not (i < len(t) and t[i].isascii() and t[i].isdigit()):
+                raise Stop
+            while i < len(t) and t[i].isascii() and t[i].isdigit():
+                i += 1
+        if i < len(t) and t[i] in "eE":
+            i += 1
+            if i < len(t) and t[i] in "+-":
+                i += 1
+            if not (i < len(t) and t[i].isascii() and t[i].isdigit()):
+                raise Stop
+            while i < len(t) and t[i].isascii() and t[i].isdigit():
+                i += 1
+        self.i = i
+
+    def first_value(self) -> None:
+        """One value, without recursion: a stack frame per open container."""
+        t = self.t
+        stack: list[list] = []  # [is_object, pointer, names, next_index]
+        ptr = ""
+        while True:
+            self.ws()
+            if self.i >= len(t):
+                raise Stop
+            ch = t[self.i]
+            if not stack:
+                self.top = ch
+            if ch in "{[":
+                self.i += 1
+                frame = [ch == "{", ptr, [], 0]
+                stack.append(frame)
+                self.deepest = max(self.deepest, len(stack))
+                if frame[0]:
+                    self.objects.append((ptr, frame[2]))
+                self.ws()
+                if self.i < len(t) and t[self.i] == ("}" if frame[0] else "]"):
+                    self.i += 1
+                    stack.pop()
+                elif frame[0]:
+                    ptr = self.member_name(frame)
+                    continue
+                else:
+                    ptr = f"{frame[1]}/0"
+                    frame[3] = 1
+                    continue
+            elif ch == '"':
+                self.string()
+            elif ch == "-" or "0" <= ch <= "9":
+                self.number()
+            else:
+                for word in ("true", "false", "null"):
+                    if t.startswith(word, self.i):
+                        self.i += len(word)
+                        break
+                else:
+                    raise Stop
+            # A value is complete: close containers until one wants another value.
+            while stack:
+                self.ws()
+                if self.i >= len(t):
+                    raise Stop
+                frame = stack[-1]
+                c = t[self.i]
+                if c == ",":
+                    self.i += 1
+                    if frame[0]:
+                        ptr = self.member_name(frame)
+                    else:
+                        ptr = f"{frame[1]}/{frame[3]}"
+                        frame[3] += 1
+                    break
+                if c == ("}" if frame[0] else "]"):
+                    self.i += 1
+                    stack.pop()
+                    continue
+                raise Stop
+            else:
+                return
 
 
 def assess(payload: bytes, defined: dict[str, list[str]]) -> str:
@@ -187,10 +234,7 @@ def assess(payload: bytes, defined: dict[str, list[str]]) -> str:
     m = Model(text)
     malformed = trailing = False
     try:
-        m.ws()
-        if m.i >= len(text):
-            raise Stop
-        m.value("", 0)
+        m.first_value()
         m.ws()
         trailing = m.i < len(text)
     except Stop:
@@ -215,6 +259,8 @@ def assess(payload: bytes, defined: dict[str, list[str]]) -> str:
             folded.setdefault(fold(n), set()).add(n)
         if any(len(group) > 1 for group in folded.values()):
             return "case_variant_member"
+    if m.top != "{":
+        return "not_an_object"
     return ACCEPT
 
 
@@ -285,7 +331,6 @@ case("clean_unknown_member", "A member no section defines is tolerated.",
      '{"status":"healthy","firmware_note":"additive"}', ACCEPT, {"": ["status"]})
 case("clean_whitespace", "Whitespace of all four kinds before, inside and after the value.",
      ' \t\r\n{ "status" :\t"healthy" ,\r\n "critical" : false }\n\r\t ', ACCEPT, {"": ["status", "critical"]})
-case("clean_top_level_scalar", "The rule judges grammar, not shape: a scalar is one JSON value.", '"healthy"', ACCEPT)
 case("clean_empty_object", "An empty object.", "{}", ACCEPT)
 case("clean_escaped_distinct_names", "\\/ unescapes to / and \\\\ to \\, so the two names differ.",
      '{"a\\/b":1,"a\\\\b":2}', ACCEPT)
@@ -376,15 +421,15 @@ case("ascii_non_letters", "Only letters fold: @ and `, [ and {, _ and DEL differ
 case("ascii_digits_and_punct", "a_b and a-b are different names.", '{"a_b":1,"a-b":2}', ACCEPT)
 
 # Depth.
-case("depth_32_arrays", "Thirty-two nested arrays.", nest(32), ACCEPT)
-case("depth_33_arrays", "Thirty-three nested arrays.", nest(33), "nesting_too_deep")
-case("depth_32_around_scalar", "A scalar adds no depth.", nest(32, "0"), ACCEPT)
+case("depth_32_arrays", "An object around thirty-one nested arrays.", '{"a":' + nest(31) + "}", ACCEPT)
+case("depth_33_arrays", "Thirty-three nested arrays: depth outranks not_an_object.", nest(33), "nesting_too_deep")
+case("depth_32_around_scalar", "A scalar adds no depth.", '{"a":' + nest(31, "0") + "}", ACCEPT)
 case("depth_32_mixed", "Objects and arrays alternating, thirty-two deep.", nest(32, "1", "{["), ACCEPT)
 case("depth_33_mixed", "Objects and arrays alternating, thirty-three deep.", nest(33, "1", "{["),
      "nesting_too_deep")
-case("depth_33_empty_object_innermost", "Thirty-two arrays around an empty object.", nest(32, "{}"),
-     "nesting_too_deep")
-case("depth_33_after_shallow", "The deep branch is the second element.", "[1," + nest(32) + "]",
+case("depth_33_empty_object_innermost", "An object around thirty-one arrays around an empty object.",
+     '{"a":' + nest(31, "{}") + "}", "nesting_too_deep")
+case("depth_33_after_shallow", "The deep branch is the second member.", '{"a":1,"b":' + nest(32) + "}",
      "nesting_too_deep")
 case("depth_33_objects", "Thirty-three nested objects.", nest(33, "1", "{"), "nesting_too_deep")
 
@@ -457,6 +502,65 @@ case("high_then_ascii_escape", "A high escape followed by a non-surrogate escape
 case("high_then_escaped_backslash", "\\\\udc00 is a backslash and text, not a low escape.",
      '{"a":"\\ud800\\\\udc00"}', "invalid_unicode")
 case("lone_in_name", "A lone escape in a name.", '{"\\ud800":1}', "invalid_unicode")
+
+# Numbers: a part begun and not completed breaks the grammar.
+case("top_level_dangling_point", "1. begins a fraction it does not complete.", "1.", "malformed_json")
+case("top_level_dangling_exponent", "1e begins an exponent it does not complete.", "1e", "malformed_json")
+case("top_level_dangling_exponent_sign", "1e+ has no exponent digits.", "1e+", "malformed_json")
+case("top_level_fraction_dangling_exponent", "1.5e has no exponent digits.", "1.5e", "malformed_json")
+case("top_level_minus", "A minus sign alone.", "-", "malformed_json")
+case("top_level_number_then_point", "1.5 is complete; the second . trails it.", "1.5.", "trailing_data")
+case("top_level_exponent_then_point", "1e5 is complete; the . trails it.", "1e5.", "trailing_data")
+case("top_level_exponent_then_e", "1e5 is complete; a second e trails it.", "1e5e", "trailing_data")
+case("nested_exponent_then_e", "1e5e inside an object breaks the grammar.", '{"v":1e5e}', "malformed_json")
+case("nested_dangling_exponent", "An exponent without digits inside an object.", '{"v":1e}', "malformed_json")
+case("nested_dangling_exponent_sign", "An exponent sign without digits inside an object.", '{"v":1e+}',
+     "malformed_json")
+case("nested_minus", "A minus sign alone inside an object.", '{"v":-}', "malformed_json")
+case("nested_negative_leading_zero", "-01 inside an object.", '{"v":-01}', "malformed_json")
+case("nested_number_then_point", "1.5. inside an object breaks the grammar.", '{"v":1.5.}', "malformed_json")
+
+# Deep payloads: scanned to the end past the bound, without recursion.
+case("depth_10001_objects", "Ten thousand and one nested objects, otherwise valid.", nest(10001, "1", "{"),
+     "nesting_too_deep")
+case("depth_10001_objects_break_at_end", "The same, with a trailing comma in the outermost object.",
+     nest(10001, "1", "{")[:-1] + ",}", "malformed_json")
+
+# More UTF-8 and surrogate forms.
+case("high_text_low", "A literal character between a high and a low escape leaves both lone.",
+     '{"a":"\\ud800x\\udc00"}', "invalid_unicode")
+case("invalid_utf8_after_break", "Invalid UTF-8 after a grammar break: the whole payload is judged.",
+     b'{"a":1,,"\xff"}', "invalid_unicode")
+case("overlong_three_byte", "E0 80 AF is an overlong /.", b'{"a":"\xe0\x80\xaf"}', "invalid_unicode")
+case("overlong_four_byte", "F0 80 80 AF is an overlong /.", b'{"a":"\xf0\x80\x80\xaf"}', "invalid_unicode")
+case("lone_continuation_byte", "0x80 with no lead byte.", b'{"a":"\x80"}', "invalid_unicode")
+case("truncated_sequence_at_end", "A multi-byte sequence cut short at the end of the payload.",
+     b"{}\xe2\x82", "invalid_unicode")
+case("leading_form_feed", "Form feed is not JSON whitespace (RFC 8259), before the value either.",
+     "\f{}", "malformed_json")
+case("raw_unit_separator", "U+001F, the last control character, must be escaped.", '{"a":"\x1f"}',
+     "malformed_json")
+case("raw_space_in_string", "U+0020 needs no escape.", '{"a":" "}', ACCEPT)
+
+# Not an object.
+case("not_an_object_array", "An empty array.", "[]", "not_an_object")
+case("not_an_object_array_of_objects", "An array of clean objects.", '[{"a":1},{"b":2}]', "not_an_object")
+case("not_an_object_number", "A number.", "1", "not_an_object")
+case("not_an_object_negative_fraction", "A negative fraction.", "-0.5", "not_an_object")
+case("not_an_object_string", "A string.", '"healthy"', "not_an_object")
+case("not_an_object_null", "null.", "null", "not_an_object")
+case("not_an_object_true", "true.", "true", "not_an_object")
+case("not_an_object_false", "false.", "false", "not_an_object")
+case("not_an_object_whitespace", "An array inside JSON whitespace (RFC 8259).", " \n[]\t", "not_an_object")
+case("precedence_trailing_over_not_an_object", "An array, then trailing data.", "[] x", "trailing_data")
+case("precedence_duplicate_over_not_an_object", "A duplicate inside a top-level array.", '[{"a":1,"a":2}]',
+     "duplicate_member")
+case("precedence_case_variant_over_not_an_object", "A case variant inside a top-level array.",
+     '[{"A":1,"a":2}]', "case_variant_member")
+case("precedence_surrogate_over_not_an_object", "A lone escape in a top-level array.", '["\\ud800"]',
+     "invalid_unicode")
+case("precedence_malformed_over_not_an_object", "A top-level array with a trailing comma.", "[1,]",
+     "malformed_json")
 
 # Precedence: the earliest row names the reason.
 case("precedence_surrogate_in_duplicate", "A lone surrogate inside a duplicated member.",
