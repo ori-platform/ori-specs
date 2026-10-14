@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 payload member corpus: exact payload bytes and the reason each is refused for.
+
+Every case is declared here with its expected outcome, and a small model of
+gateway-api/v2 `## Payload Member Rule` recomputes each one; the corpus is
+written only when the two agree. Nothing here is shared with a checker, which
+recomputes every outcome from the contract's text.
+
+    python3 scripts/generate-gateway-payload-members-vectors-v2          # write
+    python3 scripts/generate-gateway-payload-members-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "payload-members-v2.json"
+
+REASONS = (
+    "invalid_unicode",
+    "malformed_json",
+    "nesting_too_deep",
+    "trailing_data",
+    "duplicate_member",
+    "case_variant_member",
+)
+ACCEPT = "accept"
+MAX_DEPTH = 32
+TEXT_LIMIT = 400
+
+
+# --- the model -------------------------------------------------------------
+
+
+class Stop(Exception):
+    """The grammar broke: nothing after this point is read."""
+
+
+NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+LOW_ESCAPE = re.compile(r"\\u[dD][c-fC-F][0-9a-fA-F]{2}")
+SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+WS = " \t\n\r"
+
+
+def fold(name: str) -> str:
+    out = []
+    for ch in name:
+        if "A" <= ch <= "Z":
+            out.append(chr(ord(ch) + 32))
+        elif ch == "\u017f":
+            out.append("s")
+        elif ch == "\u212a":
+            out.append("k")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def pointer_token(name: str) -> str:
+    return name.replace("~", "~0").replace("/", "~1")
+
+
+class Model:
+    def __init__(self, text: str) -> None:
+        self.t = text
+        self.i = 0
+        self.lone = False
+        self.deepest = 0
+        self.objects: list[tuple[str, list[str]]] = []
+
+    def ws(self) -> None:
+        while self.i < len(self.t) and self.t[self.i] in WS:
+            self.i += 1
+
+    def string(self) -> str:
+        t = self.t
+        self.i += 1  # the opening quote
+        out: list[str] = []
+        while True:
+            if self.i >= len(t):
+                raise Stop
+            ch = t[self.i]
+            if ch == '"':
+                self.i += 1
+                return "".join(out)
+            if ord(ch) < 0x20:
+                raise Stop
+            if ch != "\\":
+                out.append(ch)
+                self.i += 1
+                continue
+            if self.i + 1 >= len(t):
+                raise Stop
+            e = t[self.i + 1]
+            if e in SIMPLE_ESCAPES:
+                out.append(SIMPLE_ESCAPES[e])
+                self.i += 2
+                continue
+            if e != "u":
+                raise Stop
+            digits = t[self.i + 2:self.i + 6]
+            if not re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                raise Stop
+            unit = int(digits, 16)
+            self.i += 6
+            if 0xD800 <= unit <= 0xDBFF and LOW_ESCAPE.match(t, self.i):
+                low = int(t[self.i + 2:self.i + 6], 16)
+                out.append(chr(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)))
+                self.i += 6
+            elif 0xD800 <= unit <= 0xDFFF:
+                self.lone = True
+                out.append(chr(unit))
+            else:
+                out.append(chr(unit))
+
+    def value(self, ptr: str, depth: int) -> None:
+        self.ws()
+        if self.i >= len(self.t):
+            raise Stop
+        ch = self.t[self.i]
+        if ch == "{":
+            self.container(ptr, depth + 1, obj=True)
+        elif ch == "[":
+            self.container(ptr, depth + 1, obj=False)
+        elif ch == '"':
+            self.string()
+        else:
+            for word in ("true", "false", "null"):
+                if self.t.startswith(word, self.i):
+                    self.i += len(word)
+                    return
+            m = NUMBER.match(self.t, self.i)
+            if not m:
+                raise Stop
+            self.i = m.end()
+
+    def container(self, ptr: str, depth: int, obj: bool) -> None:
+        self.deepest = max(self.deepest, depth)
+        close = "}" if obj else "]"
+        self.i += 1
+        names: list[str] = []
+        if obj:
+            self.objects.append((ptr, names))
+        self.ws()
+        if self.i < len(self.t) and self.t[self.i] == close:
+            self.i += 1
+            return
+        index = 0
+        while True:
+            if obj:
+                self.ws()
+                if self.i >= len(self.t) or self.t[self.i] != '"':
+                    raise Stop
+                name = self.string()
+                names.append(name)
+                self.ws()
+                if self.i >= len(self.t) or self.t[self.i] != ":":
+                    raise Stop
+                self.i += 1
+                self.value(f"{ptr}/{pointer_token(name)}", depth)
+            else:
+                self.value(f"{ptr}/{index}", depth)
+                index += 1
+            self.ws()
+            if self.i >= len(self.t):
+                raise Stop
+            if self.t[self.i] == ",":
+                self.i += 1
+                continue
+            if self.t[self.i] == close:
+                self.i += 1
+                return
+            raise Stop
+
+
+def assess(payload: bytes, defined: dict[str, list[str]]) -> str:
+    try:
+        text = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return "invalid_unicode"
+    m = Model(text)
+    malformed = trailing = False
+    try:
+        m.ws()
+        if m.i >= len(text):
+            raise Stop
+        m.value("", 0)
+        m.ws()
+        trailing = m.i < len(text)
+    except Stop:
+        malformed = True
+    if m.lone:
+        return "invalid_unicode"
+    if malformed:
+        return "malformed_json"
+    if m.deepest > MAX_DEPTH:
+        return "nesting_too_deep"
+    if trailing:
+        return "trailing_data"
+    seen = {ptr for ptr, _ in m.objects}
+    for ptr in defined:
+        if ptr not in seen:
+            raise SystemExit(f"defined members name {ptr!r}, which is not an object of the payload")
+    if any(len(set(names)) != len(names) for _, names in m.objects):
+        return "duplicate_member"
+    for ptr, names in m.objects:
+        folded: dict[str, set[str]] = {}
+        for n in names + defined.get(ptr, []):
+            folded.setdefault(fold(n), set()).add(n)
+        if any(len(group) > 1 for group in folded.values()):
+            return "case_variant_member"
+    return ACCEPT
+
+
+# --- the cases -------------------------------------------------------------
+
+HEARTBEAT = ["device_id", "status", "last_seen_ms", "gateway_seen_ms", "active_triggers", "degradation_reasons",
+             "evidence", "auth"]
+AUTH = ["scheme", "signed_at_ms", "signature"]
+REQUEST = ["request_id", "device_id", "sensor_type", "trigger_name", "prompt", "context", "action_tier_hint",
+           "timeout_ms"]
+CONTEXT = ["value", "unit", "timestamp", "producer_time", "history"]
+HISTORY = ["value", "timestamp", "received_at_ms", "producer_time"]
+RESPONSE = ["request_id", "export_type", "device_id", "items", "next_page_token", "complete", "error"]
+ACTION_ROW = ["record_kind", "record_key", "contributed_to", "action_taken", "executed"]
+INBOUND = ["device_id", "artifact_type", "artifact", "auth"]
+CUSTODY_ACK = ["v", "device_id", "local_seq", "envelope_digest", "custody_at_ms", "key_id", "mac"]
+
+CASES: list[dict] = []
+
+
+def case(name: str, description: str, payload: bytes | str, expected: str,
+         defined: dict[str, list[str]] | None = None) -> None:
+    raw = payload.encode("utf-8") if isinstance(payload, str) else payload
+    CASES.append({"name": name, "description": description, "raw": raw,
+                  "defined": defined or {}, "expected": expected})
+
+
+def nest(depth: int, inner: str = "", kinds: str = "[") -> str:
+    """depth containers around inner; kinds cycles through '[' and '{'."""
+    opens, closes = [], []
+    for d in range(depth):
+        k = kinds[d % len(kinds)]
+        if k == "[":
+            opens.append("[")
+            closes.append("]")
+        else:
+            opens.append('{"a":')
+            closes.append("}")
+    return "".join(opens) + inner + "".join(reversed(closes))
+
+
+HB = ('{"device_id":"site-a-edge-01","status":"healthy","last_seen_ms":1787000000000,"gateway_seen_ms":0,'
+      '"active_triggers":[],"auth":{"scheme":"hmac-sha256","signed_at_ms":1787000000000,'
+      '"signature":"hmac-sha256:00"}}')
+HB_DEF = {"": HEARTBEAT, "/auth": AUTH}
+
+# Clean documents: admitted unchanged.
+case("clean_runtime_heartbeat", "A runtime node heartbeat with its auth block.", HB, ACCEPT, HB_DEF)
+case("clean_reasoning_request", "A Tier 3 request whose context holds an array of history objects.",
+     '{"request_id":"r-1","device_id":"site-a-edge-01","sensor_type":"current","trigger_name":"anomalous_draw",'
+     '"prompt":"Is this anomalous?","context":{"value":8.2,"unit":"ampere","timestamp":1787000000000,'
+     '"producer_time":"reported","history":[{"value":7.9,"timestamp":1786999990000,"received_at_ms":1786999990100,'
+     '"producer_time":"reported"},{"value":8.0,"timestamp":1786999995000,"received_at_ms":1786999995100,'
+     '"producer_time":"not_reported"}]}}',
+     ACCEPT, {"": REQUEST, "/context": CONTEXT, "/context/history/0": HISTORY, "/context/history/1": HISTORY})
+case("clean_export_plaintext", "A decrypted action_log response plaintext, admitted under the same rule.",
+     '{"request_id":"r-2","export_type":"action_log","device_id":"site-a-edge-01","items":[{"record_kind":"dispatch",'
+     '"record_key":"k-1","contributed_to":null,"action_taken":"trip_relay","executed":true}],"next_page_token":"",'
+     '"complete":true,"error":null}',
+     ACCEPT, {"": RESPONSE, "/items/0": ACTION_ROW})
+case("clean_inbound_evidence", "An inbound evidence message whose artifact is a nested object.",
+     '{"device_id":"site-a-edge-01","artifact_type":"custody_acknowledgement","artifact":{"v":1,'
+     '"device_id":"site-a-edge-01","local_seq":12,"envelope_digest":"sha256:a079","custody_at_ms":1787000000900,'
+     '"key_id":"hkdf-sha256:d6af","mac":"hmac-sha256:b8bb"},"auth":{"scheme":"hmac-sha256",'
+     '"signed_at_ms":1787000000950,"signature":"hmac-sha256:00"}}',
+     ACCEPT, {"": INBOUND, "/artifact": CUSTODY_ACK, "/auth": AUTH})
+case("clean_unknown_member", "A member no section defines is tolerated.",
+     '{"status":"healthy","firmware_note":"additive"}', ACCEPT, {"": ["status"]})
+case("clean_whitespace", "Whitespace of all four kinds before, inside and after the value.",
+     ' \t\r\n{ "status" :\t"healthy" ,\r\n "critical" : false }\n\r\t ', ACCEPT, {"": ["status", "critical"]})
+case("clean_top_level_scalar", "The rule judges grammar, not shape: a scalar is one JSON value.", '"healthy"', ACCEPT)
+case("clean_empty_object", "An empty object.", "{}", ACCEPT)
+case("clean_escaped_distinct_names", "\\/ unescapes to / and \\\\ to \\, so the two names differ.",
+     '{"a\\/b":1,"a\\\\b":2}', ACCEPT)
+case("clean_paired_surrogate", "A completed surrogate pair is one scalar value.",
+     '{"label":"\\ud83d\\ude00"}', ACCEPT)
+case("clean_paired_surrogate_upper", "Hex digits in either case.", '{"label":"\\uD83D\\uDE00"}', ACCEPT)
+case("clean_number_out_of_float_range", "1e400 is a JSON value; its range is not this rule's concern.",
+     '{"value":1e400}', ACCEPT)
+case("clean_number_forms", "Negative zero, an exponent with sign, a fraction.",
+     '{"a":-0,"b":1E+2,"c":0.5e-3,"d":-12.25}', ACCEPT)
+case("clean_same_name_different_objects", "Equal names in different objects are not duplicates.",
+     '{"a":{"status":1},"b":{"status":2},"c":[{"status":3},{"status":4}]}', ACCEPT)
+case("clean_fold_across_objects", "Fold-equal names in different objects are not case variants.",
+     '{"a":{"status":1},"b":{"STATUS":2}}', ACCEPT)
+case("clean_unicode_value", "Non-ASCII text in a value, literal and escaped.",
+     '{"location":"Ikeja \u00e9 \\u00e9 \u20ac"}', ACCEPT)
+case("clean_nfc_nfd_names", "No normalisation: precomposed and decomposed e-acute are different names.",
+     '{"caf\u00e9":1,"cafe\u0301":2}', ACCEPT)
+
+# Duplicates.
+case("duplicate_top_level", "The same name twice at the top level.",
+     '{"status":"critical","status":"healthy"}', "duplicate_member", {"": HEARTBEAT})
+case("duplicate_escaped_status", "st\\u0061tus unescapes to status.",
+     '{"status":"critical","st\\u0061tus":"healthy"}', "duplicate_member", {"": HEARTBEAT})
+case("duplicate_fully_escaped", "Every character of the first name escaped.",
+     '{"\\u0073\\u0074\\u0061\\u0074\\u0075\\u0073":"critical","status":"healthy"}', "duplicate_member",
+     {"": HEARTBEAT})
+case("duplicate_nested_object", "A duplicate inside a nested object.",
+     '{"status":"healthy","auth":{"signature":"hmac-sha256:00","signature":"hmac-sha256:01"}}',
+     "duplicate_member", {"": HEARTBEAT, "/auth": AUTH})
+case("duplicate_in_array_element", "A duplicate inside the second object of an array.",
+     '{"history":[{"value":1},{"value":1,"value":2}]}', "duplicate_member")
+case("duplicate_in_nested_arrays", "A duplicate with equal values, inside arrays of arrays.",
+     '[[{"a":1,"a":1}]]', "duplicate_member")
+case("duplicate_pair_vs_literal", "A surrogate-pair escape and the literal scalar it names.",
+     '{"\U0001F600":1,"\\ud83d\\ude00":2}', "duplicate_member")
+case("duplicate_solidus_escape", "\\/ and / are one name.", '{"a/b":1,"a\\/b":2}', "duplicate_member")
+case("duplicate_empty_name", "The empty name twice.", '{"":1,"":2}', "duplicate_member")
+case("duplicate_precomposed_escape", "A literal e-acute and its escape are one name.",
+     '{"caf\u00e9":1,"caf\\u00e9":2}', "duplicate_member")
+case("duplicate_three_times", "Three members of one name.", '{"a":1,"a":2,"a":3}', "duplicate_member")
+
+# Case variants and the closed fold.
+case("case_variant_alone", "STATUS with no status member, where the contract defines status.",
+     '{"STATUS":"critical"}', "case_variant_member", {"": HEARTBEAT})
+case("case_variant_with_exact", "status and STATUS in one object.",
+     '{"status":"critical","STATUS":"healthy"}', "case_variant_member", {"": HEARTBEAT})
+case("case_variant_two_names_undefined", "Two fold-equal names in an object whose members no contract lists.",
+     '{"params":{"sensor_id":"a","Sensor_ID":"b"}}', "case_variant_member")
+case("case_variant_alone_undefined", "A single name in an object whose members no contract lists is tolerated.",
+     '{"params":{"Sensor_ID":"a"}}', ACCEPT)
+case("case_variant_defined_elsewhere", "SIGNATURE at the top level, where only auth defines signature.",
+     '{"status":"healthy","SIGNATURE":"x","auth":{"signature":"y"}}', ACCEPT, {"": HEARTBEAT, "/auth": AUTH})
+case("case_variant_escaped_capital", "\\u0053 is S.",
+     '{"status":1,"\\u0053TATUS":2}', "case_variant_member")
+case("case_variant_in_array_element", "A case variant of a defined member in an array element.",
+     '{"items":[{"record_kind":"dispatch"},{"RECORD_KIND":"dispatch"}]}', "case_variant_member",
+     {"": RESPONSE, "/items/0": ACTION_ROW, "/items/1": ACTION_ROW})
+case("long_s_defined", "U+017F matched against the defined status.",
+     '{"\u017ftatus":"healthy"}', "case_variant_member", {"": HEARTBEAT})
+case("long_s_defined_escaped", "U+017F as an escape.",
+     '{"\\u017ftatus":"healthy"}', "case_variant_member", {"": HEARTBEAT})
+case("long_s_with_exact", "U+017F beside the exact name.",
+     '{"status":"critical","\u017ftatus":"healthy"}', "case_variant_member", {"": HEARTBEAT})
+case("long_s_two_names", "U+017F and S, neither defined.", '{"\u017f":1,"S":2}', "case_variant_member")
+case("kelvin_defined", "U+212A matched against the defined record_kind.",
+     '{"items":[{"record_\u212aind":"dispatch"}]}', "case_variant_member", {"": RESPONSE, "/items/0": ACTION_ROW})
+case("kelvin_defined_escaped", "U+212A as an escape.",
+     '{"items":[{"record_\\u212aind":"dispatch"}]}', "case_variant_member", {"": RESPONSE, "/items/0": ACTION_ROW})
+case("kelvin_two_names", "U+212A and k, neither defined.", '{"\u212a":1,"k":2}', "case_variant_member")
+case("sharp_s_pair", "\u00df and \u1e9e compare exactly.", '{"\u00df":1,"\u1e9e":2}', ACCEPT)
+case("sharp_s_pair_escaped", "As escapes.", '{"\\u00df":1,"\\u1e9e":2}', ACCEPT)
+case("sharp_s_and_ss", "\u00df is not ss.", '{"stra\u00dfe":1,"strasse":2,"STRA\u1e9eE":3}', ACCEPT)
+case("greek_sigmas", "\u03c3, \u03c2 and \u03a3 compare exactly.", '{"\u03c3":1,"\u03c2":2,"\u03a3":3}', ACCEPT)
+case("greek_sigmas_escaped", "As escapes.", '{"\\u03c3":1,"\\u03c2":2,"\\u03a3":3}', ACCEPT)
+case("turkish_dotless_i_defined", "\u0131 does not fold to i.",
+     '{"dev\u0131ce_id":"site-a-edge-01"}', ACCEPT, {"": HEARTBEAT})
+case("turkish_dotless_i_defined_escaped", "As an escape.",
+     '{"dev\\u0131ce_id":"site-a-edge-01"}', ACCEPT, {"": HEARTBEAT})
+case("turkish_dotted_i_defined", "\u0130 does not fold to i.",
+     '{"dev\u0130ce_id":"site-a-edge-01"}', ACCEPT, {"": HEARTBEAT})
+case("turkish_dotted_i_defined_escaped", "As an escape.",
+     '{"dev\\u0130ce_id":"site-a-edge-01"}', ACCEPT, {"": HEARTBEAT})
+case("turkish_i_names", "\u0130, \u0131 and i compare exactly.", '{"\u0130d":1,"\u0131d":2,"id":3}', ACCEPT)
+case("fullwidth_s", "U+FF33 is not S.", '{"\uff33tatus":1}', ACCEPT, {"": HEARTBEAT})
+case("ascii_non_letters", "Only letters fold: @ and `, [ and {, _ and DEL differ by 0x20 and stay distinct.",
+     '{"@":1,"`":2,"[":3,"{":4,"_":5,"\x7f":6}', ACCEPT)
+case("ascii_digits_and_punct", "a_b and a-b are different names.", '{"a_b":1,"a-b":2}', ACCEPT)
+
+# Depth.
+case("depth_32_arrays", "Thirty-two nested arrays.", nest(32), ACCEPT)
+case("depth_33_arrays", "Thirty-three nested arrays.", nest(33), "nesting_too_deep")
+case("depth_32_around_scalar", "A scalar adds no depth.", nest(32, "0"), ACCEPT)
+case("depth_32_mixed", "Objects and arrays alternating, thirty-two deep.", nest(32, "1", "{["), ACCEPT)
+case("depth_33_mixed", "Objects and arrays alternating, thirty-three deep.", nest(33, "1", "{["),
+     "nesting_too_deep")
+case("depth_33_empty_object_innermost", "Thirty-two arrays around an empty object.", nest(32, "{}"),
+     "nesting_too_deep")
+case("depth_33_after_shallow", "The deep branch is the second element.", "[1," + nest(32) + "]",
+     "nesting_too_deep")
+case("depth_33_objects", "Thirty-three nested objects.", nest(33, "1", "{"), "nesting_too_deep")
+
+# Numbers outside the grammar.
+case("nan_value", "NaN as a member value.", '{"value":NaN}', "malformed_json")
+case("infinity_value", "Infinity as a member value.", '{"value":Infinity}', "malformed_json")
+case("negative_infinity_value", "-Infinity as a member value.", '{"value":-Infinity}', "malformed_json")
+case("nan_in_array", "NaN inside an array.", "[1,NaN]", "malformed_json")
+case("nan_top_level", "NaN as the whole payload.", "NaN", "malformed_json")
+case("infinity_top_level", "Infinity as the whole payload.", "Infinity", "malformed_json")
+case("negative_infinity_top_level", "-Infinity as the whole payload.", "-Infinity", "malformed_json")
+case("leading_zero_nested", "01 inside an array breaks the grammar; compare leading_zero_top_level.", "[01]",
+     "malformed_json")
+case("leading_zero_top_level", "At the top level, 0 is a complete value and 1 trails it; compare "
+     "leading_zero_nested.", "01",
+     "trailing_data")
+case("bare_fraction", ".5 is not a number.", '{"value":.5}', "malformed_json")
+case("trailing_point", "1. is not a number.", '{"value":1.}', "malformed_json")
+case("plus_sign", "+1 is not a number.", '{"value":+1}', "malformed_json")
+
+# Malformed.
+case("empty_payload", "No bytes.", b"", "malformed_json")
+case("whitespace_only", "Whitespace and nothing else.", " \n\t\r ", "malformed_json")
+case("truncated_object", "The object never closes.", '{"status":"healthy"', "malformed_json")
+case("trailing_comma", "A comma before the closing brace.", '{"status":"healthy",}', "malformed_json")
+case("single_quotes", "Single-quoted strings.", "{'status':'healthy'}", "malformed_json")
+case("byte_order_mark", "A UTF-8 byte order mark is not whitespace.", b"\xef\xbb\xbf" + HB.encode(),
+     "malformed_json", HB_DEF)
+case("utf16le_payload", "UTF-16LE is valid UTF-8 byte for byte here, and is not JSON.",
+     '{"a":1}'.encode("utf-16-le"), "malformed_json")
+case("leading_no_break_space", "U+00A0 is not whitespace.", '\u00a0{"a":1}', "malformed_json")
+case("raw_newline_in_string", "A control character must be escaped.", '{"a":"x\ny"}', "malformed_json")
+case("invalid_escape", "\\x is not an escape.", '{"a":"\\x41"}', "malformed_json")
+case("short_unicode_escape", "\\u needs four hex digits.", '{"a":"\\u41"}', "malformed_json")
+case("comment", "Comments are not JSON.", '{"a":1/*c*/}', "malformed_json")
+case("unquoted_name", "Names are strings.", "{status:1}", "malformed_json")
+case("missing_colon", "A name without a colon.", '{"a" 1}', "malformed_json")
+case("bare_word", "An unknown literal.", '{"a":nul}', "malformed_json")
+case("capital_true", "Literals are lower case.", '{"a":True}', "malformed_json")
+
+# Trailing data.
+case("trailing_garbage", "A character after the object.", HB + "x", "trailing_data", HB_DEF)
+case("trailing_second_value", "Two objects.", "{} {}", "trailing_data")
+case("trailing_nul", "A NUL byte after the object.", b"{}\x00", "trailing_data")
+case("trailing_form_feed", "Form feed is not whitespace.", "{}\f", "trailing_data")
+case("trailing_no_break_space", "U+00A0 is not whitespace.", "{}\u00a0", "trailing_data")
+case("trailing_comma_after_value", "A comma after the value.", "{},", "trailing_data")
+case("trailing_close", "An extra closing brace.", '{"a":1}}', "trailing_data")
+case("trailing_lone_surrogate", "A string after the value is not a name or value of the payload.",
+     '{} "\\ud800"', "trailing_data")
+
+# Unicode.
+case("invalid_utf8_byte", "0xFF in a value.", b'{"a":"\xff"}', "invalid_unicode")
+case("overlong_solidus", "C0 AF is an overlong /.", b'{"a":"\xc0\xaf"}', "invalid_unicode")
+case("encoded_surrogate", "ED A0 80 encodes U+D800.", b'{"a":"\xed\xa0\x80"}', "invalid_unicode")
+case("above_unicode_range", "F4 90 80 80 is above U+10FFFF.", b'{"a":"\xf4\x90\x80\x80"}', "invalid_unicode")
+case("truncated_sequence", "A multi-byte sequence cut short.", b'{"a":"\xe2\x82"}', "invalid_unicode")
+case("invalid_utf8_in_name", "0xFF in a name.", b'{"\xff":1}', "invalid_unicode")
+case("invalid_utf8_trailing", "Invalid UTF-8 after the value: the whole payload is judged.",
+     b"{} \xff", "invalid_unicode")
+case("lone_high_value", "A high surrogate escape with nothing after it.", '{"a":"\\ud800"}', "invalid_unicode")
+case("lone_low_value", "A low surrogate escape on its own.", '{"a":"\\udc00"}', "invalid_unicode")
+case("lone_high_upper", "Upper-case hex.", '{"a":"\\uD800"}', "invalid_unicode")
+case("misordered_pair", "Low before high.", '{"a":"\\udc00\\ud800"}', "invalid_unicode")
+case("high_then_pair", "A high escape followed by a complete pair.", '{"a":"\\ud800\\ud83d\\ude00"}',
+     "invalid_unicode")
+case("high_then_text", "A high escape followed by a letter.", '{"a":"\\ud800x"}', "invalid_unicode")
+case("high_then_ascii_escape", "A high escape followed by a non-surrogate escape.", '{"a":"\\ud800\\u0041"}',
+     "invalid_unicode")
+case("high_then_escaped_backslash", "\\\\udc00 is a backslash and text, not a low escape.",
+     '{"a":"\\ud800\\\\udc00"}', "invalid_unicode")
+case("lone_in_name", "A lone escape in a name.", '{"\\ud800":1}', "invalid_unicode")
+
+# Precedence: the earliest row names the reason.
+case("precedence_surrogate_in_duplicate", "A lone surrogate inside a duplicated member.",
+     '{"status":"critical","status":"\\ud800"}', "invalid_unicode", {"": HEARTBEAT})
+case("precedence_surrogate_in_duplicated_name", "The duplicated name holds the lone surrogate.",
+     '{"\\ud800":1,"\\ud800":2}', "invalid_unicode")
+case("precedence_utf8_over_duplicate", "Invalid UTF-8 and a duplicate.", b'{"a":1,"a":"\xff"}',
+     "invalid_unicode")
+case("precedence_surrogate_over_malformed", "The lone escape is read before the grammar breaks.",
+     '{"a":"\\ud800",}', "invalid_unicode")
+case("precedence_surrogate_at_end", "The payload stops after an unpaired escape.", '{"a":"\\ud800',
+     "invalid_unicode")
+case("precedence_surrogate_cut_pair", "The payload stops inside the low half.", '{"a":"\\ud800\\udc0',
+     "invalid_unicode")
+case("precedence_surrogate_over_depth", "A lone escape thirty-three deep.",
+     nest(33, '"\\ud800"'), "invalid_unicode")
+case("precedence_surrogate_over_trailing", "A lone escape in the value, then trailing data.",
+     '{"a":"\\ud800"}x', "invalid_unicode")
+case("precedence_surrogate_over_case_variant", "A lone escape beside a case variant.",
+     '{"a":"\\ud800","A":1}', "invalid_unicode")
+case("precedence_malformed_over_case_variant", "A case variant, then the payload stops.",
+     '{"a":1,"A":2', "malformed_json")
+case("precedence_depth_over_case_variant", "A case variant early, the depth late.",
+     '{"a":1,"A":2,"b":' + nest(32) + "}", "nesting_too_deep")
+case("precedence_trailing_over_case_variant", "A case variant in the value, then trailing data.",
+     '{"a":1,"A":2}x', "trailing_data")
+case("depth_after_first_value", "Depth past the bound after the first value is trailing data.",
+     "{}" + nest(33), "trailing_data")
+case("cut_short_first_escape", "An escape cut short names no code unit.",
+     '{"a":"\\ud8', "malformed_json")
+case("precedence_malformed_hides_later_surrogate", "Nothing after the break is read.",
+     '{"a":1,,"b":"\\ud800"}', "malformed_json")
+case("precedence_malformed_over_depth", "Thirty-three arrays that never close.", "[" * 33,
+     "malformed_json")
+case("precedence_malformed_over_depth_late", "Thirty-three deep, then a grammar break near the end.",
+     nest(33)[:-1] + ",]", "malformed_json")
+case("precedence_malformed_over_duplicate", "A duplicate, then the payload stops.", '{"a":1,"a":2',
+     "malformed_json")
+case("precedence_depth_over_trailing", "Thirty-three deep and trailing data.", nest(33) + "x",
+     "nesting_too_deep")
+case("precedence_depth_over_duplicate", "A duplicate early, the depth late.",
+     '{"a":1,"a":2,"b":' + nest(32) + "}", "nesting_too_deep")
+case("precedence_trailing_over_duplicate", "A duplicate in the value, then trailing data.",
+     '{"a":1,"a":2}x', "trailing_data")
+case("precedence_duplicate_over_case_variant", "A case variant earlier in the text, a duplicate later.",
+     '{"A":{"x":1,"X":2},"B":{"y":1,"y":2}}', "duplicate_member")
+case("precedence_duplicate_and_variant_one_object", "Both in one object.",
+     '{"status":1,"STATUS":2,"status":3}', "duplicate_member", {"": HEARTBEAT})
+
+
+# --- the corpus ------------------------------------------------------------
+
+
+def text_of(raw: bytes) -> str | None:
+    if len(raw) > TEXT_LIMIT:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def corpus() -> dict:
+    names = [c["name"] for c in CASES]
+    if len(set(names)) != len(names):
+        raise SystemExit("case names repeat")
+    out = []
+    for c in CASES:
+        if c["expected"] not in REASONS + (ACCEPT,):
+            raise SystemExit(f"{c['name']}: unknown outcome {c['expected']!r}")
+        got = assess(c["raw"], c["defined"])
+        if got != c["expected"]:
+            raise SystemExit(f"{c['name']}: declared {c['expected']!r}, the model gives {got!r}")
+        out.append({
+            "name": c["name"],
+            "description": c["description"],
+            "payload_hex": c["raw"].hex(),
+            "payload_text": text_of(c["raw"]),
+            "defined_members": c["defined"],
+            "expected": c["expected"],
+        })
+    return {
+        "vector_set": "gateway-api/v2 payload members",
+        "contract": "gateway-api/v2.md",
+        "section": "## Payload Member Rule",
+        "conventions": {
+            "payload_hex": "the exact payload bytes, lowercase hex; the only input",
+            "payload_text": "the same bytes as UTF-8 text for reading, or null when they are not valid UTF-8 "
+                            "or longer than 400 bytes; never an input",
+            "defined_members": "for each object of the payload, by RFC 6901 JSON Pointer to it, the members "
+                               "the contract defining that object names for it, as far as the case needs them: "
+                               "no name in a case's payload is a fold variant of a defined member left out; an "
+                               "object not listed has none",
+            "expected": "accept, or the reason a receiver refuses the payload for",
+        },
+        "reasons": list(REASONS),
+        "cases": out,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(corpus(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if not OUT.is_file() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces from its generator")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} ({len(CASES)} cases)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

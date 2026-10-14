@@ -1,0 +1,1502 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 payload-members corpus against the contract text.
+
+Shares no code with scripts/generate-gateway-payload-members-vectors-v2, and
+was written without reading it. Every expected outcome is recomputed by this
+script's own byte-level assessor, built from gateway-api/v2.md
+`## Payload Member Rule`: its own RFC 3629 decoder and its own iterative
+RFC 8259 scanner. Python's json module never reads a payload; it loads only
+the corpus file, refusing a duplicate key.
+
+Read from the text, not from literals here: the six reasons and their
+precedence (the `| Reason | Refused when |` table), the depth bound, the
+whitespace characters, the closed fold's non-ASCII entries, the code points
+the text says compare exactly, the non-values the malformed row names and the
+out-of-range number it admits. Every sentence of the section's prose, in
+order, and every table cell are held word for word (whitespace-normalised),
+so a sentence added, removed, reworded or reordered fails until this script
+is reviewed.
+
+Held to:
+
+- each case's `payload_hex` is lowercase hex; `payload_text` is those bytes
+  as UTF-8, and null exactly when they are not UTF-8 or exceed the corpus's
+  stated length;
+- each case's `expected` equals the assessor's outcome: accept, or the
+  earliest table row among every row that applies to the payload;
+- every `defined_members` pointer is RFC 6901, names exactly one object of
+  the scanned value, and lists ASCII names only;
+- coverage, as properties of the cases (never their names), of every
+  behaviour the text names: each reason and accept, duplicates at top level,
+  nested and in array elements and spelled with escapes, each fold entry
+  refused literally and escaped, each exact-compare code point accepted
+  literally and escaped, case variants with and without the exact member,
+  depth at and past the bound, the non-values, trailing whitespace limits,
+  each UTF-8 error kind, each lone-surrogate form, surrogate scope, and every
+  pair of rows that can apply together.
+
+Limits: a payload that breaks the grammar before its first value starts has
+no scanned value, so its pointers cannot be resolved and are not checked.
+Duplicates and case variants are judged within the first value only, as
+depth and surrogates are; a payload with trailing data is refused for it
+first in any case, so no outcome turns on that. The corpus lists defined members per object; whether those lists match the
+payload families' sections is not checked here.
+
+    python3 scripts/check-gateway-payload-members-vectors-v2
+    python3 scripts/check-gateway-payload-members-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's own
+model in turn; each hostile mutant must add a problem the unmutated run does
+not have, of the kind it targets. Permitted mutants (changes the rule does
+not care about) must add none.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+import types
+import unicodedata
+from collections.abc import Callable
+from typing import Any
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "gateway-api" / "vectors" / "payload-members-v2.json"
+GATEWAY_V2 = ROOT / "gateway-api" / "v2.md"
+SECTION = "## Payload Member Rule"
+BS = chr(92)
+
+
+class Failure(Exception):
+    pass
+
+
+# --- contract text --------------------------------------------------------------------
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def need(body: str, sentence: str) -> None:
+    if flat(sentence) not in flat(body):
+        raise Failure(f"contract no longer says: {sentence!r}")
+
+
+def cells(row: str) -> list[str]:
+    inner = row.strip()
+    if not (inner.startswith("|") and inner.endswith("|")):
+        raise Failure(f"contract: not a table row: {row!r}")
+    return [flat(p) for p in re.split(r"(?<!\\)\|", inner[1:-1])]
+
+
+def table(body: str, header: list[str]) -> list[list[str]]:
+    lines = body.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("|") and cells(line) == header:
+            if i + 1 >= len(lines) or not re.fullmatch(r"\|(?: *:?-+:? *\|)+", lines[i + 1].strip()):
+                raise Failure(f"contract: table {header} has no separator row")
+            rows = []
+            for row in lines[i + 2:]:
+                if not row.strip().startswith("|"):
+                    break
+                got = cells(row)
+                if len(got) != len(header):
+                    raise Failure(f"contract: row {row!r} has {len(got)} cells")
+                rows.append(got)
+            return rows
+    raise Failure(f"contract: no table headed {header}")
+
+
+_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+         "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+         "eighteen", "nineteen"]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def words(n: int) -> str:
+    if n < 20:
+        return _ONES[n]
+    if n < 100:
+        return _TENS[n // 10] + ("" if n % 10 == 0 else "-" + _ONES[n % 10])
+    raise Failure(f"contract: depth bound {n} is outside this script's reviewed range")
+
+
+# Each row's cell, by reason. {bound} is read from the text and checked against
+# the Depth term's own number.
+ROWS = {
+    "invalid_unicode": "The payload is not valid UTF-8, or a name or value holds a lone or "
+                       "misordered surrogate escape.",
+    "malformed_json": "The payload does not begin, after optional whitespace, with one complete "
+                      "JSON value: it is empty, ends early, or breaks the RFC 8259 grammar before "
+                      "that value ends. `NaN`, `Infinity` and `-Infinity` are not JSON values.",
+    "nesting_too_deep": "An object or array sits deeper than {bound}, the top-level value at "
+                        "depth 1.",
+    "trailing_data": "Anything other than whitespace follows that value.",
+    "duplicate_member": "Two members of one object have identical names, compared after "
+                        "unescaping, code point by code point, with no normalisation.",
+    "case_variant_member": "Two names in one object, or a name and a member the contract "
+                           "defining that object names for it, differ but are equal under the "
+                           "closed fold.",
+}
+
+# Every sentence of the section's prose, in order: a sentence added, removed, reworded or
+# reordered fails until this script is reviewed against it.
+HELD = (
+    ('Every payload this contract carries between a runtime and a gateway, on every topic and '
+     'in either direction, is admitted under this rule before any member of it is read: '
+     'before an envelope is verified, before a signing input is rebuilt, and before the '
+     'payload is routed.'),
+    ('Where a payload carries an encrypted member, the plaintext it decrypts to is a JSON '
+     'text in its own right, and is admitted under the same rule before any member of it is '
+     'read.'),
+    ('A string that encodes bytes, such as `artifact_b64`, is a string to this rule; the '
+     'bytes it decodes to are governed by the contract that defines them.'),
+    'Two readers that resolve one byte sequence differently give one signature two meanings.',
+    ('A reader that keeps the last of two same-named members and a reader that keeps the '
+     'first see different payloads under one valid signature, and a decoder that matches '
+     'member names without regard to case reads `STATUS` as `status` where an exact reader '
+     'ignores it.'),
+    'The rule leaves each payload one reading.',
+    'A receiver refuses a payload when any row below applies.',
+    'Every row applies to every object at every depth, including objects inside arrays.',
+    ('When several rows apply, the earliest row in the table names the reason, wherever in '
+     'the payload each violation sits, so every receiver names the same reason whatever order '
+     'its parser meets them in.'),
+    'The terms in the table mean exactly this:',
+    ('**Valid UTF-8** is RFC 3629 UTF-8: no overlong form, no encoded surrogate, nothing '
+     'above U+10FFFF.'),
+    'The whole payload is judged, bytes after the first value included.',
+    ("**Whitespace** is RFC 8259's four characters: space, horizontal tab, line feed and "
+     "carriage return."),
+    ('A byte order mark is not whitespace, so a payload that begins with one does not begin '
+     'with a JSON value.'),
+    ('**A surrogate escape** is a `\\u` escape naming a code unit from D800 to DFFF, in '
+     'either case of hex digit.'),
+    ('An escape from D800 to DBFF is lone unless the next six characters of the same string '
+     'are an escape from DC00 to DFFF, and an escape from DC00 to DFFF is lone unless it '
+     'completes such a pair.'),
+    'A completed pair is one scalar value.',
+    'An escape cut short names no code unit and breaks the grammar.',
+    ('Every name and value is judged from the start of the payload to the end of its first '
+     'value, or to the point where it breaks the grammar if that comes first, so a string '
+     'that ends, or a payload that stops, after an unpaired escape holds a lone one.'),
+    '**Depth** counts objects and arrays only.',
+    ('The top-level value is at depth 1, and an object or array inside another is one deeper '
+     'than its container.'),
+    'A scalar adds no depth, so thirty-two nested arrays around a number are admitted.',
+    'Depth is judged within the first value; whatever follows it is trailing data, however deep.',
+    ('**The first value** ends where the RFC 8259 grammar ends it, so a top-level `01` is the value `0` '
+     'followed by trailing data, while `[01]` breaks the grammar inside the array.'),
+    'The member rules, `duplicate_member` and `case_variant_member`, judge the first value only.',
+    ('**Unescaping** turns every escape into the scalar value it names, a completed surrogate '
+     'pair into one, so `"st\\u0061tus"` and `"status"` are one name.'),
+    ('**The closed fold** maps each code point of a name on its own: each ASCII capital '
+     'letter to its small letter, U+017F LATIN SMALL LETTER LONG S to `s`, U+212A KELVIN SIGN '
+     'to `k`, and every other code point to itself.'),
+    'Two names are equal under it when their mapped sequences are identical.',
+    ('Unicode simple case folding is not used, because it changes with the Unicode version '
+     'each toolchain ships, and a Go and a Python receiver would then fold some names '
+     'differently.'),
+    ("Every member name this contract defines is ASCII, and U+017F and U+212A are exactly the "
+     "non-ASCII code points Go's struct decoder matches to an ASCII name: ori-gateway "
+     "confirmed this on go1.26.1 (Unicode 15.0.0) by sweeping every scalar value."),
+    ('`\xdf`, `\u1e9e`, `\u03c2`, `\u03c3`, `\u03a3`, `\u0130` and `\u0131` therefore compare '
+     'exactly.'),
+    ("**A member the contract defining that object names for it** is one this contract's "
+     "section for the payload lists for that object, or, where the section hands an object to "
+     "another contract, as it hands an inbound `artifact` to `evidence-exchange`, one that "
+     "contract lists."),
+    'An object no contract lists members for is held only to the test between two of its names.',
+    'Nothing else changes.',
+    ('A member whose name passes the rule and that a section does not define stays tolerated '
+     'wherever that section tolerates unknown members, so additive compatibility holds.'),
+    ('The rule judges a number by the RFC 8259 grammar alone: its range and spelling stay '
+     'with the section that reads it and with `gateway-mqtt-canonical-json/v1`, and D-011 '
+     'numeric admission is unchanged, so `1e400` is a JSON value here.'),
+    'A refused payload reaches no verifier, changes no state, and is recorded with its reason.',
+    ('It is not answered: no member of it can be relied on, its correlation identifier and '
+     'device included, so a reply would name what the payload may not have said.'),
+    ('The six reasons name that record and add nothing to any reply vocabulary a section '
+     'defines; an error envelope or acknowledgement a section defines answers only a payload '
+     'this rule admits.'),
+    'A producer MUST NOT emit a payload this rule refuses.',
+    ('[`vectors/payload-members-v2.json`](vectors/payload-members-v2.json) carries the '
+     'payloads as exact bytes, each with the reason a receiver MUST name or the admission it '
+     'MUST give.'),
+    ('Each case names the members the contract defines for each object it holds, so the '
+     'corpus needs no payload family to be read.'),
+)
+
+WS_NAMES = {"space": 0x20, "horizontal tab": 0x09, "line feed": 0x0A, "carriage return": 0x0D}
+
+DEFAULTS: dict[str, Any] = {
+    "fold_mode": "closed",        # closed | casefold | lower
+    "dup": True,                  # False: a later duplicate silently replaces the earlier
+    "scalar_depth": False,        # True: a scalar counts as one deeper than its container
+    "depth_ge": False,            # True: refuse at the bound, not past it
+    "trailing_surrogates": False,  # True: judge surrogate escapes after the first value
+    "surrogates_past_break": False,  # True: judge surrogate escapes past a grammar break
+    "precedence": "table",        # table | position
+    "utf8_first_value_only": False,
+    "encoded_surrogates_ok": False,
+    "overlong_ok": False,
+    "nonvalues_ok": False,
+    "surrogate_lower_hex_only": False,
+    "misordered_ok": False,
+    "raw_compare": False,
+    "nfc": False,
+    "case_against_defined": True,
+    "case_between_names": True,
+    "defined_global": False,
+    "extra_ws": frozenset(),
+    "trailing_depth": False,      # True: judge depth after the first value
+    "cut_escape_lone": False,     # True: a cut-short high-surrogate escape is a lone one
+}
+
+
+def split_sentences(body: str) -> list[str]:
+    """The section's prose as sentences: paragraphs and list items, tables and rules left out."""
+    blocks: list[list[str]] = [[]]
+    for line in body.splitlines():
+        t = line.strip()
+        if not t or t.startswith("|") or re.fullmatch(r"-{3,}", t):
+            blocks.append([])
+            continue
+        if t.startswith("- "):
+            blocks.append([t[2:]])
+            continue
+        blocks[-1].append(t)
+    out: list[str] = []
+    for block in blocks:
+        text = flat(" ".join(block))
+        if text:
+            out += [x for x in re.split(r"(?<=[.!?:;])\s+(?=[A-Z`*\[\"(])", text) if x]
+    return out
+
+
+def contract_model(text: str | None = None, hold: bool = True) -> dict:
+    text = GATEWAY_V2.read_text() if text is None else text
+    try:
+        body = markdown.own_body(text, SECTION)
+    except ValueError as error:
+        raise Failure(f"contract: {error}") from None
+    if hold:
+        got = split_sentences(body)
+        if got != list(HELD):
+            added = [x for x in got if x not in HELD]
+            removed = [x for x in HELD if x not in got]
+            raise Failure(f"contract sentence changed: added {added}, removed {removed}"
+                          + ("" if added or removed else ", reordered"))
+    f = flat(body)
+
+    rows = table(body, ["Reason", "Refused when"])
+    reasons = []
+    bound = None
+    for reason_cell, when in rows:
+        m = re.fullmatch(r"`([a-z_]+)`", reason_cell)
+        if m is None:
+            raise Failure(f"contract: reason cell {reason_cell!r} is not one backticked token")
+        reason = m.group(1)
+        if reason not in ROWS:
+            raise Failure(f"contract: reason {reason!r} has no model in this script")
+        if reason == "nesting_too_deep":
+            bm = re.fullmatch(r"An object or array sits deeper than (\d+), the top-level value at "
+                              r"depth 1\.", when)
+            if bm is None:
+                raise Failure(f"contract: depth row reworded: {when!r}")
+            bound = int(bm.group(1))
+        elif when != flat(ROWS[reason]):
+            raise Failure(f"contract: row `{reason}` reworded: {when!r}")
+        reasons.append(reason)
+    if sorted(reasons) != sorted(ROWS) or len(set(reasons)) != len(reasons):
+        raise Failure(f"contract: reasons table holds {reasons}, model has {sorted(ROWS)}")
+    assert bound is not None
+    need(body, f"A scalar adds no depth, so {words(bound)} nested arrays around a number are "
+               "admitted.")
+    nonvalues = re.findall(r"`([^`]+)`", ROWS["malformed_json"].split("ends. ")[1])
+
+    wm = re.search(r"\*\*Whitespace\*\* is RFC 8259's ([a-z-]+) characters: ([a-z ,]+?)\. A byte "
+                   r"order mark", f)
+    if wm is None:
+        raise Failure("contract: the Whitespace term is reworded")
+    ws_names = re.split(r", | and ", wm.group(2))
+    if any(n not in WS_NAMES for n in ws_names) or len(set(ws_names)) != len(ws_names):
+        raise Failure(f"contract: whitespace names {ws_names} outside this script's reviewed set")
+    if words(len(ws_names)) != wm.group(1):
+        raise Failure(f"contract: whitespace says {wm.group(1)} characters and lists {ws_names}")
+    ws = frozenset(WS_NAMES[n] for n in ws_names)
+
+    fm = re.search(r"\*\*The closed fold\*\* maps each code point of a name on its own: each ASCII "
+                   r"capital letter to its small letter, ((?:U\+[0-9A-F]{4,6} [A-Z ]+? to `[^`]+`, )*)"
+                   r"and every other code point to itself\.", f)
+    if fm is None:
+        raise Failure("contract: the closed fold definition is reworded")
+    fold_extra: dict[int, int] = {}
+    for hexcp, name, target in re.findall(r"U\+([0-9A-F]{4,6}) ([A-Z ]+?) to `([^`]+)`",
+                                          fm.group(1)):
+        cp = int(hexcp, 16)
+        if unicodedata.name(chr(cp), "") != name:
+            raise Failure(f"contract: fold names U+{hexcp} {name!r}, which is not its name")
+        if len(target) != 1 or cp < 0x80 or ord(target) >= 0x80:
+            raise Failure(f"contract: fold entry U+{hexcp} -> {target!r} is not non-ASCII to ASCII")
+        fold_extra[cp] = ord(target)
+    listed = " and ".join(f"U+{cp:04X}" for cp in fold_extra)
+    need(body, f"is ASCII, and {listed} are exactly the non-ASCII code points Go's struct decoder matches to an "
+               "ASCII name")
+    em = re.search(r"((?:`[^`]+`, )*`[^`]+`) and `([^`]+)` therefore compare exactly\.", f)
+    if em is None:
+        raise Failure("contract: the exact-compare list is reworded")
+    exact_chars = re.findall(r"`([^`]+)`", em.group(1)) + [em.group(2)]
+    if any(len(c) != 1 for c in exact_chars):
+        raise Failure(f"contract: exact-compare list holds a non-character: {exact_chars}")
+    num = re.search(r"so `([^`]+)` is a JSON value here\.", f)
+    if num is None:
+        raise Failure("contract: the admitted out-of-range number is reworded")
+    return {**DEFAULTS, "reasons": reasons, "bound": bound, "ws": ws, "fold_extra": fold_extra,
+            "exact": [ord(c) for c in exact_chars], "nonvalues": nonvalues,
+            "big_number": num.group(1)}
+
+
+# --- UTF-8 ------------------------------------------------------------------------------
+
+def decode_utf8(data: bytes, m: dict) -> tuple[list[int], list[int], list[tuple[int, str]]]:
+    """Code points (-1 for an ill-formed byte), their byte offsets, and each error."""
+    cps: list[int] = []
+    offs: list[int] = []
+    errors: list[tuple[int, str]] = []
+    i, n = 0, len(data)
+    while i < n:
+        b = data[i]
+        if b < 0x80:
+            cps.append(b)
+            offs.append(i)
+            i += 1
+            continue
+        lo, hi = 0x80, 0xBF
+        if 0xC2 <= b <= 0xDF:
+            count, value = 1, b & 0x1F
+        elif 0xE0 <= b <= 0xEF:
+            count, value = 2, b & 0x0F
+            if b == 0xE0 and not m["overlong_ok"]:
+                lo = 0xA0
+            if b == 0xED and not m["encoded_surrogates_ok"]:
+                hi = 0x9F
+        elif 0xF0 <= b <= 0xF4:
+            count, value = 3, b & 0x07
+            if b == 0xF0 and not m["overlong_ok"]:
+                lo = 0x90
+            if b == 0xF4:
+                hi = 0x8F
+        elif b in (0xC0, 0xC1) and m["overlong_ok"]:
+            count, value = 1, b & 0x1F
+        else:
+            kind = ("stray_continuation" if b <= 0xBF else "overlong" if b <= 0xC1
+                    else "above_range" if b <= 0xF7 else "invalid_byte")
+            errors.append((i, kind))
+            cps.append(-1)
+            offs.append(i)
+            i += 1
+            continue
+        ok = True
+        for k in range(1, count + 1):
+            if i + k >= n:
+                ok = False
+                errors.append((i, "truncated"))
+                break
+            c = data[i + k]
+            first = k == 1
+            if not ((lo if first else 0x80) <= c <= (hi if first else 0xBF)):
+                ok = False
+                if first and 0x80 <= c <= 0xBF:
+                    kind = ("overlong" if b in (0xE0, 0xF0) else "surrogate" if b == 0xED
+                            else "above_range")
+                else:
+                    kind = "truncated"
+                errors.append((i, kind))
+                break
+            value = (value << 6) | (c & 0x3F)
+        if not ok:
+            cps.append(-1)
+            offs.append(i)
+            i += 1
+            continue
+        cps.append(value)
+        offs.append(i)
+        i += count + 1
+    return cps, offs, errors
+
+
+# --- the assessor ---------------------------------------------------------------------------
+
+class Name:
+    def __init__(self, key: tuple, raw: tuple, off: int, esc: set, lit: set) -> None:
+        self.key, self.raw, self.off, self.esc, self.lit = key, raw, off, esc, lit
+
+
+class Node:
+    def __init__(self, kind: str, depth: int, pointer: str, in_array: bool) -> None:
+        self.kind, self.depth, self.pointer, self.in_array = kind, depth, pointer, in_array
+        self.children: list[tuple[Any, Any]] = []
+        self.names: list[Name] = []
+        self.scalar_inside = False
+
+
+class Assessment:
+    pass
+
+
+SIMPLE = {ord('"'): 0x22, 0x5C: 0x5C, ord("/"): 0x2F, ord("b"): 8, ord("f"): 12, ord("n"): 10,
+          ord("r"): 13, ord("t"): 9}
+HEX = set(b"0123456789abcdefABCDEF")
+
+
+def text_of(key: tuple) -> str:
+    return "".join(chr(c) if c >= 0 else "�" for c in key)
+
+
+def seg(s: str) -> str:
+    return s.replace("~", "~0").replace("/", "~1")
+
+
+def loose_lone(cps: list[int], start: int) -> bool:
+    """Whether a lone surrogate escape appears from `start` on, read loosely."""
+    s = "".join(chr(c) if 0 <= c < 0xD800 or 0xE000 <= c < 0x110000 else "?" for c in cps[start:])
+    units = [(mt.start(), int(mt.group(1), 16))
+             for mt in re.finditer(r"\\u([dD][89a-fA-F][0-9a-fA-F]{2})", s)]
+    k = 0
+    while k < len(units):
+        pos, u = units[k]
+        if u <= 0xDBFF and k + 1 < len(units) and units[k + 1][0] == pos + 6 \
+                and units[k + 1][1] >= 0xDC00:
+            k += 2
+            continue
+        return True
+    return False
+
+
+def fold(key: tuple, m: dict) -> Any:
+    if m["fold_mode"] == "casefold":
+        return text_of(key).casefold()
+    if m["fold_mode"] == "lower":
+        return text_of(key).lower()
+    extra = m["fold_extra"]
+    return tuple(c + 32 if 0x41 <= c <= 0x5A else extra.get(c, c) for c in key)
+
+
+def assess(data: bytes, defined: dict, m: dict) -> Assessment:
+    cps, offs, utf8_errors = decode_utf8(data, m)
+    n = len(cps)
+
+    def off(i: int) -> int:
+        return offs[i] if i < n else len(data)
+
+    ws = m["ws"] | m["extra_ws"]
+    a = Assessment()
+    a.cps, a.utf8_errors, a.lone, a.objects, a.dups, a.cases, a.numbers = cps, utf8_errors, [], [], [], [], []
+    a.root = None
+    a.root_scalar = False
+    a.cut_escape = False
+    a.cut_surrogate = False
+    a.trailing_depth = 0
+    a.max_depth = 0
+    a.deep_kind = None
+    viol: list[tuple[str, int]] = []
+    stack: list[Node] = []
+    pending: list[Any] = [None]
+    brk = None
+    brk_value = None
+
+    def read_string(i: int, where: str) -> tuple[bool, int, tuple, tuple, set, set]:
+        j = i + 1
+        out: list[int] = []
+        esc: set = set()
+        lit: set = set()
+        while True:
+            if j >= n:
+                return False, j, (), (), esc, lit
+            c = cps[j]
+            if c == 0x22:
+                return True, j + 1, tuple(out), tuple(cps[i + 1:j]), esc, lit
+            if c == 0x5C:
+                if j + 1 >= n:
+                    return False, j + 1, (), (), esc, lit
+                e = cps[j + 1]
+                if e in SIMPLE:
+                    out.append(SIMPLE[e])
+                    esc.add(SIMPLE[e])
+                    j += 2
+                    continue
+                if e != ord("u"):
+                    return False, j + 1, (), (), esc, lit
+                digits = cps[j + 2:j + 6]
+                if len(digits) < 4 or any(d not in HEX for d in digits):
+                    a.cut_escape = True
+                    if len(digits) >= 2 and all(d in HEX for d in digits) \
+                            and chr(digits[0]) in "dD" and chr(digits[1]) in "89abAB":
+                        a.cut_surrogate = True
+                        if m["cut_escape_lone"]:
+                            viol.append(("invalid_unicode", off(j)))
+                    bad = next((j + 2 + k for k, d in enumerate(digits) if d not in HEX), j + 6)
+                    return False, min(bad, n), (), (), esc, lit
+                unit = int("".join(map(chr, digits)), 16)
+                upper = any(chr(d) in "ABCDEF" for d in digits)
+                start = j
+                j += 6
+                is_sur = 0xD800 <= unit <= 0xDFFF and not (m["surrogate_lower_hex_only"] and upper)
+                if is_sur:
+                    nxt = cps[j:j + 6]
+                    low = None
+                    if len(nxt) == 6 and nxt[0] == 0x5C and nxt[1] == ord("u") \
+                            and all(d in HEX for d in nxt[2:]):
+                        low = int("".join(map(chr, nxt[2:])), 16)
+                    if unit <= 0xDBFF and low is not None and 0xDC00 <= low <= 0xDFFF:
+                        unit = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                        j += 6
+                    elif unit >= 0xDC00 and m["misordered_ok"] and low is not None \
+                            and 0xD800 <= low <= 0xDBFF:
+                        j += 6
+                        unit = 0x10000
+                    else:
+                        a.lone.append({"off": off(start), "unit": unit, "where": where,
+                                       "node": stack[-1] if stack else None,
+                                       "member": pending[0] if where == "value" else None,
+                                       "upper": upper, "next": tuple(cps[j:j + 2]),
+                                       "name_ref": None})
+                        viol.append(("invalid_unicode", off(start)))
+                out.append(unit)
+                esc.add(unit)
+                continue
+            if 0 <= c < 0x20:
+                return False, j, (), (), esc, lit
+            out.append(c)
+            lit.add(c)
+            j += 1
+
+    def attach(node: Node | None) -> tuple[str, bool]:
+        if not stack:
+            return "", False
+        parent = stack[-1]
+        if parent.kind == "obj":
+            key = pending[0]
+            parent.children.append((key, node))
+            return parent.pointer + "/" + seg(text_of(key)), parent.in_array
+        parent.children.append((len(parent.children), node))
+        return parent.pointer + "/" + str(len(parent.children) - 1), True
+
+    def after() -> str:
+        if not stack:
+            return "done"
+        return "obj_next" if stack[-1].kind == "obj" else "arr_next"
+
+    def skip(i: int) -> int:
+        while i < n and cps[i] in ws:
+            i += 1
+        return i
+
+    i = skip(0)
+    a.lead = set(cps[:i])
+    state = "value"
+    while state != "done":
+        i = skip(i)
+        if i >= n:
+            brk = i
+            break
+        c = cps[i]
+        if state == "value":
+            if c in (ord("{"), ord("[")):
+                kind = "obj" if c == ord("{") else "arr"
+                depth = len(stack) + 1
+                node = Node(kind, depth, "", False)
+                pointer, in_arr = attach(node)
+                node.pointer, node.in_array = pointer, in_arr
+                if not stack:
+                    a.root = node
+                if kind == "obj":
+                    a.objects.append(node)
+                a.max_depth = max(a.max_depth, depth)
+                if depth > m["bound"] or (m["depth_ge"] and depth >= m["bound"]):
+                    viol.append(("nesting_too_deep", off(i)))
+                    if a.deep_kind is None:
+                        a.deep_kind = kind
+                stack.append(node)
+                i += 1
+                state = "obj_first" if kind == "obj" else "arr_first"
+                continue
+            start = i
+            ok = True
+            if c == 0x22:
+                ok, i, _, _, _, _ = read_string(i, "value")
+            elif c == ord("-") or 0x30 <= c <= 0x39:
+                mt = re.match(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?",
+                              "".join(chr(x) if 0 <= x < 0x80 else "\x00" for x in cps[i:i + 4096]))
+                tok = mt.group(0) if mt else ""
+                nonvalue = next((t for t in m["nonvalues"] if t.startswith("-")
+                                 and text_of(tuple(cps[i:i + len(t)])) == t),
+                                None) if m["nonvalues_ok"] else None
+                if nonvalue:
+                    i += len(nonvalue)
+                elif tok in ("", "-"):
+                    ok = False
+                else:
+                    # A number ends at the first character its grammar cannot extend with;
+                    # a dangling fraction or exponent is a break, not an end.
+                    end = i + len(tok)
+                    if end < n and (cps[end] == ord(".") or cps[end] in (ord("e"), ord("E"))):
+                        ok, i = False, end
+                    else:
+                        a.numbers.append(tok)
+                        i = end
+            else:
+                lits = ["true", "false", "null"] + (m["nonvalues"] if m["nonvalues_ok"] else [])
+                hit = next((t for t in lits if text_of(tuple(cps[i:i + len(t)])) == t), None)
+                if hit is None:
+                    ok = False
+                else:
+                    i += len(hit)
+            if not ok:
+                brk, brk_value = i, start
+                break
+            if not stack:
+                a.root_scalar = True
+            else:
+                stack[-1].scalar_inside = True
+                attach(None)
+            if m["scalar_depth"] and len(stack) + 1 > m["bound"]:
+                viol.append(("nesting_too_deep", off(start)))
+            state = after()
+        elif state in ("obj_first", "obj_name"):
+            if c == ord("}") and state == "obj_first":
+                stack.pop()
+                i += 1
+                state = after()
+                continue
+            if c != 0x22:
+                brk = i
+                break
+            name_off = off(i)
+            ok, j, key, raw, esc, lit = read_string(i, "name")
+            if not ok:
+                brk = j
+                break
+            node = stack[-1]
+            for lone in a.lone:
+                if lone["where"] == "name" and lone["name_ref"] is None:
+                    lone["name_ref"], lone["node"] = key, node
+            if m["raw_compare"]:
+                key = raw
+            elif m["nfc"]:
+                key = tuple(map(ord, unicodedata.normalize("NFC", text_of(key))))
+            nm = Name(key, raw, name_off, esc, lit)
+            first = next((x for x in node.names if x.key == key), None)
+            if first is not None:
+                a.dups.append((node, first, nm))
+                if m["dup"]:
+                    viol.append(("duplicate_member", name_off))
+                else:
+                    node.names.remove(first)
+            node.names.append(nm)
+            pending[0] = key
+            i = skip(j)
+            if i >= n or cps[i] != ord(":"):
+                brk = i
+                break
+            i += 1
+            state = "value"
+        elif state == "obj_next":
+            if c == ord(","):
+                state = "obj_name"
+            elif c == ord("}"):
+                stack.pop()
+                state = None
+            else:
+                brk = i
+                break
+            i += 1
+            if state is None:
+                state = after()
+        elif state == "arr_first":
+            if c == ord("]"):
+                stack.pop()
+                i += 1
+                state = after()
+            else:
+                state = "value"
+        elif state == "arr_next":
+            if c == ord(","):
+                state = "value"
+            elif c == ord("]"):
+                stack.pop()
+                state = None
+            else:
+                brk = i
+                break
+            i += 1
+            if state is None:
+                state = after()
+
+    a.brk = brk
+    a.brk_value_text = None
+    a.value_end = None
+    a.trailing = None
+    a.trail_ws: set = set()
+    if brk is not None:
+        viol.append(("malformed_json", off(brk)))
+        if brk_value is not None:
+            a.brk_value_text = "".join(chr(x) for x in cps[brk_value:brk_value + 16] if x >= 0)
+        if m["surrogates_past_break"] and loose_lone(cps, brk):
+            viol.append(("invalid_unicode", off(brk)))
+    else:
+        a.value_end = off(i)
+        j = skip(i)
+        a.trail_ws = set(cps[i:j])
+        if j < n:
+            a.trailing = j
+            viol.append(("trailing_data", off(j)))
+            level = 0
+            for x in cps[j:]:
+                level += (x in (0x5B, 0x7B)) - (x in (0x5D, 0x7D))
+                a.trailing_depth = max(a.trailing_depth, level)
+            if m["trailing_depth"] and a.trailing_depth > m["bound"]:
+                viol.append(("nesting_too_deep", off(j)))
+            if m["trailing_surrogates"] and loose_lone(cps, j):
+                viol.append(("invalid_unicode", off(j)))
+    for eo, _ in utf8_errors:
+        if m["utf8_first_value_only"] and a.value_end is not None and eo >= a.value_end:
+            continue
+        viol.append(("invalid_unicode", eo))
+
+    # The closed-fold row, over every object the scan reached.
+    all_defined = {d for names in defined.values() for d in names}
+    for node in a.objects:
+        own = defined.get(node.pointer, []) if isinstance(defined, dict) else []
+        dset = all_defined if m["defined_global"] else set(own)
+        names = node.names
+        for x in range(len(names)):
+            for y in range(x):
+                p, q = names[y], names[x]
+                if p.key != q.key and fold(p.key, m) == fold(q.key, m):
+                    a.cases.append((node, p, q))
+                    if m["case_between_names"]:
+                        viol.append(("case_variant_member", q.off))
+            for d in sorted(dset):
+                dk = tuple(map(ord, d))
+                if names[x].key != dk and fold(names[x].key, m) == fold(dk, m):
+                    a.cases.append((node, names[x], d))
+                    if m["case_against_defined"]:
+                        viol.append(("case_variant_member", names[x].off))
+
+    a.violations = viol
+    a.reasons = {r for r, _ in viol}
+    if not viol:
+        a.outcome = "accept"
+    elif m["precedence"] == "position":
+        a.outcome = min(viol, key=lambda v: (v[1], m["reasons"].index(v[0])))[0]
+    else:
+        a.outcome = min(viol, key=lambda v: m["reasons"].index(v[0]))[0]
+    return a
+
+
+def resolve(a: Assessment, pointer: str) -> Any:
+    if pointer == "":
+        return a.root
+    if not pointer.startswith("/"):
+        raise ValueError("does not start with /")
+    node = a.root
+    for raw in pointer[1:].split("/"):
+        if re.search(r"~[^01]|~$", raw):
+            raise ValueError(f"bad escape in {raw!r}")
+        s = raw.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, Node):
+            raise ValueError(f"steps through a scalar at {s!r}")  # noqa: TRY004 - one refusal type
+        if node.kind == "obj":
+            hits = [child for key, child in node.children if text_of(key) == s]
+            if len(hits) != 1:
+                raise ValueError(f"names {len(hits)} members {s!r}")
+            node = hits[0]
+        else:
+            if not re.fullmatch(r"0|[1-9][0-9]*", s) or int(s) >= len(node.children):
+                raise ValueError(f"no element {s!r}")
+            node = node.children[int(s)][1]
+    return node
+
+
+# --- corpus checks ------------------------------------------------------------------------
+
+CASE_KEYS = {"name", "description", "payload_hex", "payload_text", "defined_members", "expected"}
+
+
+def refuse_duplicates(pairs: list[tuple[str, Any]]) -> dict:
+    out: dict = {}
+    for k, v in pairs:
+        if k in out:
+            raise ValueError(f"duplicate key {k!r}")
+        out[k] = v
+    return out
+
+
+def check(corpus: dict, m: dict) -> tuple[list[str], dict[str, Assessment]]:
+    problems: list[str] = []
+    done: dict[str, Assessment] = {}
+    if corpus.get("contract") != "gateway-api/v2.md" or corpus.get("section") != SECTION:
+        problems.append("corpus header: contract or section does not name this rule")
+    if corpus.get("reasons") != m["reasons"]:
+        problems.append(f"corpus reasons {corpus.get('reasons')} differ from the table {m['reasons']}")
+    conv = corpus.get("conventions", {}).get("payload_text", "")
+    lm = re.search(r"longer than (\d+) bytes", conv)
+    limit = int(lm.group(1)) if lm else None
+    if limit is None:
+        problems.append("corpus conventions: payload_text length limit unstated")
+    names = [c.get("name") for c in corpus.get("cases", [])]
+    if len(set(names)) != len(names):
+        problems.append("corpus: case names repeat")
+    for case in corpus.get("cases", []):
+        name = case.get("name", "?")
+        if set(case) != CASE_KEYS:
+            problems.append(f"{name}: keys {sorted(case)} are not {sorted(CASE_KEYS)}")
+            continue
+        hexs = case["payload_hex"]
+        if not isinstance(hexs, str) or not re.fullmatch(r"(?:[0-9a-f]{2})*", hexs):
+            problems.append(f"{name}: payload_hex is not lowercase hex")
+            continue
+        data = bytes.fromhex(hexs)
+        cps, _, errs = decode_utf8(data, DEFAULTS)
+        text = None if errs else "".join(map(chr, cps))
+        want_null = text is None or (limit is not None and len(data) > limit)
+        pt = case["payload_text"]
+        if want_null and pt is not None:
+            problems.append(f"{name}: payload_text should be null")
+        elif not want_null and pt != text:
+            problems.append(f"{name}: payload_text differs from the payload bytes as UTF-8")
+        defined = case["defined_members"]
+        if not isinstance(defined, dict) or not all(
+                isinstance(v, list) and all(isinstance(s, str) for s in v) and len(set(v)) == len(v)
+                for v in defined.values()):
+            problems.append(f"{name}: defined_members is not pointer -> distinct names")
+            continue
+        for ptr, members in defined.items():
+            if any(not s.isascii() for s in members):
+                problems.append(f"{name}: defined member at {ptr!r} is not ASCII")
+        if case["expected"] not in m["reasons"] + ["accept"]:
+            problems.append(f"{name}: expected {case['expected']!r} is no reason in the table")
+        a = assess(data, defined, m)
+        done[name] = a
+        if a.outcome != case["expected"]:
+            problems.append(f"{name}: outcome: corpus expects {case['expected']}, model gives "
+                            f"{a.outcome} (rows applying: {sorted(a.reasons)})")
+        if a.root is None and not a.root_scalar:
+            continue
+        for ptr in defined:
+            try:
+                target = resolve(a, ptr)
+            except ValueError as error:
+                problems.append(f"{name}: pointer {ptr!r} {error}")
+                continue
+            if not (isinstance(target, Node) and target.kind == "obj"):
+                problems.append(f"{name}: pointer {ptr!r} does not name an object")
+    return problems, done
+
+
+# --- coverage ------------------------------------------------------------------------------
+
+UFOLDS = (str.casefold, str.lower, str.upper)
+
+
+def properties(m: dict) -> list[tuple[str, Callable[[dict, Assessment], bool]]]:
+    R = m["reasons"]
+    inv, mal, deep, trail, dup, var = (
+        "invalid_unicode", "malformed_json", "nesting_too_deep", "trailing_data",
+        "duplicate_member", "case_variant_member")
+    props: list[tuple[str, Callable[[dict, Assessment], bool]]] = []
+
+    def p(label: str, fn: Callable[[dict, Assessment], bool]) -> None:
+        props.append((label, fn))
+
+    def exp(c: dict, r: str) -> bool:
+        return c["expected"] == r
+
+    for r in R + ["accept"]:
+        p(f"expected {r}", lambda c, a, r=r: exp(c, r))
+
+    def dup_where(c: dict, a: Assessment, test: Callable[[Node], bool]) -> bool:
+        return exp(c, dup) and a.reasons == {dup} and any(test(n) for n, _, _ in a.dups)
+
+    p("duplicate in the top-level object", lambda c, a: dup_where(c, a, lambda n: n.depth == 1))
+    p("duplicate in a nested object outside arrays",
+      lambda c, a: dup_where(c, a, lambda n: n.depth > 1 and not n.in_array))
+    p("duplicate inside an array element", lambda c, a: dup_where(c, a, lambda n: n.in_array))
+    p("duplicate spelled with an escape",
+      lambda c, a: exp(c, dup) and any(x.raw != y.raw for _, x, y in a.dups))
+    p("duplicate of a non-BMP name, pair escape against literal",
+      lambda c, a: exp(c, dup) and any(x.raw != y.raw and any(k > 0xFFFF for k in x.key)
+                                       for _, x, y in a.dups))
+
+    def names_of(a: Assessment, pair: tuple) -> list[Name]:
+        return [v for v in pair[1:] if isinstance(v, Name)]
+
+    for cp in m["fold_extra"]:
+        for how in ("lit", "esc"):
+            p(f"U+{cp:04X} refused as a case variant ({'literal' if how == 'lit' else 'escaped'})",
+              lambda c, a, cp=cp, how=how: exp(c, var) and a.reasons == {var} and any(
+                  cp in getattr(nm, how) for pair in a.cases for nm in names_of(a, pair)))
+    for cp in m["exact"]:
+        for how in ("lit", "esc"):
+            p(f"U+{cp:04X} accepted ({'literal' if how == 'lit' else 'escaped'})",
+              lambda c, a, cp=cp, how=how: exp(c, "accept") and any(
+                  cp in getattr(nm, how) for node in a.objects for nm in node.names))
+
+    def trap(c: dict, a: Assessment, how: str) -> bool:
+        if not exp(c, "accept"):
+            return False
+        for node in a.objects:
+            others = [(nm.key, nm) for nm in node.names] + [
+                (tuple(map(ord, d)), None) for d in c["defined_members"].get(node.pointer, [])]
+            for nm in node.names:
+                for key, other in others:
+                    if other is nm or key == nm.key:
+                        continue
+                    s, t = text_of(nm.key), text_of(key)
+                    if not any(f(s) == f(t) for f in UFOLDS):
+                        continue
+                    non_ascii = {k for k in nm.key if k >= 0x80}
+                    pool = nm.esc if how == "esc" else nm.lit
+                    if non_ascii and non_ascii <= pool:
+                        return True
+        return False
+
+    p("a Unicode-fold collision accepted (literal)", lambda c, a: trap(c, a, "lit"))
+    p("a Unicode-fold collision accepted (escaped)", lambda c, a: trap(c, a, "esc"))
+
+    def var_only(c: dict, a: Assessment) -> bool:
+        return exp(c, var) and a.reasons == {var}
+
+    p("case variant against a defined member, exact absent",
+      lambda c, a: var_only(c, a) and any(
+          isinstance(o, str) and all(nm.key != tuple(map(ord, o)) for nm in n.names)
+          and not any(isinstance(o2, Name) and n2 is n for n2, _, o2 in a.cases)
+          for n, _, o in a.cases))
+    p("case variant with the exact defined member present",
+      lambda c, a: var_only(c, a) and any(
+          isinstance(o, Name) and text_of(x.key) in c["defined_members"].get(n.pointer, [])
+          for n, x, o in a.cases))
+    p("case variant between two names of an object with no defined members",
+      lambda c, a: var_only(c, a) and any(
+          isinstance(o, Name) and not c["defined_members"].get(n.pointer) for n, _, o in a.cases))
+    p("a folding name accepted in an object with no defined members",
+      lambda c, a: exp(c, "accept") and any(
+          not c["defined_members"].get(n.pointer) and any(fold(nm.key, m) != nm.key
+                                                          for nm in n.names)
+          for n in a.objects))
+    p("a variant of a member defined only in another object accepted",
+      lambda c, a: exp(c, "accept") and any(
+          nm.key != tuple(map(ord, d)) and fold(nm.key, m) == fold(tuple(map(ord, d)), m)
+          for n in a.objects for nm in n.names
+          for ptr, ds in c["defined_members"].items() if ptr != n.pointer for d in ds))
+    p("case variant inside an array element",
+      lambda c, a: var_only(c, a) and any(n.in_array for n, _, _ in a.cases))
+    p("case variant spelled with an escaped capital",
+      lambda c, a: var_only(c, a) and any(
+          any(0x41 <= k <= 0x5A for k in nm.esc) for pair in a.cases for nm in names_of(a, pair)))
+
+    b = m["bound"]
+    p("depth exactly at the bound accepted", lambda c, a: exp(c, "accept") and a.max_depth == b)
+    p("depth one past the bound refused",
+      lambda c, a: exp(c, deep) and a.reasons == {deep} and a.max_depth == b + 1)
+    p("a scalar inside the innermost of bound containers accepted",
+      lambda c, a: exp(c, "accept") and a.max_depth == b and any(
+          n.scalar_inside and n.depth == b for n in _all_nodes(a)))
+    p("an object past the bound", lambda c, a: exp(c, deep) and a.deep_kind == "obj")
+    p("an array past the bound", lambda c, a: exp(c, deep) and a.deep_kind == "arr")
+    p("an over-deep empty object innermost",
+      lambda c, a: exp(c, deep) and any(n.kind == "obj" and n.depth == b + 1 and not n.names
+                                        for n in a.objects))
+
+    for tok in m["nonvalues"]:
+        p(f"`{tok}` refused as malformed",
+          lambda c, a, tok=tok: exp(c, mal) and (a.brk_value_text or "").startswith(tok))
+    p("empty payload malformed", lambda c, a: exp(c, mal) and not a.cps)
+    p("whitespace-only payload malformed",
+      lambda c, a: exp(c, mal) and a.cps and all(x in m["ws"] for x in a.cps))
+    p("a payload that ends early",
+      lambda c, a: exp(c, mal) and a.reasons == {mal} and a.brk == len(a.cps) and bool(a.cps)
+      and not all(x in m["ws"] for x in a.cps))
+    p("every whitespace character before and after the value accepted",
+      lambda c, a: exp(c, "accept") and m["ws"] <= a.lead and m["ws"] <= a.trail_ws)
+    p("a byte order mark before the value refused", lambda c, a: exp(c, mal) and a.cps[:1] == [0xFEFF])
+    p("a form feed after the value refused",
+      lambda c, a: exp(c, trail) and a.trailing is not None and a.cps[a.trailing] == 0x0C)
+    p("a second value after the first refused",
+      lambda c, a: exp(c, trail) and a.trailing is not None and a.cps[a.trailing] in (0x7B, 0x5B))
+    p("trailing data holding a lone surrogate escape, judged as trailing",
+      lambda c, a: exp(c, trail) and a.reasons == {trail} and loose_lone(a.cps, a.trailing))
+    p("depth past the bound after the first value, judged as trailing",
+      lambda c, a: exp(c, trail) and a.reasons == {trail} and a.trailing_depth > b)
+    p("an escape cut short, refused as malformed",
+      lambda c, a: exp(c, mal) and a.reasons == {mal} and a.cut_escape)
+    p("a cut-short escape spelling a high surrogate, refused as malformed",
+      lambda c, a: exp(c, mal) and a.reasons == {mal} and a.cut_surrogate)
+    p("a lone surrogate after a grammar break, not judged",
+      lambda c, a: exp(c, mal) and a.brk is not None and loose_lone(a.cps, a.brk))
+    p(f"the out-of-range number `{m['big_number']}` accepted",
+      lambda c, a: exp(c, "accept") and m["big_number"] in a.numbers)
+    p("names equal only under normalisation accepted",
+      lambda c, a: exp(c, "accept") and any(
+          x.key != y.key and unicodedata.normalize("NFC", text_of(x.key))
+          == unicodedata.normalize("NFC", text_of(y.key))
+          for n in a.objects for x in n.names for y in n.names))
+    p("a top-level scalar accepted", lambda c, a: exp(c, "accept") and a.root_scalar)
+
+    for kind in ("invalid_byte", "overlong", "surrogate", "above_range", "truncated"):
+        p(f"UTF-8 error: {kind}",
+          lambda c, a, kind=kind: exp(c, inv) and a.utf8_errors[:1] != []
+          and a.utf8_errors[0][1] == kind)
+    p("invalid UTF-8 after the first value",
+      lambda c, a: exp(c, inv) and a.value_end is not None
+      and any(o >= a.value_end for o, _ in a.utf8_errors))
+    p("invalid UTF-8 in a name",
+      lambda c, a: exp(c, inv) and any(-1 in nm.lit for n in a.objects for nm in n.names))
+
+    def lone(c: dict, a: Assessment, test: Callable[[dict], bool]) -> bool:
+        return exp(c, inv) and any(test(x) for x in a.lone)
+
+    p("lone high escape before the closing quote",
+      lambda c, a: lone(c, a, lambda x: x["unit"] <= 0xDBFF and x["next"][:1] == (0x22,)))
+    p("lone low escape", lambda c, a: lone(c, a, lambda x: x["unit"] >= 0xDC00))
+    p("misordered pair",
+      lambda c, a: lone(c, a, lambda x: x["unit"] >= 0xDC00 and x["next"] == (0x5C, ord("u"))))
+    p("upper-case hex lone escape", lambda c, a: lone(c, a, lambda x: x["upper"]))
+    p("high escape followed by a non-low escape",
+      lambda c, a: lone(c, a, lambda x: x["unit"] <= 0xDBFF and x["next"] == (0x5C, ord("u"))))
+    p("high escape followed by an escaped backslash",
+      lambda c, a: lone(c, a, lambda x: x["unit"] <= 0xDBFF and x["next"] == (0x5C, 0x5C)))
+    p("high escape followed by a plain character",
+      lambda c, a: lone(c, a, lambda x: x["unit"] <= 0xDBFF and x["next"][:1] != ()
+                        and x["next"][0] not in (0x22, 0x5C)))
+    p("lone surrogate in a name", lambda c, a: lone(c, a, lambda x: x["where"] == "name"))
+    p("payload stops after an unpaired escape",
+      lambda c, a: exp(c, inv) and a.brk == len(a.cps) and bool(a.lone) and a.reasons == {inv, mal})
+
+    def in_dup(c: dict, a: Assessment, where: str) -> bool:
+        if not (exp(c, inv) and dup in a.reasons):
+            return False
+        dup_keys = {(id(n), y.key) for n, _, y in a.dups}
+        for x in a.lone:
+            key = x["name_ref"] if where == "name" else x["member"]
+            if x["where"] == where and x["node"] is not None and (id(x["node"]), key) in dup_keys:
+                return True
+        return False
+
+    p("lone surrogate in a duplicated member's name", lambda c, a: in_dup(c, a, "name"))
+    p("lone surrogate in a duplicated member's value", lambda c, a: in_dup(c, a, "value"))
+
+    for i, ri in enumerate(R):
+        for rj in R[i + 1:]:
+            if {ri, rj} == {mal, trail}:
+                continue  # trailing data needs a complete value; malformed has none
+            p(f"precedence: {ri} over {rj}",
+              lambda c, a, ri=ri, rj=rj: exp(c, ri) and {ri, rj} <= a.reasons)
+    p("precedence against position: a later row's violation sits first",
+      lambda c, a: len(a.reasons) > 1 and min(a.violations, key=lambda v: v[1])[0] != c["expected"])
+    return props
+
+
+def _all_nodes(a: Assessment) -> list[Node]:
+    out, todo = [], [a.root] if isinstance(a.root, Node) else []
+    while todo:
+        n = todo.pop()
+        out.append(n)
+        todo.extend(ch for _, ch in n.children if isinstance(ch, Node))
+    return out
+
+
+def coverage(corpus: dict, done: dict[str, Assessment], m: dict) -> dict[str, list[str]]:
+    cases = [c for c in corpus.get("cases", []) if c.get("name") in done]
+    return {label: [c["name"] for c in cases if fn(c, done[c["name"]])]
+            for label, fn in properties(m)}
+
+
+def problems_of(corpus_bytes: bytes, m: dict) -> list[str]:
+    try:
+        corpus = json.loads(corpus_bytes, object_pairs_hook=refuse_duplicates)
+    except ValueError as error:
+        return [f"corpus does not load: {error}"]
+    found, done = check(corpus, m)
+    found += [f"not covered: {label}" for label, who in coverage(corpus, done, m).items() if not who]
+    return found
+
+
+# --- mutations --------------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[int, int, int, int]:
+    base = json.loads(corpus_bytes, object_pairs_hook=refuse_duplicates)
+    before = set(baseline)
+    text0 = GATEWAY_V2.read_text()
+
+    def new(problems: list[str]) -> set[str]:
+        return set(problems) - before
+
+    def run_corpus(edit: Callable[[dict], None]) -> list[str]:
+        mutated = copy.deepcopy(base)
+        edit(mutated)
+        return problems_of(json.dumps(mutated, ensure_ascii=False, indent=2).encode(), model)
+
+    def corpus_mutant(edit: Callable[[dict], None], expect: str) -> Callable[[], bool]:
+        return lambda: any(expect in p for p in new(run_corpus(edit)))
+
+    def bytes_mutant(edit: Callable[[bytes], bytes], expect: str) -> Callable[[], bool]:
+        return lambda: any(expect in p for p in new(problems_of(edit(corpus_bytes), model)))
+
+    def model_mutant(expect: str, **changes: Any) -> Callable[[], bool]:
+        return lambda: any(expect in p for p in new(problems_of(corpus_bytes, {**model, **changes})))
+
+    def text_mutant(old: str, new_text: str, expect: str, hold: bool = True) -> Callable[[], bool]:
+        def go() -> bool:
+            pattern = r"\s+".join(map(re.escape, old.split()))
+            if not re.search(pattern, text0):
+                raise AssertionError(f"mutant target missing: {old!r}")
+            try:
+                m = contract_model(re.sub(pattern, lambda _: new_text, text0, count=1), hold)
+            except Failure as failure:
+                return expect in str(failure)
+            return any(expect in p for p in new(problems_of(corpus_bytes, m)))
+        return go
+
+    def case(c: dict, name: str) -> dict:
+        return next(x for x in c["cases"] if x["name"] == name)
+
+    def set_(name: str, key: str, value: Any) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case(c, name)[key] = value
+        return edit
+
+    def payload(name: str, data: bytes) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            x = case(c, name)
+            x["payload_hex"] = data.hex()
+            x["payload_text"] = data.decode() if len(data) <= 400 else None
+        return edit
+
+    def first_with(test: Callable[[dict], bool]) -> str:
+        return next(c["name"] for c in base["cases"] if test(c))
+
+    accept = first_with(lambda c: c["expected"] == "accept" and c["defined_members"].get("/auth"))
+    text_case = first_with(lambda c: c["payload_text"] is not None and c["payload_text"])
+    at_bound = first_with(lambda c: c["expected"] == "accept"
+                          and bytes.fromhex(c["payload_hex"]).startswith(b"[[[[") and
+                          bytes.fromhex(c["payload_hex"]).count(b"[") == model["bound"])
+
+    hostile: list[tuple[str, Callable[[], bool]]] = []
+    for c in base["cases"]:
+        flipped = "accept" if c["expected"] != "accept" else "duplicate_member"
+        if c["expected"] in ("duplicate_member", "case_variant_member"):
+            flipped = ("case_variant_member" if c["expected"] == "duplicate_member"
+                       else "duplicate_member")
+        hostile.append((f"corpus: {c['name']} expects {flipped}",
+                        corpus_mutant(set_(c["name"], "expected", flipped), "outcome")))
+    hostile += [
+        ("corpus: one payload byte altered", corpus_mutant(
+            payload(at_bound, bytes.fromhex(case(base, at_bound)["payload_hex"]).replace(
+                b"[", b"[[", 1).replace(b"]", b"]]", 1)), "outcome")),
+        ("corpus: a byte appended", corpus_mutant(
+            payload(accept, bytes.fromhex(case(base, accept)["payload_hex"]) + b"x"), "outcome")),
+        ("corpus: payload_hex upper-case", corpus_mutant(
+            set_(accept, "payload_hex", case(base, accept)["payload_hex"].upper()), "payload_hex")),
+        ("corpus: payload_hex odd length", corpus_mutant(
+            set_(accept, "payload_hex", case(base, accept)["payload_hex"][:-1]), "payload_hex")),
+        ("corpus: payload_text desynchronised", corpus_mutant(
+            set_(text_case, "payload_text", case(base, text_case)["payload_text"] + " "),
+            "payload_text")),
+        ("corpus: payload_text nulled", corpus_mutant(set_(text_case, "payload_text", None),
+                                                      "payload_text")),
+        ("corpus: pointer renamed", corpus_mutant(
+            set_(accept, "defined_members", {**{k: v for k, v in case(base, accept)
+                                                ["defined_members"].items() if k != "/auth"},
+                                             "/auht": ["scheme"]}), "pointer")),
+        ("corpus: pointer to a scalar", corpus_mutant(
+            set_(accept, "defined_members", {"/status": ["x"]}), "pointer")),
+        ("corpus: pointer without a leading solidus", corpus_mutant(
+            set_(accept, "defined_members", {"auth": ["x"]}), "pointer")),
+        ("corpus: non-ASCII defined member", corpus_mutant(
+            set_(accept, "defined_members", {"": ["stätus"]}), "ASCII")),
+        ("corpus: expected names no reason", corpus_mutant(set_(accept, "expected", "refused"),
+                                                           "no reason in the table")),
+        ("corpus: an extra key", corpus_mutant(set_(accept, "note", "x"), "keys")),
+        ("corpus: reasons reordered", corpus_mutant(
+            lambda c: c.__setitem__("reasons", list(reversed(c["reasons"]))), "corpus reasons")),
+        ("corpus: a case name repeated", corpus_mutant(
+            lambda c: c["cases"].append(copy.deepcopy(c["cases"][0])), "names repeat")),
+        ("corpus: a duplicate key in the file", bytes_mutant(
+            lambda b: b.replace(b'"vector_set":', b'"vector_set": "x", "vector_set":', 1),
+            "duplicate key")),
+    ]
+    _, done = check(base, model)
+    for label, who in coverage(base, done, model).items():
+        if not who:
+            continue
+
+        def drop(c: dict, who: list[str] = who) -> None:
+            c["cases"] = [x for x in c["cases"] if x["name"] not in who]
+        hostile.append((f"corpus: drop cases covering {label}",
+                        corpus_mutant(drop, f"not covered: {label}")))
+
+    hostile += [
+        ("model: U+017F not folded", model_mutant(
+            "outcome", fold_extra={k: v for k, v in model["fold_extra"].items() if k != 0x17F})),
+        ("model: U+212A not folded", model_mutant(
+            "outcome", fold_extra={k: v for k, v in model["fold_extra"].items() if k != 0x212A})),
+        ("model: all of Unicode folded (casefold)", model_mutant("outcome", fold_mode="casefold")),
+        ("model: all of Unicode folded (lower)", model_mutant("outcome", fold_mode="lower")),
+        ("model: scalars count as depth", model_mutant("outcome", scalar_depth=True)),
+        ("model: the last duplicate wins", model_mutant("outcome", dup=False)),
+        ("model: form feed is whitespace", model_mutant("outcome", extra_ws=frozenset({0x0C}))),
+        ("model: BOM is whitespace", model_mutant("outcome", extra_ws=frozenset({0xFEFF}))),
+        ("model: NBSP is whitespace", model_mutant("outcome", extra_ws=frozenset({0xA0}))),
+        ("model: surrogates judged in trailing data",
+         model_mutant("outcome", trailing_surrogates=True)),
+        ("model: surrogates judged past a grammar break",
+         model_mutant("outcome", surrogates_past_break=True)),
+        ("model: depth refused at the bound", model_mutant("outcome", depth_ge=True)),
+        ("model: precedence by position", model_mutant("outcome", precedence="position")),
+        ("model: UTF-8 judged in the first value only",
+         model_mutant("outcome", utf8_first_value_only=True)),
+        ("model: encoded surrogates are UTF-8", model_mutant("outcome", encoded_surrogates_ok=True)),
+        ("model: overlong forms are UTF-8", model_mutant("outcome", overlong_ok=True)),
+        ("model: NaN and Infinity are values", model_mutant("outcome", nonvalues_ok=True)),
+        ("model: upper-case hex is not a surrogate escape",
+         model_mutant("outcome", surrogate_lower_hex_only=True)),
+        ("model: a misordered pair completes", model_mutant("outcome", misordered_ok=True)),
+        ("model: names compared before unescaping", model_mutant("outcome", raw_compare=True)),
+        ("model: names normalised to NFC", model_mutant("outcome", nfc=True)),
+        ("model: no test against defined members",
+         model_mutant("outcome", case_against_defined=False)),
+        ("model: no test between two names", model_mutant("outcome", case_between_names=False)),
+        ("model: defined members compared across objects",
+         model_mutant("outcome", defined_global=True)),
+        ("model: depth judged after the first value", model_mutant("outcome", trailing_depth=True)),
+        ("model: a cut-short escape is a lone surrogate",
+         model_mutant("outcome", cut_escape_lone=True)),
+        ("model: depth bound one higher", model_mutant("outcome", bound=model["bound"] + 1)),
+        ("model: case variant ahead of duplicate", model_mutant(
+            "outcome", reasons=[r for r in model["reasons"] if r != "case_variant_member"][:4]
+            + ["case_variant_member", "duplicate_member"])),
+        ("model: trailing data ahead of depth", model_mutant(
+            "outcome", reasons=["invalid_unicode", "malformed_json", "trailing_data",
+                                "nesting_too_deep", "duplicate_member", "case_variant_member"])),
+    ]
+
+    def both_31(hold: bool) -> bool:
+        t = text0.replace(depth_row, depth_row.replace("32", "31"), 1).replace(
+            "so thirty-two nested", "so thirty-one nested", 1)
+        try:
+            m = contract_model(t, hold)
+        except Failure as failure:
+            return hold and "contract sentence changed" in str(failure)
+        return any("outcome" in p for p in new(problems_of(corpus_bytes, m)))
+
+    depth_row = "| `nesting_too_deep` | An object or array sits deeper than 32, the top-level value at depth 1. |"
+    dup_row = next(line for line in text0.splitlines() if line.startswith("| `duplicate_member`"))
+    var_row = next(line for line in text0.splitlines() if line.startswith("| `case_variant_member`"))
+    trail_row = next(line for line in text0.splitlines() if line.startswith("| `trailing_data`"))
+    hostile += [
+        ("text: case_variant row dropped", text_mutant(var_row + "\n", "", "reasons table holds")),
+        ("text: duplicate and case_variant rows swapped",
+         text_mutant(dup_row + "\n" + var_row, var_row + "\n" + dup_row, "outcome")),
+        ("text: depth and trailing rows swapped",
+         text_mutant(depth_row + "\n" + trail_row, trail_row + "\n" + depth_row, "outcome")),
+        ("text: depth bound 31 in the table only",
+         text_mutant(depth_row, depth_row.replace("32", "31"), "no longer says")),
+        ("text: a row reworded", text_mutant("with no normalisation.", "with NFC normalisation.",
+                                             "reworded")),
+        ("text: a sentence inserted", text_mutant(
+            "Nothing else changes.", "Nothing else changes. A receiver may refuse more.",
+            "contract sentence changed: added")),
+        ("text: a sentence deleted", text_mutant(
+            "A completed pair is one scalar value.", "", "contract sentence changed: added []")),
+        ("text: two sentences reordered", text_mutant(
+            "Nothing else changes. A member whose name passes the rule and that a section does "
+            "not define stays tolerated wherever that section tolerates unknown members, so "
+            "additive compatibility holds.",
+            "A member whose name passes the rule and that a section does not define stays "
+            "tolerated wherever that section tolerates unknown members, so additive "
+            "compatibility holds. Nothing else changes.", "reordered")),
+        ("text: a sentence reworded", text_mutant(
+            "lone unless it completes such a pair", "lone unless it begins such a pair",
+            "contract sentence changed")),
+        ("text: precedence sentence reworded", text_mutant(
+            "the earliest row in the table names", "the first violation met names",
+            "contract sentence changed")),
+        ("text: surrogate scope changed", text_mutant(
+            "to the end of its first value", "to the end of the payload",
+            "contract sentence changed")),
+        ("text: cut-short escape sentence dropped", text_mutant(
+            "An escape cut short names no code unit and breaks the grammar.", "",
+            "contract sentence changed")),
+        ("text: depth-in-trailing sentence dropped", text_mutant(
+            "Depth is judged within the first value; whatever follows it is trailing data, "
+            "however deep.", "", "contract sentence changed")),
+    ]
+    # Prose the model reads: each edit must fail the sentence hold, and, with the hold
+    # lifted, must still fail through the reading it changes.
+    read_edits = [
+        ("depth bound 31 in table and term", None, None, None),
+        ("Kelvin entry folds to x", "U+212A KELVIN SIGN to `k`", "U+212A KELVIN SIGN to `x`",
+         "outcome"),
+        ("long-s entry removed", "U+017F LATIN SMALL LETTER LONG S to `s`,", "", "no longer says"),
+        ("fold entry names the wrong character", "U+212A KELVIN SIGN", "U+212B KELVIN SIGN",
+         "not its name"),
+        ("fold covers capitals no more", "each ASCII capital letter to its small letter",
+         "each ASCII letter to itself", "closed fold definition is reworded"),
+        ("form feed added to whitespace",
+         "four characters: space, horizontal tab, line feed and carriage return",
+         "five characters: space, horizontal tab, form feed, line feed and carriage return",
+         "outside this script's reviewed set"),
+        ("whitespace count disagrees", "four characters: space", "three characters: space",
+         "whitespace says"),
+        ("exact-compare sentence changed", "therefore compare exactly", "therefore fold",
+         "exact-compare list is reworded"),
+        ("depth term disagrees with the table", "so thirty-two nested", "so thirty-one nested",
+         "no longer says"),
+    ]
+    for label, old, new_text, expect in read_edits:
+        if old is None:
+            hostile.append((f"text: {label} [held]", lambda: both_31(True)))
+            hostile.append((f"text: {label} [hold lifted]", lambda: both_31(False)))
+            continue
+        hostile.append((f"text: {label} [held]",
+                        text_mutant(old, new_text, "contract sentence changed")))
+        hostile.append((f"text: {label} [hold lifted]",
+                        text_mutant(old, new_text, expect, hold=False)))
+
+    permitted: list[tuple[str, Callable[[], bool]]] = []
+
+    def quiet(problems: list[str]) -> bool:
+        return not new(problems)
+
+    def perm_corpus(edit: Callable[[dict], None]) -> Callable[[], bool]:
+        return lambda: quiet(run_corpus(edit))
+
+    def perm_text(old: str, new_text: str) -> Callable[[], bool]:
+        def go() -> bool:
+            if old not in text0:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            return quiet(problems_of(corpus_bytes, contract_model(text0.replace(old, new_text, 1))))
+        return go
+
+    def reorder_keys(c: dict) -> None:
+        c["cases"] = [dict(reversed(list(x.items()))) for x in c["cases"]]
+
+    def reorder_pointers(c: dict) -> None:
+        for x in c["cases"]:
+            x["defined_members"] = dict(reversed(list(x["defined_members"].items())))
+
+    def add_case(c: dict) -> None:
+        data = b'{"b":1,"B2":[{"Z":null}]}'
+        c["cases"].append({"name": "extra", "description": "x", "payload_hex": data.hex(),
+                           "payload_text": data.decode(), "defined_members": {}, "expected": "accept"})
+
+    def rename(c: dict) -> None:
+        for k, x in enumerate(c["cases"]):
+            x["name"] = f"case_{k:03d}_{x['expected']}"
+
+    permitted += [
+        ("corpus: cases reversed", perm_corpus(lambda c: c["cases"].reverse())),
+        ("corpus: a description reworded", perm_corpus(set_(accept, "description", "Reworded."))),
+        ("corpus: re-indented", lambda: quiet(problems_of(
+            json.dumps(base, indent=7).encode(), model))),
+        ("corpus: compact", lambda: quiet(problems_of(
+            json.dumps(base, separators=(",", ":")).encode(), model))),
+        ("corpus: keys reordered in every case", perm_corpus(reorder_keys)),
+        ("corpus: pointers reordered", perm_corpus(reorder_pointers)),
+        ("corpus: cases renamed (misleadingly)", perm_corpus(rename)),
+        ("corpus: a correct case added", perm_corpus(add_case)),
+        ("text: a paragraph reflowed", perm_text(
+            "give one signature two\nmeanings.", "give\none   signature two meanings.")),
+        ("text: a term reflowed", perm_text(
+            "is lone unless the\n  next six characters", "is lone unless\n  the next six characters")),
+        ("text: the fold bullet reflowed", perm_text(
+            "U+017F LATIN SMALL LETTER LONG S to `s`,\n  U+212A",
+            "U+017F LATIN SMALL\n  LETTER LONG S to `s`, U+212A")),
+    ]
+
+    survived = 0
+    for name, go in hostile:
+        try:
+            ok = go()
+        except (Failure, AssertionError, KeyError, TypeError, ValueError, StopIteration,
+                IndexError) as error:
+            ok = False
+            name += f" (raised {type(error).__name__}: {error})"
+        if not ok:
+            survived += 1
+            print(f"  hostile survived: {name}")
+    failed = 0
+    for name, go in permitted:
+        try:
+            ok = go()
+        except (Failure, AssertionError, KeyError, TypeError, ValueError, StopIteration,
+                IndexError) as error:
+            ok = False
+            name += f" (raised {type(error).__name__}: {error})"
+        if not ok:
+            failed += 1
+            print(f"  permitted refused: {name}")
+    return len(hostile), survived, len(permitted), failed
+
+
+NOT_PROVED = ("not proved: that the defined_members lists match each payload family's section, "
+              "that a gateway or runtime receiver implements this rule, or how a refused payload "
+              "is recorded")
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        model = contract_model()
+    except Failure as failure:
+        print(f"gateway-api/v2 payload members contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    problems = problems_of(corpus_bytes, model)
+    status = 0
+    if problems:
+        print(f"gateway-api/v2 payload members corpus: {len(problems)} problem(s):\n  "
+              + "\n  ".join(problems))
+        status = 1
+    else:
+        count = len(json.loads(corpus_bytes)["cases"])
+        print(f"gateway-api/v2 payload members corpus: {count} cases held, recomputed from "
+              f"gateway-api/v2; {NOT_PROVED}")
+    if argv == ["--mutations"]:
+        hostile, survived, permitted, failed = mutations(corpus_bytes, model, problems)
+        print(f"{hostile - survived} of {hostile} hostile mutants refused for their intended "
+              f"reason; {permitted - failed} of {permitted} permitted mutants passed")
+        if survived or failed:
+            status = 1
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

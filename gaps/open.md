@@ -677,3 +677,15 @@ accurate description of what a repo implements.
   literal in `device/main/app_main.c`, and both `boards/` profile directories
   are empty. The bench value is annotated as unconfirmed by a terminal-state
   table, which is honest and is not a substitute for one.
+
+## gateway-api/v2 implementation targets
+
+- **Neither side enforces the payload member rule yet**
+  ([gateway-api/v2.md](../gateway-api/v2.md#payload-member-rule)): several of
+  the gateway's decoders match member names without regard to case, U+017F and
+  U+212A included, and keep the last of a duplicated name, and the runtime
+  keeps the last duplicate on its gateway envelope and inbound evidence paths
+  while refusing duplicates on some other paths through local hooks. Both
+  adopt the rule and vendor its corpus, `ori-runtime` on every gateway path and
+  `ori-gateway` on every decoder, through the shared canonical JSON library in
+  `ori-canonicaljson`.
