@@ -1360,15 +1360,18 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     f"hunk {digest[:12]} is classified semantic, so it belongs to "
                                     f"{h.get('destination')} and may not remain in this frozen version"))
         elif h["classification"] == "erratum":
-            for ref in absent_references(key[0], added_lines.get(digest, ""), str(ba["freeze_revision"])):
+            for ref in absent_references(key[0], key[1], added_lines.get(digest, ""), str(ba["freeze_revision"])):
                 findings.append(Finding(
                     "erratum-imports-later-document", where,
-                    f"hunk {digest[:12]} is recorded erratum but names {ref}, which does not exist at the freeze "
-                    f"revision {ba['freeze_revision']}. An erratum changes nothing a conforming party does, and a "
-                    "document the version froze without can only add to that, so the hunk is semantic and moves to a "
-                    "successor. A later version of this contract is exempt, so a frozen version may point at its own "
-                    "successor. The check reads Markdown link targets and backticked .md paths in the hunk's added "
-                    "lines only, and not additive hunks: a document named in prose without a path passes it"))
+                    f"hunk {digest[:12]} is recorded erratum but points at {ref}, which the freeze revision "
+                    f"{ba['freeze_revision']} does not have. An erratum changes nothing a conforming party does, and a "
+                    "file or section the version froze without can only add to that, so the hunk is semantic and "
+                    "moves to a successor. Limits: it reads link targets of every form and backticked paths into "
+                    "this repository in the hunk's added lines, but not a document named in prose, not a path that "
+                    "leaves the repository, not additive "
+                    "hunks, and not a rule added later inside a section that existed at the freeze revision; and a "
+                    "later version of this contract is exempt, so an erratum may point at its successor and, through "
+                    "that pointer, at that successor's rules"))
     for h in ba["hunks"]:
         if h["classification"] == "semantic" and not (root / f"{h.get('destination')}.md").is_file():
             findings.append(Finding("semantic-destination-missing", where,
@@ -1376,21 +1379,74 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     "does not exist"))
 
 
-_DOC_REFERENCE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)\s]*)?\)|`([A-Za-z0-9_./-]+\.md)`")
+# Every form a hunk can point at a file with: inline links and images (with an optional title or angle brackets),
+# reference definitions, HTML href and src, and backticked paths.
+_LINK_INLINE = re.compile(r"\]\(\s*<?([^)\s>]+)>?(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
+_LINK_DEFINITION = re.compile(r"^ {0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)", re.M)
+_LINK_HTML = re.compile(r"(?:href|src)\s*=\s*[\"']([^\"']+)[\"']", re.I)
+_TICKED = re.compile(r"`([^`\s]+)`")
+# A bare backticked name is read as a file only with one of these extensions; config keys and versions carry dots.
+_DOC_FILE = re.compile(r"\.(?:md|json|ya?ml|txt|csv)$", re.I)
 
 
-def absent_references(contract: str, added: str, revision: str) -> list[str]:
-    """Repository paths of the Markdown documents an audited hunk names that do not exist at the revision.
+def _github_slugs(text: str) -> set[str]:
+    out, seen, fenced = set(), {}, False
+    for line in text.split("\n"):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+            continue
+        m = None if fenced else re.match(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
+        if m:
+            slug = re.sub(r"[^\w\- ]", "", m.group(2).lower()).replace(" ", "-")
+            n = seen.get(slug, 0)
+            seen[slug] = n + 1
+            out.add(slug if n == 0 else f"{slug}-{n}")
+    return out
 
-    A link target resolves against the contract's directory and a backticked path against the repository root,
-    as the contracts write them. Only those two forms are read; a document named in prose is not."""
-    out = []
-    for link, tick in _DOC_REFERENCE.findall(added):
-        path = posixpath.normpath(posixpath.join(contract, link)) if link else posixpath.normpath(tick)
-        if path.startswith("..") or path in out or (path.startswith(f"{contract}/") and is_version_document(contract, path)):
+
+def absent_references(contract: str, version: str, added: str, revision: str) -> list[str]:
+    """What an audited hunk points at that the freeze revision does not have: a repository path absent there, or a
+    path#anchor whose heading the document did not have there.
+
+    Links resolve against the contract's directory. A backticked token is read as a path when it names a file in
+    this repository: a bare name with a document extension (.md, .json, .yaml, .txt, .csv) or a ./ or ../ path
+    resolves against the contract's directory, a path whose first segment is a top-level directory here, or that has
+    a contract version's shape, against the root. Anything else in backticks (another repository's source path, an
+    identifier) and any URL with a scheme is not read. A later version of the same contract is exempt, so a frozen
+    version may point at its successor."""
+    own = f"{contract}/{version}.md"
+    tops = {p.name for p in ROOT.iterdir() if not p.name.startswith(".")}
+    targets: list[tuple[str, str]] = []  # (raw target, base)
+    for rx in (_LINK_INLINE, _LINK_DEFINITION, _LINK_HTML):
+        targets += [(m, "contract") for m in rx.findall(added)]
+    for tok in _TICKED.findall(added):
+        head = tok.split("#", 1)[0]
+        if not head or re.match(r"^[a-z][a-z0-9+.-]*:", head, re.I):
+            continue
+        if head.startswith(("./", "../")) or ("/" not in head and _DOC_FILE.search(head)):
+            targets.append((tok, "contract"))
+        elif "/" in head and (head.split("/", 1)[0] in tops or re.fullmatch(r"[a-z0-9-]+/v[1-9][0-9]*\.md", head)):
+            targets.append((tok, "root"))
+    out: list[str] = []
+    for raw, base in targets:
+        if re.match(r"^[a-z][a-z0-9+.-]*:", raw, re.I) or raw.startswith("//"):
+            continue
+        target, _, anchor = raw.partition("#")
+        path = own if not target else posixpath.normpath(
+            posixpath.join(contract, target) if base == "contract" else target)
+        if path.startswith("../") or path == "..":
+            continue
+        if path != own and path.startswith(f"{contract}/") and is_version_document(contract, path):
+            continue
+        label = f"{path}#{anchor}" if anchor else path
+        if label in out:
             continue
         if _git_out(ROOT, "cat-file", "-e", f"{revision}:{path}") is None:
             out.append(path)
+        elif anchor and path.lower().endswith(".md"):
+            at = _git_out(ROOT, "show", f"{revision}:{path}")
+            if at is not None and anchor not in _github_slugs(at):
+                out.append(label)
     return out
 
 
@@ -2643,6 +2699,16 @@ def mutations() -> int:
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum pointing at its own contract's successor passes", None,
          lambda root: (append_normative(root, audited, "Superseded by [v9](v9.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking a vector file absent at the freeze revision", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the corpus](../no-such-contract/vectors-v1.json)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking a section its own text did not have at the freeze revision",
+         "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [that rule](#no-such-section-at-freeze)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum citing a document by a reference definition", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules][r].\n\n[r]: ../no-such-contract/v1.md"),
                        complete_audit(root, last_hunk_erratum))),
         ("an additive hunk linking a document absent at the freeze revision passes", None,
          lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
