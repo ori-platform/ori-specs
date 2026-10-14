@@ -347,7 +347,7 @@ DEFAULTS: dict[str, Any] = {
     "f4_takes_90": False,         # True: F4 accepts 90 as second byte
     "defined_top_only": False,    # True: family members apply to the root object only
     "intake_alone": False,        # True: a carried object is judged alone
-    "intake_reencoded": frozenset(),  # {"dup", "lone"}: what re-encoding a carried object hides
+    "intake_reencoded": frozenset(),  # {"dup", "lone", "utf8"}: what re-encoding hides
     "trailing_depth": False,      # True: judge depth after the first value
     "cut_escape_lone": False,     # True: a cut-short high-surrogate escape is a lone one
 }
@@ -1254,13 +1254,15 @@ def _assess(data: bytes, defined: frozenset, m: dict) -> Assessment:
 
 def reencoded(a: Assessment, span: tuple[int, int], m: dict) -> Assessment:
     """The defect of judging a carried object after decoding and re-encoding it: what that
-    loses inside the object (a duplicate, read last-wins; a lone surrogate, replaced) is no
-    longer seen. Only the outcome is recomputed; the rest of the assessment is shared."""
+    loses inside the object (a duplicate, read last-wins; a lone surrogate or ill-formed
+    UTF-8, replaced) is no longer seen. Only the outcome is recomputed."""
     lone_offs = {x["off"] for x in a.lone}
+    utf8_offs = {o for o, _, _ in a.utf8_errors}
     inside = range(*span)
     kept = [(r, o) for r, o in a.violations if not (o in inside and (
         (r == "duplicate_member" and "dup" in m["intake_reencoded"])
-        or (r == "invalid_unicode" and o in lone_offs and "lone" in m["intake_reencoded"])))]
+        or (r == "invalid_unicode" and o in lone_offs and "lone" in m["intake_reencoded"])
+        or (r == "invalid_unicode" and o in utf8_offs and "utf8" in m["intake_reencoded"])))]
     out = copy.copy(a)
     out.violations = kept
     out.reasons = {r for r, _ in kept}
@@ -1281,6 +1283,7 @@ def carried_span(a: Assessment, m: dict) -> tuple[int, int] | None:
 
 # --- corpus checks ------------------------------------------------------------------------
 
+TOP_KEYS = {"vector_set", "contract", "section", "conventions", "reasons", "families", "cases"}
 CASE_KEYS = {"name", "description", "payload_hex", "payload_text", "family", "expected"}
 
 
@@ -1296,6 +1299,8 @@ def refuse_duplicates(pairs: list[tuple[str, Any]]) -> dict:
 def check(corpus: dict, m: dict) -> tuple[list[str], dict[str, Assessment]]:
     problems: list[str] = []
     done: dict[str, Assessment] = {}
+    if set(corpus) != TOP_KEYS:
+        problems.append(f"corpus top-level keys {sorted(corpus)} are not {sorted(TOP_KEYS)}")
     if corpus.get("contract") != "gateway-api/v2.md" or corpus.get("section") != SECTION:
         problems.append("corpus header: contract or section does not name this rule")
     if corpus.get("reasons") != m["reasons"]:
@@ -1652,6 +1657,10 @@ def properties(m: dict) -> list[tuple[str, Callable[[dict, Assessment], bool]]]:
     p("a lone surrogate inside a carried object refused as received",
       lambda c, a: exp(c, inv) and a.reasons == {inv} and inside_carried(c, a) is not None
       and bool(a.lone) and all(x["off"] in inside_carried(c, a) for x in a.lone))
+    p("raw invalid UTF-8 inside a carried object refused as received",
+      lambda c, a: exp(c, inv) and a.reasons == {inv} and inside_carried(c, a) is not None
+      and bool(a.utf8_errors) and not a.lone
+      and all(o in inside_carried(c, a) for o, _, _ in a.utf8_errors))
     p("a case variant on Z", lambda c, a: var_only(c, a) and any(
         isinstance(o, Name) and {0x5A, 0x7A} <= set(x.key) | set(o.key) for _, x, o in a.cases))
     for cp in (0x09, 0x0D):
@@ -1867,6 +1876,10 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
             lambda c: c["conventions"].__setitem__(
                 "family", "the topic whose JSON examples give the payload's defined members"),
             "family is not described")),
+        ("corpus: an extra top-level key", corpus_mutant(
+            lambda c: c.__setitem__("zzz", 1), "corpus top-level keys")),
+        ("corpus: a top-level key dropped", corpus_mutant(
+            lambda c: c.pop("vector_set"), "corpus top-level keys")),
         ("corpus: families drops a name", corpus_mutant(
             lambda c: c["families"][min(c["families"])].pop(), "corpus families differ")),
         ("corpus: families adds a name", corpus_mutant(
@@ -1965,6 +1978,8 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
          model_mutant("outcome", intake_reencoded=frozenset({"dup"}))),
         ("model: a carried object re-encoded, lone surrogates replaced",
          model_mutant("outcome", intake_reencoded=frozenset({"lone"}))),
+        ("model: a carried object re-encoded, invalid UTF-8 replaced",
+         model_mutant("outcome", intake_reencoded=frozenset({"utf8"}))),
         ("model: the fold ends at Y", model_mutant("outcome", fold_top=0x59)),
         ("model: a raw TAB admitted in a string",
          model_mutant("outcome", control_allowed=frozenset({0x09}))),
