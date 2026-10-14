@@ -1283,6 +1283,17 @@ def carried_span(a: Assessment, m: dict) -> tuple[int, int] | None:
 
 # --- corpus checks ------------------------------------------------------------------------
 
+VECTOR_SET = "gateway-api/v2 payload members"
+# Each convention, reviewed against the section: bytes are the only input; the text is a
+# reading aid; `expected` is the reason a receiver MUST name or the admission it MUST give.
+CONVENTIONS = {
+    "payload_hex": "the exact payload bytes, lowercase hex; the only input",
+    "payload_text": ("the same bytes as UTF-8 text for reading, or null when they are not valid "
+                     "UTF-8 or longer than 400 bytes; never an input"),
+    "family": FAMILY_CONVENTION,
+    "expected": "accept, or the reason a receiver refuses the payload for",
+    "families": FAMILIES_CONVENTION,
+}
 TOP_KEYS = {"vector_set", "contract", "section", "conventions", "reasons", "families", "cases"}
 CASE_KEYS = {"name", "description", "payload_hex", "payload_text", "family", "expected"}
 
@@ -1296,19 +1307,54 @@ def refuse_duplicates(pairs: list[tuple[str, Any]]) -> dict:
     return out
 
 
+def shape_problems(corpus: Any) -> list[str]:
+    """Type and header faults, found before any member is read; any here stops the check."""
+    if not isinstance(corpus, dict):
+        return [f"corpus shape: top level is {type(corpus).__name__}, not an object"]
+    out = []
+    if set(corpus) != TOP_KEYS:
+        out.append(f"corpus top-level keys {sorted(corpus)} are not {sorted(TOP_KEYS)}")
+    if corpus.get("vector_set") != VECTOR_SET:
+        out.append(f"corpus header: vector_set is {corpus.get('vector_set')!r}, not {VECTOR_SET!r}")
+    conv = corpus.get("conventions")
+    if not isinstance(conv, dict):
+        out.append(f"corpus shape: conventions is {type(conv).__name__}, not an object")
+    else:
+        if set(conv) != set(CONVENTIONS):
+            out.append(f"corpus conventions: keys {sorted(conv)} are not {sorted(CONVENTIONS)}")
+        for key, want in CONVENTIONS.items():
+            if key in conv and conv[key] != want:
+                out.append(f"corpus conventions: {key} is not described as reviewed")
+    if not isinstance(corpus.get("reasons"), list):
+        out.append("corpus shape: reasons is not an array")
+    fams = corpus.get("families")
+    if not (isinstance(fams, dict) and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v) for v in fams.values())):
+        out.append("corpus shape: families is not an object of string arrays")
+    cases = corpus.get("cases")
+    if not isinstance(cases, list):
+        out.append(f"corpus shape: cases is {type(cases).__name__}, not an array")
+    else:
+        for k, case in enumerate(cases):
+            if not isinstance(case, dict):
+                out.append(f"corpus shape: case {k} is {type(case).__name__}, not an object")
+                continue
+            for key, types_ in (("name", (str,)), ("description", (str,)),
+                                ("payload_hex", (str,)), ("payload_text", (str, type(None))),
+                                ("family", (str, type(None))), ("expected", (str,))):
+                if key in case and not isinstance(case[key], types_):
+                    out.append(f"corpus shape: case {k} {key} has type "
+                               f"{type(case[key]).__name__}")
+    return out
+
+
 def check(corpus: dict, m: dict) -> tuple[list[str], dict[str, Assessment]]:
     problems: list[str] = []
     done: dict[str, Assessment] = {}
-    if set(corpus) != TOP_KEYS:
-        problems.append(f"corpus top-level keys {sorted(corpus)} are not {sorted(TOP_KEYS)}")
     if corpus.get("contract") != "gateway-api/v2.md" or corpus.get("section") != SECTION:
         problems.append("corpus header: contract or section does not name this rule")
     if corpus.get("reasons") != m["reasons"]:
         problems.append(f"corpus reasons {corpus.get('reasons')} differ from the table {m['reasons']}")
-    if corpus.get("conventions", {}).get("family") != FAMILY_CONVENTION:
-        problems.append("corpus conventions: family is not described as the contract defines it")
-    if corpus.get("conventions", {}).get("families") != FAMILIES_CONVENTION:
-        problems.append("corpus conventions: families is not described as the contract does")
     listed = corpus.get("families")
     derived = {k: sorted(v) for k, v in m["families"].items()}
     if not isinstance(listed, dict) or listed != derived:
@@ -1764,6 +1810,9 @@ def problems_of(corpus_bytes: bytes, m: dict) -> list[str]:
         corpus = json.loads(corpus_bytes, object_pairs_hook=refuse_duplicates)
     except ValueError as error:
         return [f"corpus does not load: {error}"]
+    shape = shape_problems(corpus)
+    if shape:
+        return shape
     found, done = check(corpus, m)
     found += [f"not covered: {label}" for label, who in coverage(corpus, done, m).items() if not who]
     return found
@@ -1875,7 +1924,36 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
         ("corpus: family convention says JSON examples only", corpus_mutant(
             lambda c: c["conventions"].__setitem__(
                 "family", "the topic whose JSON examples give the payload's defined members"),
-            "family is not described")),
+            "family is not described as reviewed")),
+        *[(f"corpus: conventions.{k} reworded", corpus_mutant(
+            lambda c, k=k: c["conventions"].__setitem__(k, "anything"),
+            f"{k} is not described as reviewed")) for k in CONVENTIONS],
+        *[(f"corpus: conventions.{k} removed", corpus_mutant(
+            lambda c, k=k: c["conventions"].pop(k), "corpus conventions: keys"))
+          for k in CONVENTIONS],
+        ("corpus: an extra convention", corpus_mutant(
+            lambda c: c["conventions"].__setitem__("zzz", "x"), "corpus conventions: keys")),
+        ("corpus: vector_set renamed", corpus_mutant(
+            lambda c: c.__setitem__("vector_set", "other"), "vector_set is")),
+        ("corpus: vector_set a number", corpus_mutant(
+            lambda c: c.__setitem__("vector_set", 1), "vector_set is")),
+        *[(f"corpus: top level is {raw.decode()}", bytes_mutant(
+            lambda b, raw=raw: raw, "corpus shape: top level"))
+          for raw in (b"[]", b'[{}]', b'"x"', b"1", b"null")],
+        ("corpus: a case that is not an object", corpus_mutant(
+            lambda c: c.__setitem__("cases", [1]), "case 0 is int")),
+        ("corpus: conventions not an object", corpus_mutant(
+            lambda c: c.__setitem__("conventions", 1), "conventions is int")),
+        ("corpus: cases not an array", corpus_mutant(
+            lambda c: c.__setitem__("cases", {}), "cases is dict")),
+        ("corpus: families values not arrays", corpus_mutant(
+            lambda c: c["families"].__setitem__(min(c["families"]), 1),
+            "families is not an object of string arrays")),
+        ("corpus: a case name that is not a string", corpus_mutant(
+            lambda c: c["cases"][0].__setitem__("name", 1), "name has type int")),
+        ("corpus: an expected that is not a string", corpus_mutant(
+            lambda c: c["cases"][0].__setitem__("expected", ["accept"]),
+            "expected has type list")),
         ("corpus: an extra top-level key", corpus_mutant(
             lambda c: c.__setitem__("zzz", 1), "corpus top-level keys")),
         ("corpus: a top-level key dropped", corpus_mutant(
@@ -1891,7 +1969,7 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
             lambda c: c["families"][min(c["families"])].reverse(), "corpus families differ")),
         ("corpus: families convention reworded", corpus_mutant(
             lambda c: c["conventions"].__setitem__("families", "the members"),
-            "families is not described")),
+            "families is not described as reviewed")),
         ("corpus: expected names no reason", corpus_mutant(set_(accept, "expected", "refused"),
                                                            "no reason in the table")),
         ("corpus: an extra key", corpus_mutant(set_(accept, "note", "x"), "keys")),
