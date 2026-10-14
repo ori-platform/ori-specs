@@ -1412,18 +1412,21 @@ _DOC_FILE = re.compile(r"\.(?:md|json|ya?ml|txt|csv)$", re.I)
 _VERSION_DOC = re.compile(r"v([1-9][0-9]*)\.md")
 
 
-def _rendered_text(text: str) -> str:
-    """A heading's text as rendered: code spans as their content, links and images as their text (destinations with
-    nested parentheses included), HTML tags dropped, entities decoded, emphasis delimiters removed."""
+def _rendered_text(text: str, definitions: frozenset[str] = frozenset()) -> str:
+    """A heading's text as rendered: code spans as their content; links and images as their text (destinations with
+    nested parentheses, link text with one level of nested brackets; a reference link only when the document defines
+    its label, and otherwise literally); real HTML tags dropped; entities decoded; emphasis delimiters removed only
+    where an opener pairs with a closer; backslash escapes as the character they escape."""
     spans: list[str] = []
 
     def keep(m: re.Match) -> str:
         spans.append(m.group(2).strip())
         return f"\x00{len(spans) - 1}\x00"
     text = _CODE_SPAN.sub(keep, text)
+    label = r"((?:[^\[\]\\]|\\.|\[(?:[^\[\]\\]|\\.)*\])*)"
     out, i = [], 0
     while i < len(text):
-        m = re.match(r"!?\[((?:[^\[\]\\]|\\.)*)\]", text[i:])
+        m = re.match(r"!?\[" + label + r"\]", text[i:])
         if m:
             j = i + m.end()
             if j < len(text) and text[j] == "(":
@@ -1436,22 +1439,25 @@ def _rendered_text(text: str) -> str:
                 if depth == 0:
                     out.append(m.group(1)); i = k + 1
                     continue
-            ref = re.match(r"\[[^\]]*\]", text[j:])
-            out.append(m.group(1)); i = j + (ref.end() if ref else 0)
-            continue
+            ref = re.match(r"\[([^\]]*)\]", text[j:])
+            name = (ref.group(1) if ref and ref.group(1) else m.group(1)).strip().lower()
+            if name in definitions:
+                out.append(m.group(1)); i = j + (ref.end() if ref else 0)
+                continue
         out.append(text[i]); i += 1
     text = "".join(out)
-    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"<!--.*?-->|</?[A-Za-z][^<>]*>", "", text)
     text = html.unescape(text)
-    text = text.replace("*", "")
-    text = re.sub(r"(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])", "", text)
+    for mark in (r"\*\*", r"__", r"\*", r"_"):
+        text = re.sub(r"(?<![A-Za-z0-9\\])" + mark + r"(?=\S)(.+?)(?<=\S)" + mark + r"(?![A-Za-z0-9])", r"\1", text)
+    text = re.sub(r"\\([!-/:-@\[-`{-~])", r"\1", text)
     return re.sub("\x00([0-9]+)\x00", lambda m: spans[int(m.group(1))], text)
 
 
-def _heading_text_slug(text: str) -> str:
+def _heading_text_slug(text: str, definitions: frozenset[str] = frozenset()) -> str:
     """GitHub's anchor for a heading: its rendered text, lowercase, with punctuation other than - and _ removed and
     spaces as hyphens."""
-    return re.sub(r"[^\w\- ]", "", _rendered_text(text).lower()).replace(" ", "-")
+    return re.sub(r"[^\w\- ]", "", _rendered_text(text, definitions).lower()).replace(" ", "-")
 
 
 # GitHub's anchors for a fixed set of headings, held so the slug rules are tested, not assumed.
@@ -1465,6 +1471,15 @@ SLUG_TABLE = (
     ('## How Much of `detail` Is Constrained', 'how-much-of-detail-is-constrained'),
     ('## See [x](https://a/b)', 'see-x'),
     ('## snake_case_name', 'snake_case_name'),
+    ('## _a_b', '_a_b'),
+    ('## _private', '_private'),
+    ('## foo_', 'foo_'),
+    ('## foo_ bar', 'foo_-bar'),
+    ('## \\_a\\_', '_a_'),
+    ('## a\\_b', 'a_b'),
+    ('## [a][r]', 'ar'),
+    ('## [[x]](y)', 'x'),
+    ('## a < b > c', 'a--b--c'),
 )
 
 
@@ -1472,9 +1487,10 @@ def _github_slugs(text: str) -> set[str]:
     """Every heading anchor a document has, ATX and setext, outside fenced code, with GitHub's -1, -2 suffixes."""
     out, seen = set(), {}
     lines, fence = text.split("\n"), None
+    definitions = frozenset(m.group(1).strip().lower() for m in re.finditer(r"^ {0,3}\[([^\]\n]+)\]:", text, re.M))
 
     def add(raw: str) -> None:
-        slug = _heading_text_slug(raw.strip())
+        slug = _heading_text_slug(raw.strip(), definitions)
         n = seen.get(slug, 0)
         seen[slug] = n + 1
         out.add(slug if n == 0 else f"{slug}-{n}")
@@ -1634,8 +1650,12 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
             head = raw.split("#", 1)[0]
             if head.startswith(("./", "../")) or "/" not in head:
                 targets.append((raw, "contract"))
-            elif head.split("/", 1)[0] in tops:
-                targets.append((raw, "root"))
+                continue
+            # Scope is decided on the path a renderer resolves: docs/../device-provisioning/v1.md is this
+            # repository's device-provisioning/v1.md, whatever the first segment it was written with.
+            normal = posixpath.normpath(head)
+            if not normal.startswith("..") and normal.split("/", 1)[0] in tops:
+                targets.append((normal + raw[len(head):], "root"))
             continue
         if base in ("repo-path", "rootscan"):
             targets.append((raw, "root"))
@@ -3090,6 +3110,15 @@ def mutations() -> int:
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum naming another repository's document passes", None,
          lambda root: (append_normative(root, audited, 'See ori-runtime/docs/safety.md and docs/x.md.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through docs/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See docs/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through ori-runtime/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See ori-runtime/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through x/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See x/../gaps/no-such-file.md for it.'),
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum linking an issue of this repository by URL passes", None,
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
