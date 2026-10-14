@@ -1,0 +1,477 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the inbound retirement corpus against gateway-evidence-carriage/v1.
+
+`gateway-evidence-carriage/vectors/inbound-retirement-v1.json` fixes what a
+courier does with the head of a device's return lane for each answer a runtime
+can give. Shares no code with
+scripts/generate-gateway-evidence-carriage-retirement-vectors, and was written
+without reading it. Every expected value is read from the text:
+
+- the vocabulary is evidence-exchange/v3's receiver rejection vocabulary;
+- each reason's retire verdict and deciding cell come from carriage/v1's
+  retirement table, and an applied acknowledgement, an unrecognised reason and
+  a store fault with no acknowledgement from the prose that decides each;
+- carriage/v1's table and gateway-api/v2's inbound retirement table agree row
+  for row with each other and with the vocabulary, less the reasons
+  gateway-api/v2 states never arise on it, and each table's exception prose
+  names exactly the retiring refusals its rows decide from receiver state;
+- every case's `clause` is the deciding sentence or cell, quoted exactly;
+- one case per vocabulary reason, one for `applied`, one for a reason outside
+  the vocabulary and one for no acknowledgement after a store fault.
+
+The retirement text of both contracts is pinned unit for unit in
+scripts/gateway-evidence-carriage-retirement-pinned-units.json.
+
+    python3 scripts/check-gateway-evidence-carriage-retirement-vectors
+    python3 scripts/check-gateway-evidence-carriage-retirement-vectors --mutations
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import re
+import sys
+from collections.abc import Callable
+from typing import Any, NoReturn
+
+NAME = "check-gateway-evidence-carriage-retirement-vectors"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CARRIAGE = ROOT / "gateway-evidence-carriage" / "v1.md"
+GATEWAY = ROOT / "gateway-api" / "v2.md"
+EXCHANGE = ROOT / "evidence-exchange" / "v3.md"
+CORPUS = ROOT / "gateway-evidence-carriage" / "vectors" / "inbound-retirement-v1.json"
+PINNED = ROOT / "scripts" / "gateway-evidence-carriage-retirement-pinned-units.json"
+
+TABLE_HEADER = "| Rejection reason | Retire? | Determined by |"
+STORE_FAULT_LEAD = "**An undecided store-fault attempt produces no acknowledgement.**"
+STORE_FAULT_SENTENCES = (
+    ("No rejection reason stands for a store fault: a retiring reason would retire valid "
+     "evidence, and a non-retiring one would hold the artifact until a release or an operator "
+     "acted."),
+    ("A decided refusal whose record could not be written is not undecided: it is acknowledged "
+     "as that refusal, and retires as that reason's row in the retirement table says."),
+)
+NEW_REASON_LEAD = "**A new rejection reason is supported by the gateway first.**"
+APPLIED_SENTENCE = ("The runtime therefore publishes an ingest acknowledgement, and the gateway "
+                    "retires an artifact from its durable queue only on receiving one.")
+TEXT_BLOCKS = (
+    (CARRIAGE, "**Retirement is by acknowledgement, never by PUBACK.**", "**Return order is per device.**"),
+    (CARRIAGE, "`outcome: refused` retires the artifact only when", "**Every delivery attempt MUST"),
+    (CARRIAGE, "[`vectors/inbound-retirement-v1.json`]", "## Site Health"),
+    (GATEWAY, "`outcome: refused` retires the artifact only when", "**Every delivery attempt MUST"),
+    (EXCHANGE, "## Receiver rejection vocabulary", "## Three state models"),
+    (EXCHANGE, "Whatever inbound carriage delivered the artifact, the receiver answers a store",
+     "[runtime-health/v4.md](../runtime-health/v4.md)'s application-storage fault"),
+)
+# What evidence-exchange/v3 says the runtime acknowledges after a store fault: nothing for one that
+# leaves the artifact undecided, which is this corpus's no-acknowledgement case, and the refusal
+# itself for a decided refusal whose record could not be written, which then retires as that
+# reason's row says, so no case of its own is owed.
+EXCHANGE_ACK = (
+    ("Whatever inbound carriage delivered the artifact, the receiver answers a store fault that "
+     "leaves the artifact undecided with no ingest acknowledgement"),
+    "A decided refusal whose record could not be written is acknowledged as that refusal.",
+)
+CASE_KEYS = {"name", "note", "acknowledgement", "retire", "head", "redelivery", "clause"}
+BYTES_CATEGORIES = ("The bytes.", "The bytes and the named key.")
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message: str) -> NoReturn:
+    raise Failure(message)
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _sentences(paragraph: str) -> list[str]:
+    # A bold lead ending in a full stop is a sentence of its own.
+    return [u for u in re.split(r"(?:(?<=[.:;])|(?<=\.\*\*))\s+(?=[A-Z`*\[(])", _norm(paragraph))
+            if u]
+
+
+def _units(block: str) -> list[str]:
+    units: list[str] = []
+    for paragraph in re.split(r"\n\s*\n", block):
+        lines = paragraph.strip().splitlines()
+        if not lines:
+            continue
+        if lines[0].lstrip().startswith("|"):
+            units += [_norm(x) for x in lines if x.strip() and not re.fullmatch(r"\|[\s:|-]+\|", x.strip())]
+        else:
+            units += _sentences(paragraph)
+    return units
+
+
+def read_texts() -> dict:
+    return {p: p.read_text(encoding="utf-8") for p in (CARRIAGE, GATEWAY, EXCHANGE)}
+
+
+def _span(body: str, start: str, end: str, source: pathlib.Path) -> str:
+    i = body.find(start)
+    j = body.find(end, i)
+    if i < 0 or j < i:
+        fail(f"{source.name} lacks the block starting {start[:50]!r}")
+    return body[i:j]
+
+
+def units_of(texts: dict) -> list[str]:
+    out: list[str] = []
+    for source, start, end in TEXT_BLOCKS:
+        out += _units(_span(texts[source], start, end, source))
+    return out
+
+
+def check_pin(texts: dict) -> None:
+    units = units_of(texts)
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    if units != pinned:
+        added = [u for u in units if u not in pinned]
+        removed = [u for u in pinned if u not in units]
+        fail("the retirement text differs from the pinned units; re-pinning is a semantic change "
+             "made together with this corpus and checker\n"
+             + "".join(f"  + {u}\n" for u in added) + "".join(f"  - {u}\n" for u in removed))
+
+
+def _rows(text: str, header: str) -> list[list[str]]:
+    lines = text.splitlines()
+    found = [i for i, line in enumerate(lines) if _norm(line) == header]
+    if len(found) != 1:
+        fail(f"{len(found)} tables headed {header!r}")
+    rows = []
+    for line in lines[found[0] + 2:]:
+        if not line.strip().startswith("|"):
+            break
+        rows.append([c.strip() for c in line.strip().strip("|").split("|")])
+    return rows
+
+
+def _paragraph(text: str, lead: str) -> str:
+    hits = [p for p in re.split(r"\n\s*\n", text) if p.strip().startswith(lead)]
+    if len(hits) != 1:
+        fail(f"{len(hits)} paragraphs lead {lead!r}")
+    return hits[0]
+
+
+def retirement_table(text: str, where: str) -> dict[str, tuple[bool, str]]:
+    table: dict[str, tuple[bool, str]] = {}
+    for row in _rows(text, TABLE_HEADER):
+        reason = re.fullmatch(r"`(\w+)`", row[0])
+        verdict = {"yes": True, "**no**": False}.get(row[1])
+        if reason is None or verdict is None or len(row) != 3:
+            fail(f"{where}: a retirement row this checker cannot read: {row}")
+        if reason.group(1) in table:
+            fail(f"{where}: {reason.group(1)} has two rows")
+        table[reason.group(1)] = (verdict, row[2])
+    return table
+
+
+def exceptions(table: dict[str, tuple[bool, str]]) -> set[str]:
+    """Retiring refusals whose deciding cell is not the artifact's bytes alone."""
+    return {r for r, (yes, cell) in table.items()
+            if yes and not any(cell == c or cell.startswith(c + " ") for c in BYTES_CATEGORIES)}
+
+
+def rules_from(texts: dict) -> dict:
+    vocab = [r[0].strip("`") for r in _rows(texts[EXCHANGE], "| Reason | Meaning |")]
+    if len(set(vocab)) != len(vocab) or not vocab:
+        fail("evidence-exchange/v3's vocabulary repeats a reason or is empty")
+    carriage = retirement_table(texts[CARRIAGE], "gateway-evidence-carriage/v1")
+    gateway = retirement_table(texts[GATEWAY], "gateway-api/v2")
+    if set(carriage) != set(vocab):
+        fail(f"carriage/v1's retirement table is not the v3 vocabulary: extra "
+             f"{sorted(set(carriage) - set(vocab))}, missing {sorted(set(vocab) - set(carriage))}")
+    absent = set(re.findall(r"so `(\w+)` never arises on it", _norm(texts[GATEWAY])))
+    if set(gateway) != set(vocab) - absent or not absent <= set(vocab):
+        fail(f"gateway-api/v2's retirement table is not the v3 vocabulary less {sorted(absent)}: "
+             f"extra {sorted(set(gateway) - set(vocab))}, missing "
+             f"{sorted(set(vocab) - absent - set(gateway))}")
+    for reason, row in gateway.items():
+        if row != carriage[reason]:
+            fail(f"gateway-api/v2 and carriage/v1 disagree on {reason}, in verdict or wording: "
+                 f"{row} against {carriage[reason]}")
+    for where, text, table, prose in (
+            ("carriage/v1", texts[CARRIAGE], carriage,
+             r"`(\w+)` and `(\w+)` are those refusals"),
+            ("gateway-api/v2", texts[GATEWAY], gateway,
+             r"Two refusals are of that kind, `(\w+)` and\s+`(\w+)`")):
+        named = re.search(prose, _norm(text))
+        if named is None:
+            fail(f"{where} no longer names its retiring exceptions as this checker reads them")
+        if set(named.groups()) - absent != exceptions(table) - absent \
+                or not set(named.groups()) <= set(carriage):
+            fail(f"{where} names exceptions {sorted(named.groups())}; its table retires "
+                 f"{sorted(exceptions(table))} on receiver state")
+    carriage_text = texts[CARRIAGE]
+    durability = _span(carriage_text, "### Durability and Retirement", "### Envelope", CARRIAGE)
+    if APPLIED_SENTENCE not in _sentences(durability):
+        fail("carriage/v1 no longer retires an artifact on receiving an acknowledgement as quoted")
+    store = _paragraph(carriage_text, STORE_FAULT_LEAD)
+    # Both routes answer a store fault the same way, so their paragraphs are one text.
+    if _norm(_paragraph(texts[GATEWAY], STORE_FAULT_LEAD)) != _norm(store):
+        fail("gateway-api/v2's store-fault paragraph is not carriage/v1's")
+    for sentence in STORE_FAULT_SENTENCES:
+        if sentence not in _sentences(store):
+            fail(f"the store-fault paragraph no longer states {sentence[:60]!r}")
+    new_reason = _paragraph(carriage_text, NEW_REASON_LEAD)
+    for needed, where in (("publishes no ingest acknowledgement", store),
+                          ("redelivers it in a newly signed envelope", store),
+                          (("cannot retire the artifact, and holds it at the head of that device's "
+                            "lane as a non-retiring refusal"), new_reason)):
+        if needed not in _norm(where):
+            fail(f"carriage/v1 no longer states {needed!r}")
+    exchange_ack = _norm(texts[EXCHANGE])
+    for needed in EXCHANGE_ACK:
+        if needed not in exchange_ack:
+            fail(f"evidence-exchange/v3 no longer states {needed!r}")
+    fixtures = _norm(_span(carriage_text, "[`vectors/inbound-retirement-v1.json`]", "## Site Health",
+                           CARRIAGE))
+    for needed in (("one case for `applied`, one per reason in the vocabulary, one for a reason "
+                    "outside it, which is held as a non-retiring refusal, and one for no "
+                    "acknowledgement after a store fault"),
+                   "`on_state_change` for one kept under a non-retiring refusal",
+                   "`fresh_envelope` for one with no acknowledgement",
+                   "`null` for a retired artifact"):
+        if needed not in fixtures:
+            fail(f"the Fixtures paragraph no longer states {needed!r}")
+    return {"vocab": vocab, "carriage": carriage, "gateway": gateway,
+            "applied": [APPLIED_SENTENCE],
+            "store": _sentences(store), "new_reason": _sentences(new_reason)}
+
+
+def expected(case: dict, rules: dict) -> tuple[str, bool, str, str | None, list[str]]:
+    """(kind, retire, head, redelivery, the clauses that decide it)."""
+    ack = case["acknowledgement"]
+    if ack is None:
+        return "no_ack", False, "kept", "fresh_envelope", rules["store"]
+    if not isinstance(ack, dict) or set(ack) != {"outcome", "reason"}:
+        fail(f"{case['name']}: acknowledgement is not {{outcome, reason}} or null")
+    if ack["outcome"] == "applied":
+        if ack["reason"] != "":
+            fail(f"{case['name']}: an applied acknowledgement carries a reason")
+        return "applied", True, "retired", None, rules["applied"]
+    if ack["outcome"] != "refused" or not isinstance(ack["reason"], str) or not ack["reason"]:
+        fail(f"{case['name']}: outcome {ack['outcome']!r} with reason {ack['reason']!r}")
+    if ack["reason"] in rules["carriage"]:
+        yes, cell = rules["carriage"][ack["reason"]]
+        return (f"reason:{ack['reason']}", yes, "retired" if yes else "kept",
+                None if yes else "on_state_change", [cell])
+    return "unrecognised", False, "kept", "on_state_change", rules["new_reason"]
+
+
+def check_corpus(corpus: Any, rules: dict) -> list[str]:
+    try:
+        return _check_corpus(corpus, rules)
+    except (KeyError, TypeError, AttributeError, ValueError) as error:
+        return [f"[malformed] {error.__class__.__name__} {error}"]
+
+
+def _check_corpus(corpus: Any, rules: dict) -> list[str]:
+    out: list[str] = []
+    if not isinstance(corpus, dict) or corpus.get("contract") != "gateway-evidence-carriage/v1":
+        return ["[file] the corpus does not name gateway-evidence-carriage/v1"]
+    vocab = corpus.get("vocabulary")
+    if not isinstance(vocab, list) or not all(isinstance(v, str) for v in vocab) \
+            or sorted(vocab) != sorted(rules["vocab"]) \
+            or len(set(vocab)) != len(vocab):
+        out.append("[vocabulary] the corpus vocabulary is not evidence-exchange/v3's")
+    seen: dict[str, int] = {}
+    for case in corpus["cases"]:
+        where = case.get("name", "?") if isinstance(case, dict) else "?"
+        if not isinstance(case, dict) or set(case) != CASE_KEYS:
+            out.append(f"[shape] {where}: members are not {sorted(CASE_KEYS)}")
+            continue
+        if not (isinstance(case["name"], str) and case["name"] and isinstance(case["note"], str)
+                and isinstance(case["clause"], str)):
+            out.append(f"[shape] {where}: name, note and clause are not strings")
+            continue
+        try:
+            kind, retire, head, redelivery, clauses = expected(case, rules)
+        except Failure as error:
+            out.append(f"[shape] {error}")
+            continue
+        seen[kind] = seen.get(kind, 0) + 1
+        if case["retire"] is not retire:
+            out.append(f"[retire] {where}: retire {case['retire']!r}, the text gives {retire}")
+        if case["head"] != head:
+            out.append(f"[head] {where}: head {case['head']!r}, the text gives {head!r}")
+        if case["redelivery"] != redelivery:
+            out.append(f"[redelivery] {where}: {case['redelivery']!r}, the text gives {redelivery!r}")
+        if case["clause"] not in clauses:
+            out.append(f"[clause] {where}: the clause is not the deciding sentence or cell, quoted "
+                       f"exactly: {case['clause']!r}")
+    wanted = ["applied", "no_ack", "unrecognised", *(f"reason:{r}" for r in rules["vocab"])]
+    for kind in wanted:
+        if seen.get(kind, 0) != 1:
+            out.append(f"[coverage] {seen.get(kind, 0)} cases for {kind}, not one")
+    return out
+
+
+# --- mutations ----------------------------------------------------------------------------
+
+def corpus_mutants(corpus: dict) -> list[tuple[str, str, Callable[[dict], Any]]]:
+    out: list[tuple[str, str, Callable[[dict], Any]]] = []
+    for i, case in enumerate(corpus["cases"]):
+        n = case["name"]
+        out.append((f"{n}: retire flipped", "[retire]",
+                    lambda c, i=i: c["cases"][i].update(retire=not c["cases"][i]["retire"])))
+        out.append((f"{n}: head flipped", "[head]", lambda c, i=i: c["cases"][i].update(
+            head="kept" if c["cases"][i]["head"] == "retired" else "retired")))
+        for value in (None, "on_state_change", "fresh_envelope"):
+            if value != case["redelivery"]:
+                out.append((f"{n}: redelivery {value}", "[redelivery]",
+                            lambda c, i=i, v=value: c["cases"][i].update(redelivery=v)))
+        out.append((f"{n}: clause loses its last word", "[clause]", lambda c, i=i: c["cases"][i].update(
+            clause=c["cases"][i]["clause"].rsplit(" ", 1)[0])))
+        out.append((f"{n}: dropped", "[coverage]", lambda c, i=i: c["cases"].pop(i)))
+        out.append((f"{n}: repeated", "[coverage]",
+                    lambda c, i=i: c["cases"].append(copy.deepcopy(c["cases"][i]))))
+        ack = case["acknowledgement"]
+        if ack is not None and ack["outcome"] == "refused" and ack["reason"] in corpus["vocabulary"]:
+            other = "unknown_key" if case["retire"] else "malformed"
+            out.append((f"{n}: reason swapped to one decided the other way", "[retire]",
+                        lambda c, i=i, o=other: c["cases"][i]["acknowledgement"].update(reason=o)))
+    out.append(("vocabulary loses a reason", "[vocabulary]", lambda c: c["vocabulary"].pop()))
+    out.append(("vocabulary holds a non-string", "[vocabulary]", lambda c: c["vocabulary"].append(3)))
+    for field, value in (("name", 5), ("note", None), ("clause", 7), ("retire", 1), ("head", None)):
+        out.append((f"first case's {field} is {value!r}", "[",
+                    lambda c, f=field, v=value: c["cases"][1].update({f: v})))
+    return out
+
+
+TEXT_EDITS = (
+    # The guard the review found missing: gateway-api/v2 alone retires differently.
+    ("gateway-api/v2 holds restatement_conflict", GATEWAY,
+     "| `restatement_conflict`  | yes     | The bytes against", "| `restatement_conflict`  | **no**  | The bytes against"),
+    ("gateway-api/v2 retires unknown_key", GATEWAY,
+     "| `unknown_key`           | **no**  |", "| `unknown_key`           | yes     |"),
+    ("gateway-api/v2 rewords a cell", GATEWAY,
+     "| `binding_mismatch`      | yes     | The bytes. The artifact is about another device, another key,",
+     "| `binding_mismatch`      | yes     | The bytes. The artifact is about another device or another key,"),
+    ("carriage/v1 rewords a cell", CARRIAGE,
+     "| `unknown_key`           | **no**  | Receiver state. A later release may ship the authority key. |",
+     "| `unknown_key`           | **no**  | Receiver state. A later release may add the authority key. |"),
+    ("gateway-api/v2 drops a row", GATEWAY,
+     "| `retired_key`           | **no**  | Receiver state, resolved by operator action.               |\n", ""),
+    ("carriage/v1 holds superseded", CARRIAGE,
+     "| `superseded`            | yes     |", "| `superseded`            | **no**  |"),
+    ("carriage/v1 retires unknown_sequence", CARRIAGE,
+     "| `unknown_sequence`      | **no**  |", "| `unknown_sequence`      | yes     |"),
+    ("carriage/v1 names one exception", CARRIAGE,
+     "`superseded` and `restatement_conflict` are those refusals",
+     "`superseded` and `superseded` are those refusals"),
+    ("gateway-api/v2 lets superseded arise", GATEWAY,
+     "so `superseded` never arises on it", "so nothing fails to arise on it"),
+    ("v3 adds a reason", EXCHANGE,
+     "| `superseded` | A disposition", "| `stale` | Never sent. |\n| `superseded` | A disposition"),
+    ("carriage/v1 drops the applied retirement", CARRIAGE,
+     "retires an artifact from its durable queue only on receiving one.",
+     "retires an artifact from its durable queue on its PUBACK."),
+    ("v3 leaves a refusal with an unwritten record unacknowledged", EXCHANGE,
+     "A decided refusal whose record could not be written is acknowledged as that refusal.",
+     "A decided refusal whose record could not be written is not acknowledged."),
+    ("v3 acknowledges an undecided store fault", EXCHANGE,
+     "store fault that leaves the artifact undecided with no ingest acknowledgement",
+     "store fault that leaves the artifact undecided with an ingest acknowledgement"),
+    ("gateway-api/v2's store-fault paragraph differs", GATEWAY,
+     "rolls back and records no decision, as", "rolls back and records nothing, as"),
+    ("both routes leave a refusal with an unwritten record unretired", CARRIAGE,
+     "and retires as that reason's row in the retirement table says.",
+     "and is kept until a relevant state change."),
+    ("carriage/v1 drops why no reason stands", CARRIAGE,
+     ("a retiring reason would retire valid evidence, and a non-retiring one would hold the "
+      "artifact until a release or an operator acted."), "it is not a statement about the artifact."),
+    ("carriage/v1 acknowledges a store fault", CARRIAGE,
+     "and publishes no ingest acknowledgement.", "and publishes an ingest acknowledgement."),
+)
+
+
+def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tuple[int, list[str]]:
+    survived: list[str] = []
+    count = 0
+    for source, start, end in TEXT_BLOCKS:
+        body = texts[source]
+        block = _span(body, start, end, source)
+        for unit in _units(block):
+            count += 1
+            pattern = r"\s+".join(re.escape(w) for w in unit.split())
+            edited_block, n = re.subn(pattern, "", block, count=1)
+            if n != 1:
+                survived.append(f"unit not removable: {unit[:60]}")
+                continue
+            try:
+                check_pin({**texts, source: body.replace(block, edited_block, 1)})
+            except Failure:
+                continue
+            survived.append(f"unit removed: {unit[:60]}")
+    for label, source, old, new in TEXT_EDITS:
+        count += 1
+        pattern = r"\s+".join(re.escape(w) for w in old.split())
+        changed, n = re.subn(pattern, lambda _m, new=new: new, texts[source])
+        if n != 1:
+            survived.append(f"text edit {label!r} matches {n} places")
+            continue
+        edited = {**texts, source: changed}
+        try:
+            found = check_corpus(corpus, rules_from(edited))
+        except Failure:
+            continue
+        if set(found) - set(base):
+            continue
+        survived.append(f"text edit: {label}")
+    for label, wanted, edit in corpus_mutants(corpus):
+        count += 1
+        bad = copy.deepcopy(corpus)
+        edit(bad)
+        new = [f for f in check_corpus(bad, rules) if f not in base]
+        if any(f.startswith(wanted) for f in new):
+            continue
+        survived.append(f"{label}: refused for {new[:1] or 'nothing'}, not {wanted}")
+    return count, survived
+
+
+def main(argv: list[str]) -> int:
+    texts = read_texts()
+    if argv == ["--print-units"]:
+        print(json.dumps(units_of(texts), indent=2, ensure_ascii=False))
+        return 0
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        check_pin(texts)
+        rules = rules_from(texts)
+        corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    except (Failure, ValueError, OSError) as error:
+        print(f"{NAME}: {error}", file=sys.stderr)
+        return 1
+    found = check_corpus(corpus, rules)
+    status = 0
+    if found:
+        print(f"{NAME}: {len(found)} disagreement(s):", file=sys.stderr)
+        for line in found:
+            print(f"  {line}", file=sys.stderr)
+        status = 1
+    if argv == ["--mutations"]:
+        count, survived = run_mutations(texts, corpus, rules, found)
+        for line in survived:
+            print(f"mutant survived: {line[:160]}", file=sys.stderr)
+        if survived:
+            return 1
+        print(f"{NAME}: {count} mutants refused, each for its intended reason")
+    if status == 0:
+        print(f"{NAME}: corpus agrees with the contract ({len(corpus['cases'])} cases; carriage/v1 "
+              f"and gateway-api/v2 retirement tables agree with the v3 vocabulary)")
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

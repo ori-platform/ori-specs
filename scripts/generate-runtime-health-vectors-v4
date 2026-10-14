@@ -35,6 +35,7 @@ SEVERITY = {
     "decision_record_lost": C,
     "evidence_contributor_link_unresolved": D,
     "evidence_courier_answer_unrecognised": D,
+    "evidence_application_storage_fault": D,
     "evidence_posture_problem": D,
     "firmware_liveness_device_expired": C,
     "firmware_liveness_over_capacity": D,
@@ -160,6 +161,8 @@ def holding(v: dict) -> list[str]:
         out.append("evidence_courier_answer_unrecognised")
     if ev.get("attestation_summary_available") and ev["contributor_links_unresolved"] > 0:
         out.append("evidence_contributor_link_unresolved")
+    if ev["application_storage_fault"]:
+        out.append("evidence_application_storage_fault")
     cm = v["commissioning"]
     if avail(cm) and cm["problems"]:
         out.append("commissioning_problem")
@@ -225,7 +228,7 @@ def baseline() -> dict:
                 "oldest_pending_age_ms": None, "recovery_failed": False},
             "attestation_summary_available": True, "registration_available": True,
             "delivery_ledger_available": True, "contributor_links_unresolved": 0,
-            "courier_answer_faults": 0},
+            "courier_answer_faults": 0, "application_storage_fault": False},
         "sensors": [sensor("load-current"), sensor("grid-voltage"),
                     sensor("tank-temperature"), sensor("zone-a-current")],
         "alert_outbox": {
@@ -308,6 +311,7 @@ SINGLE = {
     "evidence_posture_problem": [((EV, "posture_problems"), ["custody_unconfigured"])],
     "evidence_courier_answer_unrecognised": [((EV, "courier_answer_faults"), 1)],
     "evidence_contributor_link_unresolved": [((EV, "contributor_links_unresolved"), 1)],
+    "evidence_application_storage_fault": [((EV, "application_storage_fault"), True)],
     "commissioning_problem": [(("commissioning", "problems"), ["binding_missing"])],
     "safety_zone_active_unprotected": [(("safety_zones", 0, "protection_claim"), "unprotected")],
     "subsystem_starting": [(("sensors", 2, "connection"), "pending")],
@@ -539,6 +543,15 @@ def snapshot_specs() -> list[tuple[str, list, str]]:
          "evidence open and its ledger not read"),
         ("registration_unread", [((EV, "registration_available"), False)],
          "evidence open and registration not read"),
+        ("storage_fault_ledger_unread", [((EV, "delivery_ledger_available"), False),
+                                         ((EV, "application_storage_fault"), True)],
+         "the in-memory signal is reported while the delivery ledger cannot be read"),
+        ("storage_fault_evidence_unavailable",
+         [((EV, "state"), "unavailable"), ((EV, "posture_problems"), ["signing_unavailable"]),
+          ((EV, "attestation_summary_available"), False),
+          ((EV, "registration_available"), False), ((EV, "delivery_ledger_available"), False),
+          ((EV, "application_storage_fault"), True)],
+         "the signal's condition holds in every evidence state"),
         ("attestations_unread", [((EV, "attestation_summary_available"), False)],
          "evidence open and the attestation summary not read"),
         ("evidence_disabled", [((EV, "state"), "disabled"),
@@ -1197,6 +1210,7 @@ def full_health() -> dict:
             "state": "disabled", "enabled": False, "available": False, "public_key_hex": "",
             "protocol_version": "", "action_event_type": "", "anchor_epoch_id": "",
             "inbound_route_connected": False, "posture_problems": [],
+            "application_storage_fault": False,
             "action_records": {
                 "state": "available", "pending": 0, "outcome_unknown": 0,
                 "dispatch_unproven": 0, "lost": 0, "ceiling": 64, "unknown_live": 0,
@@ -1291,6 +1305,19 @@ def profiles_block(unmapped: list[int]) -> dict:
     }
 
 
+def evidence_starting(signal: bool, reasons: list[str]) -> dict:
+    """A whole snapshot whose evidence is starting: no section read, no registration row."""
+    h = full_health()
+    ev = h["evidence"]
+    ev.update(state="starting", enabled=True, application_storage_fault=signal)
+    ev["registration_available"] = False
+    for member in ("registration_status", "registration_pending_since_ms",
+                   "registration_confirmation_overdue", "registration_offer", "last_disposition"):
+        del ev[member]
+    h.update(status=D, critical=False, degradation_reasons=reasons)
+    return h
+
+
 def response_cases() -> list[dict]:
     base = envelope_text()
     specs = [
@@ -1338,6 +1365,17 @@ def response_cases() -> list[dict]:
         ("member_behind_flag", envelope_text(edited(("evidence", "delivery_stop_status"),
                                                     "not_stopped")),
          "shape_invalid", "a delivery-ledger row while its flag is false"),
+        ("evidence_starting_served", envelope_text(evidence_starting(False, ["subsystem_starting"])),
+         "accept", "evidence starting, the signal false: the whole response holds"),
+        ("storage_fault_while_evidence_starting", envelope_text(evidence_starting(
+            True, ["evidence_application_storage_fault", "subsystem_starting"])),
+         "shape_invalid", "the storage fault signal raised while evidence is starting, served "
+         "with its condition"),
+        ("storage_fault_while_evidence_disabled", envelope_text(served(
+            [(("evidence", "application_storage_fault"), True)],
+            "degraded", ["evidence_application_storage_fault"])),
+         "shape_invalid", "the storage fault signal raised while evidence is disabled, served "
+         "with its condition"),
         ("member_while_unavailable", envelope_text(served(
             [(("config_authority", "state"), "unavailable")],
             "degraded", ["subsystem_state_unknown"])),
@@ -1587,6 +1625,7 @@ def evidence_available() -> dict:
         "public_key_hex": "ab" * 32, "protocol_version": "ori.evidence.v2",
         "action_event_type": "SAFETY_ACTION_EXECUTED", "anchor_epoch_id": "epoch-1",
         "inbound_route_connected": True, "posture_problems": [],
+        "application_storage_fault": False,
         "action_records": {
             "state": "available", "pending": 0, "outcome_unknown": 0, "dispatch_unproven": 0,
             "lost": 0, "ceiling": 64, "unknown_live": 0, "oldest_pending_age_ms": None,
