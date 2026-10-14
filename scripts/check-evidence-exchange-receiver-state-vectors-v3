@@ -375,8 +375,10 @@ RECORD_MEMBERS = {
                             "confirmed_at_ms", "key_id", "applied_at_ms"},
     "registration_obligations": {"anchor_epoch_id", "pubkey_hex", "state", "closed_at_ms"},
     "dispositions": {"triggering_digest", "anchor_epoch_id", "scope", "disposition",
-                     "decided_at_ms", "key_id"},
+                     "decided_at_ms", "key_id", "artifact_digest"},
 }
+DISPOSITION_BODY = ("triggering_digest", "anchor_epoch_id", "scope", "disposition",
+                    "decided_at_ms", "key_id")
 
 
 def _table(text: str, header: str) -> list[list[str]]:
@@ -551,6 +553,58 @@ def hkdf(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
         out += block
         counter += 1
     return out[:length]
+
+
+L_ORDER = 2**252 + 27742317777372353535851937790883648493
+
+
+def _ed_add(p1: tuple, p2: tuple) -> tuple:
+    x1, y1, z1, t1 = p1
+    x2, y2, z2, t2 = p2
+    a, b = (y1 - x1) * (y2 - x2) % P, (y1 + x1) * (y2 + x2) % P
+    c, d = 2 * t1 * t2 * D % P, 2 * z1 * z2 % P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return e * f % P, g * h % P, f * g % P, e * h % P
+
+
+def _ed_mul(k: int, point: tuple) -> tuple:
+    out = (0, 1, 1, 0)
+    while k:
+        if k & 1:
+            out = _ed_add(out, point)
+        point, k = _ed_add(point, point), k >> 1
+    return out
+
+
+def _ed_encode(point: tuple) -> bytes:
+    x, y, z, _ = point
+    zi = pow(z, P - 2, P)
+    x, y = x * zi % P, y * zi % P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_base() -> tuple:
+    y = 4 * pow(5, P - 2, P) % P
+    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    x = pow(x2, (P + 3) // 8, P)
+    if (x * x - x2) % P:
+        x = x * pow(2, (P - 1) // 4, P) % P
+    if x & 1:
+        x = P - x
+    return x, y, 1, x * y % P
+
+
+def sign_with_nonce(seed: bytes, message: bytes, nonce: bytes) -> bytes:
+    """An RFC 8032 signature whose r comes from `nonce` rather than the key's prefix: as valid as
+    the deterministic one, and different bytes, so a re-signed artifact with the same body."""
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+    base = _ed_base()
+    public = _ed_encode(_ed_mul(a, base))
+    r = int.from_bytes(hashlib.sha512(b"alternate" + nonce + message).digest(), "little") % L_ORDER
+    big_r = _ed_encode(_ed_mul(r, base))
+    k = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little") % L_ORDER
+    return big_r + ((r + k * a) % L_ORDER).to_bytes(32, "little")
 
 
 def refused_point(public_hex: str, small_order_y: set[str]) -> str | None:
@@ -873,6 +927,13 @@ def held_values(state: dict, corpus: dict, rules: dict, where: str) -> list[str]
             bad("dispositions", "scope", (r["scope"], r["disposition"]))
         integer("dispositions", "decided_at_ms", r["decided_at_ms"])
         authority_key("dispositions", r["key_id"], "evidence_disposition")
+        # The digest is over the held disposition's own wire bytes. A held record's artifact is
+        # not carried, so the digest must be one this script can rebuild: that of a corpus
+        # artifact with this body, or of this body signed under the published seed by RFC 8032's
+        # deterministic signature. A digest of the unsigned preimage is neither.
+        shaped = isinstance(r["artifact_digest"], str) and SHA256_ID.fullmatch(r["artifact_digest"])
+        if not shaped or r["artifact_digest"] not in rebuildable_digests(r, corpus, rules):
+            bad("dispositions", "artifact_digest", r["artifact_digest"])
     for r in state["stops"]:
         if not isinstance(r, dict) or set(r) != STOP_MEMBERS or r["scope"] not in ("epoch", "identity"):
             bad("stops", "scope", r)
@@ -882,6 +943,28 @@ def held_values(state: dict, corpus: dict, rules: dict, where: str) -> list[str]
             # An identity stop covers every epoch of the identity and names none.
             bad("stops", "anchor_epoch_id", r["anchor_epoch_id"])
     return out
+
+
+def _rec(corpus: dict, rules: dict, fields: dict) -> dict:
+    """A held disposition record with the digest of its body signed under the published seed."""
+    body = {k: fields[k] for k in DISPOSITION_BODY}
+    digests = rebuildable_digests({**body, "artifact_digest": ""}, corpus,
+                                  {**rules, "disposition_digests": {}})
+    return {**body, "artifact_digest": next(iter(digests))}
+
+
+def rebuildable_digests(record: dict, corpus: dict, rules: dict) -> set[str]:
+    body = tuple(record[k] for k in DISPOSITION_BODY)
+    found = set(rules.get("disposition_digests", {}).get(json.dumps(body), set()))
+    seed = corpus["authority_seeds"].get(record["key_id"])
+    if seed is not None:
+        artifact = {**{k: record[k] for k in DISPOSITION_BODY}, "v": 1,
+                    "device_id": corpus["device"]["device_id"]}
+        preimage = rules["domain"]["evidence_disposition"] + canonical(artifact)
+        artifact["signature"] = "ed25519:" + base64.b64encode(
+            Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed)).sign(preimage)).decode()
+        found.add(wire_digest(artifact))
+    return found
 
 
 def check_state(state: Any, corpus: dict, where: str, projection: set[str],
@@ -982,11 +1065,17 @@ def restates(kind: str, art: dict, held: dict) -> Any:
     if kind == "epoch_confirmation":
         return next((r for r in held["epoch_confirmations"]
                      if r["anchor_epoch_id"] == art["anchor_epoch_id"]), None)
-    return next((r for r in held["dispositions"] if r == disposition_record(art)), None)
+    # Byte identity of the complete signed artifact: its wire-bytes digest, never its body.
+    return next((r for r in held["dispositions"] if r["artifact_digest"] == wire_digest(art)), None)
+
+
+def wire_digest(art: dict) -> str:
+    """`sha256:` over the wire bytes: the complete artifact, its signature included."""
+    return "sha256:" + hashlib.sha256(canonical(art)).hexdigest()
 
 
 def disposition_record(art: dict) -> dict:
-    return {k: art[k] for k in RECORD_MEMBERS["dispositions"]}
+    return {**{k: art[k] for k in DISPOSITION_BODY}, "artifact_digest": wire_digest(art)}
 
 
 def decide(case: dict, corpus: dict, rules: dict) -> dict:
@@ -1290,6 +1379,16 @@ def coverage_classes(corpus: dict) -> dict[str, Callable[[dict], bool]]:
         "disposition: an artifact-scoped disposition recorded under an identity stop": lambda c:
         dis(c) and _plain(c) and c["artifact"]["scope"] == "artifact" and c["expected"] == "accept"
         and _held(c) is None and any(s["scope"] == "identity" for s in c["held_before"]["stops"]),
+        "disposition: a re-signed body under its stop, superseded": lambda c:
+        dis(c) and _plain(c) and c["reject_reason"] == "superseded" and any(
+            all(d[k] == c["artifact"][k] for k in DISPOSITION_BODY)
+            and d["artifact_digest"] != wire_digest(c["artifact"])
+            for d in c["held_before"]["dispositions"]),
+        "disposition: a re-signed artifact-scoped body, applied as a new disposition": lambda c:
+        dis(c) and _plain(c) and c["expected"] == "accept" and c["artifact"]["scope"] == "artifact"
+        and _held(c) is None and any(
+            all(d[k] == c["artifact"][k] for k in DISPOSITION_BODY)
+            for d in c["held_before"]["dispositions"]),
         "disposition: a store fault after the first write": fault(dis, "after_first_write"),
         "disposition: a store fault at commit": fault(dis, "at_commit"),
         "disposition: the redelivery after a fault": _redelivery(corpus, "evidence_disposition"),
@@ -1380,6 +1479,14 @@ def _check_corpus(corpus: dict, rules: dict) -> list[str]:
     names = [c.get("name") for c in corpus["cases"]]
     if len(set(names)) != len(names):
         out.append("[file] case names repeat")
+    digests: dict[str, set[str]] = {}
+    for case in corpus["cases"]:
+        if isinstance(case, dict) and case.get("artifact_type") == "evidence_disposition" \
+                and isinstance(case.get("artifact"), dict) \
+                and set(case["artifact"]) == set(rules["fields"]["evidence_disposition"]):
+            body = tuple(case["artifact"][k] for k in DISPOSITION_BODY)
+            digests.setdefault(json.dumps(body), set()).add(wire_digest(case["artifact"]))
+    rules = {**rules, "disposition_digests": digests}
     for case in corpus["cases"]:
         out += check_case(case, corpus, rules, mat)
     out += coverage(corpus)
@@ -1484,7 +1591,52 @@ def retained_value_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict]
     return out
 
 
-def cross_scope_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+def resigned_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+    """Byte identity is the complete signed artifact's: a re-signed body is never a replay."""
+    out: list[tuple[str, Any, Callable[[dict], Any]]] = []
+
+    def resign_other(c: dict, i: int) -> None:
+        x = c["cases"][i]
+        art = x["artifact"]
+        body = {k: v for k, v in art.items() if k != "signature"}
+        preimage = rules["domain"]["evidence_disposition"] + canonical(body)
+        sig = sign_with_nonce(bytes.fromhex(c["authority_seeds"][art["key_id"]]), preimage, b"r4")
+        art["signature"] = "ed25519:" + base64.b64encode(sig).decode()
+
+    for i, case in enumerate(corpus["cases"]):
+        if case["artifact_type"] != "evidence_disposition" or case["store_fault"] is not None:
+            continue
+        held = restates("evidence_disposition", case["artifact"], case["held_before"])
+        if held is not None:
+            out.append((f"{case['name']}: a signature-only variant answered as the replay",
+                        ("[answer]", "[reason]", "[held_after"),
+                        lambda c, i=i: resign_other(c, i)))
+        if case["held_before"]["dispositions"]:
+            out.append((f"{case['name']}: a held artifact_digest altered in both states",
+                        "[state]|artifact_digest",
+                        lambda c, i=i: [d.update(artifact_digest="sha256:" + "9" * 64)
+                                        for side in ("held_before", "held_after")
+                                        for d in c["cases"][i][side]["dispositions"][:1]]))
+            out.append((f"{case['name']}: a held artifact_digest over the unsigned preimage",
+                        "[state]|artifact_digest", lambda c, i=i: _preimage_digests(c, i, rules)))
+        if case["expected"] == "accept" and held is None and case["artifact"]["scope"] == "artifact" \
+                and case["held_before"]["dispositions"]:
+            out.append((f"{case['name']}: the re-signed artifact-scoped body answered as a replay",
+                        "[held_after", lambda c, i=i: c["cases"][i].update(
+                            held_after={**copy.deepcopy(c["cases"][i]["held_before"]),
+                                        "application_storage_fault": False})))
+    return out
+
+
+def _preimage_digests(c: dict, i: int, rules: dict) -> None:
+    for side in ("held_before", "held_after"):
+        for d in c["cases"][i][side]["dispositions"][:1]:
+            body = {**{k: d[k] for k in DISPOSITION_BODY}, "v": 1, "device_id": c["device"]["device_id"]}
+            d["artifact_digest"] = "sha256:" + hashlib.sha256(
+                rules["domain"]["evidence_disposition"] + canonical(body)).hexdigest()
+
+
+def cross_scope_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
     """An identity stop covers every epoch: each way of letting an epoch stop past it."""
     out: list[tuple[str, Any, Callable[[dict], Any]]] = []
     for i, case in enumerate(corpus["cases"]):
@@ -1504,8 +1656,8 @@ def cross_scope_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], A
         def held(c: dict, i: int = i) -> None:
             x = c["cases"][i]
             for side in ("held_before", "held_after"):
-                x[side]["dispositions"].append({**disposition_record(x["artifact"]),
-                                                "decided_at_ms": 1})
+                x[side]["dispositions"].append(_rec(c, rules, {
+                    **disposition_record(x["artifact"]), "decided_at_ms": 1}))
                 x[side]["stops"].append(stop_of(x["artifact"]))
         out.append((f"{case['name']}: applied after the identity stop instead of superseded",
                     ("[answer]", "[reason]", "[held_after", "[state]"), applied))
@@ -1547,11 +1699,11 @@ def subject_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[
         c["sealed_artifacts"].append(dict(registration))
         case = next(x for x in c["cases"] if x["name"] == "receipt_union_over_held_prefix")
         for side in ("held_before", "held_after"):
-            case[side]["dispositions"].append({
+            case[side]["dispositions"].append(_rec(c, rules, {
                 "triggering_digest": registration["digest"],
                 "anchor_epoch_id": registration["anchor_epoch_id"], "scope": "artifact",
                 "disposition": "artifact_terminal", "decided_at_ms": 1787000003000,
-                "key_id": c["cases"][dis]["artifact"]["key_id"]})
+                "key_id": c["cases"][dis]["artifact"]["key_id"]}))
     return [
         ("subject: an arriving disposition names a sealed envelope", "[schema]",
          arriving(lambda c: c["sealed_envelopes"][0]["envelope_digest"])),
@@ -1561,7 +1713,7 @@ def subject_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[
     ]
 
 
-def permitted_states(corpus: dict) -> list[tuple[str, Callable[[dict], Any]]]:
+def permitted_states(corpus: dict, rules: dict) -> list[tuple[str, Callable[[dict], Any]]]:
     """Held states the text allows that a stricter checker might refuse."""
     def both(name: str, edit: Callable[[dict], Any]) -> Callable[[dict], Any]:
         def go(c: dict) -> None:
@@ -1577,26 +1729,28 @@ def permitted_states(corpus: dict) -> list[tuple[str, Callable[[dict], Any]]]:
                 "decided_at_ms": 1787000003000, "key_id": key}
     return [
         ("an artifact-scoped terminal disposition naming no epoch",
-         both("receipt_union_over_held_prefix", lambda h: h["dispositions"].append(dict(terminal)))),
+         both("receipt_union_over_held_prefix", lambda h: h["dispositions"].append(
+             _rec(corpus, rules, terminal)))),
         ("a projection an earlier receiver left disagreeing with its record",
          both("confirmation_identical", lambda h: h["active_epoch"].update(actor="earlier@site"))),
         ("an identity disposition and its identity stop, naming no epoch",
          both("receipt_union_over_held_prefix", lambda h: (
-             h["dispositions"].append({**terminal, "scope": "identity",
-                                       "disposition": "identity_replacement_required",
-                                       "anchor_epoch_id": corpus["sealed_artifacts"][0][
-                                           "anchor_epoch_id"]}),
+             h["dispositions"].append(_rec(corpus, rules, {
+                 **terminal, "scope": "identity", "disposition": "identity_replacement_required",
+                 "anchor_epoch_id": corpus["sealed_artifacts"][0]["anchor_epoch_id"]})),
              h["stops"].append({"scope": "identity", "anchor_epoch_id": ""})))),
         ("confirmation application times decreasing along the list",
          both("confirmation_earlier_epoch_agreeing_restatement", _times_step_back)),
         ("disposition decision times decreasing along the list",
          both("receipt_union_over_held_prefix", lambda h: h["dispositions"].extend([
-             {**terminal, "triggering_digest": corpus["sealed_artifacts"][0]["digest"],
-              "anchor_epoch_id": corpus["sealed_artifacts"][0]["anchor_epoch_id"],
-              "decided_at_ms": 1787000009000},
-             {**terminal, "triggering_digest": corpus["sealed_artifacts"][1]["digest"],
-              "anchor_epoch_id": corpus["sealed_artifacts"][1]["anchor_epoch_id"],
-              "decided_at_ms": 1787000001000}]))),
+             _rec(corpus, rules, {**terminal,
+                                  "triggering_digest": corpus["sealed_artifacts"][0]["digest"],
+                                  "anchor_epoch_id": corpus["sealed_artifacts"][0]["anchor_epoch_id"],
+                                  "decided_at_ms": 1787000009000}),
+             _rec(corpus, rules, {**terminal,
+                                  "triggering_digest": corpus["sealed_artifacts"][1]["digest"],
+                                  "anchor_epoch_id": corpus["sealed_artifacts"][1]["anchor_epoch_id"],
+                                  "decided_at_ms": 1787000001000})]))),
     ]
 
 
@@ -1609,7 +1763,7 @@ def _times_step_back(h: dict) -> None:
             o["closed_at_ms"] = first["applied_at_ms"]
 
 
-def relationship_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
+def relationship_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[dict], Any]]]:
     """Each relationship between held records broken identically in held_before and held_after,
     so the case's answer still follows; each must be refused for that relationship."""
     def both(name: str, edit: Callable[[dict], Any]) -> Callable[[dict], Any]:
@@ -1651,17 +1805,14 @@ def relationship_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], 
          lambda h: h["dispositions"][0].update(anchor_epoch_id="") or h["stops"][0].update(
              anchor_epoch_id="")),
         ("a retained_pending names a checkpoint", rec, "retained_pending names",
-         lambda h: h["dispositions"].append({
-             "triggering_digest": checkpoint, "anchor_epoch_id": corpus["sealed_artifacts"][0][
-                 "anchor_epoch_id"], "scope": "artifact", "disposition": "retained_pending",
-             "decided_at_ms": 1787000003000, "key_id": next(
-                 k["key_id"] for k in corpus["authority_key_registry"]["keys"]
-                 if k["purpose"] == "evidence_authority_disposition")})),
+         lambda h: h["dispositions"].append(_rec(corpus, rules, {
+             **template, "scope": "artifact", "disposition": "retained_pending"}))),
         ("a disposition and its stop held twice", disp, "twice",
          lambda h: (h["dispositions"].append(dict(h["dispositions"][0])),
                     h["stops"].append(dict(h["stops"][0])))),
         ("a second stop-producing disposition for one epoch", disp, "one scope",
-         lambda h: (h["dispositions"].append({**h["dispositions"][0], "decided_at_ms": 1}),
+         lambda h: (h["dispositions"].append(_rec(corpus, rules, {**h["dispositions"][0],
+                                                                  "decided_at_ms": 1})),
                     h["stops"].append(dict(h["stops"][0])))),
         ("a stop without its disposition", disp, "stops are not",
          lambda h: h["dispositions"].clear()),
@@ -1683,13 +1834,13 @@ def relationship_mutants(corpus: dict) -> list[tuple[str, Any, Callable[[dict], 
         ("a sequence receipted twice", rec, "receipts",
          lambda h: h["receipts"].append(dict(h["receipts"][0]))),
         ("a disposition names a sealed envelope", rec, "triggering_digest",
-         lambda h: h["dispositions"].append({**template, "scope": "artifact",
-                                             "disposition": "artifact_terminal",
-                                             "triggering_digest": envelope["envelope_digest"],
-                                             "anchor_epoch_id": envelope["anchor_epoch_id"]})),
+         lambda h: h["dispositions"].append(_rec(corpus, rules, {
+             **template, "scope": "artifact", "disposition": "artifact_terminal",
+             "triggering_digest": envelope["envelope_digest"],
+             "anchor_epoch_id": envelope["anchor_epoch_id"]}))),
         ("an identity stop names an epoch", rec, "stops",
-         lambda h: (h["dispositions"].append({**template, "scope": "identity",
-                                              "disposition": "identity_replacement_required"}),
+         lambda h: (h["dispositions"].append(_rec(corpus, rules, {
+             **template, "scope": "identity", "disposition": "identity_replacement_required"})),
                     h["stops"].append({"scope": "identity",
                                        "anchor_epoch_id": template["anchor_epoch_id"]}))),
         ("an epoch stop names no epoch", disp, "stops", lambda h: h["stops"][0].update(
@@ -1905,9 +2056,10 @@ def corpus_mutants(corpus: dict, rules: dict) -> list[tuple[str, Any, Callable[[
                             _resign(c["cases"][i], c, r))))
     out += vocabulary_mutants(corpus, rules)
     out += retained_value_mutants(corpus)
-    out += relationship_mutants(corpus)
+    out += relationship_mutants(corpus, rules)
     out += subject_mutants(corpus, rules)
-    out += cross_scope_mutants(corpus)
+    out += cross_scope_mutants(corpus, rules)
+    out += resigned_mutants(corpus, rules)
     for label in coverage_classes(corpus):
         out.append((f"without {label}", "[coverage]",
                     lambda c, label=label: c.update(cases=[
@@ -2068,7 +2220,7 @@ def run_mutations(texts: dict, corpus: dict, rules: dict, base: list[str]) -> tu
             continue
         survived.append(f"re-pin: {label}")
     # States the text permits, held in both before and after: each must still pass.
-    permitted = permitted_states(corpus)
+    permitted = permitted_states(corpus, rules)
     for label, edit in permitted:
         good = copy.deepcopy(corpus)
         edit(good)
@@ -2140,7 +2292,7 @@ def main(argv: list[str]) -> int:
                 print(f"mutant survived: {line[:160]}", file=sys.stderr)
             return 1
         print(f"{NAME}: {count} mutants refused, each for its intended reason; "
-              f"{len(permitted_states(corpus))} permitted states pass")
+              f"{len(permitted_states(corpus, rules))} permitted states pass")
     if status == 0:
         print(f"{NAME}: corpus agrees with the contract ({len(corpus['cases'])} cases, "
               f"{len(coverage_classes(corpus))} case classes covered)")

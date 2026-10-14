@@ -206,8 +206,77 @@ def stop_of(artifact: dict) -> dict | None:
 
 
 def applied_disposition(artifact: dict) -> dict:
-    return {k: artifact[k] for k in ("triggering_digest", "anchor_epoch_id", "scope",
-                                     "disposition", "decided_at_ms", "key_id")}
+    """The held record: the body's fields and the complete signed artifact's digest."""
+    record = {k: artifact[k] for k in ("triggering_digest", "anchor_epoch_id", "scope",
+                                       "disposition", "decided_at_ms", "key_id")}
+    record["artifact_digest"] = "sha256:" + hashlib.sha256(canonical(artifact)).hexdigest()
+    return record
+
+
+# A second valid Ed25519 signature over the same preimage, from a nonce other
+# than RFC 8032's deterministic one, so a re-signed disposition is a different
+# artifact with an identical body. Affine arithmetic over edwards25519.
+_P = 2**255 - 19
+_L = 2**252 + 27742317777372353535851937790883648493
+_D = (-121665 * pow(121666, _P - 2, _P)) % _P
+_GY = 4 * pow(5, _P - 2, _P) % _P
+
+
+def _recover_x(y: int, sign: int) -> int:
+    xx = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    x = pow(xx, (_P + 3) // 8, _P)
+    if (x * x - xx) % _P:
+        x = x * pow(2, (_P - 1) // 4, _P) % _P
+    if x % 2 != sign:
+        x = _P - x
+    return x
+
+
+_G = (_recover_x(_GY, 0), _GY)
+
+
+def _add(a: tuple, b: tuple) -> tuple:
+    (x1, y1), (x2, y2) = a, b
+    t = _D * x1 * x2 * y1 * y2 % _P
+    return ((x1 * y2 + x2 * y1) * pow(1 + t, _P - 2, _P) % _P,
+            (y1 * y2 + x1 * x2) * pow(1 - t, _P - 2, _P) % _P)
+
+
+def _mul(k: int, point: tuple) -> tuple:
+    out = (0, 1)
+    while k:
+        if k & 1:
+            out = _add(out, point)
+        point = _add(point, point)
+        k >>= 1
+    return out
+
+
+def _encode(point: tuple) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def resign(artifact: dict, domain: str, key: str) -> dict:
+    """The same body signed again under *key* with a non-deterministic nonce."""
+    body = {k: v for k, v in artifact.items() if k != "signature"}
+    message = preimage(domain, body, "signature")
+    digest = hashlib.sha512(bytes.fromhex(SEEDS[key])).digest()
+    a = int.from_bytes(digest[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    public = _encode(_mul(a, _G))
+    assert public.hex() == public_hex(SEEDS[key])
+    r = int.from_bytes(hashlib.sha512(b"ori-specs restated records second nonce" + message).digest(),
+                       "little") % _L
+    big_r = _encode(_mul(r, _G))
+    k = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little") % _L
+    signature = big_r + ((r + k * a) % _L).to_bytes(32, "little")
+    Ed25519PrivateKey.from_private_bytes(bytes.fromhex(SEEDS[key])).public_key().verify(
+        signature, message)
+    resigned = dict(body, signature="ed25519:" + base64.b64encode(signature).decode("ascii"))
+    assert resigned["signature"] != artifact["signature"]
+    return resigned
 
 
 # --- held records ----------------------------------------------------------------------
@@ -373,7 +442,7 @@ def decide_once(kind: str, before: dict, artifact: dict, now: int,
             record = applied_disposition(artifact)
             stop = stop_of(artifact)
             identity_stopped = any(x["scope"] == "identity" for x in s["stops"])
-            if record in s["dispositions"]:
+            if any(d["artifact_digest"] == record["artifact_digest"] for d in s["dispositions"]):
                 pass
             elif stop is None:
                 # Artifact scope, on a sealed checkpoint: recorded, with no
@@ -526,19 +595,13 @@ CASES: list[tuple[str, str, str, dict, dict, str | None]] = [
      held(), disposition(1, T0 + 3000), None),
     ("disposition_byte_identical_repeat", "evidence_disposition",
      "Byte-identical to the applied disposition. v2's rule: applied again with no new state.",
-     held(dispositions=[{"triggering_digest": SEALED_ARTIFACTS[0]["digest"],
-                         "anchor_epoch_id": EPOCH_CURRENT, "scope": "epoch",
-                         "disposition": "epoch_reprovisioning_required",
-                         "decided_at_ms": T0 + 3000, "key_id": KEY_ID["disposition_active"]}],
-          stops=[{"scope": "epoch", "anchor_epoch_id": EPOCH_CURRENT}]),
+     held(dispositions=[applied_disposition(disposition(1, T0 + 3000))],
+          stops=[stop_of(disposition(1, T0 + 3000))]),
      disposition(1, T0 + 3000), None),
     ("disposition_no_new_effect_is_superseded", "evidence_disposition",
      "Another epoch-scoped disposition for the current epoch, triggered by another sealed checkpoint, while that epoch's stop is in force. v2's rule: refused superseded, never restatement_conflict; nothing changes.",
-     held(dispositions=[{"triggering_digest": SEALED_ARTIFACTS[0]["digest"],
-                         "anchor_epoch_id": EPOCH_CURRENT, "scope": "epoch",
-                         "disposition": "epoch_reprovisioning_required",
-                         "decided_at_ms": T0 + 3000, "key_id": KEY_ID["disposition_active"]}],
-          stops=[{"scope": "epoch", "anchor_epoch_id": EPOCH_CURRENT}]),
+     held(dispositions=[applied_disposition(disposition(1, T0 + 3000))],
+          stops=[stop_of(disposition(1, T0 + 3000))]),
      disposition(2, T0 + 4000), None),
     ("disposition_epoch_under_identity_stop_same_epoch", "evidence_disposition",
      "An identity stop is in force. An epoch-scoped disposition for the current epoch has no new effect, since the identity stop already covers every epoch: refused superseded, and nothing changes.",
@@ -565,6 +628,15 @@ CASES: list[tuple[str, str, str, dict, dict, str | None]] = [
      held(dispositions=[applied_disposition(disposition(2, T0 + 3000, "identity"))],
           stops=[stop_of(disposition(2, T0 + 3000, "identity"))]),
      disposition(1, T0 + 4000, "artifact"), None),
+    ("disposition_resigned_body_under_its_stop", "evidence_disposition",
+     "The same body as the applied epoch disposition under another valid signature. A different signature makes a different artifact, so it is not a byte-identical repeat, and its stop is in force: refused superseded, and nothing changes.",
+     held(dispositions=[applied_disposition(disposition(1, T0 + 3000))],
+          stops=[stop_of(disposition(1, T0 + 3000))]),
+     resign(disposition(1, T0 + 3000), DISPOSITION_DOMAIN, "disposition_active"), None),
+    ("disposition_resigned_artifact_scope_body", "evidence_disposition",
+     "The same body as an applied artifact-scoped disposition under another valid signature. It is a different artifact and no stop decides it: applied as a new disposition, with its own record and artifact_digest beside the first.",
+     held(dispositions=[applied_disposition(disposition(1, T0 + 3000, "artifact"))]),
+     resign(disposition(1, T0 + 3000, "artifact"), DISPOSITION_DOMAIN, "disposition_active"), None),
     ("disposition_store_fault_after_first_write", "evidence_disposition",
      "As disposition_first_application, with the store failing on the write after the disposition record. Rolled back: no disposition and no stop is held, the artifact is undecided, and the signal is raised.",
      held(), disposition(1, T0 + 3000), "after_first_write"),
