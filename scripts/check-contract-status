@@ -1402,8 +1402,8 @@ _REPO_PATH_VERBS = {"blob", "tree", "raw", "blame", "edit", "commits", "history"
 _REPO_OTHER_VERBS = {"issues", "pull", "pulls", "actions", "releases", "commit", "compare", "discussions", "wiki",
                      "security", "tags", "branches", "milestones", "labels", "projects", "pulse", "graphs", "network",
                      "settings", "archive", "tree-commit"}
-_PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9.@/-])((?:\.{1,2}/)*(?:[\w.-]+/)*[\w.-]+\.(?:md|json|ya?ml|txt|csv|png|svg|jpe?g|"
-                         r"gif|pdf|html?)(?:#[\w-]*)?)(?![A-Za-z0-9/-])", re.I)
+_PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9.@/-])((?:\.{1,2}/)*(?:[\w.-]+/)*[\w-]+\.[A-Za-z0-9]+(?:#[\w-]*)?)"
+                         r"(?![A-Za-z0-9/-])")
 _LINE_PREFIX = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*")
 _ANGLE_PATH = re.compile(r"<([^<>\s][^<>\n]*)>")
 _CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
@@ -1412,14 +1412,60 @@ _DOC_FILE = re.compile(r"\.(?:md|json|ya?ml|txt|csv)$", re.I)
 _VERSION_DOC = re.compile(r"v([1-9][0-9]*)\.md")
 
 
-def _heading_text_slug(text: str) -> str:
-    """GitHub's anchor for a heading's text: inline links and images read as their text, code spans and HTML tags as
-    their content, emphasis marks dropped, then lowercase with punctuation other than - and _ removed."""
-    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"!?\[([^\]]*)\]\[[^\]]*\]", r"\1", text)
+def _rendered_text(text: str) -> str:
+    """A heading's text as rendered: code spans as their content, links and images as their text (destinations with
+    nested parentheses included), HTML tags dropped, entities decoded, emphasis delimiters removed."""
+    spans: list[str] = []
+
+    def keep(m: re.Match) -> str:
+        spans.append(m.group(2).strip())
+        return f"\x00{len(spans) - 1}\x00"
+    text = _CODE_SPAN.sub(keep, text)
+    out, i = [], 0
+    while i < len(text):
+        m = re.match(r"!?\[((?:[^\[\]\\]|\\.)*)\]", text[i:])
+        if m:
+            j = i + m.end()
+            if j < len(text) and text[j] == "(":
+                depth, k = 0, j
+                while k < len(text):
+                    depth += {"(": 1, ")": -1}.get(text[k], 0)
+                    if depth == 0:
+                        break
+                    k += 1
+                if depth == 0:
+                    out.append(m.group(1)); i = k + 1
+                    continue
+            ref = re.match(r"\[[^\]]*\]", text[j:])
+            out.append(m.group(1)); i = j + (ref.end() if ref else 0)
+            continue
+        out.append(text[i]); i += 1
+    text = "".join(out)
     text = re.sub(r"<[^>]+>", "", text)
-    text = _CODE_SPAN.sub(lambda m: m.group(2), text)
-    return re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+    text = html.unescape(text)
+    text = text.replace("*", "")
+    text = re.sub(r"(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])", "", text)
+    return re.sub("\x00([0-9]+)\x00", lambda m: spans[int(m.group(1))], text)
+
+
+def _heading_text_slug(text: str) -> str:
+    """GitHub's anchor for a heading: its rendered text, lowercase, with punctuation other than - and _ removed and
+    spaces as hyphens."""
+    return re.sub(r"[^\w\- ]", "", _rendered_text(text).lower()).replace(" ", "-")
+
+
+# GitHub's anchors for a fixed set of headings, held so the slug rules are tested, not assumed.
+SLUG_TABLE = (
+    ('## __Rule__', 'rule'),
+    ('## [Rule](foo(bar).md)', 'rule'),
+    ('## `storage_degraded` Is Late', 'storage_degraded-is-late'),
+    ('## *Emphasis* and **strong**', 'emphasis-and-strong'),
+    ('## A &amp; B', 'a--b'),
+    ('## Runtime Liveness at `v` 2', 'runtime-liveness-at-v-2'),
+    ('## How Much of `detail` Is Constrained', 'how-much-of-detail-is-constrained'),
+    ('## See [x](https://a/b)', 'see-x'),
+    ('## snake_case_name', 'snake_case_name'),
+)
 
 
 def _github_slugs(text: str) -> set[str]:
@@ -1534,14 +1580,17 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
     if tops:
         # A directory scan names a file only with a file-shaped tail: an extension, a contract version vN (read as
         # vN.md) or an anchor. A bare directory phrase (status/health, events/alarms) is prose, not a reference.
-        scan = re.compile(r"(?<![A-Za-z0-9/-])((?:" + "|".join(map(re.escape, tops)) + r")(?:/[A-Za-z0-9._-]+)*"
-                          r"(?:\.[A-Za-z0-9]{1,6}|/v[1-9][0-9]*)(?:#[\w-]+)?)(?![A-Za-z0-9/])")
+        # The boundary's three tails: an extension of any length, a contract version dir/vN, or an anchor.
+        scan = re.compile(r"(?<![A-Za-z0-9/-])((?:" + "|".join(map(re.escape, tops)) + r")(?:/[A-Za-z0-9._-]+)+)"
+                          r"(#[\w-]+)?(?![A-Za-z0-9/])")
         for m in scan.finditer(decoded):
-            path = m.group(1)
-            head = path.split("#", 1)[0]
-            if re.search(r"/v[1-9][0-9]*$", head):
-                path = head + ".md" + path[len(head):]
-            targets.append((path, "rootscan"))
+            path, anchor = m.group(1).rstrip("."), m.group(2) or ""
+            last = path.rsplit("/", 1)[-1]
+            if re.fullmatch(r"v[1-9][0-9]*", last):
+                path += ".md"
+            elif "." not in last.strip(".") and not anchor:
+                continue  # a directory phrase in prose (status/health) has none of the three tails
+            targets.append((path + anchor, "rootscan"))
     for m in re.finditer(r"api\.github\.com/repos/ori-platform/ori-specs/contents/([^\s?#<>\"')\]]+)", added, re.I):
         targets.append((m.group(1), "repo-path"))
     for m in _PATH_TOKEN.finditer(added):
@@ -1580,13 +1629,13 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
     targets: list[tuple[str, str]] = []
     for raw, base in found:
         if base == "token":
+            # Repository scope first: a path whose first segment is not a top-level directory here (ori-runtime/...,
+            # docs/...) is another repository's and is not read; only then does existence at the freeze matter.
             head = raw.split("#", 1)[0]
             if head.startswith(("./", "../")) or "/" not in head:
                 targets.append((raw, "contract"))
             elif head.split("/", 1)[0] in tops:
                 targets.append((raw, "root"))
-            else:
-                targets.append((raw, "either"))
             continue
         if base in ("repo-path", "rootscan"):
             targets.append((raw, "root"))
@@ -1615,12 +1664,6 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
         target = target.split("?", 1)[0]
         if base == "root" and re.fullmatch(r"L[0-9]+(?:C[0-9]+)?(?:-L[0-9]+(?:C[0-9]+)?)?", anchor):
             anchor = ""  # a GitHub line anchor names a line, not a heading
-        if base == "either":
-            # A path that is neither ./-relative nor under a top-level directory here: it names a file of this
-            # repository only if one exists at the freeze revision on either reading, and is refused otherwise.
-            as_contract = posixpath.normpath(posixpath.join(contract, target))
-            base, target = ("contract", target) if _git_out(
-                ROOT, "cat-file", "-e", f"{revision}:{as_contract}") is not None else ("root", target)
         path = own if not target else posixpath.normpath(
             posixpath.join(contract, target) if base == "contract" else target)
         if path.startswith("../") or path == "..":
@@ -3030,6 +3073,24 @@ def mutations() -> int:
         ('an erratum citing a contract version present at freeze in prose passes', None,
          lambda root: (append_normative(root, audited, 'See signing/v1 for it.'),
                        complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path with a long extension absent at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/no-such.markdown for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path with an anchor-only tail absent at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/no-such#rule for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a contract version absent at freeze by dir/vN', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/v9 for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a heading its target lacked at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See firmware-commands/v1.md#no-such-rule for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a heading its target had at freeze passes', None,
+         lambda root: (append_normative(root, audited, 'See signing/v1.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming another repository's document passes", None,
+         lambda root: (append_normative(root, audited, 'See ori-runtime/docs/safety.md and docs/x.md.'),
+                       complete_audit(root, last_hunk_erratum))),
         ("an erratum linking an issue of this repository by URL passes", None,
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
                        complete_audit(root, last_hunk_erratum))),
@@ -3515,6 +3576,14 @@ def mutations() -> int:
     more, bad_changes = changes_mutations()
     total += more
     failed += bad_changes
+    # The heading anchors the erratum guard checks, against a fixed table of GitHub's rendered anchors. A rule that
+    # invented an anchor (keeping emphasis marks, a link's destination) would let a missing section look present.
+    for heading, want in SLUG_TABLE:
+        got = sorted(_github_slugs(heading))
+        good = got == [want]
+        print(f"{'ok  ' if good else 'FAIL'} the anchor of {heading!r} is {want!r}" + ("" if good else f" (got {got})"))
+        total += 1
+        failed += not good
     print(f"{total - failed}/{total} mutations behaved as named")
     return 1 if failed else 0
 
