@@ -50,6 +50,7 @@ import json
 import multiprocessing
 import os
 import pathlib
+import posixpath
 import re
 import shutil
 import subprocess
@@ -1345,6 +1346,7 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     f"hunk {str(h.get('hunk_sha256'))[:12]} names commit {h['commit']}, which is not in "
                                     "HEAD's history; a squash or a rewrite leaves the record pointing at nothing"))
     recorded = {h["hunk_sha256"]: h for h in ba["hunks"]}
+    added_lines = net_hunk_added(base.decode("utf-8", errors="replace"), current)
     for digest, first in net_hunks(base.decode("utf-8", errors="replace"), current):
         h = recorded.get(digest)
         if h is None:
@@ -1357,11 +1359,39 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
             findings.append(Finding("semantic-hunk-in-frozen", where,
                                     f"hunk {digest[:12]} is classified semantic, so it belongs to "
                                     f"{h.get('destination')} and may not remain in this frozen version"))
+        elif h["classification"] == "erratum":
+            for ref in absent_references(key[0], added_lines.get(digest, ""), str(ba["freeze_revision"])):
+                findings.append(Finding(
+                    "erratum-imports-later-document", where,
+                    f"hunk {digest[:12]} is recorded erratum but names {ref}, which does not exist at the freeze "
+                    f"revision {ba['freeze_revision']}. An erratum changes nothing a conforming party does, and a "
+                    "document the version froze without can only add to that, so the hunk is semantic and moves to a "
+                    "successor. A later version of this contract is exempt, so a frozen version may point at its own "
+                    "successor. The check reads Markdown link targets and backticked .md paths in the hunk's added "
+                    "lines only, and not additive hunks: a document named in prose without a path passes it"))
     for h in ba["hunks"]:
         if h["classification"] == "semantic" and not (root / f"{h.get('destination')}.md").is_file():
             findings.append(Finding("semantic-destination-missing", where,
                                     f"semantic hunk {h['hunk_sha256'][:12]} names {h.get('destination')}, which "
                                     "does not exist"))
+
+
+_DOC_REFERENCE = re.compile(r"\]\(([^)#\s]+\.md)(?:#[^)\s]*)?\)|`([A-Za-z0-9_./-]+\.md)`")
+
+
+def absent_references(contract: str, added: str, revision: str) -> list[str]:
+    """Repository paths of the Markdown documents an audited hunk names that do not exist at the revision.
+
+    A link target resolves against the contract's directory and a backticked path against the repository root,
+    as the contracts write them. Only those two forms are read; a document named in prose is not."""
+    out = []
+    for link, tick in _DOC_REFERENCE.findall(added):
+        path = posixpath.normpath(posixpath.join(contract, link)) if link else posixpath.normpath(tick)
+        if path.startswith("..") or path in out or (path.startswith(f"{contract}/") and is_version_document(contract, path)):
+            continue
+        if _git_out(ROOT, "cat-file", "-e", f"{revision}:{path}") is None:
+            out.append(path)
+    return out
 
 
 def _refuse_duplicates(pairs: list) -> dict:
@@ -2271,6 +2301,12 @@ def mutations() -> int:
     def first_hunk(update: dict) -> Callable[[dict], None]:
         return lambda a: a["hunks"][0].update(update)
 
+    def last_hunk_erratum(a: dict) -> None:
+        h = a["hunks"][-1]
+        for k in ("optional", "unknown_field_compatible"):
+            h.pop(k, None)
+        h["classification"] = "erratum"
+
     def rec_edit(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
         return lambda root: _edit_json(root, f"status/{rel}.json", fn)
 
@@ -2599,6 +2635,18 @@ def mutations() -> int:
          lambda root: (complete_audit(root), append_normative(root, audited, "A consumer MUST also refuse this."))),
         ("a complete audit missing one net hunk", "baseline-drift",
          lambda root: complete_audit(root, lambda a: a["hunks"].pop(0))),
+        ("an erratum linking a document absent at the freeze revision", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming a document absent at the freeze revision in backticks", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See `no-such-contract/v1.md`."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum pointing at its own contract's successor passes", None,
+         lambda root: (append_normative(root, audited, "Superseded by [v9](v9.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an additive hunk linking a document absent at the freeze revision passes", None,
+         lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
+                       complete_audit(root))),
         ("a semantic hunk left in the frozen version", "semantic-hunk-in-frozen",
          lambda root: complete_audit(root, first_hunk({"classification": "semantic", "destination": "evidence/v2"}))),
         ("a semantic hunk with no destination", "bad-value",
