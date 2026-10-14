@@ -1369,13 +1369,11 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                     f"{ba['freeze_revision']} does not have (or which this check cannot read). An erratum changes "
                     "nothing a conforming party does, and a file or section the version froze without can only add "
                     "to that, so the hunk is semantic and moves to a successor; reference syntax the check cannot "
-                    "read is refused rather than passed. Limits: it reads the hunk's added lines only, and not a "
-                    "document named in prose without a path, a bare file name other than a .md document, a path that "
-                    "leaves the repository, a URL to another site, a path under a directory this repository does not "
-                    "have and written without an extension the check reads, "
-                    "additive hunks, or a "
-                    "rule added later inside a section that existed at the freeze revision. A later version of this "
-                    "contract, by number, is exempt, so an erratum may point at its successor and, through that "
+                    "read is refused rather than passed. Its boundary is the references a renderer turns into a link to a "
+                    "file in this repository and path tokens with a file-shaped tail, in the hunk's added lines; a name "
+                    "written in prose without a path, obfuscated or encoded beyond that, or in an additive hunk is "
+                    "outside it and is held to the erratum definition by review. A later version of this contract, by "
+                    "number, is exempt, so an erratum may point at its successor and, through that "
                     "pointer, at that successor's rules; an earlier version is not"))
     for h in ba["hunks"]:
         if h["classification"] == "semantic" and not (root / f"{h.get('destination')}.md").is_file():
@@ -1523,13 +1521,29 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
     # that path, whatever surrounds it: a URL on any host, an API path, a path split by markup, any extension or
     # none. Each must exist at the freeze revision, as a file or a directory.
     decoded = html.unescape(urllib.parse.unquote(urllib.parse.unquote(added)))
-    decoded = re.sub(r"<[^<>\n]*>", "", decoded)
+    decoded = re.sub(r"<!--.*?-->", "", decoded, flags=re.S)
+    decoded = re.sub(r"<[^<>]*>", "", decoded)
+    decoded = re.sub("[\u00ad\u200b\u200c\u200d\u2060\ufeff]", "", decoded)
+    # Emphasis markers inside a path are dropped outright, so `dir/*v1*.md` reads as dir/v1.md.
+    decoded = re.sub(r"(?<=[/A-Za-z0-9.-])[_*]+(?=[A-Za-z0-9./-])", "", decoded)
     decoded = re.sub(r"(?<![A-Za-z0-9])[_*]+|[_*]+(?![A-Za-z0-9])", " ", decoded)
+    # Another site's URL is not read: its path is that site's, whatever directory names it shares with this one.
+    decoded = re.sub(r"\b(?:https?:)?//(?!(?:www\.)?(?:[\w-]+\.)*github(?:usercontent)?\.com/(?:repos/)?ori-platform/ori-specs)"
+                     r"[^\s<>()\]\"']+", " ", decoded, flags=re.I)
     tops = sorted((p.name for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")), key=len, reverse=True)
     if tops:
-        scan = re.compile(r"(?<![A-Za-z0-9-])((?:" + "|".join(map(re.escape, tops)) + r")/[A-Za-z0-9._/-]*[A-Za-z0-9_/-])")
+        # A directory scan names a file only with a file-shaped tail: an extension, a contract version vN (read as
+        # vN.md) or an anchor. A bare directory phrase (status/health, events/alarms) is prose, not a reference.
+        scan = re.compile(r"(?<![A-Za-z0-9/-])((?:" + "|".join(map(re.escape, tops)) + r")/[A-Za-z0-9._/-]*"
+                          r"(?:\.[A-Za-z0-9]{1,6}|/v[1-9][0-9]*)(?:#[\w-]+)?)(?![A-Za-z0-9/])")
         for m in scan.finditer(decoded):
-            targets.append((m.group(1).rstrip("/") or m.group(1), "rootscan"))
+            path = m.group(1)
+            head = path.split("#", 1)[0]
+            if re.search(r"/v[1-9][0-9]*$", head):
+                path = head + ".md" + path[len(head):]
+            targets.append((path, "rootscan"))
+    for m in re.finditer(r"api\.github\.com/repos/ori-platform/ori-specs/contents/([^\s?#<>\"')\]]+)", added, re.I):
+        targets.append((m.group(1), "repo-path"))
     for m in _PATH_TOKEN.finditer(added):
         token = m.group(1)
         # A bare file name with no directory is another repository's file as often as this one's (gateway.yaml,
@@ -2992,8 +3006,20 @@ def mutations() -> int:
         ('an erratum naming a path split by markup', "erratum-imports-later-document",
          lambda root: (append_normative(root, audited, 'See gaps/<em>no-such</em>-file.md for it.'),
                        complete_audit(root, last_hunk_erratum))),
-        ('an erratum naming a script with no extension', "erratum-imports-later-document",
-         lambda root: (append_normative(root, audited, 'Run scripts/no-such-script first.'),
+        ('an erratum with emphasis inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/*no-such*-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an invisible character inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/\u200bno-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a tag spanning lines inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/<em\nclass=x>no-such</em>-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with directory words in prose passes', None,
+         lambda root: (append_normative(root, audited, 'Status/health and events/alarms are reported elsewhere.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming another repository's source path passes", None,
+         lambda root: (append_normative(root, audited, 'See ori-runtime/src/signing/mod.rs and https://example.com/gaps/x.md.'),
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum linking an issue of this repository by URL passes", None,
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
