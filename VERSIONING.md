@@ -413,13 +413,13 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence-audit | v1 | `draft` | `amendable` | — |
 | evidence-commissioning-ingest | v1 | `draft` | `amendable` | — |
 | evidence-exchange | v1 | `draft` | `frozen` | claiming-merge, gateway `1d46303`, 2026-08-25; audit complete |
-| evidence-exchange | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit pending |
+| evidence-exchange | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
 | evidence-exchange | v3 | `draft` | `amendable` | — |
 | evidence-transport | v1 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
-| evidence-transport | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit pending |
+| evidence-transport | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit pending |
 | firmware-commands | v2 | `draft` | `amendable` | — |
-| firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit pending |
+| firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit complete |
 | firmware-telemetry | v1 | `draft` | `frozen` | claiming-merge, runtime `8aefc63`, 2026-07-16; audit pending |
 | firmware-telemetry | v2 | `draft` | `amendable` | — |
 | gateway-api | v1 | `draft` | `frozen` | claiming-merge, gateway `663c99f`, 2026-06-04; audit complete |
@@ -431,7 +431,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | offline-tokens | v2 | `draft` | `frozen` | claiming-merge, runtime `31ef157`, 2026-09-26; audit complete |
 | operator-socket | v1 | `draft` | `frozen` | claiming-merge, runtime `4078762`, 2026-09-29; audit complete |
-| operator-socket | v2 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
+| operator-socket | v2 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
 | runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | runtime-config | v2 | `draft` | `amendable` | — |
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
@@ -443,13 +443,13 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-health | v3 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
 | runtime-health | v4 | `draft` | `amendable` | — |
 | runtime-mobile | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
-| runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit pending |
+| runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit complete |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
 | runtime-telemetry | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-telemetry | v2 | `draft` | `frozen` | shipment, runtime `f87be13`, 2026-09-16; audit pending |
 | safety-profile | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
 | safety-qualification-fixture | v1 | `draft` | `amendable` | — |
-| schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit pending |
+| schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
 | sensor-configuration | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit pending |
 | signing | v1 | `draft` | `frozen` | shipment, runtime `1411814`, 2026-06-12; audit complete |
 | signing | v2 | `draft` | `amendable` | — |
