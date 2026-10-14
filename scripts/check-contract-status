@@ -1368,7 +1368,8 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                     "nothing a conforming party does, and a file or section the version froze without can only add "
                     "to that, so the hunk is semantic and moves to a successor; reference syntax the check cannot "
                     "read is refused rather than passed. Limits: it reads the hunk's added lines only, and not a "
-                    "document named in prose without a path, a path that leaves the repository, a URL to another site, "
+                    "document named in prose without a path, a bare file name other than a .md document, a path that "
+                    "leaves the repository, a URL to another site, "
                     "additive hunks, or a "
                     "rule added later inside a section that existed at the freeze revision. A later version of this "
                     "contract, by number, is exempt, so an erratum may point at its successor and, through that "
@@ -1384,8 +1385,8 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
 # patterns cannot read completely is itself a finding, so the guard fails closed on a form it does not know.
 _DEST = r"(?:<([^<>\n]*)>|((?:[^\s()<>\\]|\\.|\([^\s()<>]*\))+))"
 _LINK_INLINE = re.compile(r"\]\(\s*" + _DEST + r"(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?\s*\)")
-_LINK_DEFINITION = re.compile(r"^ {0,3}\[[^\]\n]+\]:[ \t]*(?:\n[ \t]*)?" + _DEST, re.M)
-_DEFINITION_SHAPE = re.compile(r"^ {0,3}\[[^\]\n]+\]:", re.M)
+_LINK_DEFINITION = re.compile(r"^ {0,3}\[(?:[^\]\\]|\\.)+\]:[ \t]*(?:\n[ \t]*)?" + _DEST, re.M)
+_DEFINITION_SHAPE = re.compile(r"^ {0,3}\[(?:[^\]\\]|\\.)+\]:", re.M)
 _HTML_TAG = re.compile(r"<([A-Za-z][\w:-]*)((?:\s[^<>]*)?)/?>")
 _HTML_ATTR_ANY = re.compile(r"([A-Za-z_:][\w:.-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))")
 _HTML_ATTR_SHAPE = re.compile(r"\b(?:href|src|data|cite|action|formaction|srcset|poster|background|content)\s*=",
@@ -1393,6 +1394,15 @@ _HTML_ATTR_SHAPE = re.compile(r"\b(?:href|src|data|cite|action|formaction|srcset
 # A link into this repository by URL names the path after the ref.
 _REPO_URL = re.compile(r"^https?://(?:github\.com/ori-platform/ori-specs/(?:blob|tree|raw)/[^/]+/"
                        r"|raw\.githubusercontent\.com/ori-platform/ori-specs/[^/]+/)(.*)$", re.I)
+_REPO_ANY_URL = re.compile(r"(?:https?:)?//(?:www\.)?(?:github\.com/ori-platform/ori-specs(?:/([A-Za-z-]+))?"
+                           r"|raw\.githubusercontent\.com/ori-platform/ori-specs)/?([^\s<>()\[\]\"'`]*)", re.I)
+# GitHub views whose path after the ref is a file in this repository, and views that name none.
+_REPO_PATH_VERBS = {"blob", "tree", "raw", "blame", "edit", "commits", "history", "delete", "new"}
+_REPO_OTHER_VERBS = {"issues", "pull", "pulls", "actions", "releases", "commit", "compare", "discussions", "wiki",
+                     "security", "tags", "branches", "milestones", "labels", "projects", "pulse", "graphs", "network",
+                     "settings", "archive", "tree-commit"}
+_PATH_TOKEN = re.compile(r"(?<![\w.@/-])((?:\.{1,2}/)*(?:[\w-]+/)*[\w.-]+\.(?:md|json|ya?ml|txt|csv|png|svg|jpe?g|"
+                         r"gif|pdf|html?)(?:#[\w-]*)?)(?![\w/-])", re.I)
 _LINE_PREFIX = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*")
 _ANGLE_PATH = re.compile(r"<([^<>\s][^<>\n]*)>")
 _CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
@@ -1457,7 +1467,13 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
         covered.append(m.span())
         targets.append((m.group(1) if m.group(1) is not None else m.group(2), "contract"))
     # A definition may sit behind blockquote markers or inside a list item; read it with that prefix removed.
-    unprefixed = "\n".join(_LINE_PREFIX.sub("", line, count=1) for line in prose.split("\n"))
+    def strip_prefixes(line: str) -> str:
+        while True:
+            shorter = _LINE_PREFIX.sub("", line, count=1)
+            if shorter == line:
+                return line
+            line = shorter
+    unprefixed = "\n".join(strip_prefixes(line) for line in prose.split("\n"))
     for m in _DEFINITION_SHAPE.finditer(unprefixed):
         d = _LINK_DEFINITION.match(unprefixed, m.start())
         if d is None:
@@ -1488,10 +1504,23 @@ def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
     for m in _HTML_ATTR_SHAPE.finditer(prose):
         if not any(lo <= m.start() < hi for lo, hi in covered):
             unread.append(prose[m.start():m.start() + 60])
-    # GitHub links a bare URL in prose; one into this repository is read like a link.
-    for m in re.finditer(r"(?<![(<\"'=])\bhttps?://(?:github\.com|raw\.githubusercontent\.com)/ori-platform/ori-specs/"
-                         r"[^\s<>()\]\"']+", prose, re.I):
-        targets.append((m.group(0).rstrip(".,;:"), "contract"))
+    # The backstop, independent of syntax: every URL into this repository and every path-shaped token with a
+    # document or vector extension anywhere in the added text, code spans included, is read as a reference too, so
+    # a form the patterns above do not know still names its file.
+    for m in _REPO_ANY_URL.finditer(added):
+        verb, rest = (m.group(1) or "").lower(), m.group(2)
+        if m.group(0).lower().find("raw.githubusercontent.com") >= 0:
+            targets.append((rest.split("/", 1)[1] if "/" in rest else "", "repo-path"))
+        elif verb in _REPO_PATH_VERBS:
+            targets.append((rest.split("/", 1)[1] if "/" in rest else "", "repo-path"))
+        elif verb and verb not in _REPO_OTHER_VERBS:
+            unread.append(m.group(0)[:60])
+    for m in _PATH_TOKEN.finditer(added):
+        token = m.group(1)
+        # A bare file name with no directory is another repository's file as often as this one's (gateway.yaml,
+        # ori.yaml); only a bare Markdown document is read.
+        if "/" in token or token.split("#", 1)[0].lower().endswith(".md"):
+            targets.append((token, "token"))
     for m in _ANGLE_PATH.finditer(prose):
         inside = m.group(1)
         if any(lo <= m.start() < hi for lo, hi in covered) or re.match(r"^[a-z][a-z0-9+.-]*:", inside, re.I):
@@ -1521,6 +1550,18 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
     out: list[str] = [f"unreadable reference {u!r}" for u in unread]
     targets: list[tuple[str, str]] = []
     for raw, base in found:
+        if base == "token":
+            head = raw.split("#", 1)[0]
+            if head.startswith(("./", "../")) or "/" not in head:
+                targets.append((raw, "contract"))
+            elif head.split("/", 1)[0] in tops:
+                targets.append((raw, "root"))
+            else:
+                targets.append((raw, "either"))
+            continue
+        if base == "repo-path":
+            targets.append((raw, "root"))
+            continue
         if base != "tick":
             targets.append((raw, base))
             continue
@@ -1543,6 +1584,14 @@ def absent_references(contract: str, version: str, added: str, revision: str) ->
             continue
         target, _, anchor = raw.partition("#")
         target = target.split("?", 1)[0]
+        if base == "root" and re.fullmatch(r"L[0-9]+(?:C[0-9]+)?(?:-L[0-9]+(?:C[0-9]+)?)?", anchor):
+            anchor = ""  # a GitHub line anchor names a line, not a heading
+        if base == "either":
+            # A path that is neither ./-relative nor under a top-level directory here: it names a file of this
+            # repository only if one exists at the freeze revision on either reading, and is refused otherwise.
+            as_contract = posixpath.normpath(posixpath.join(contract, target))
+            base, target = ("contract", target) if _git_out(
+                ROOT, "cat-file", "-e", f"{revision}:{as_contract}") is not None else ("root", target)
         path = own if not target else posixpath.normpath(
             posixpath.join(contract, target) if base == "contract" else target)
         if path.startswith("../") or path == "..":
@@ -2894,6 +2943,27 @@ def mutations() -> int:
         ("an erratum naming this repository by a bare URL", "erratum-imports-later-document",
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/blob/main/"
                                                        "no-such-contract/v1.md for it."),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an autolink into this repository', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See <https://github.com/ori-platform/ori-specs/blob/main/no-such-contract/v1.md> for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a parenthesised repository URL', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See (https://www.github.com/ori-platform/ori-specs/blob/main/no-such-contract/v1.md) for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with another GitHub view of a file', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See [it](https://github.com/ori-platform/ori-specs/blame/main/no-such-contract/v1.md).'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a definition behind a list then a quote marker', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '- > [dp]: ../no-such-contract/v1.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a definition label spanning lines', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '[a\nb]: ../no-such-contract/v1.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a refresh naming its target without url=', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '<meta http-equiv="refresh" content="0; ../no-such-contract/v1.md">'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a file through CSS', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '<style>@import "../no-such-contract/v1.md";</style>'),
                        complete_audit(root, last_hunk_erratum))),
         ("an erratum linking an issue of this repository by URL passes", None,
          lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
