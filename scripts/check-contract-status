@@ -46,13 +46,16 @@ import argparse
 import copy
 import difflib
 import hashlib
+import html
 import json
 import multiprocessing
 import os
 import pathlib
+import posixpath
 import re
 import shutil
 import subprocess
+import urllib.parse
 import sys
 import tempfile
 import textwrap
@@ -1345,6 +1348,7 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
                                     f"hunk {str(h.get('hunk_sha256'))[:12]} names commit {h['commit']}, which is not in "
                                     "HEAD's history; a squash or a rewrite leaves the record pointing at nothing"))
     recorded = {h["hunk_sha256"]: h for h in ba["hunks"]}
+    added_lines = net_hunk_added(base.decode("utf-8", errors="replace"), current)
     for digest, first in net_hunks(base.decode("utf-8", errors="replace"), current):
         h = recorded.get(digest)
         if h is None:
@@ -1357,11 +1361,351 @@ def check_audit(root: pathlib.Path, key: tuple[str, str], rec: dict, findings: l
             findings.append(Finding("semantic-hunk-in-frozen", where,
                                     f"hunk {digest[:12]} is classified semantic, so it belongs to "
                                     f"{h.get('destination')} and may not remain in this frozen version"))
+        elif h["classification"] == "erratum":
+            for ref in absent_references(key[0], key[1], added_lines.get(digest, ""), str(ba["freeze_revision"])):
+                findings.append(Finding(
+                    "erratum-imports-later-document", where,
+                    f"hunk {digest[:12]} is recorded erratum but points at {ref}, which the freeze revision "
+                    f"{ba['freeze_revision']} does not have (or which this check cannot read). An erratum changes "
+                    "nothing a conforming party does, and a file or section the version froze without can only add "
+                    "to that, so the hunk is semantic and moves to a successor; reference syntax the check cannot "
+                    "read is refused rather than passed. Its boundary is the references a renderer turns into a link to a "
+                    "file in this repository and path tokens with a file-shaped tail, in the hunk's added lines; a name "
+                    "written in prose without a path, obfuscated or encoded beyond that, or in an additive hunk is "
+                    "outside it and is held to the erratum definition by review. A later version of this contract, by "
+                    "number, is exempt, so an erratum may point at its successor and, through that "
+                    "pointer, at that successor's rules; an earlier version is not"))
     for h in ba["hunks"]:
         if h["classification"] == "semantic" and not (root / f"{h.get('destination')}.md").is_file():
             findings.append(Finding("semantic-destination-missing", where,
                                     f"semantic hunk {h['hunk_sha256'][:12]} names {h.get('destination')}, which "
                                     "does not exist"))
+
+
+# How a hunk can point at a file or a section. Anything that has the syntax of a reference but that these
+# patterns cannot read completely is itself a finding, so the guard fails closed on a form it does not know.
+_DEST = r"(?:<([^<>\n]*)>|((?:[^\s()<>\\]|\\.|\([^\s()<>]*\))+))"
+_LINK_INLINE = re.compile(r"\]\(\s*" + _DEST + r"(?:\s+(?:\"[^\"\n]*\"|'[^'\n]*'|\([^()\n]*\)))?\s*\)")
+_LINK_DEFINITION = re.compile(r"^ {0,3}\[(?:[^\]\\]|\\.)+\]:[ \t]*(?:\n[ \t]*)?" + _DEST, re.M)
+_DEFINITION_SHAPE = re.compile(r"^ {0,3}\[(?:[^\]\\]|\\.)+\]:", re.M)
+_HTML_TAG = re.compile(r"<([A-Za-z][\w:-]*)((?:\s[^<>]*)?)/?>")
+_HTML_ATTR_ANY = re.compile(r"([A-Za-z_:][\w:.-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))")
+_HTML_ATTR_SHAPE = re.compile(r"\b(?:href|src|data|cite|action|formaction|srcset|poster|background|content)\s*=",
+                              re.I)
+# A link into this repository by URL names the path after the ref.
+_REPO_URL = re.compile(r"^https?://(?:github\.com/ori-platform/ori-specs/(?:blob|tree|raw)/[^/]+/"
+                       r"|raw\.githubusercontent\.com/ori-platform/ori-specs/[^/]+/)(.*)$", re.I)
+_REPO_ANY_URL = re.compile(r"(?:https?:)?//(?:www\.)?(?:github\.com/ori-platform/ori-specs(?:/([A-Za-z-]+))?"
+                           r"|raw\.githubusercontent\.com/ori-platform/ori-specs)/?([^\s<>()\[\]\"'`]*)", re.I)
+# GitHub views whose path after the ref is a file in this repository, and views that name none.
+_REPO_PATH_VERBS = {"blob", "tree", "raw", "blame", "edit", "commits", "history", "delete", "new"}
+_REPO_OTHER_VERBS = {"issues", "pull", "pulls", "actions", "releases", "commit", "compare", "discussions", "wiki",
+                     "security", "tags", "branches", "milestones", "labels", "projects", "pulse", "graphs", "network",
+                     "settings", "archive", "tree-commit"}
+_PATH_TOKEN = re.compile(r"(?<![A-Za-z0-9.@/-])((?:\.{1,2}/)*(?:[\w.-]+/)*[\w-]+\.[A-Za-z0-9]+(?:#[\w-]*)?)"
+                         r"(?![A-Za-z0-9/-])")
+_LINE_PREFIX = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)*")
+_ANGLE_PATH = re.compile(r"<([^<>\s][^<>\n]*)>")
+_CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
+# A bare backticked name is read as a file only with one of these extensions; config keys and versions carry dots.
+_DOC_FILE = re.compile(r"\.(?:md|json|ya?ml|txt|csv)$", re.I)
+_VERSION_DOC = re.compile(r"v([1-9][0-9]*)\.md")
+
+
+def _heading_anchor(text: str) -> str | None:
+    """GitHub's anchor for a heading built only from forms this guard fully supports, or None for any other.
+
+    Supported: plain text, code spans, and emphasis with * or _ that pairs an opener with a closer between ASCII
+    letters and digits. Anything else (link or image syntax, raw HTML, backslash escapes, entities, emphasis next to
+    a non-ASCII character) renders in ways this guard does not reproduce, so it gives no anchor: an erratum pointing
+    into such a heading is left to review rather than guessed at."""
+    spans: list[str] = []
+
+    def keep(m: re.Match) -> str:
+        spans.append(m.group(2).strip())
+        return f"\x00{len(spans) - 1}\x00"
+    body = _CODE_SPAN.sub(keep, text.strip())
+    if re.search(r"[\[\]<>\\&`]", body) or re.search(r"[^\x00-\x7f][*_]|[*_][^\x00-\x7f]", body):
+        return None
+    for mark in (r"\*\*", r"__", r"\*", r"_"):
+        body = re.sub(r"(?<![A-Za-z0-9])" + mark + r"(?=\S)(.+?)(?<=\S)" + mark + r"(?![A-Za-z0-9])", r"\1", body)
+    if "*" in body:
+        return None
+    rendered = re.sub("\x00([0-9]+)\x00", lambda m: spans[int(m.group(1))], body)
+    return re.sub(r"[^\w\- ]", "", rendered.lower()).replace(" ", "-")
+
+
+# GitHub's anchor for each heading form the guard supports, and None for each it refuses to derive one for, among
+# them every form a comparison with a CommonMark renderer found the earlier hand parsing got wrong. "" marks text
+# that is not a heading at all. Tested on every mutation run.
+SLUG_TABLE = (
+    ("## __Rule__", "rule"),
+    ("## `storage_degraded` Is Late", "storage_degraded-is-late"),
+    ("## *Emphasis* and **strong**", "emphasis-and-strong"),
+    ("## Runtime Liveness at `v` 2", "runtime-liveness-at-v-2"),
+    ("## How Much of `detail` Is Constrained", "how-much-of-detail-is-constrained"),
+    ("## snake_case_name", "snake_case_name"),
+    ("## _a_b", "_a_b"),
+    ("## _private", "_private"),
+    ("## foo_", "foo_"),
+    ("## foo_ bar", "foo_-bar"),
+    ("## [Rule](foo(bar).md)", None),
+    ('## [Rule](x "a ) title")', None),
+    ("## [a](b\\)c)", None),
+    ("## A &amp; B", None),
+    ("## See [x](https://a/b)", None),
+    ("## \\_a\\_", None),
+    ("## a\\_b", None),
+    ("## [a][r]", None),
+    ("## [[x]](y)", None),
+    ("## a < b > c", None),
+    ("## _été_", None),
+    ("    ## Indented code", ""),
+    ("```\n## Fenced code\n```", ""),
+)
+
+
+def _anchor_report(text: str) -> tuple[set[str], int]:
+    """(the anchors this guard is sure a document has, the number of headings whose form it does not support).
+
+    A document with any unsupported heading has no sure anchors: its unknown anchor could take the duplicate suffix
+    (-1, -2) a later heading's anchor would otherwise get, so none can be relied on."""
+    out, seen, unsupported = set(), {}, 0
+    lines, fence = text.split("\n"), None
+    headings: list[str] = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence is not None:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and \
+                    not line.strip().lstrip(fence[0]).strip():
+                fence = None
+            continue
+        if m and not (m.group(1)[0] == "`" and "`" in line.strip()[len(m.group(1)):]):
+            fence = m.group(1)
+            continue
+        if re.match(r"^(?: {4}|\t)", line):
+            continue  # indented code: no heading inside it
+        h = re.match(r"^ {0,3}#{1,6}(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$", line)
+        if h:
+            headings.append(h.group(1) or "")
+        elif line.strip() and i + 1 < len(lines) and re.match(r"^ {0,3}(?:=+|-+)[ \t]*$", lines[i + 1]) and \
+                not re.match(r"^ {0,3}(?:[-*+]|\d+[.)])[ \t]|^ {0,3}>|^ {0,3}#", line):
+            headings.append(line)
+    for raw in headings:
+        slug = _heading_anchor(raw)
+        if slug is None:
+            unsupported += 1
+            continue
+        n = seen.get(slug, 0)
+        seen[slug] = n + 1
+        out.add(slug if n == 0 else f"{slug}-{n}")
+    return (set() if unsupported else out), unsupported
+
+
+def anchor_problem(document: str, anchor: str) -> str | None:
+    """None when the guard is sure the document has the anchor; otherwise the refusal's qualifier, which names an
+    unsupported heading form when the document has one, since the anchor may then exist where the guard cannot tell."""
+    sure, unsupported = _anchor_report(document)
+    if anchor in sure:
+        return None
+    return " (a heading form not supported by the guard; review must confirm)" if unsupported else ""
+
+
+def _github_slugs(text: str) -> set[str]:
+    """The anchors this guard is sure a document has (see _anchor_report)."""
+    return _anchor_report(text)[0]
+
+
+def _references(added: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """(target, base) for every reference in a hunk's added text, and the reference-shaped text it could not read.
+
+    Code spans are read for paths (below) and blanked for everything else, since a link inside one is code."""
+    targets: list[tuple[str, str]] = []
+    unread: list[str] = []
+    ticks = [m.group(2).strip() for m in _CODE_SPAN.finditer(added)]
+    prose = _CODE_SPAN.sub(lambda m: " " * len(m.group(0)), added)
+    covered: list[tuple[int, int]] = []
+    for at in [m.start() for m in re.finditer(r"\]\(", prose)]:
+        m = _LINK_INLINE.match(prose, at)
+        if m is None:
+            unread.append(prose[at:at + 60])
+            continue
+        covered.append(m.span())
+        targets.append((m.group(1) if m.group(1) is not None else m.group(2), "contract"))
+    # A definition may sit behind blockquote markers or inside a list item; read it with that prefix removed.
+    def strip_prefixes(line: str) -> str:
+        while True:
+            shorter = _LINE_PREFIX.sub("", line, count=1)
+            if shorter == line:
+                return line
+            line = shorter
+    unprefixed = "\n".join(strip_prefixes(line) for line in prose.split("\n"))
+    for m in _DEFINITION_SHAPE.finditer(unprefixed):
+        d = _LINK_DEFINITION.match(unprefixed, m.start())
+        if d is None:
+            unread.append(unprefixed[m.start():m.start() + 60])
+            continue
+        targets.append((d.group(1) if d.group(1) is not None else d.group(2), "contract"))
+    # Every attribute of every HTML tag whose value can name a file: the link attributes always, any other when its
+    # value looks like a path. srcset lists several, and a refresh's content carries url=.
+    for tag in _HTML_TAG.finditer(prose):
+        covered.append(tag.span())
+        for a in _HTML_ATTR_ANY.finditer(tag.group(2) or ""):
+            name, value = a.group(1).lower(), next(g for g in a.groups()[1:] if g is not None)
+            if name == "srcset":
+                values = [part.strip().split()[0] for part in value.split(",") if part.strip()]
+            elif name == "content":
+                url = re.search(r"url\s*=\s*['\"]?([^'\";\s]+)", value, re.I)
+                values = [url.group(1)] if url else []
+            elif _HTML_ATTR_SHAPE.match(name + "=") or "/" in value or _DOC_FILE.search(value.split("#")[0]) \
+                    or value.startswith("#"):
+                values = [value]
+            else:
+                values = []
+            for v in values:
+                if not v:
+                    unread.append(tag.group(0)[:60])
+                else:
+                    targets.append((v, "contract"))
+    for m in _HTML_ATTR_SHAPE.finditer(prose):
+        if not any(lo <= m.start() < hi for lo, hi in covered):
+            unread.append(prose[m.start():m.start() + 60])
+    # The backstop, independent of syntax: every URL into this repository and every path-shaped token with a
+    # document or vector extension anywhere in the added text, code spans included, is read as a reference too, so
+    # a form the patterns above do not know still names its file.
+    for m in _REPO_ANY_URL.finditer(added):
+        verb, rest = (m.group(1) or "").lower(), m.group(2)
+        if m.group(0).lower().find("raw.githubusercontent.com") >= 0:
+            targets.append((rest.split("/", 1)[1] if "/" in rest else "", "repo-path"))
+        elif verb in _REPO_PATH_VERBS:
+            targets.append((rest.split("/", 1)[1] if "/" in rest else "", "repo-path"))
+        elif verb and verb not in _REPO_OTHER_VERBS:
+            unread.append(m.group(0)[:60])
+    # The widest backstop: in the text decoded (entities, percent-encoding), with inline HTML tags and emphasis
+    # markers removed, every occurrence of one of this repository's top-level directories followed by a path names
+    # that path, whatever surrounds it: a URL on any host, an API path, a path split by markup, any extension or
+    # none. Each must exist at the freeze revision, as a file or a directory.
+    decoded = html.unescape(urllib.parse.unquote(urllib.parse.unquote(added)))
+    decoded = re.sub(r"<!--.*?-->", "", decoded, flags=re.S)
+    decoded = re.sub(r"<[^<>]*>", "", decoded)
+    decoded = re.sub("[\u00ad\u200b\u200c\u200d\u2060\ufeff]", "", decoded)
+    # Emphasis markers inside a path are dropped outright, so `dir/*v1*.md` reads as dir/v1.md.
+    decoded = re.sub(r"(?<=[/A-Za-z0-9.-])[_*]+(?=[A-Za-z0-9./-])", "", decoded)
+    decoded = re.sub(r"(?<![A-Za-z0-9])[_*]+|[_*]+(?![A-Za-z0-9])", " ", decoded)
+    # Another site's URL is not read: its path is that site's, whatever directory names it shares with this one.
+    decoded = re.sub(r"\b(?:https?:)?//(?!(?:www\.)?(?:[\w-]+\.)*github(?:usercontent)?\.com/(?:repos/)?ori-platform/ori-specs)"
+                     r"[^\s<>()\]\"']+", " ", decoded, flags=re.I)
+    tops = sorted((p.name for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")), key=len, reverse=True)
+    if tops:
+        # A directory scan names a file only with a file-shaped tail: an extension, a contract version vN (read as
+        # vN.md) or an anchor. A bare directory phrase (status/health, events/alarms) is prose, not a reference.
+        # The boundary's three tails: an extension of any length, a contract version dir/vN, or an anchor.
+        scan = re.compile(r"(?<![A-Za-z0-9/-])((?:" + "|".join(map(re.escape, tops)) + r")(?:/[A-Za-z0-9._-]+)+)"
+                          r"(#[\w-]+)?(?![A-Za-z0-9/])")
+        for m in scan.finditer(decoded):
+            path, anchor = m.group(1).rstrip("."), m.group(2) or ""
+            last = path.rsplit("/", 1)[-1]
+            if re.fullmatch(r"v[1-9][0-9]*", last):
+                path += ".md"
+            elif "." not in last.strip(".") and not anchor:
+                continue  # a directory phrase in prose (status/health) has none of the three tails
+            targets.append((path + anchor, "rootscan"))
+    for m in re.finditer(r"api\.github\.com/repos/ori-platform/ori-specs/contents/([^\s?#<>\"')\]]+)", added, re.I):
+        targets.append((m.group(1), "repo-path"))
+    for m in _PATH_TOKEN.finditer(added):
+        token = m.group(1)
+        # A bare file name with no directory is another repository's file as often as this one's (gateway.yaml,
+        # ori.yaml); only a bare Markdown document is read.
+        if "/" in token or token.split("#", 1)[0].lower().endswith(".md"):
+            targets.append((token, "token"))
+    for m in _ANGLE_PATH.finditer(prose):
+        inside = m.group(1)
+        if any(lo <= m.start() < hi for lo, hi in covered) or re.match(r"^[a-z][a-z0-9+.-]*:", inside, re.I):
+            continue
+        if re.match(r"^/?[A-Za-z][\w-]*(?:\s[^<>]*)?/?$", inside):
+            continue  # an HTML tag: its links are its href and src attributes, read above
+        if "/" in inside or _DOC_FILE.search(inside.split("#", 1)[0]):
+            unread.append(m.group(0)[:60])
+    return targets + [(t, "tick") for t in ticks], unread
+
+
+def absent_references(contract: str, version: str, added: str, revision: str) -> list[str]:
+    """What an audited hunk points at that the freeze revision does not have: a repository path absent there, a
+    path#anchor whose heading the document did not have there, or reference syntax this check cannot read.
+
+    Links (inline, reference definitions, HTML href and src, quoted or not) resolve against the contract's directory.
+    A backticked token is read as a path when it names a file in this repository: a bare name with a document
+    extension (.md, .json, .yaml, .txt, .csv) or a ./ or ../ path resolves against the contract's directory, a path
+    whose first segment is a top-level directory here, or that has a contract version's shape (`contract/vN` names
+    `contract/vN.md`), against the root. Anything else in backticks (another repository's source path, an
+    identifier) and any URL with a scheme is not read. A later version of the same contract, by number, is exempt,
+    so a frozen version may point at its successor; an earlier one is not."""
+    own = f"{contract}/{version}.md"
+    own_number = int(version[1:]) if re.fullmatch(r"v[1-9][0-9]*", version) else 0
+    tops = {p.name for p in ROOT.iterdir() if not p.name.startswith(".")}
+    found, unread = _references(added)
+    out: list[str] = [f"unreadable reference {u!r}" for u in unread]
+    targets: list[tuple[str, str]] = []
+    for raw, base in found:
+        if base == "token":
+            # Repository scope first: a path whose first segment is not a top-level directory here (ori-runtime/...,
+            # docs/...) is another repository's and is not read; only then does existence at the freeze matter.
+            head = raw.split("#", 1)[0]
+            if head.startswith(("./", "../")) or "/" not in head:
+                targets.append((raw, "contract"))
+                continue
+            # Scope is decided on the path a renderer resolves: docs/../device-provisioning/v1.md is this
+            # repository's device-provisioning/v1.md, whatever the first segment it was written with.
+            normal = posixpath.normpath(head)
+            if not normal.startswith("..") and normal.split("/", 1)[0] in tops:
+                targets.append((normal + raw[len(head):], "root"))
+            continue
+        if base in ("repo-path", "rootscan"):
+            targets.append((raw, "root"))
+            continue
+        if base != "tick":
+            targets.append((raw, base))
+            continue
+        head = raw.split("#", 1)[0]
+        if not head or re.match(r"^[a-z][a-z0-9+.-]*:", head, re.I) or any(c.isspace() for c in raw):
+            continue
+        if head.startswith(("./", "../")) or ("/" not in head and _DOC_FILE.search(head)):
+            targets.append((raw, "contract"))
+        elif re.fullmatch(r"[a-z0-9-]+/v[1-9][0-9]*", head):
+            # A contract version written as `contract/vN` names its document.
+            targets.append((head + ".md" + raw[len(head):], "root"))
+        elif "/" in head and (head.split("/", 1)[0] in tops or re.fullmatch(r"[a-z0-9-]+/v[1-9][0-9]*\.md", head)):
+            targets.append((raw, "root"))
+    for raw, base in targets:
+        raw = raw.strip()
+        repo = _REPO_URL.match(raw)
+        if repo:
+            raw, base = repo.group(1), "root"
+        elif re.match(r"^[a-z][a-z0-9+.-]*:", raw, re.I) or raw.startswith("//"):
+            continue
+        target, _, anchor = raw.partition("#")
+        target = target.split("?", 1)[0]
+        if base == "root" and re.fullmatch(r"L[0-9]+(?:C[0-9]+)?(?:-L[0-9]+(?:C[0-9]+)?)?", anchor):
+            anchor = ""  # a GitHub line anchor names a line, not a heading
+        path = own if not target else posixpath.normpath(
+            posixpath.join(contract, target) if base == "contract" else target)
+        if path.startswith("../") or path == "..":
+            continue
+        name = path[len(contract) + 1:] if path.startswith(f"{contract}/") else ""
+        later = _VERSION_DOC.fullmatch(name)
+        if later and int(later.group(1)) > own_number:
+            continue
+        label = f"{path}#{anchor}" if anchor else path
+        if label in out or path in out:
+            continue
+        if _git_out(ROOT, "cat-file", "-e", f"{revision}:{path}") is None:
+            out.append(path)
+        elif anchor and path.lower().endswith(".md"):
+            at = _git_out(ROOT, "show", f"{revision}:{path}")
+            problem = None if at is None else anchor_problem(at, anchor)
+            if problem is not None:
+                out.append(label + problem)
+    return out
 
 
 def _refuse_duplicates(pairs: list) -> dict:
@@ -2086,6 +2430,14 @@ def mutations() -> int:
 
     # A version cut after its freeze has its baseline under another name at the freeze revision, so the harness
     # completes an audit only for a record whose own file exists there.
+    # A completed version numbered 2 or more whose predecessor's text exists at its freeze revision: the subject of
+    # the version-exemption cases.
+    later_complete = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "complete"
+                            and re.fullmatch(r"v([2-9]|[1-9][0-9]+)", str(r.get("version")))
+                            and not r["baseline_audit"].get("baseline_path")
+                            and git_blob(r["baseline_audit"]["freeze_revision"],
+                                         f'{r["contract"]}/v{int(r["version"][1:]) - 1}.md') is not None)
+    later_number = int(later_complete.split("/")[1][1:])
     audited = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
                      and r["baseline_audit"].get("pinned_files")
                      and any(e["lifecycle"] != "unimplemented" for e in r["adoption"])
@@ -2270,6 +2622,32 @@ def mutations() -> int:
 
     def first_hunk(update: dict) -> Callable[[dict], None]:
         return lambda a: a["hunks"][0].update(update)
+
+    own_doc = f"{audited.split('/')[1]}.md"
+
+    def own_slug() -> str:
+        rec = json.loads((ROOT / f"status/{audited}.json").read_text(encoding="utf-8"))
+        text = (git_blob(rec["baseline_audit"]["freeze_revision"], f"{audited}.md") or b"").decode("utf-8", "replace")
+        return sorted(_github_slugs(text))[0]
+
+    def erratum_on_complete(root: pathlib.Path, rel: str, sentence: str) -> None:
+        """Append a sentence to a completed version and record the hunk it makes as an erratum."""
+        append_normative(root, rel, sentence)
+        rec = json.loads((root / f"status/{rel}.json").read_text(encoding="utf-8"))
+        ba = rec["baseline_audit"]
+        base = (git_blob(ba["freeze_revision"], f"{rel}.md") or b"").decode("utf-8", "replace")
+        known = {h["hunk_sha256"] for h in ba["hunks"]}
+        new = [d for d, _ in net_hunks(base, (root / f"{rel}.md").read_text(encoding="utf-8")) if d not in known]
+        assert new, f"no new hunk in {rel}"
+        _edit_json(root, f"status/{rel}.json", lambda r: r["baseline_audit"]["hunks"].extend(
+            {"hunk_sha256": d, "classification": "erratum", "summary": "x"} for d in new))
+
+    def last_hunk_erratum(a: dict) -> None:
+        h = a["hunks"][-1]
+        for k in ("optional", "unknown_field_compatible"):
+            h.pop(k, None)
+        h["classification"] = "erratum"
+        h["summary"] = "An erratum under test."
 
     def rec_edit(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
         return lambda root: _edit_json(root, f"status/{rel}.json", fn)
@@ -2599,6 +2977,180 @@ def mutations() -> int:
          lambda root: (complete_audit(root), append_normative(root, audited, "A consumer MUST also refuse this."))),
         ("a complete audit missing one net hunk", "baseline-drift",
          lambda root: complete_audit(root, lambda a: a["hunks"].pop(0))),
+        ("an erratum linking a document absent at the freeze revision", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming a document absent at the freeze revision in backticks", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See `no-such-contract/v1.md`."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum pointing at its own contract's successor passes", None,
+         lambda root: (append_normative(root, audited, "Superseded by [v9](v9.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking a vector file absent at the freeze revision", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the corpus](../no-such-contract/vectors-v1.json)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking a section its own text did not have at the freeze revision",
+         "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [that rule](#no-such-section-at-freeze)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum citing a document by a reference definition", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules][r].\n\n[r]: ../no-such-contract/v1.md"),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with an unquoted HTML href to a document absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "A producer MUST obey "
+                                        "<a href=../no-such-contract/v1.md>the lifecycle</a>."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with a quoted HTML href to a document absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See <a href="../no-such-contract/v1.md">the rules</a>.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with an unquoted HTML src absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See <img src=../no-such-contract/diagram.png>."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with an angle-bracket destination with spaces absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules](<../no such contract/v1.md>)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with reference syntax the check cannot read", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [the rules](../no such contract/v1.md and more."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with a bare angle-bracket path", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See <../no-such-contract/v1.md> for it."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with an HTML data attribute absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See <object data="../no-such-contract/v1.md">it</object>.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with an HTML cite attribute absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See <q cite="../no-such-contract/v1.md">it</q>.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with a meta refresh absent at freeze", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited,
+                                        '<meta http-equiv="refresh" content="0; url=../no-such-contract/v1.md">'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with a reference definition in a blockquote", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "> See [it][dp].\n>\n> [dp]: ../no-such-contract/v1.md"),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with a reference definition in a nested list item", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited,
+                                        "- a\n    - b [it][dp]\n\n        [dp]: ../no-such-contract/v1.md"),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking this repository by URL", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See [it](https://github.com/ori-platform/ori-specs/blob/main/"
+                                                       "no-such-contract/v1.md)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming this repository by a bare URL", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/blob/main/"
+                                                       "no-such-contract/v1.md for it."),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an autolink into this repository', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See <https://github.com/ori-platform/ori-specs/blob/main/no-such-contract/v1.md> for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a parenthesised repository URL', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See (https://www.github.com/ori-platform/ori-specs/blob/main/no-such-contract/v1.md) for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with another GitHub view of a file', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See [it](https://github.com/ori-platform/ori-specs/blame/main/no-such-contract/v1.md).'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a definition behind a list then a quote marker', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '- > [dp]: ../no-such-contract/v1.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a definition label spanning lines', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '[a\nb]: ../no-such-contract/v1.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a refresh naming its target without url=', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '<meta http-equiv="refresh" content="0; ../no-such-contract/v1.md">'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a file through CSS', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, '<style>@import "../no-such-contract/v1.md";</style>'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an underscore-emphasised path', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See _gaps/no-such-file.md_ for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a path climbing back through its own directory', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See gaps/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a file through the GitHub API', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'https://api.github.com/repos/ori-platform/ori-specs/contents/gaps/no-such-file.md'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path split by markup', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See gaps/<em>no-such</em>-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with emphasis inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/*no-such*-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with an invisible character inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/\u200bno-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with a tag spanning lines inside a path', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/<em\nclass=x>no-such</em>-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum with directory words in prose passes', None,
+         lambda root: (append_normative(root, audited, 'Status/health and events/alarms are reported elsewhere.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming another repository's source path passes", None,
+         lambda root: (append_normative(root, audited, 'See ori-runtime/src/signing/mod.rs and https://example.com/gaps/x.md.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum citing a contract version absent at freeze in prose', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/v9 for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum citing a nested version absent at freeze in prose', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/no-such/v1 for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum citing a contract version present at freeze in prose passes', None,
+         lambda root: (append_normative(root, audited, 'See signing/v1 for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path with a long extension absent at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/no-such.markdown for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a path with an anchor-only tail absent at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/no-such#rule for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a contract version absent at freeze by dir/vN', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See gaps/v9 for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a heading its target lacked at freeze', 'erratum-imports-later-document',
+         lambda root: (append_normative(root, audited, 'See firmware-commands/v1.md#no-such-rule for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum naming a heading its target had at freeze passes', None,
+         lambda root: (append_normative(root, audited, 'See signing/v1.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum naming another repository's document passes", None,
+         lambda root: (append_normative(root, audited, 'See ori-runtime/docs/safety.md and docs/x.md.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through docs/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See docs/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through ori-runtime/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See ori-runtime/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ('an erratum re-entering this repository through x/../', "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, 'See x/../gaps/no-such-file.md for it.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum pointing at an anchor its target lacked at freeze, under a title-like name", "erratum-imports-later-document",
+         lambda root: (append_normative(root, audited, f"See [the rule]({own_doc}#rule-title)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking an issue of this repository by URL passes", None,
+         lambda root: (append_normative(root, audited, "See https://github.com/ori-platform/ori-specs/issues/49."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking its own text, present at freeze, passes", None,
+         lambda root: (append_normative(root, audited, f"See [this]({own_doc}) and [that](<{own_doc}>)."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum with HTML links to its own text, quoted and not, passes", None,
+         lambda root: (append_normative(root, audited, f'See <a href={own_doc}>this</a> and <a href="{own_doc}">that</a>.'),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum citing its own text by reference definition and backticks passes", None,
+         lambda root: (append_normative(root, audited, f"See [this][own] and `{audited}.md`.\n\n[own]: {own_doc}"),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum linking a heading its text had at freeze passes", None,
+         lambda root: (append_normative(root, audited, f"See [that rule](#{own_slug()})."),
+                       complete_audit(root, last_hunk_erratum))),
+        ("an erratum pointing at an earlier version of its contract", "erratum-imports-later-document",
+         lambda root: erratum_on_complete(root, later_complete, f"See [the rule](v{later_number - 1}.md#no-such-rule-at-freeze).")),
+        ("an erratum pointing at its own version's missing section", "erratum-imports-later-document",
+         lambda root: erratum_on_complete(root, later_complete, f"See [the rule](v{later_number}.md#no-such-rule-at-freeze).")),
+        ("an erratum pointing at a later version of its contract passes", None,
+         lambda root: erratum_on_complete(root, later_complete, f"See [the successor](v{later_number + 1}.md#anything).")),
+        ("an additive hunk linking a document absent at the freeze revision passes", None,
+         lambda root: (append_normative(root, audited, "See [the rules](../no-such-contract/v1.md)."),
+                       complete_audit(root))),
         ("a semantic hunk left in the frozen version", "semantic-hunk-in-frozen",
          lambda root: complete_audit(root, first_hunk({"classification": "semantic", "destination": "evidence/v2"}))),
         ("a semantic hunk with no destination", "bad-value",
@@ -3060,6 +3612,25 @@ def mutations() -> int:
     more, bad_changes = changes_mutations()
     total += more
     failed += bad_changes
+    # The heading anchors the erratum guard checks, against a fixed table of GitHub's rendered anchors. A rule that
+    # invented an anchor (keeping emphasis marks, a link's destination) would let a missing section look present.
+    # The quoted-title heading a CommonMark comparison found the earlier parsing anchored as #rule-title: both the
+    # anchor the earlier parsing invented and the one GitHub renders are refused, the latter for its form.
+    for anchor, want in (("rule-title", "not supported"), ("rule", "not supported")):
+        got = anchor_problem('# Doc\n\n## [Rule](x "a ) title")\n', anchor)
+        good = got is not None and want in got
+        print(f"{'ok  ' if good else 'FAIL'} an erratum pointing at #{anchor} under a quoted-title link heading is "
+              f"refused, its heading form named" + ("" if good else f" (got {got!r})"))
+        total += 1
+        failed += not good
+    for heading, want in SLUG_TABLE:
+        sure, unsupported = _anchor_report(heading)
+        got = None if unsupported else (sorted(sure)[0] if sure else "")
+        good = got == want and len(sure) <= 1
+        say = "has no anchor the guard derives" if want is None else "is not a heading" if want == "" else f"is {want!r}"
+        print(f"{'ok  ' if good else 'FAIL'} the anchor of {heading!r} {say}" + ("" if good else f" (got {got!r})"))
+        total += 1
+        failed += not good
     print(f"{total - failed}/{total} mutations behaved as named")
     return 1 if failed else 0
 
