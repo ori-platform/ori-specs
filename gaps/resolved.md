@@ -162,7 +162,7 @@ Tracked in `ori-runtime` and `ori-cli`.
 Implemented: firmware emits `storage_degraded` from a latch held outside the
 failed store (`ori-edge-firmware`), and the runtime verifies it against a
 shared vector. Hardware-in-the-loop proof pending. See
-`firmware-telemetry/v1.md`.
+`firmware-telemetry/v2.md`.
 
 ## G-27 — The unsafe NC rule in governing documents
 

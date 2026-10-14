@@ -487,7 +487,7 @@ accurate description of what a repo implements.
 ## firmware-commands/v1 implementation targets
 
 - **Runtime liveness adoption**
-  ([firmware-commands/v1.md](../firmware-commands/v1.md)): the contract
+  ([firmware-commands/v2.md](../firmware-commands/v2.md)): the contract
   defines the signal, and the producer side is **implemented**: the signing
   path, the publisher and its scheduler, durable per-device `runtime_seq` in
   the state store, and shared cross-language golden vectors. Firmware
@@ -510,7 +510,7 @@ accurate description of what a repo implements.
 
 ## firmware-commands/v1 protocol targets
 
-- **Signing-purpose separation** ([firmware-commands/v1.md](../firmware-commands/v1.md)):
+- **Signing-purpose separation** ([firmware-commands/v2.md](../firmware-commands/v2.md)):
   command and liveness signatures are made with the same runtime command key
   over raw object bytes, so any runtime path able to sign liveness bytes can
   sign command bytes without passing the command path's checks. No such path
