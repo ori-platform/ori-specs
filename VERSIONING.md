@@ -283,6 +283,8 @@ pending audit is never shown as `amendable`.
 | `pinned_sha256` | While `pending`: the SHA-256 of the contract text with its `Status:` paragraph removed (`--digest` prints it). |
 | `pinned_files` | While `pending`: `{path: sha256}` for every file of the version other than its `v<N>.md`, vectors and companion documents alike (`--digest` prints them). A file belongs to the version its name carries; a companion document to the version whose record lists it in `companion_files`; a file under a directory in the checker's attribution table to that directory's owner; and any other non-Markdown file to the only version of a single-version directory. |
 | `contract_sha256` | When `complete`: the SHA-256 of the contract file at `freeze_revision`. |
+| `baseline_path` | Optional, and admitted only when the version's own `v<N>.md` does not exist at `freeze_revision`: the path its text had there, as for a successor cut from its predecessor's text after the freeze. It names another version document of the same contract. The baseline, `contract_sha256`, every net hunk, and a correction's derivation of the contract revision in its history basis are then read from that path. |
+| `baseline_files` | Optional: `{current path: path at freeze_revision}` for each file in `vectors` absent at the freeze revision under its current path, whose bytes had the earlier name there. Each recorded hash is checked against the earlier path, the erratum guard reads a link to the current name as present at the freeze, and `--verify-siblings` accepts a manifest pin of the earlier name only where the manifest declares the digest recorded in `vectors`; it reads the declaration, not the vendored copy. |
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
@@ -303,7 +305,8 @@ the default branch, and refuses:
 - while the audit is pending, a change to `frozen_by`, `freeze_revision`,
   `pinned_sha256` or `pinned_files`;
 - once the audit is complete, a return to `pending`, a change to
-  `frozen_by`, `freeze_revision`, `contract_sha256` or `vectors`, or any change
+  `frozen_by`, `freeze_revision`, `contract_sha256`, `vectors`, `baseline_path`
+  or `baseline_files`, or any change
   to a recorded hunk or vector erratum (both may only be appended);
 - a shipped or claimed adoption entry removed or moved to an earlier
   lifecycle, a claim changed from `claimed` to `none`, an assessed conformance
@@ -341,6 +344,20 @@ removed once recorded. The checker cannot verify a sibling repository's commit
 or release; `--verify-siblings` does. A shipment attributed to the wrong
 release or repository is not a misclassification and cannot be corrected this
 way; it needs a later, separately ratified change to this schema.
+
+A **transcription** is the one other correction of `frozen_by`, recorded with
+`class: "transcription"`. It corrects `frozen_by.commit` alone, where the
+recorded ID names no commit and the event's release tag resolves to the
+corrected one: a tag named literally, which git accepts as `refs/tags/<release>` and which holds no revision expression (`~`, `^`, `:`, `@{`, `..`), not a branch, a ref or a commit given as the release. `old` and `new` name `frozen_by` only and differ in `commit`
+and nothing else; the event has a `release`; no `history_basis_revision` is
+named, since no event is replaced; the decision record names the recorded ID,
+the corrected commit and the release tag; and an adoption entry of the
+freezing repository records the corrected commit at that release. The checker
+enforces these conditions. That the recorded ID names no commit and the tag
+resolves to the corrected one are in the sibling repository, so
+`--verify-siblings` checks them and CI cannot. A transcription may correct a
+shipment, because it replaces no event. The bar on a wrong release or
+repository stands.
 
 When an audit is **complete**, the checker reads `freeze_revision` from
 history, confirms the recorded contract and vector hashes, and compares the
@@ -399,7 +416,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
 | cli-commands | v2 | `draft` | `amendable` | — |
 | commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit complete |
-| commissioned-safety-binding | v2 | `draft` | `frozen` | shipment, runtime `332754b`, 2026-09-23; audit pending |
+| commissioned-safety-binding | v2 | `draft` | `frozen` | shipment, runtime `332754b`, 2026-09-23; audit complete |
 | device-configuration | v1 | `draft` | `amendable` | — |
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
