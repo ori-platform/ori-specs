@@ -348,7 +348,7 @@ way; it needs a later, separately ratified change to this schema.
 A **transcription** is the one other correction of `frozen_by`, recorded with
 `class: "transcription"`. It corrects `frozen_by.commit` alone, where the
 recorded ID names no commit and the event's release tag resolves to the
-corrected one: a tag, not a branch, a ref or a commit given as the release. `old` and `new` name `frozen_by` only and differ in `commit`
+corrected one: a tag named literally, which git accepts as `refs/tags/<release>` and which holds no revision expression (`~`, `^`, `:`, `@{`, `..`), not a branch, a ref or a commit given as the release. `old` and `new` name `frozen_by` only and differ in `commit`
 and nothing else; the event has a `release`; no `history_basis_revision` is
 named, since no event is replaced; the decision record names the recorded ID,
 the corrected commit and the release tag; and an adoption entry of the

@@ -864,12 +864,29 @@ def check_transcription_shape(w: str, c: dict, decision: pathlib.Path | None, ba
         bad("correction-refused", f"{w} is a transcription, which needs the event's release tag to resolve the "
                                   "corrected commit; an event with no release cannot be corrected this way")
         return
+    if not literal_tag_name(n["release"]):
+        bad("correction-refused", f"{w} names release {n['release']!r}, which is not a literal tag name: a revision "
+                                  "expression (~, ^, :, @{, .., whitespace) or a name git refuses as refs/tags/<name> "
+                                  "is not a release")
+        return
     text = decision.read_text(encoding="utf-8", errors="replace") if decision is not None else ""
     for name, value in (("the recorded ID", o["commit"]), ("the corrected commit", n["commit"]),
                         ("the release tag", n["release"])):
         if decision is not None and str(value) not in text:
             bad("correction-decision", f"{w}.decision does not name {name} {value}; the decision record shows the "
                                        "release tag resolving to the corrected commit")
+
+
+def literal_tag_name(release: str) -> bool:
+    """Whether a release names a tag literally: no revision-expression syntax, and a name git accepts as
+    refs/tags/<name> (git check-ref-format). Nested names such as release/x pass; v1~1, v1^0 and @{0} do not."""
+    if not release or re.search(r"[~^:\s]|@\{|\.\.", release):
+        return False
+    try:
+        return subprocess.run(["git", "check-ref-format", f"refs/tags/{release}"], capture_output=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def check_transcription_adoption(rec: dict, c: dict, where: str, w: str, findings: list[Finding]) -> None:
@@ -2303,9 +2320,14 @@ def check_transcriptions(rec: dict, where: str, repos: dict, findings: list[Find
             findings.append(Finding("sibling-transcription", w,
                                     f"the corrected ID {old.get('commit')} resolves to a commit; a transcription "
                                     "correction replaces an ID that names nothing, never a real commit"))
-        # The release must be a tag: a branch of that name, a full ref or a raw commit is not a release.
-        tag = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{new.get('release')}^{{commit}}")
-        resolved = tag.stdout.decode("utf-8", "replace").strip() if tag.returncode == 0 else ""
+        # The release must be a tag, named literally: a branch of that name, a full ref, a raw commit or a revision
+        # expression (v1~1, v1^0, @{0}) is not a release. The exact ref must exist before it is peeled.
+        release = str(new.get("release") or "")
+        resolved = ""
+        if literal_tag_name(release) and _git(repo, "show-ref", "--verify", "--quiet",
+                                              f"refs/tags/{release}").returncode == 0:
+            tag = _git(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{release}^{{commit}}")
+            resolved = tag.stdout.decode("utf-8", "replace").strip() if tag.returncode == 0 else ""
         if not (resolved and str(new.get("commit")) and resolved.startswith(str(new.get("commit")))):
             findings.append(Finding("sibling-transcription", w,
                                     f"release tag {new.get('release')} does not resolve to the corrected commit "
@@ -2330,7 +2352,7 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
         ba_rec = rec.get("baseline_audit") if isinstance(rec.get("baseline_audit"), dict) else {}
         ba_files, ba_vectors = ba_rec.get("baseline_files"), ba_rec.get("vectors")
         earlier: dict = {}
-        if ba_files is not None or ba_rec.get("baseline_path") is not None:
+        if ba_files is not None:
             if not (isinstance(ba_files, dict) and isinstance(ba_vectors, dict)
                     and all(isinstance(k, str) and isinstance(v, str) for k, v in ba_files.items())):
                 findings.append(Finding("bad-value", f"status/{c}/{v}.json",
@@ -3330,6 +3352,9 @@ def mutations() -> int:
                                   r["adoption"][0]["implementation"].update(commit="aaaaaaaaaaaa")))),
         ("a transcription the freezing adoption entry does not record", "correction-history:no adoption entry",
          rec_edit(CUT, lambda r: r["adoption"][0]["implementation"].update(commit="332754b1f0a3"))),
+        ("a transcription whose release is a revision expression", "correction-refused:not a literal tag name",
+         rec_edit(CUT, lambda r: (r["corrections"][-1]["old"]["frozen_by"].update(release="v2.5.0-rc.11~1"),
+                                  r["corrections"][-1]["new"]["frozen_by"].update(release="v2.5.0-rc.11~1")))),
         ("a transcription naming a history basis", "bad-value:names no history_basis_revision",
          rec_edit(CUT, lambda r: r["corrections"][-1].update(history_basis_revision="1b6f789"))),
         ("an additive hunk linking a document absent at the freeze revision passes", None,
@@ -3960,6 +3985,7 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
         git(repo, "add", "impl.go", "MANIFEST.json", "old/MANIFEST.json")
         git(repo, "commit", "-q", "-m", "implement")
         git(repo, "tag", "v1")
+        git(repo, "tag", "release/v1")
         git(repo, "branch", "v7")
         a = git(repo, "rev-parse", "--short=12", "HEAD")
         git(repo, "checkout", "-q", "-b", "side")
@@ -4015,6 +4041,20 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
          lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, a)])),
         ("sibling: a transcription correction whose release is a full branch ref", "sibling-transcription:does not resolve",
          lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "refs/heads/main")])),
+        ("sibling: a transcription correction whose release is the expression v1~1", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, 'v1~1')])),
+        ("sibling: a transcription correction whose release is the expression v1^0", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, 'v1^0')])),
+        ("sibling: a transcription correction whose release is the expression v1@{0}", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, 'v1@{0}')])),
+        ("sibling: a transcription correction whose release is the expression v0..v1", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, 'v0..v1')])),
+        ("sibling: a transcription correction whose release is the expression v1:impl.go", "sibling-transcription:does not resolve",
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, 'v1:impl.go')])),
+        ("sibling: a transcription correction whose release is a nested tag name passes", None,
+         lambda e, a, b: e.update(_corrections=[transcription("1" * 12, a, "release/v1")])),
+        ("sibling: an audit with baseline_path and no baseline_files passes", None,
+         lambda e, a, b: e.update(_baseline={"baseline_path": f"{c}/v1.md"})),
         ("sibling: malformed baseline fields are a named finding, not a crash", "bad-value:baseline_files and vectors",
          lambda e, a, b: e.update(_baseline={"baseline_files": {"x": []}, "vectors": [1]})),
         ("sibling: an earlier-name pin at the recorded bytes passes", None,
