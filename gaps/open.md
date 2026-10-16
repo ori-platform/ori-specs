@@ -510,13 +510,14 @@ accurate description of what a repo implements.
 
 ## firmware-commands/v1 protocol targets
 
-- **Signing-purpose separation** ([firmware-commands/v2.md](../firmware-commands/v2.md)):
-  command and liveness signatures are made with the same runtime command key
-  over raw object bytes, so any runtime path able to sign liveness bytes can
-  sign command bytes without passing the command path's checks. No such path
-  exists today. A later protocol version separates the purposes, by a signing
-  domain per message type or a separate liveness key, in this contract and in
-  firmware together. Tracked in `ori-specs` for v2.6.0.
+- **Signing-purpose separation**
+  ([firmware-commands/v2.md](../firmware-commands/v2.md#signing-domains)):
+  firmware-commands/v2 signs commands and liveness in separate domains, and
+  its command corpus and both liveness corpora refuse each cross-purpose
+  signature. Neither implementation signs or verifies in those domains yet:
+  the runtime signer and the edge firmware verifier still use the object bytes
+  alone, so the separation is defined and not enforced. The two switch
+  together. Tracked in `ori-runtime` and `ori-edge-firmware`.
 
 ## firmware-mqtt-provisioning/v1 implementation targets
 

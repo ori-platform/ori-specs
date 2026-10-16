@@ -1,0 +1,551 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-commands/v2 command corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-command-vectors-v2. Every
+signature is verified with this script's own affine Ed25519 arithmetic,
+cofactorless with strict decoding as ed25519-verification/v1 requires. The
+domains, their byte lengths and the NUL come from firmware-commands/v2.md
+Signing Domains; the refusal list and the corpus digest from its Command
+vectors; `bad_signature` from its Error Semantics; the command field order,
+the `cmd_seq` range, the identifier alphabet, the capability hash and `v` from
+firmware-commands/v1.md Wire Format; and the topic from v1's MQTT table.
+
+Held to:
+
+- each accepted case: its command, preimage and wire bytes reproduce from its
+  input, and the device model accepts it;
+- each refusal: refused as `bad_signature` by a device that passes it on every
+  other check, its signature made by the declared signer over the declared
+  preimage, and not verifying in the command domain;
+- each cross-purpose entry: three different signatures over one object, each
+  verifying over its own preimage only;
+- the domains: distinct, neither a prefix of the other, neither beginning with
+  `{`, and of the lengths the text states;
+- coverage: a refusal for every listed signature, and a cross-purpose object
+  of each purpose;
+- the digest firmware-commands/v2.md pins is the corpus's.
+
+    python3 scripts/check-firmware-command-vectors-v2
+    python3 scripts/check-firmware-command-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and this script's model
+in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-commands" / "command-vectors-v2.json"
+V1 = ROOT / "firmware-commands" / "v1.md"
+V2 = ROOT / "firmware-commands" / "v2.md"
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, affine, cofactorless, strict ------------------------------------------
+
+P = 2**255 - 19
+L = 2**252 + 27742317777372353535851937790883648493
+D = (-121665 * pow(121666, -1, P)) % P
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+
+
+def _add(a: tuple[int, int], b: tuple[int, int]) -> tuple[int, int]:
+    (x1, y1), (x2, y2) = a, b
+    t = D * x1 * x2 * y1 * y2 % P
+    return ((x1 * y2 + x2 * y1) * pow(1 + t, -1, P) % P,
+            (y1 * y2 + x1 * x2) * pow(1 - t, -1, P) % P)
+
+
+def _mul(k: int, point: tuple[int, int]) -> tuple[int, int]:
+    out = (0, 1)
+    while k:
+        if k & 1:
+            out = _add(out, point)
+        point = _add(point, point)
+        k >>= 1
+    return out
+
+
+def _decode(raw: bytes) -> tuple[int, int] | None:
+    y = int.from_bytes(raw, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    if y >= P:
+        return None
+    u, v = (y * y - 1) % P, (D * y * y + 1) % P
+    x = u * pow(v, 3, P) * pow(u * pow(v, 7, P), (P - 5) // 8, P) % P
+    if v * x * x % P == (-u) % P:
+        x = x * SQRT_M1 % P
+    elif v * x * x % P != u:
+        return None
+    if x == 0 and sign:
+        return None
+    if x & 1 != sign:
+        x = P - x
+    return x, y
+
+
+def _encode(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+_BY = 4 * pow(5, -1, P) % P
+BASE = _decode(_BY.to_bytes(32, "little"))
+assert BASE is not None
+
+
+def public_from_seed(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return _encode(_mul(a, BASE))
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if len(public) != 32 or len(signature) != 64:
+        return False
+    a, r = _decode(public), _decode(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or r is None or s >= L:
+        return False
+    k = int.from_bytes(hashlib.sha512(signature[:32] + public + message).digest(), "little") % L
+    return _mul(s, BASE) == _add(r, _mul(k, a))
+
+
+# --- the model, from the contracts ------------------------------------------------
+
+def flat(text: str) -> str:
+    return re.sub(r"\s+", " ", text)
+
+
+def section(text: str, heading: str) -> str:
+    """The text under a heading line, up to the next heading of the same or higher level."""
+    level = heading.split(" ", 1)[0]
+    start = text.find("\n" + heading + "\n")
+    if start < 0:
+        raise Failure(f"no section {heading!r}")
+    body = text[start + len(heading) + 2:]
+    stop = re.search(rf"^#{{1,{len(level)}}} ", body, re.M)
+    return body if stop is None else body[:stop.start()]
+
+
+# The listed refusals of Command vectors, each to the (signer, preimage form) it names.
+REFUSAL_BULLETS = {
+    "the runtime key over the command object bytes alone, v1's form;": ("runtime", "alone"),
+    "the runtime key in the liveness domain;": ("runtime", "liveness"),
+    "the runtime key over the command domain and the object bytes with no NUL between them;":
+        ("runtime", "command_no_nul"),
+    "a rogue key in the command domain.": ("rogue", "command"),
+}
+
+
+def contract_model(v1: str | None = None, v2: str | None = None) -> dict:
+    v1 = V1.read_text() if v1 is None else v1
+    v2 = V2.read_text() if v2 is None else v2
+    domains_text = section(v2, "## Signing Domains")
+    rows = dict(re.findall(r"^\| (Command|Runtime liveness)[^|]*\| `([^`]+)` \|", domains_text,
+                           re.M))
+    if set(rows) != {"Command", "Runtime liveness"}:
+        raise Failure(f"Signing Domains names domains for {sorted(rows)}")
+    domains = {"command": rows["Command"], "liveness": rows["Runtime liveness"]}
+    for name, domain in domains.items():
+        stated = re.search(rf"`{re.escape(domain)}` is (\d+)\b", flat(domains_text))
+        if stated is None or int(stated.group(1)) != len(domain.encode("ascii")):
+            raise Failure(f"Signing Domains does not state {domain!r} as its own byte length")
+    if "the domain of the message's purpose; one zero byte, NUL; and the canonical bytes of " \
+            "the signed object exactly as transmitted" not in flat(domains_text):
+        raise Failure("Signing Domains does not state the preimage as domain, NUL, object")
+    vectors = section(v2, "### Command vectors")
+    pin = re.search(r"\[command-vectors-v2\.json\]\(command-vectors-v2\.json\).*?Its SHA-256 is "
+                    r"`([0-9a-f]{64})`", flat(vectors))
+    if pin is None:
+        raise Failure("Command vectors pins no digest")
+    listed = [flat(b) for b in re.findall(r"^- (.+?)(?=\n- |\n\n)", vectors, re.M | re.S)]
+    if listed != list(REFUSAL_BULLETS):
+        raise Failure(f"the Command vectors refusal list changed: {listed}")
+    verdict = re.search(r"^\| `(bad_signature)` \| Signature verification",
+                        section(v2, "## Error Semantics"), re.M)
+    if verdict is None:
+        raise Failure("Error Semantics names no bad_signature verdict")
+    wire = flat(section(v1, "## Wire Format"))
+    order = re.search(r"Field order is exactly as shown: (.*?) — the lexicographic", wire)
+    seq = re.search(r"`cmd_seq` is a canonical decimal integer[^.]*?within `(\d+) \.\. 2\^(\d+) - 1`",
+                    wire)
+    fleet = re.search(r"are fleet identifiers: `(\[[^`]+\])`, non-empty", wire)
+    hash_hex = re.search(r"`capability_hash` is `sha256:` plus exactly (\d+) lowercase hex", wire)
+    version = re.search(r"`v` must be `(\d+)`", wire)
+    topic = re.search(r"^\| `(ori/fw/<device_id>/cmd)` \| (\d) \| (no|yes) \|",
+                      section(v1, "## MQTT Transport Binding"), re.M)
+    if None in (order, seq, fleet, hash_hex, version, topic):
+        raise Failure("firmware-commands/v1.md Wire Format or MQTT table changed shape")
+    assert order and seq and fleet and hash_hex and version and topic
+    return {
+        "domains": domains,
+        "nul": True,
+        "trial": False,
+        "fields": re.findall(r"`([a-z_]+)`", order.group(1)),
+        "seq": (int(seq.group(1)), 2 ** int(seq.group(2)) - 1),
+        "fleet": fleet.group(1),
+        "hash_hex": int(hash_hex.group(1)),
+        "v": int(version.group(1)),
+        "topic": (topic.group(1), int(topic.group(2)), topic.group(3) == "yes"),
+        "verdict": verdict.group(1),
+        "pin": pin.group(1),
+        "skip": frozenset(),
+    }
+
+
+def preimage(model: dict, form: str, body: bytes) -> bytes:
+    if form == "alone":
+        return body
+    if form == "command_no_nul":
+        return model["domains"]["command"].encode("ascii") + body
+    sep = b"\x00" if model["nul"] else b""
+    return model["domains"][form].encode("ascii") + sep + body
+
+
+# --- the device -------------------------------------------------------------------
+
+def parse_command(raw: bytes, model: dict) -> tuple[bytes, dict, bytes] | None:
+    """(object bytes, fields, signature) if the message has v1's grammar, else None."""
+    head, mid = b'{"command":', b',"signature":"ed25519:'
+    cut = raw.rfind(mid)
+    if not raw.startswith(head) or cut < 0 or not raw.endswith(b'"}'):
+        return None
+    body, sig_text = raw[len(head):cut], raw[cut + len(mid):-2]
+    try:
+        pairs = json.loads(body, object_pairs_hook=lambda p: p)
+        signature = base64.b64decode(sig_text, validate=True)
+    except ValueError:
+        return None
+    if not isinstance(pairs, list) or [k for k, _ in pairs] != model["fields"]:
+        return None
+    fields = dict(pairs)
+    if json.dumps(fields, separators=(",", ":"), ensure_ascii=False).encode() != body:
+        return None
+    if base64.b64encode(signature) != sig_text or len(signature) != 64:
+        return None
+    lo, hi = model["seq"]
+    if type(fields["cmd_seq"]) is not int or not lo <= fields["cmd_seq"] <= hi:
+        return None
+    if fields["v"] != model["v"] or type(fields["v"]) is not int:
+        return None
+    for name in ("action", "channel", "device_id"):
+        if not isinstance(fields[name], str) or not re.fullmatch(model["fleet"] + "+", fields[name]):
+            return None
+    if not isinstance(fields["capability_hash"], str) or not re.fullmatch(
+            "sha256:[0-9a-f]{%d}" % model["hash_hex"], fields["capability_hash"]):
+        return None
+    return body, fields, signature
+
+
+def device(raw: bytes, ctx: dict, model: dict, runtime_key: bytes) -> tuple[str | None, set[str]]:
+    """(the verdict, or None when accepted; every check the message fails)."""
+    parsed = parse_command(raw, model)
+    if parsed is None:
+        return "malformed", {"grammar"}
+    body, fields, signature = parsed
+    signed = verify(runtime_key, preimage(model, "command", body), signature)
+    if model["trial"]:
+        signed = signed or verify(runtime_key, body, signature)
+    fails = {
+        "device": fields["device_id"] != ctx["device_id"],
+        "signature": not signed,
+        "freshness": fields["cmd_seq"] <= ctx["last_accepted_cmd_seq"],
+        "manifest": fields["capability_hash"] != ctx["capability_hash"],
+        "authority": [fields["action"], fields["channel"]] not in ctx["runtime_commanded"],
+    }
+    failed = {name for name, bad in fails.items() if bad}
+    verdicts = (("device", "wrong_device"), ("signature", model["verdict"]),
+                ("freshness", "replayed"), ("manifest", "capability_mismatch"),
+                ("authority", "unknown_action"))
+    for check, verdict in verdicts:
+        if check in failed and check not in model["skip"]:
+            return verdict, failed
+    return None, failed
+
+
+# --- the corpus -------------------------------------------------------------------
+
+def _wire(body: bytes, signature_b64: str) -> bytes:
+    return b'{"command":' + body + b',"signature":"ed25519:' + signature_b64.encode() + b'"}'
+
+
+def check(corpus: dict, model: dict) -> None:
+    domains = model["domains"]
+    if corpus["domains"] != domains:
+        raise Failure("the corpus's domains are not the ones Signing Domains lists")
+    a, b = (d.encode("ascii") for d in domains.values())
+    if a == b or a.startswith(b) or b.startswith(a) or a[:1] == b"{" or b[:1] == b"{":
+        raise Failure("the domains are not disjoint from each other and from a JSON object")
+    runtime_key = public_from_seed(bytes.fromhex(corpus["runtime_test_seed_hex"]))
+    rogue_key = public_from_seed(bytes.fromhex(corpus["rogue_test_seed_hex"]))
+    if corpus["runtime_public_key_hex"] != runtime_key.hex() or base64.b64decode(
+            corpus["runtime_public_key_b64"]) != runtime_key:
+        raise Failure("runtime public key does not derive from the seed")
+    if corpus["rogue_public_key_hex"] != rogue_key.hex():
+        raise Failure("rogue public key does not derive from the seed")
+    if (corpus["topic"], corpus["qos"], corpus["retain"]) != model["topic"]:
+        raise Failure("corpus transport binding differs from v1's MQTT table")
+    keys = {"runtime": runtime_key, "rogue": rogue_key}
+    names = [c["name"] for k in ("cases", "reject_cases", "cross_purpose") for c in corpus[k]]
+    if len(names) != len(set(names)):
+        raise Failure("duplicate case name")
+
+    def rebuild(case: dict) -> bytes:
+        body = json.dumps(case["input"], separators=(",", ":"), ensure_ascii=False).encode()
+        if bytes.fromhex(case["command_hex"]) != body:
+            raise Failure(f"{case['name']}: command bytes do not reproduce from input")
+        raw = _wire(body, case["signature_b64"])
+        if bytes.fromhex(case["message_hex"]) != raw:
+            raise Failure(f"{case['name']}: wire message does not reproduce")
+        return raw
+
+    if not corpus["cases"]:
+        raise Failure("coverage: no accepted command")
+    for case in corpus["cases"]:
+        raw = rebuild(case)
+        body = bytes.fromhex(case["command_hex"])
+        if bytes.fromhex(case["preimage_hex"]) != preimage(model, "command", body):
+            raise Failure(f"{case['name']}: preimage is not the command domain's")
+        verdict, _ = device(raw, case["verifier_context"], model, runtime_key)
+        if verdict is not None:
+            raise Failure(f"{case['name']}: refused ({verdict})")
+
+    seen = set()
+    for case in corpus["reject_cases"]:
+        raw = rebuild(case)
+        if case["reason"] != model["verdict"]:
+            raise Failure(f"{case['name']}: reason {case['reason']}, not {model['verdict']}")
+        verdict, failed = device(raw, case["verifier_context"], model, runtime_key)
+        if verdict != model["verdict"] or failed != {"signature"}:
+            raise Failure(f"{case['name']}: {verdict}, failing {sorted(failed)}, not "
+                          f"{model['verdict']} alone")
+        body = bytes.fromhex(case["command_hex"])
+        signature = base64.b64decode(case["signature_b64"])
+        form, signer = case["signed_over"], case["signer"]
+        if form not in ("alone", "liveness", "command_no_nul", "command") or signer not in keys:
+            raise Failure(f"{case['name']}: unknown signer or preimage")
+        if not verify(keys[signer], preimage(model, form, body), signature):
+            raise Failure(f"{case['name']}: not signed by {signer} over the {form} preimage")
+        seen.add((signer, form))
+    for wanted in REFUSAL_BULLETS.values():
+        if wanted not in seen:
+            raise Failure(f"coverage: no refusal signed by {wanted[0]} over {wanted[1]}")
+
+    purposes = set()
+    for entry in corpus["cross_purpose"]:
+        body = bytes.fromhex(entry["object_hex"])
+        if entry["purpose"] not in domains:
+            raise Failure(f"{entry['name']}: unknown purpose")
+        first = {"command": b'{"action":', "liveness": b'{"boot_id":'}[entry["purpose"]]
+        if not body.startswith(first):
+            raise Failure(f"{entry['name']}: not an object of its purpose")
+        purposes.add(entry["purpose"])
+        sigs = {form: base64.b64decode(s) for form, s in entry["signatures"].items()}
+        if set(sigs) != {"command", "liveness", "alone"}:
+            raise Failure(f"{entry['name']}: signatures {sorted(sigs)}")
+        if len(set(sigs.values())) != 3:
+            raise Failure(f"{entry['name']}: two forms share a signature")
+        for form, signature in sigs.items():
+            for other in sigs:
+                ok = verify(runtime_key, preimage(model, other, body), signature)
+                if ok != (other == form):
+                    raise Failure(f"{entry['name']}: the {form} signature "
+                                  f"{'verifies' if ok else 'fails'} over the {other} preimage")
+    if purposes != set(domains):
+        raise Failure(f"coverage: cross-purpose objects for {sorted(purposes)} only")
+
+
+def run(corpus_bytes: bytes, model: dict) -> None:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-commands/v2.md pins")
+    check(json.loads(corpus_bytes), model)
+
+
+# --- mutations ----------------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def text_mutant(which: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = {"v1": V1.read_text(), "v2": V2.read_text()}
+            if old not in texts[which]:
+                raise AssertionError(f"mutant target missing from {which}: {old!r}")
+            texts[which] = texts[which].replace(old, new, 1)
+            run(corpus_bytes, contract_model(texts["v1"], texts["v2"]))
+        return go
+
+    def case(key: str, name: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c[key] if x["name"] == name)
+
+    def flip(key: str, name: str, field: str = "signature_b64") -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            target = case(key, name)(c)
+            raw = bytearray(base64.b64decode(target[field]))
+            raw[40] ^= 1
+            target[field] = base64.b64encode(bytes(raw)).decode()
+            if "command_hex" in target:
+                target["message_hex"] = _wire(bytes.fromhex(target["command_hex"]),
+                                              target[field]).hex()
+        return edit
+
+    def resign_alone(c: dict) -> None:
+        # The v1 form in an accepted case: the bare-form signature of the same bytes.
+        accepted = c["cases"][0]
+        alone = next(x for x in c["cross_purpose"] if x["purpose"] == "command")
+        refused = next(x for x in c["reject_cases"] if x["signed_over"] == "alone")
+        accepted.update(input=refused["input"], command_hex=refused["command_hex"],
+                        preimage_hex=(model["domains"]["command"].encode() + b"\x00"
+                                      + bytes.fromhex(refused["command_hex"])).hex(),
+                        signature_b64=alone["signatures"]["alone"],
+                        message_hex=refused["message_hex"],
+                        verifier_context=refused["verifier_context"])
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("accepted signature bit flipped",
+         corpus_mutant(flip("cases", "command_sealed_epoch_relay_open"))),
+        ("an accepted case signed in v1's form", corpus_mutant(resign_alone)),
+        ("command edited after signing", corpus_mutant(
+            lambda c: c["cases"][1]["input"].update(cmd_seq=3))),
+        ("refusal relabelled", corpus_mutant(
+            lambda c: c["reject_cases"][0].update(reason="replayed"))),
+        ("refusal's preimage misdeclared", corpus_mutant(
+            lambda c: c["reject_cases"][0].update(signed_over="liveness"))),
+        ("refusal's signer misdeclared", corpus_mutant(
+            lambda c: c["reject_cases"][3].update(signer="runtime"))),
+        ("refusal also stale", corpus_mutant(
+            lambda c: c["reject_cases"][1]["verifier_context"].update(last_accepted_cmd_seq=42))),
+        ("refusal also unauthorised", corpus_mutant(
+            lambda c: c["reject_cases"][2]["verifier_context"].update(runtime_commanded=[]))),
+        ("refusal signature replaced by an accepted one", corpus_mutant(
+            lambda c: c["reject_cases"][0].update(
+                signature_b64=c["cross_purpose"][0]["signatures"]["command"],
+                message_hex=_wire(bytes.fromhex(c["reject_cases"][0]["command_hex"]),
+                                  c["cross_purpose"][0]["signatures"]["command"]).hex()))),
+        ("cross-purpose signatures equal", corpus_mutant(
+            lambda c: c["cross_purpose"][0]["signatures"].update(
+                liveness=c["cross_purpose"][0]["signatures"]["command"]))),
+        ("cross-purpose forms swapped", corpus_mutant(
+            lambda c: c["cross_purpose"][1].update(signatures={
+                "command": c["cross_purpose"][1]["signatures"]["liveness"],
+                "liveness": c["cross_purpose"][1]["signatures"]["command"],
+                "alone": c["cross_purpose"][1]["signatures"]["alone"]}))),
+        ("cross-purpose liveness object dropped", corpus_mutant(
+            lambda c: c.update(cross_purpose=c["cross_purpose"][:1]))),
+        ("corpus domains swapped", corpus_mutant(lambda c: c.update(domains={
+            "command": c["domains"]["liveness"], "liveness": c["domains"]["command"]}))),
+        ("runtime seed swapped", corpus_mutant(lambda c: c.update(runtime_test_seed_hex="12" * 32))),
+        ("topic retained", corpus_mutant(lambda c: c.update(retain=True))),
+        ("domains swapped in the model", model_mutant(lambda m: m.update(domains={
+            "command": m["domains"]["liveness"], "liveness": m["domains"]["command"]}))),
+        ("command domain renamed", model_mutant(
+            lambda m: m["domains"].update(command="ori.firmware_command.v1"))),
+        ("NUL dropped", model_mutant(lambda m: m.update(nul=False))),
+        ("trial verification of v1's form", model_mutant(lambda m: m.update(trial=True))),
+        ("signature check skipped", model_mutant(lambda m: m.update(skip=frozenset({"signature"})))),
+        ("verdict renamed", model_mutant(lambda m: m.update(verdict="signature_invalid"))),
+        ("cmd_seq ceiling lowered", model_mutant(lambda m: m.update(seq=(1, 2**53 - 2)))),
+        ("field order changed", model_mutant(
+            lambda m: m.update(fields=m["fields"][1:] + m["fields"][:1]))),
+        ("digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("text: command domain", text_mutant(
+            "v2", "| Command | `ori.firmware_command.v2` |", "| Command | `ori.firmware_command.v3` |")),
+        ("text: liveness domain", text_mutant(
+            "v2", "| `ori.firmware_liveness.v2` |", "| `ori.firmware_liveness.v3` |")),
+        ("text: domain length", text_mutant(
+            "v2", "`ori.firmware_command.v2` is 23 bytes", "`ori.firmware_command.v2` is 24 bytes")),
+        ("text: NUL dropped from the preimage", text_mutant(
+            "v2", "purpose; one zero byte, NUL; and the canonical bytes",
+            "purpose; and the canonical bytes")),
+        ("text: refusal bullet dropped", text_mutant(
+            "v2", "- the runtime key in the liveness domain;\n", "")),
+        ("text: verdict renamed", text_mutant(
+            "v2", "| `bad_signature` | Signature verification", "| `bad_sig` | Signature verification")),
+        ("text: cmd_seq range", text_mutant("v1", "`1 .. 2^53 - 1`.", "`1 .. 2^52 - 1`.")),
+        ("text: command topic retained", text_mutant(
+            "v1", "| `ori/fw/<device_id>/cmd` | 1 | no |", "| `ori/fw/<device_id>/cmd` | 1 | yes |")),
+        ("text: digest", text_mutant("v2", model["pin"], "0" * 64)),
+    ]
+    for key in ("cases", "reject_cases", "cross_purpose"):
+        for entry in base[key]:
+            if key == "cases" and len(base["cases"]) > 1:
+                continue
+            cases.append((f"{entry['name']} dropped", corpus_mutant(
+                lambda c, k=key, n=entry["name"]: c.update({k: [x for x in c[k] if x["name"] != n]}))))
+    cases.append(("every accepted case dropped", corpus_mutant(lambda c: c.update(cases=[]))))
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    print(f"{len(cases)} mutants")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except Failure as failure:
+        print(f"firmware-commands/v2 signing domains: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-commands/v2 command corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(f"firmware-commands/v2 command corpus: {len(corpus['cases'])} commands accepted, "
+          f"{len(corpus['reject_cases'])} refused as {model['verdict']} for their signature "
+          f"alone, {len(corpus['cross_purpose'])} cross-purpose objects with three distinct "
+          f"signatures each")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
