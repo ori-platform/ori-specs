@@ -74,6 +74,17 @@ HELD = (
     "by topic family, and reports nothing else about them.",
     "whose value is an object with exactly two integer members, `payload_too_large` and "
     "`volume_dropped`",
+    "holds as many items as keep the payload, after encryption, encoding and `auth`, within "
+    "the maximum, and at least one; `next_page_token` continues from the first item not "
+    "returned.",
+    "is replaced by the family's error response, with `error` `response_too_large`, so the "
+    "runtime does not wait for an answer that will not come.",
+    "a peer can never raise them: no payload, envelope or configuration the other side "
+    "controls changes a bound.",
+    "whose canonical bytes exceed 1048576 is outside this hop, as an outbound artifact of "
+    "that size is. The gateway refuses it when it receives it from the evidence authority, "
+    "never stages or delivers it, and records a delivery failure in its operational posture. "
+    "It is not redelivered, so it can never hold an inbound lane.",
 )
 
 
@@ -132,6 +143,10 @@ def contract_model(text: str | None = None) -> dict:
         s for s in re.findall(r"`(ori/[^`]*)`", text)
         if not ("+" in s or "#" in s or s.endswith(".py") or s.endswith("/..."))
     }
+    item_error = re.search(r"An item that does not fit in a page by itself ends the export with an "
+                           r"error response whose `error` is `([a-z_]+)`", flat)
+    if item_error is None:
+        raise Failure("Payload Size names no error for an item that does not fit alone")
     lowered = re.search(r"The evidence topics, `([^`]+)` and `([^`]+)`, are never lowered", flat)
     if lowered is None:
         raise Failure("Payload Size names no topic that is never lowered")
@@ -152,6 +167,7 @@ def contract_model(text: str | None = None) -> dict:
         "pin": pin.group(1),
         "floor": int(floor.group(1)),
         "never_lowered": never_lowered,
+        "item_error": item_error.group(1),
     }
 
 
@@ -221,10 +237,51 @@ def check(corpus: dict, model: dict) -> None:
             raise Failure(f"coverage: {topic} lacks {sorted(wanted - got)}")
 
 
+def page_export(fixed: int, items: list[int], maximum: int,
+                item_error: str) -> tuple[list[dict], dict | None]:
+    """The export rule, item by item: as many as fit, at least one, resuming at
+    the first item not returned."""
+    produced: list[dict] = []
+    index = 0
+    while index < len(items):
+        if fixed + items[index] > maximum:
+            return produced, {"at": index, "error": item_error}
+        size, count = fixed, 0
+        while index + count < len(items) and size + items[index + count] <= maximum:
+            size += items[index + count]
+            count += 1
+        index += count
+        produced.append({"items": count, "next": index})
+    return produced, None
+
+
+def check_paging(corpus: dict, model: dict) -> None:
+    seen = set()
+    for c in corpus["paging"]:
+        produced, error = page_export(c["fixed_bytes"], c["item_bytes"], c["maximum"],
+                                      model["item_error"])
+        if (produced, error) != (c["pages"], c["error"]):
+            raise Failure(f"{c['name']}: pages {c['pages']} {c['error']}, the rule gives "
+                          f"{produced} {error}")
+        if error is not None:
+            seen.add("alone_too_large")
+        if len(produced) > 2:
+            seen.add("several_pages")
+        for page in produced:
+            start = page["next"] - page["items"]
+            if c["fixed_bytes"] + sum(c["item_bytes"][start:page["next"]]) == c["maximum"]:
+                seen.add("filled_exactly")
+    missing = {"alone_too_large", "several_pages", "filled_exactly"} - seen
+    if missing:
+        raise Failure(f"coverage: no paging case with {sorted(missing)}")
+
+
 def run(corpus_bytes: bytes, model: dict) -> None:
     if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
         raise Failure("corpus digest differs from the one gateway-api/v2.md pins")
-    check(json.loads(corpus_bytes), model)
+    corpus = json.loads(corpus_bytes)
+    check(corpus, model)
+    check_paging(corpus, model)
 
 
 def mutations(corpus_bytes: bytes, model: dict) -> int:
@@ -236,6 +293,13 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             mutated = copy.deepcopy(base)
             edit(mutated)
             check(mutated, model)
+        return go
+
+    def paging_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check_paging(mutated, model)
         return go
 
     def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
@@ -297,6 +361,29 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "| `ori/gateway/health` | Gateway -> Runtime | 16384 |",
             "| `ori/gateway/health` | Gateway -> Runtime | 16385 |")),
         ("floor ignored", model_mutant(lambda m: m.update(floor=0))),
+        ("text: pagination resumes at the first item returned", text_mutant(
+            "continues from the first item not returned", "continues from the first item returned")),
+        ("text: response error renamed", text_mutant(
+            "with `error` `response_too_large`", "with `error` `response_ignored`")),
+        ("text: a peer may raise a bound", text_mutant(
+            "a peer can never raise them", "a peer can always raise them")),
+        ("text: oversized inbound artifacts redelivered", text_mutant(
+            "It is not redelivered, so it can never hold an inbound lane.",
+            "It is redelivered until it is acknowledged.")),
+        ("text: item error renamed", text_mutant(
+            "whose `error` is `item_exceeds_payload_maximum`", "whose `error` is `item_too_big`")),
+        ("paging: a page one item short", paging_mutant(
+            lambda c: c["paging"][0]["pages"][0].update(items=2))),
+        ("paging: resumes at the first item returned", paging_mutant(
+            lambda c: c["paging"][0]["pages"][0].update(next=0))),
+        ("paging: oversized item silently skipped", paging_mutant(
+            lambda c: c["paging"][1].update(error=None))),
+        ("paging: no page filled to the byte", paging_mutant(
+            lambda c: c.update(paging=[x for x in c["paging"]
+                                       if x["name"] == "an_item_too_large_alone"] + [
+                {"name": "pages_of_two", "fixed_bytes": 100, "item_bytes": [301] * 10,
+                 "maximum": 1000, "error": None,
+                 "pages": [{"items": 2, "next": n} for n in (2, 4, 6, 8, 10)]}]))),
         ("evidence lowered", model_mutant(lambda m: m.update(never_lowered=set()))),
         ("text: a hyphenated topic with no row", text_mutant(
             "| `ori/gateway/health` |", "| `ori/gateway/health` | `ori/{device_id}/tier-c/relay` |")),
