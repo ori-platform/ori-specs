@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 Payload Size corpus against the contract.
+
+Shares no code with scripts/generate-gateway-payload-size-vectors-v2. The
+topics and their maxima, the verdict names, the constructions and the corpus
+digest are read from gateway-api/v2.md Payload Size; every payload is built
+here from its construction and compared by digest.
+
+Held to:
+
+- every case: its bytes, built here, have its digest; its verdict is the one
+  the maximum in force decides, and a configured maximum above the table is
+  refused;
+- the table: every topic of the contract's Topics and Tier C Enrichment tables
+  has a maximum, and every maximum names a topic;
+- coverage, for every topic: a json_object payload at the maximum, one byte
+  over and four times over; an invalid_utf8 payload one byte over; a configured
+  maximum half the table's, at and one over; and one a byte above the table;
+- the digest the contract pins is the corpus's.
+
+    python3 scripts/check-gateway-payload-size-vectors-v2
+    python3 scripts/check-gateway-payload-size-vectors-v2 --mutations
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-api" / "v2.md"
+CORPUS = ROOT / "gateway-api" / "vectors" / "payload-size-v2.json"
+DIRECTIONS = {"Gateway -> Runtime": "gateway_to_runtime",
+              "Runtime -> Gateway": "runtime_to_gateway"}
+
+
+class Failure(Exception):
+    pass
+
+
+def _section(text: str, heading: str) -> str:
+    start = text.index("\n" + heading + "\n")
+    body = text[start + len(heading) + 2:]
+    stop = re.search(r"^## ", body, re.M)
+    return body if stop is None else body[:stop.start()]
+
+
+def contract_model(text: str | None = None) -> dict:
+    text = CONTRACT.read_text() if text is None else text
+    size = _section(text, "## Payload Size")
+    rows = re.findall(r"^\| `([^`]+)` \| (Gateway -> Runtime|Runtime -> Gateway) \| (\d+) \|",
+                      size, re.M)
+    if not rows:
+        raise Failure("Payload Size holds no table of maxima")
+    table = {topic: (DIRECTIONS[direction], int(maximum)) for topic, direction, maximum in rows}
+    if len(table) != len(rows):
+        raise Failure("a topic is listed twice in the Payload Size table")
+    flat = " ".join(size.split())
+    reason = re.search(r"A payload longer than the maximum is refused as `([a-z_]+)`", flat)
+    verdicts = re.search(r"a verdict: `([a-z_]+)`, when the length is within the maximum in force.*?"
+                         r"`([a-z_]+)`; or `([a-z_]+)`, when the configured maximum is above the "
+                         r"table", flat)
+    head = re.search(r"`json_object`: the bytes `([^`]+)`, then `(.)` repeated to make up the "
+                     r"length, then `([^`]+)`", flat)
+    fill = re.search(r"`invalid_utf8`: the byte `0x([0-9A-F]{2})` repeated", flat)
+    pin = re.search(r"\[vectors/payload-size-v2\.json\]\(vectors/payload-size-v2\.json\) holds "
+                    r"this section's cases\. Its SHA-256 is `([0-9a-f]{64})`", flat)
+    lower = "may configure a lower maximum for a topic, never a higher one" in flat
+    if None in (reason, verdicts, head, fill, pin) or not lower:
+        raise Failure("Payload Size changed shape: reason, verdicts, constructions, pin or "
+                      "the lower-only rule")
+    assert reason and verdicts and head and fill and pin
+    if verdicts.group(2) != reason.group(1):
+        raise Failure("the corpus verdict for an oversized payload is not the refusal reason")
+    # Every topic the contract defines has a maximum, and every maximum names one.
+    defined = set(re.findall(r"^\| [^|]+\| (?:Gateway -> Runtime|Runtime -> Gateway)\s*\| `([^`]+)`",
+                             _section(text, "## Topics"), re.M))
+    defined |= set(re.findall(r"^\| Enrichment (?:request|response)\s*\| [^|]+\| `([^`]+)`",
+                              text, re.M))
+    if defined != set(table):
+        raise Failure(f"topics without a maximum {sorted(defined - set(table))}, maxima for no "
+                      f"topic {sorted(set(table) - defined)}")
+    return {
+        "table": table,
+        "admitted": verdicts.group(1),
+        "too_large": verdicts.group(2),
+        "config_refused": verdicts.group(3),
+        "json_head": head.group(1).encode(),
+        "json_fill": head.group(2).encode(),
+        "json_tail": head.group(3).encode(),
+        "invalid_byte": bytes.fromhex(fill.group(1)),
+        "pin": pin.group(1),
+    }
+
+
+def build(model: dict, kind: str, length: int) -> bytes:
+    if kind == "json_object":
+        body = length - len(model["json_head"]) - len(model["json_tail"])
+        if body < 0:
+            raise Failure(f"json_object cannot be {length} bytes long")
+        return model["json_head"] + model["json_fill"] * body + model["json_tail"]
+    if kind == "invalid_utf8":
+        return model["invalid_byte"] * length
+    raise Failure(f"unknown construction {kind!r}")
+
+
+def verdict(model: dict, topic: str, configured: int | None, length: int) -> str:
+    maximum = model["table"][topic][1]
+    if configured is not None and configured > maximum:
+        return model["config_refused"]
+    in_force = maximum if configured is None else configured
+    return model["admitted"] if length <= in_force else model["too_large"]
+
+
+def check(corpus: dict, model: dict) -> None:
+    names = [c["name"] for c in corpus["cases"]]
+    if len(names) != len(set(names)):
+        raise Failure("duplicate case name")
+    seen: dict[str, set[str]] = {topic: set() for topic in model["table"]}
+    for c in corpus["cases"]:
+        if c["topic"] not in model["table"]:
+            raise Failure(f"{c['name']}: topic {c['topic']!r} has no maximum in the contract")
+        direction, maximum = model["table"][c["topic"]]
+        if c["direction"] != direction:
+            raise Failure(f"{c['name']}: direction is not the table's")
+        data = build(model, c["construction"], c["length"])
+        if len(data) != c["length"] or hashlib.sha256(data).hexdigest() != c["sha256"]:
+            raise Failure(f"{c['name']}: bytes do not reproduce from the construction")
+        want = verdict(model, c["topic"], c["configured_maximum"], c["length"])
+        if c["verdict"] != want:
+            raise Failure(f"{c['name']}: verdict {c['verdict']}, the contract decides {want}")
+        configured, kind, length = c["configured_maximum"], c["construction"], c["length"]
+        if configured is None and kind == "json_object":
+            if length == maximum:
+                seen[c["topic"]].add("at")
+            elif length == maximum + 1:
+                seen[c["topic"]].add("one_over")
+            elif length == 4 * maximum:
+                seen[c["topic"]].add("four_times")
+        if configured is None and kind == "invalid_utf8" and length == maximum + 1:
+            seen[c["topic"]].add("invalid_one_over")
+        if configured == maximum // 2 and kind == "json_object":
+            if length == configured:
+                seen[c["topic"]].add("configured_at")
+            elif length == configured + 1:
+                seen[c["topic"]].add("configured_over")
+        if configured == maximum + 1:
+            seen[c["topic"]].add("configured_above")
+    wanted = {"at", "one_over", "four_times", "invalid_one_over", "configured_at",
+              "configured_over", "configured_above"}
+    for topic, got in seen.items():
+        if got != wanted:
+            raise Failure(f"coverage: {topic} lacks {sorted(wanted - got)}")
+
+
+def run(corpus_bytes: bytes, model: dict) -> None:
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one gateway-api/v2.md pins")
+    check(json.loads(corpus_bytes), model)
+
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+    text = CONTRACT.read_text()
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def text_mutant(old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            if old not in text:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            run(corpus_bytes, contract_model(text.replace(old, new, 1)))
+        return go
+
+    def by_name(c: dict, name: str) -> dict:
+        return next(x for x in c["cases"] if x["name"] == name)
+
+    def drop(name: str) -> Callable[[dict], None]:
+        return lambda c: c.update(cases=[x for x in c["cases"] if x["name"] != name])
+
+    first = base["cases"][0]["topic"]
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("one-over admitted", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_one_over").update(verdict="admitted"))),
+        ("at-maximum refused", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_at_maximum").update(verdict="payload_too_large"))),
+        ("raised configuration admitted", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_configured_above_table").update(
+                verdict="admitted"))),
+        ("configured lower ignored", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_configured_half_over").update(
+                verdict="admitted"))),
+        ("digest of other bytes", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_at_maximum").update(sha256="0" * 64))),
+        ("length off by one", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_at_maximum").update(length=16383))),
+        ("unknown topic", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_at_maximum").update(topic="ori/x"))),
+        ("wrong direction", corpus_mutant(
+            lambda c: by_name(c, "gateway_health_at_maximum").update(
+                direction="runtime_to_gateway"))),
+        ("maximum read one larger", model_mutant(
+            lambda m: m["table"].__setitem__(first, (m["table"][first][0],
+                                                     m["table"][first][1] + 1)))),
+        ("maximum read one smaller", model_mutant(
+            lambda m: m["table"].__setitem__(first, (m["table"][first][0],
+                                                     m["table"][first][1] - 1)))),
+        ("a raised configuration honoured", model_mutant(
+            lambda m: m.update(config_refused=m["admitted"]))),
+        ("fill byte changed", model_mutant(lambda m: m.update(json_fill=b"b"))),
+        ("invalid byte changed", model_mutant(lambda m: m.update(invalid_byte=b"\xfe"))),
+        ("pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("text: a maximum changed", text_mutant(
+            "| `ori/gateway/health` | Gateway -> Runtime | 16384 |",
+            "| `ori/gateway/health` | Gateway -> Runtime | 16385 |")),
+        ("text: a topic dropped from the table", text_mutant(
+            "| `ori/{device_id}/evidence/outbound/ack` | Gateway -> Runtime | 16384 | Fixed members. |\n",
+            "")),
+        ("text: reason renamed", text_mutant(
+            "refused as `payload_too_large`", "refused as `too_large`")),
+        ("text: raising allowed", text_mutant(
+            "may configure a lower maximum for a topic, never a higher one",
+            "may configure any maximum for a topic")),
+        ("text: construction changed", text_mutant(
+            "`json_object`: the bytes `{\"pad\":\"`", "`json_object`: the bytes `{\"p\":\"`")),
+    ]
+    for name in [c["name"] for c in base["cases"] if c["topic"] == first]:
+        cases.append((f"{name} dropped", corpus_mutant(drop(name))))
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    print(f"{len(cases)} mutants")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except Failure as failure:
+        print(f"gateway-api/v2 payload size contract: {failure}")
+        return 1
+    corpus_bytes = CORPUS.read_bytes()
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"gateway-api/v2 payload size corpus: {failure!r}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    print(f"gateway-api/v2 payload size corpus: {len(corpus['cases'])} cases over "
+          f"{len(model['table'])} topics, each built and decided from the contract")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

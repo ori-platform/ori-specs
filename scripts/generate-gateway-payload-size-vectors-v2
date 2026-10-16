@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 Payload Size corpus.
+
+Nothing here is shared with scripts/check-gateway-payload-size-vectors-v2,
+which reads the table, the verdicts and the constructions from the contract.
+
+    python3 scripts/generate-gateway-payload-size-vectors-v2          # write
+    python3 scripts/generate-gateway-payload-size-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "payload-size-v2.json"
+
+# (topic, direction, maximum): the Payload Size table.
+TOPICS = (
+    ("ori/gateway/health", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/runtime/heartbeat", "runtime_to_gateway", 65536),
+    ("ori/{device_id}/reasoning/request", "runtime_to_gateway", 262144),
+    ("ori/{device_id}/reasoning/response", "gateway_to_runtime", 262144),
+    ("ori/{device_id}/tier_c/enrichment/request", "runtime_to_gateway", 262144),
+    ("ori/{device_id}/tier_c/enrichment/response", "gateway_to_runtime", 262144),
+    ("ori/{device_id}/export/request", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/export/response/{request_id}", "runtime_to_gateway", 4194304),
+    ("ori/{device_id}/evidence/outbound", "runtime_to_gateway", 1572864),
+    ("ori/{device_id}/evidence/outbound/ack", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/evidence/inbound", "gateway_to_runtime", 1572864),
+)
+
+
+def construct(kind: str, length: int) -> bytes:
+    if kind == "json_object":
+        head, tail = b'{"pad":"', b'"}'
+        return head + b"a" * (length - len(head) - len(tail)) + tail
+    if kind == "invalid_utf8":
+        return b"\xff" * length
+    raise ValueError(kind)
+
+
+def case(name: str, topic: str, direction: str, configured: int | None, kind: str,
+         length: int, verdict: str, note: str) -> dict:
+    return {
+        "name": name,
+        "topic": topic,
+        "direction": direction,
+        "configured_maximum": configured,
+        "construction": kind,
+        "length": length,
+        "sha256": hashlib.sha256(construct(kind, length)).hexdigest(),
+        "verdict": verdict,
+        "note": note,
+    }
+
+
+def build() -> bytes:
+    cases = []
+    for topic, direction, maximum in TOPICS:
+        family = topic.replace("ori/", "").replace("{device_id}/", "").replace(
+            "/{request_id}", "").replace("/", "_")
+        half = maximum // 2
+        cases += [
+            case(f"{family}_at_maximum", topic, direction, None, "json_object", maximum,
+                 "admitted", "exactly the maximum"),
+            case(f"{family}_one_over", topic, direction, None, "json_object", maximum + 1,
+                 "payload_too_large", "one byte over the maximum"),
+            case(f"{family}_four_times", topic, direction, None, "json_object", 4 * maximum,
+                 "payload_too_large", "refused without reading past the length"),
+            case(f"{family}_invalid_utf8_one_over", topic, direction, None, "invalid_utf8",
+                 maximum + 1, "payload_too_large",
+                 "size is decided before the Payload Member Rule's invalid_unicode"),
+            case(f"{family}_configured_half_at", topic, direction, half, "json_object", half,
+                 "admitted", "a configured lower maximum admits a payload at it"),
+            case(f"{family}_configured_half_over", topic, direction, half, "json_object",
+                 half + 1, "payload_too_large",
+                 "a configured lower maximum refuses a conforming payload above it"),
+            case(f"{family}_configured_above_table", topic, direction, maximum + 1,
+                 "json_object", maximum, "configuration_refused",
+                 "configuration may lower a maximum, never raise it"),
+        ]
+    corpus = {
+        "contract": "ori-specs/gateway-api/v2.md#payload-size",
+        "version": 2,
+        "comment": (
+            "Golden vectors for gateway-api/v2 Payload Size. Build each payload from its "
+            "construction and length, confirm its SHA-256, and apply the topic's maximum, "
+            "or the configured maximum when one is given, before anything else: the verdict "
+            "is admitted, payload_too_large, or configuration_refused for a configured "
+            "maximum above the table."
+        ),
+        "constructions": {
+            "json_object": "{\"pad\":\" then 'a' repeated then \"}",
+            "invalid_utf8": "the byte 0xFF repeated",
+        },
+        "cases": cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
