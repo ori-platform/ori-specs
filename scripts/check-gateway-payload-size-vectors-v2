@@ -19,6 +19,12 @@ Held to:
 - coverage, for every topic: a json_object payload at the maximum, one byte
   over and four times over; an invalid_utf8 payload one byte over; a configured
   maximum half the table's, at and one over; and one a byte above the table;
+- paging: the pages and the terminal error the export rule gives, with an
+  oversized item, several pages and an exact fill among the cases;
+- envelopes: each evidence payload at its bound, rebuilt here with its own
+  serialiser, decided by the table; the device_id bound agrees with the
+  pattern runtime-config/v2 declares, and the types and reasons are the
+  longest the contract's vocabularies hold;
 - the digest the contract pins is the corpus's.
 
     python3 scripts/check-gateway-payload-size-vectors-v2
@@ -27,6 +33,7 @@ Held to:
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -38,6 +45,7 @@ from typing import Callable
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CONTRACT = ROOT / "gateway-api" / "v2.md"
 CORPUS = ROOT / "gateway-api" / "vectors" / "payload-size-v2.json"
+RUNTIME_SCHEMA = ROOT / "runtime-config" / "vectors" / "schema.json"
 DIRECTIONS = {"Gateway -> Runtime": "gateway_to_runtime",
               "Runtime -> Gateway": "runtime_to_gateway"}
 # The rule's own sentences, held word for word: the order, the length basis,
@@ -81,10 +89,28 @@ HELD = (
     "runtime does not wait for an answer that will not come.",
     "a peer can never raise them: no payload, envelope or configuration the other side "
     "controls changes a bound.",
-    "whose canonical bytes exceed 1048576 is outside this hop, as an outbound artifact of "
-    "that size is. The gateway refuses it when it receives it from the evidence authority, "
-    "never stages or delivers it, and records a delivery failure in its operational posture. "
-    "It is not redelivered, so it can never hold an inbound lane.",
+    "An item that does not fit in a page by itself ends the export with an error response "
+    "whose `error` is `item_exceeds_payload_maximum`, and the gateway does not request that "
+    "page again.",
+    "is published as the canonical JSON of the whole payload, `auth` included, under the "
+    "canonicalisation of [Artifact Bytes](#artifact-bytes), so the artifact occupies exactly "
+    "its canonical bytes. This bounds size only: a receiver neither checks it nor relies on "
+    "it, and Artifact Bytes is unchanged.",
+    "whose canonical bytes exceed 1048576 cannot be carried on this hop, as an outbound "
+    "artifact of that size cannot. The gateway's staging admits no artifact it could not "
+    "carry, so a response carrying one is a response carrying an authority artifact the "
+    "gateway cannot durably stage, which evidence-transport/v2 already decides: an "
+    "unrecognised outcome for that attempt, the queue entry retained and backed off, the "
+    "artifacts already staged staying staged, and delivery reported degraded. No such "
+    "artifact is ever published to the runtime.",
+    "An authority that keeps returning one holds that entry at the head of that device's "
+    "lane, as any unrecognised response does, and evidence-transport/v2 keeps the device's "
+    "other lane and every other device moving.",
+    "Every row counts `device_id` at its bound. A runtime refuses at load a `device.id` "
+    "outside the pattern",
+    "A gateway configuration may still name an identity outside it, as gateway-config/v2's "
+    "compatibility rule allows, but no conforming runtime answers to one, so these maxima "
+    "hold wherever a conforming runtime is on the other end.",
 )
 
 
@@ -99,8 +125,16 @@ def _section(text: str, heading: str) -> str:
     return body if stop is None else body[:stop.start()]
 
 
-def contract_model(text: str | None = None) -> dict:
+def _vocabulary(flat: str, pattern: str, what: str) -> list[str]:
+    found = re.search(pattern, flat)
+    if found is None:
+        raise Failure(f"gateway-api/v2 no longer states {what}")
+    return re.findall(r"`([a-z_]+)`", found.group(1))
+
+
+def contract_model(text: str | None = None, schema: str | None = None) -> dict:
     text = CONTRACT.read_text() if text is None else text
+    schema = RUNTIME_SCHEMA.read_text() if schema is None else schema
     size = _section(text, "## Payload Size")
     rows = re.findall(r"^\| `([^`]+)` \| (Gateway -> Runtime|Runtime -> Gateway) \| (\d+) \|",
                       size, re.M)
@@ -155,7 +189,43 @@ def contract_model(text: str | None = None) -> dict:
         raise Failure("this recognises topics written in backticks only; "
                       f"topics without a maximum {sorted(defined - set(table))}, maxima for no "
                       f"topic {sorted(set(table) - defined)}")
+    whole_flat = " ".join(text.split())
+    routing = re.search(r"so a `device_id` on this hop is at most (\d+) Unicode scalar values", flat)
+    declared = json.loads(schema)["properties"]["device"]["properties"]["id"]["pattern"]
+    declared_bound = re.search(r"\{1,(\d+)\}\$$", declared)
+    if routing is None or declared_bound is None:
+        raise Failure("no device_id bound in Payload Size or in runtime-config/v2's pattern")
+    if routing.group(1) != declared_bound.group(1):
+        raise Failure(f"Payload Size counts device_id at {routing.group(1)} scalars, "
+                      f"runtime-config/v2 declares {declared_bound.group(1)}")
+    if f"`{declared}`" not in flat:
+        raise Failure("Payload Size does not quote the pattern runtime-config/v2 declares")
+    inbound_bound = re.search(r"An authority artifact of at most (\d+) canonical bytes", flat)
+    outbound_bound = re.search(r"An artifact of at most (\d+) bytes \(evidence-transport/v2\)",
+                               flat)
+    if inbound_bound is None or outbound_bound is None:
+        raise Failure("the evidence rows no longer state their artifact bounds")
+    types_section = _section(text, "### Artifact Type Vocabulary")
+    inbound_types = re.findall(r"^\| `([a-z_]+)` +\|", types_section, re.M)
+    rejections = re.findall(r"^\| `([a-z_]+)` +\| (?:yes|\*\*no\*\*) ", text, re.M)
+    if not inbound_types or not rejections:
+        raise Failure("gateway-api/v2 no longer tabulates inbound types or rejection reasons")
     return {
+        "device_id_scalars": int(routing.group(1)),
+        "device_id_pattern": declared,
+        "artifact_bound": {"inbound": int(inbound_bound.group(1)),
+                           "outbound": int(outbound_bound.group(1))},
+        "outbound_types": _vocabulary(
+            whole_flat, r"The closed outbound vocabulary is (.*?)\. Type is named",
+            "the outbound artifact types"),
+        "transport_reasons": _vocabulary(
+            whole_flat, r"the closed transport refusal vocabulary is (.*?)\. `queue_full`",
+            "the transport refusal vocabulary"),
+        "outbound_outcomes": _vocabulary(
+            whole_flat, r"`outcome` is (`[a-z_]+` or `[a-z_]+`)\. `reason` is empty for",
+            "the outbound acknowledgement outcomes"),
+        "inbound_types": inbound_types,
+        "rejection_reasons": rejections,
         "table": table,
         "admitted": verdicts.group(1),
         "too_large": verdicts.group(2),
@@ -276,12 +346,108 @@ def check_paging(corpus: dict, model: dict) -> None:
         raise Failure(f"coverage: no paging case with {sorted(missing)}")
 
 
+def _json_string(value: str, escaped: bool) -> bytes:
+    out = ['"']
+    for ch in value:
+        point = ord(ch)
+        if ch in '"\\':
+            out.append("\\" + ch)
+        elif point < 0x20:
+            out.append("\\u%04x" % point)
+        elif point < 0x80 or not escaped:
+            out.append(ch)
+        elif point > 0xFFFF:
+            point -= 0x10000
+            out.append("\\u%04x\\u%04x" % (0xD800 + (point >> 10), 0xDC00 + (point & 0x3FF)))
+        else:
+            out.append("\\u%04x" % point)
+    out.append('"')
+    return "".join(out).encode("utf-8")
+
+
+def _json(value: object, escaped: bool) -> bytes:
+    if isinstance(value, str):
+        return _json_string(value, escaped)
+    if isinstance(value, int):
+        return str(value).encode()
+    assert isinstance(value, dict)
+    members = [_json_string(k, escaped) + b":" + _json(value[k], escaped)
+               for k in sorted(value)]
+    return b"{" + b",".join(members) + b"}"
+
+
+def evidence_payload(model: dict, c: dict) -> object:
+    device_id = chr(int(c["device_id_scalar"][2:], 16)) * c["device_id_scalars"]
+    top = 2 ** 53 - 1
+    auth = {"scheme": "hmac-sha256", "signed_at_ms": top,
+            "signature": "hmac-sha256:" + "0" * 64}
+    topic = c["topic"]
+    if topic.endswith("/outbound"):
+        return {"artifact_b64": base64.b64encode(bytes(c["artifact_bytes"])).decode(),
+                "artifact_type": c["artifact_type"], "device_id": device_id}
+    if topic.endswith("/inbound"):
+        shell = len(b'{"pad":""}')
+        artifact = {"pad": "\u00e9" * ((c["artifact_bytes"] - shell) // 2)}
+        if len(_json(artifact, False)) != c["artifact_bytes"]:
+            raise Failure(f"{c['name']}: no artifact is {c['artifact_bytes']} canonical bytes")
+        return {"artifact": artifact, "artifact_type": c["artifact_type"], "auth": auth,
+                "device_id": device_id}
+    return {"acknowledged_at_ms": top, "artifact_digest": "sha256:" + "0" * 64,
+            "artifact_type": c["artifact_type"], "auth": auth, "device_id": device_id,
+            "outcome": c["outcome"], "reason": c["reason"]}
+
+
+def check_envelopes(corpus: dict, model: dict) -> None:
+    longest = lambda words: max(len(w) for w in words)  # noqa: E731
+    vocab = {
+        "ori/{device_id}/evidence/outbound": (model["outbound_types"], None),
+        "ori/{device_id}/evidence/outbound/ack": (model["outbound_types"],
+                                                  model["transport_reasons"]),
+        "ori/{device_id}/evidence/inbound": (model["inbound_types"], None),
+        "ori/{device_id}/evidence/inbound/ack": (model["inbound_types"],
+                                                 model["rejection_reasons"]),
+    }
+    seen = set()
+    for c in corpus["envelopes"]:
+        topic = c["topic"]
+        if topic not in vocab:
+            raise Failure(f"{c['name']}: {topic} is not an evidence topic")
+        data = _json(evidence_payload(model, c), c["encoding"] == "escaped")
+        if c["encoding"] not in ("canonical", "escaped"):
+            raise Failure(f"{c['name']}: unknown encoding {c['encoding']!r}")
+        if len(data) != c["length"] or hashlib.sha256(data).hexdigest() != c["sha256"]:
+            raise Failure(f"{c['name']}: bytes do not reproduce")
+        maximum = model["table"][topic][1]
+        want = model["admitted"] if len(data) <= maximum else model["too_large"]
+        if c["verdict"] != want:
+            raise Failure(f"{c['name']}: verdict {c['verdict']}, the table decides {want}")
+        scalar = chr(int(c["device_id_scalar"][2:], 16))
+        types, reasons = vocab[topic]
+        at_bound = (
+            c["device_id_scalars"] == model["device_id_scalars"]
+            and ord(scalar) > 0xFFFF
+            and re.fullmatch(model["device_id_pattern"], scalar * c["device_id_scalars"])
+            and c["artifact_type"] in types and len(c["artifact_type"]) == longest(types)
+            and (reasons is None or (c["reason"] in reasons
+                                     and len(c["reason"]) == longest(reasons)))
+            and (topic.endswith("/ack") or c["artifact_bytes"] == model["artifact_bound"][
+                "inbound" if topic.endswith("/inbound") else "outbound"])
+        )
+        if at_bound:
+            seen.add((topic, c["encoding"]))
+    wanted = {(t, "escaped") for t in vocab} | {("ori/{device_id}/evidence/inbound",
+                                                  "canonical")}
+    if seen != wanted:
+        raise Failure(f"coverage: no envelope at its bound for {sorted(wanted - seen)}")
+
+
 def run(corpus_bytes: bytes, model: dict) -> None:
     if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
         raise Failure("corpus digest differs from the one gateway-api/v2.md pins")
     corpus = json.loads(corpus_bytes)
     check(corpus, model)
     check_paging(corpus, model)
+    check_envelopes(corpus, model)
 
 
 def mutations(corpus_bytes: bytes, model: dict) -> int:
@@ -301,6 +467,25 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             edit(mutated)
             check_paging(mutated, model)
         return go
+
+    def envelope_mutant(edit: Callable[[dict], None],
+                        consistent: bool = False) -> Callable[[], None]:
+        """With ``consistent``, the edited cases are rebuilt with true bytes and
+        verdicts, so only the coverage rule can refuse them."""
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            if consistent:
+                for c in mutated["envelopes"]:
+                    data = _json(evidence_payload(model, c), c["encoding"] == "escaped")
+                    over = len(data) > model["table"][c["topic"]][1]
+                    c.update(length=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                             verdict=model["too_large"] if over else model["admitted"])
+            check_envelopes(mutated, model)
+        return go
+
+    def envelope(c: dict, name: str) -> dict:
+        return next(x for x in c["envelopes"] if x["name"] == name)
 
     def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
         def go() -> None:
@@ -361,15 +546,56 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "| `ori/gateway/health` | Gateway -> Runtime | 16384 |",
             "| `ori/gateway/health` | Gateway -> Runtime | 16385 |")),
         ("floor ignored", model_mutant(lambda m: m.update(floor=0))),
+        ("text: an oversized item asked for again", text_mutant(
+            "and the gateway does not request that page again",
+            "and the gateway requests that page again")),
+        ("paging: a page after the oversized item", paging_mutant(
+            lambda c: next(x for x in c["paging"] if x["name"] == "an_item_too_large_alone")[
+                "pages"].append({"items": 1, "next": 3}))),
+        ("text: inbound published in any encoding", text_mutant(
+            "is published as the canonical JSON of the whole payload",
+            "is published as any JSON encoding of the whole payload")),
+        ("text: oversized artifact archived", text_mutant(
+            "an unrecognised outcome for that attempt", "a refusal that archives the entry")),
+        ("text: routing bound widened", text_mutant(
+            "so a `device_id` on this hop is at most 128 Unicode scalar values",
+            "so a `device_id` on this hop is at most 4096 Unicode scalar values")),
+        ("schema: runtime pattern widened", lambda: run(corpus_bytes, contract_model(
+            None, RUNTIME_SCHEMA.read_text().replace("]{1,128}$", "]{1,4096}$")))),
+        ("model: inbound maximum at the artifact bound", lambda: check_envelopes(
+            base, {**model, "table": {**model["table"], "ori/{device_id}/evidence/inbound": (
+                "gateway_to_runtime", 1048576)}})),
+        ("model: acknowledgement maximum below an escaped device_id", lambda: check_envelopes(
+            base, {**model, "table": {**model["table"],
+                                      "ori/{device_id}/evidence/inbound/ack": (
+                                          "runtime_to_gateway", 1024)}})),
+        ("envelope: device_id one scalar short", envelope_mutant(
+            lambda c: [x.update(device_id_scalars=127) for x in c["envelopes"]], consistent=True)),
+        ("envelope: device_id in the basic plane", envelope_mutant(
+            lambda c: [x.update(device_id_scalar="U+00E9") for x in c["envelopes"]], consistent=True)),
+        ("envelope: escaped inbound admitted", envelope_mutant(
+            lambda c: envelope(c, "evidence_inbound_escaped_at_bound").update(
+                verdict="admitted"))),
+        ("envelope: escaped inbound dropped", envelope_mutant(
+            lambda c: c.update(envelopes=[x for x in c["envelopes"]
+                                          if x["name"] != "evidence_inbound_escaped_at_bound"]))),
+        ("envelope: a shorter artifact type", envelope_mutant(
+            lambda c: [x.update(artifact_type="delivery_receipt") for x in c["envelopes"]
+                       if "inbound" in x["topic"]], consistent=True)),
+        ("envelope: a shorter rejection reason", envelope_mutant(
+            lambda c: envelope(c, "evidence_inbound_ack_at_bound").update(reason="malformed"), consistent=True)),
+        ("envelope: an artifact below the bound", envelope_mutant(
+            lambda c: [x.update(artifact_bytes=1024) for x in c["envelopes"]
+                       if x["artifact_bytes"]], consistent=True)),
         ("text: pagination resumes at the first item returned", text_mutant(
             "continues from the first item not returned", "continues from the first item returned")),
         ("text: response error renamed", text_mutant(
             "with `error` `response_too_large`", "with `error` `response_ignored`")),
         ("text: a peer may raise a bound", text_mutant(
             "a peer can never raise them", "a peer can always raise them")),
-        ("text: oversized inbound artifacts redelivered", text_mutant(
-            "It is not redelivered, so it can never hold an inbound lane.",
-            "It is redelivered until it is acknowledged.")),
+        ("text: an oversized artifact holds every lane", text_mutant(
+            "keeps the device's other lane and every other device moving",
+            "holds the device's other lane and every other device")),
         ("text: item error renamed", text_mutant(
             "whose `error` is `item_exceeds_payload_maximum`", "whose `error` is `item_too_big`")),
         ("paging: a page one item short", paging_mutant(

@@ -12,6 +12,7 @@ which reads the table, the verdicts and the constructions from the contract.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import pathlib
@@ -98,6 +99,50 @@ def pages(fixed: int, items: list[int], maximum: int) -> tuple[list[dict], dict 
     return out, None
 
 
+# Evidence payloads at their bounds.
+SCALAR = "\U0001F600"
+SCALARS = 128
+ARTIFACT_BYTES = 1048576
+TOP_INT = 9007199254740991
+AUTH = {"scheme": "hmac-sha256", "signature": "hmac-sha256:" + "0" * 64,
+        "signed_at_ms": TOP_INT}
+# (name, topic, encoding, artifact_type, outcome, reason)
+ENVELOPES = (
+    ("evidence_outbound_at_bound", "ori/{device_id}/evidence/outbound", "escaped",
+     "anchor_registration", None, None),
+    ("evidence_outbound_ack_at_bound", "ori/{device_id}/evidence/outbound/ack", "escaped",
+     "anchor_registration", "refused", "binding_mismatch"),
+    ("evidence_inbound_canonical_at_bound", "ori/{device_id}/evidence/inbound", "canonical",
+     "custody_acknowledgement", None, None),
+    ("evidence_inbound_escaped_at_bound", "ori/{device_id}/evidence/inbound", "escaped",
+     "custody_acknowledgement", None, None),
+    ("evidence_inbound_ack_at_bound", "ori/{device_id}/evidence/inbound/ack", "escaped",
+     "custody_acknowledgement", "refused", "restatement_conflict"),
+)
+
+
+def envelope(topic: str, artifact_type: str, outcome: str | None,
+             reason: str | None) -> dict:
+    device_id = SCALAR * SCALARS
+    if topic.endswith("/outbound"):
+        raw = b"\x00" * ARTIFACT_BYTES
+        return {"device_id": device_id, "artifact_type": artifact_type,
+                "artifact_b64": base64.b64encode(raw).decode()}
+    if topic.endswith("/inbound"):
+        # {"pad":"…"} of 2-byte characters, ARTIFACT_BYTES long in canonical form.
+        pad = "\u00e9" * ((ARTIFACT_BYTES - len('{"pad":""}')) // 2)
+        return {"device_id": device_id, "artifact_type": artifact_type,
+                "artifact": {"pad": pad}, "auth": AUTH}
+    return {"device_id": device_id, "artifact_type": artifact_type,
+            "artifact_digest": "sha256:" + "0" * 64, "outcome": outcome, "reason": reason,
+            "acknowledged_at_ms": TOP_INT, "auth": AUTH}
+
+
+def encode(payload: dict, encoding: str) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=encoding == "escaped").encode("utf-8")
+
+
 def build() -> bytes:
     cases = []
     for topic, direction, maximum in TOPICS:
@@ -135,6 +180,18 @@ def build() -> bytes:
         produced, error = pages(fixed, items, maximum)
         paging.append({"name": name, "fixed_bytes": fixed, "item_bytes": items,
                        "maximum": maximum, "pages": produced, "error": error, "note": note})
+    maxima = {topic: maximum for topic, _, maximum in TOPICS}
+    envelopes = []
+    for name, topic, encoding, artifact_type, outcome, reason in ENVELOPES:
+        data = encode(envelope(topic, artifact_type, outcome, reason), encoding)
+        envelopes.append({
+            "name": name, "topic": topic, "encoding": encoding,
+            "device_id_scalar": f"U+{ord(SCALAR):04X}", "device_id_scalars": SCALARS,
+            "artifact_type": artifact_type, "outcome": outcome, "reason": reason,
+            "artifact_bytes": ARTIFACT_BYTES if "/ack" not in topic else None,
+            "length": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "verdict": "admitted" if len(data) <= maxima[topic] else "payload_too_large",
+        })
     corpus = {
         "contract": "ori-specs/gateway-api/v2.md#payload-size",
         "version": 2,
@@ -151,6 +208,7 @@ def build() -> bytes:
         },
         "cases": cases,
         "paging": paging,
+        "envelopes": envelopes,
     }
     return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
