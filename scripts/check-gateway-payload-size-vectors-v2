@@ -106,8 +106,13 @@ HELD = (
     "An authority that keeps returning one holds that entry at the head of that device's "
     "lane, as any unrecognised response does, and evidence-transport/v2 keeps the device's "
     "other lane and every other device moving.",
-    "Every row counts `device_id` at its bound. A runtime refuses at load a `device.id` "
-    "outside the pattern",
+    "Every row counts its routing members at their bounds. A runtime refuses at load a "
+    "`device.id` outside the pattern",
+    "a runtime refuses an export request whose `request_id` is outside it, unanswered, as it "
+    "refuses an oversized payload.",
+    "fits within 4096 bytes, the floor, so no permitted configuration refuses one",
+    "An error response carries an `error` of at most 128 Unicode scalar values and no other "
+    "text, every other string member empty or, where its family lets it, omitted.",
     "A gateway configuration may still name an identity outside it, as gateway-config/v2's "
     "compatibility rule allows, but no conforming runtime answers to one, so these maxima "
     "hold wherever a conforming runtime is on the other end.",
@@ -190,16 +195,38 @@ def contract_model(text: str | None = None, schema: str | None = None) -> dict:
                       f"topics without a maximum {sorted(defined - set(table))}, maxima for no "
                       f"topic {sorted(set(table) - defined)}")
     whole_flat = " ".join(text.split())
-    routing = re.search(r"so a `device_id` on this hop is at most (\d+) Unicode scalar values", flat)
+    routing = re.search(r"so a `device_id` on this hop is at most (\d+) ASCII characters", flat)
     declared = json.loads(schema)["properties"]["device"]["properties"]["id"]["pattern"]
-    declared_bound = re.search(r"\{1,(\d+)\}\$$", declared)
-    if routing is None or declared_bound is None:
-        raise Failure("no device_id bound in Payload Size or in runtime-config/v2's pattern")
-    if routing.group(1) != declared_bound.group(1):
-        raise Failure(f"Payload Size counts device_id at {routing.group(1)} scalars, "
-                      f"runtime-config/v2 declares {declared_bound.group(1)}")
+    # One bracket class and one {1,N}, nothing else: a prefix or a second atom
+    # would admit lengths no suffix shows.
+    shape = re.fullmatch(r"\^\[([ -~]+?)\]\{1,(\d+)\}\$", declared)
+    if routing is None or shape is None or "]" in shape.group(1) or "[" in shape.group(1):
+        raise Failure(f"device.id pattern {declared!r} is not one ASCII bracket class with a "
+                      "{1,N} bound, or Payload Size states no device_id bound")
+    if routing.group(1) != shape.group(2):
+        raise Failure(f"Payload Size counts device_id at {routing.group(1)} characters, "
+                      f"runtime-config/v2 declares {shape.group(2)}")
+    admitted = {chr(c) for c in range(128) if re.fullmatch(declared, chr(c))}
+    unsafe = admitted & set("/+#|${}\"\\ \t\r\n\x00\x7f")
+    if unsafe or not admitted:
+        raise Failure(f"device.id pattern admits {sorted(unsafe)}")
     if f"`{declared}`" not in flat:
         raise Failure("Payload Size does not quote the pattern runtime-config/v2 declares")
+    request_bound = re.search(r"A `request_id` is 1 to (\d+) characters from the same set", flat)
+    error_bound = re.search(r"an `error` of at most (\d+) Unicode scalar values", flat)
+    event_bound = re.search(r"`action_event_type` is at most (\d+) ASCII characters", flat)
+    if None in (request_bound, error_bound, event_bound):
+        raise Failure("Payload Size no longer bounds request_id, error or action_event_type")
+    assert request_bound and error_bound and event_bound
+    export_types = re.search(r"^\| `export_type` +\| +yes \| One of (.*?)\. \|$", text, re.M)
+    tokens = re.findall(r"^\| `([a-z_]+)` \| (?:`degraded`|`critical`|none) +\|",
+                        _section(text, "### `degradation_reasons`"), re.M)
+    gateway_status = re.search(r'"status": "([a-z|]+)",\n  "uptime_s"', text)
+    provider = re.search(r'"provider": "([a-z_|]+)"', text)
+    if None in (export_types, gateway_status, provider) or not tokens:
+        raise Failure("gateway-api/v2 no longer states export types, degradation tokens, or "
+                      "the gateway heartbeat's status and provider")
+    assert export_types and gateway_status and provider
     inbound_bound = re.search(r"An authority artifact of at most (\d+) canonical bytes", flat)
     outbound_bound = re.search(r"An artifact of at most (\d+) bytes \(evidence-transport/v2\)",
                                flat)
@@ -211,6 +238,14 @@ def contract_model(text: str | None = None, schema: str | None = None) -> dict:
     if not inbound_types or not rejections:
         raise Failure("gateway-api/v2 no longer tabulates inbound types or rejection reasons")
     return {
+        "routing": int(routing.group(1)),
+        "request_id_bound": int(request_bound.group(1)),
+        "error_bound": int(error_bound.group(1)),
+        "event_bound": int(event_bound.group(1)),
+        "export_types": re.findall(r"`([a-z_]+)`", export_types.group(1)),
+        "degradation_tokens": tokens,
+        "gateway_statuses": gateway_status.group(1).split("|"),
+        "providers": provider.group(1).split("|"),
         "device_id_scalars": int(routing.group(1)),
         "device_id_pattern": declared,
         "artifact_bound": {"inbound": int(inbound_bound.group(1)),
@@ -366,10 +401,18 @@ def _json_string(value: str, escaped: bool) -> bytes:
 
 
 def _json(value: object, escaped: bool) -> bytes:
+    if value is None:
+        return b"null"
+    if value is True or value is False:
+        return b"true" if value else b"false"
     if isinstance(value, str):
         return _json_string(value, escaped)
     if isinstance(value, int):
         return str(value).encode()
+    if isinstance(value, float):
+        return repr(value).encode()
+    if isinstance(value, list):
+        return b"[" + b",".join(_json(v, escaped) for v in value) + b"]"
     assert isinstance(value, dict)
     members = [_json_string(k, escaped) + b":" + _json(value[k], escaped)
                for k in sorted(value)]
@@ -425,7 +468,6 @@ def check_envelopes(corpus: dict, model: dict) -> None:
         types, reasons = vocab[topic]
         at_bound = (
             c["device_id_scalars"] == model["device_id_scalars"]
-            and ord(scalar) > 0xFFFF
             and re.fullmatch(model["device_id_pattern"], scalar * c["device_id_scalars"])
             and c["artifact_type"] in types and len(c["artifact_type"]) == longest(types)
             and (reasons is None or (c["reason"] in reasons
@@ -441,6 +483,79 @@ def check_envelopes(corpus: dict, model: dict) -> None:
         raise Failure(f"coverage: no envelope at its bound for {sorted(wanted - seen)}")
 
 
+REPLY_TOPICS = {
+    "reasoning_error": "ori/{device_id}/reasoning/response",
+    "enrichment_error": "ori/{device_id}/tier_c/enrichment/response",
+    "export_error_encrypted": "ori/{device_id}/export/response/{request_id}",
+    "runtime_heartbeat_no_triggers": "ori/{device_id}/runtime/heartbeat",
+    "gateway_heartbeat": "ori/gateway/health",
+}
+
+
+def reply_payload(model: dict, name: str) -> object:
+    """Each required reply at the bounds the contract states."""
+    widest = lambda words: max(words, key=len)  # noqa: E731
+    device_id = "a" * model["routing"]
+    request_id = "a" * model["request_id_bound"]
+    error = "\U0001F600" * model["error_bound"]
+    top = 2 ** 53 - 1
+    auth = {"scheme": "hmac-sha256", "signature": "hmac-sha256:" + "0" * 64,
+            "signed_at_ms": top}
+    if name == "reasoning_error":
+        return {"action_tier": "A", "auth": auth, "confidence": 0.0, "device_id": device_id,
+                "error": error, "latency_ms": top, "model": "", "proposed_action": None,
+                "request_id": request_id, "text": "", "tokens_used": top}
+    if name == "enrichment_error":
+        return {"auth": auth, "device_id": device_id, "error": error, "latency_ms": top,
+                "proposal_id": "A" * 8, "request_id": request_id, "tokens_used": top}
+    if name == "export_error_encrypted":
+        export_type = widest(model["export_types"])
+        plaintext = _json({"complete": True, "device_id": device_id, "error": error,
+                           "export_type": export_type, "items": [], "next_page_token": "",
+                           "request_id": request_id}, True)
+        return {"auth": auth, "device_id": device_id, "encrypted": True,
+                "encryption": {"ciphertext": base64.b64encode(bytes(len(plaintext) + 16)).decode(),
+                               "nonce": base64.b64encode(bytes(12)).decode(),
+                               "scheme": "aes-256-gcm"},
+                "export_type": export_type, "request_id": request_id}
+    if name == "runtime_heartbeat_no_triggers":
+        return {"active_triggers": [], "auth": auth, "degradation_reasons": model[
+                    "degradation_tokens"], "device_id": device_id,
+                "evidence": {"action_event_type": "A" * model["event_bound"],
+                             "attestation_gap_count": top, "available": True,
+                             "chain_head_hash": "0" * 64},
+                "gateway_seen_ms": top, "last_seen_ms": top, "status": "critical"}
+    if name == "gateway_heartbeat":
+        return {"auth": auth, "provider": widest(model["providers"]),
+                "sim_available": False, "status": widest(model["gateway_statuses"]),
+                "timestamp_ms": top, "uptime_s": 1.7976931348623157e308,
+                "webhook_bridge": {"body_limit_bytes": top, "enabled": False,
+                                   "loopback_only": False, "provider_cidr_count": top,
+                                   "ready": False, "request_timeout_ms": top,
+                                   "runtime_target_configured": False,
+                                   "source_cidrs_configured": False}}
+    raise Failure(f"no required reply named {name!r}")
+
+
+def check_replies(corpus: dict, model: dict) -> None:
+    names = {c["name"] for c in corpus["replies"]}
+    if names != set(REPLY_TOPICS):
+        raise Failure(f"coverage: required replies {sorted(set(REPLY_TOPICS) - names)} "
+                      f"missing, {sorted(names - set(REPLY_TOPICS))} unknown")
+    for c in corpus["replies"]:
+        if c["topic"] != REPLY_TOPICS[c["name"]] or c["configured_maximum"] != model["floor"]:
+            raise Failure(f"{c['name']}: not on its topic at the floor")
+        data = _json(reply_payload(model, c["name"]), True)
+        if len(data) != c["length"] or hashlib.sha256(data).hexdigest() != c["sha256"]:
+            raise Failure(f"{c['name']}: bytes do not reproduce")
+        if c["verdict"] != model["admitted"] or len(data) > model["floor"]:
+            raise Failure(f"{c['name']}: a required reply of {len(data)} bytes does not fit "
+                          f"the floor of {model['floor']}")
+    for c in corpus["envelopes"]:
+        if c["topic"].endswith("/ack") and c["length"] > model["floor"]:
+            raise Failure(f"{c['name']}: an acknowledgement does not fit the floor")
+
+
 def run(corpus_bytes: bytes, model: dict) -> None:
     if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
         raise Failure("corpus digest differs from the one gateway-api/v2.md pins")
@@ -448,6 +563,7 @@ def run(corpus_bytes: bytes, model: dict) -> None:
     check(corpus, model)
     check_paging(corpus, model)
     check_envelopes(corpus, model)
+    check_replies(corpus, model)
 
 
 def mutations(corpus_bytes: bytes, model: dict) -> int:
@@ -482,6 +598,22 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                     c.update(length=len(data), sha256=hashlib.sha256(data).hexdigest(),
                              verdict=model["too_large"] if over else model["admitted"])
             check_envelopes(mutated, model)
+        return go
+
+    def replies_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        """A contract whose bounds changed, with replies rebuilt consistently under
+        them: only the floor can refuse it."""
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            corpus = copy.deepcopy(base)
+            for c in corpus["replies"]:
+                data = _json(reply_payload(mutated, c["name"]), True)
+                over = len(data) > mutated["floor"]
+                c.update(configured_maximum=mutated["floor"], length=len(data),
+                         sha256=hashlib.sha256(data).hexdigest(),
+                         verdict=mutated["too_large"] if over else mutated["admitted"])
+            check_replies(corpus, mutated)
         return go
 
     def envelope(c: dict, name: str) -> dict:
@@ -558,20 +690,41 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("text: oversized artifact archived", text_mutant(
             "an unrecognised outcome for that attempt", "a refusal that archives the entry")),
         ("text: routing bound widened", text_mutant(
-            "so a `device_id` on this hop is at most 128 Unicode scalar values",
-            "so a `device_id` on this hop is at most 4096 Unicode scalar values")),
+            "so a `device_id` on this hop is at most 128 ASCII characters",
+            "so a `device_id` on this hop is at most 4096 ASCII characters")),
+        ("schema and text: a prefix admits any length", lambda: run(corpus_bytes, contract_model(
+            text.replace("`^[A-Za-z0-9._-]{1,128}$`", "`^A*[A-Za-z0-9._-]{1,128}$`"),
+            RUNTIME_SCHEMA.read_text().replace('"^[A-Za-z0-9._-]{1,128}$"',
+                                               '"^A*[A-Za-z0-9._-]{1,128}$"')))),
+        ("schema and text: the class admits a placeholder", lambda: run(
+            corpus_bytes, contract_model(
+                text.replace("`^[A-Za-z0-9._-]{1,128}$`", "`^[A-Za-z0-9._${}-]{1,128}$`"),
+                RUNTIME_SCHEMA.read_text().replace('"^[A-Za-z0-9._-]{1,128}$"',
+                                                   '"^[A-Za-z0-9._${}-]{1,128}$"')))),
+        ("text: request_id refused answered", text_mutant(
+            "a runtime refuses an export request whose `request_id` is outside it, unanswered",
+            "a runtime answers an export request whose `request_id` is outside it")),
+        ("replies: request_id unbounded", replies_mutant(
+            lambda m: m.update(request_id_bound=3000))),
+        ("replies: error widened", replies_mutant(lambda m: m.update(error_bound=512))),
+        ("replies: floor lowered", replies_mutant(lambda m: m.update(floor=2048))),
+        ("replies: export reply dropped", lambda: check_replies(
+            {**base, "replies": [x for x in base["replies"]
+                                 if x["name"] != "export_error_encrypted"]}, model)),
+        ("replies: heartbeat without a token", lambda: check_replies(
+            base, {**model, "degradation_tokens": model["degradation_tokens"][1:]})),
         ("schema: runtime pattern widened", lambda: run(corpus_bytes, contract_model(
             None, RUNTIME_SCHEMA.read_text().replace("]{1,128}$", "]{1,4096}$")))),
         ("model: inbound maximum at the artifact bound", lambda: check_envelopes(
             base, {**model, "table": {**model["table"], "ori/{device_id}/evidence/inbound": (
                 "gateway_to_runtime", 1048576)}})),
-        ("model: acknowledgement maximum below an escaped device_id", lambda: check_envelopes(
+        ("model: acknowledgement maximum below its members", lambda: check_envelopes(
             base, {**model, "table": {**model["table"],
                                       "ori/{device_id}/evidence/inbound/ack": (
-                                          "runtime_to_gateway", 1024)}})),
+                                          "runtime_to_gateway", 512)}})),
         ("envelope: device_id one scalar short", envelope_mutant(
             lambda c: [x.update(device_id_scalars=127) for x in c["envelopes"]], consistent=True)),
-        ("envelope: device_id in the basic plane", envelope_mutant(
+        ("envelope: device_id outside the pattern", envelope_mutant(
             lambda c: [x.update(device_id_scalar="U+00E9") for x in c["envelopes"]], consistent=True)),
         ("envelope: escaped inbound admitted", envelope_mutant(
             lambda c: envelope(c, "evidence_inbound_escaped_at_bound").update(
