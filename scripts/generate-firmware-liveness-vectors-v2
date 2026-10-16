@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Ori Nexus Systems LTD
 # SPDX-License-Identifier: Apache-2.0
-"""Generate the firmware-commands/v2 runtime liveness corpus (liveness at v 2).
+"""Generate the firmware-commands/v2 runtime liveness corpora, at v 1 and at v 2.
 
 Signatures come from OpenSSL through `cryptography`, under the disclosed
-runtime and rogue test seeds of the v 1 liveness corpus. Object bytes are
-written field by field, so a case can carry the non-canonical bytes it is
-refused for. Nonces are fixed fixture values. Nothing here is shared with
-scripts/check-firmware-liveness-vectors-v2, which reads the grammar and the
-acceptance order from the contract.
+runtime and rogue test seeds, in the liveness domain of Signing Domains unless
+a case names another preimage. Object bytes are written field by field, so a
+case can carry the non-canonical bytes it is refused for. Nonces are fixed
+fixture values. Nothing here is shared with
+scripts/check-firmware-liveness-vectors-v2, which reads the grammar, the
+domains and the acceptance order from the contract.
 
-    python3 scripts/generate-firmware-liveness-vectors-v2          # write
-    python3 scripts/generate-firmware-liveness-vectors-v2 --check  # reproduce
+    python3 scripts/generate-firmware-liveness-vectors-v2          # write both
+    python3 scripts/generate-firmware-liveness-vectors-v2 --check  # reproduce both
 """
 
 from __future__ import annotations
@@ -27,6 +28,17 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "firmware-commands" / "liveness-vectors-v2.json"
+OUT_V1 = ROOT / "firmware-commands" / "liveness-at-v-1-vectors-v2.json"
+
+LIVENESS_DOMAIN = b"ori.firmware_liveness.v2"
+COMMAND_DOMAIN = b"ori.firmware_command.v2"
+# The preimage each signature form covers, for the object bytes it signs.
+PREIMAGES = {
+    "liveness": lambda body: LIVENESS_DOMAIN + b"\x00" + body,
+    "command": lambda body: COMMAND_DOMAIN + b"\x00" + body,
+    "alone": lambda body: body,
+    "liveness_no_nul": lambda body: LIVENESS_DOMAIN + body,
+}
 
 RUNTIME_SEED_HEX = "11" * 32
 ROGUE_SEED_HEX = "99" * 32
@@ -171,6 +183,18 @@ REJECT = (
      "signed for another manifest"),
     ("reject_v2_rogue_key", "signature_invalid", fields(n=C, runtime_seq=3), context(2, B), True,
      "signed by a key the device does not hold"),
+    ("reject_v2_signed_over_object_alone", "signature_invalid", fields(n=C, runtime_seq=3),
+     context(2, B), "alone",
+     "signed by the runtime key over the object bytes alone, v1's form, which no domain "
+     "begins"),
+    ("reject_v2_signed_in_command_domain", "signature_invalid", fields(n=C, runtime_seq=3),
+     context(2, B), "command",
+     "signed by the runtime key in the command domain: a command signature is never a "
+     "liveness signature"),
+    ("reject_v2_liveness_domain_without_nul", "signature_invalid", fields(n=C, runtime_seq=3),
+     context(2, B), "liveness_no_nul",
+     "signed by the runtime key over the liveness domain and the object bytes with no NUL "
+     "between them"),
 )
 
 # Each breaks two adjacent checks and is refused for the earlier.
@@ -244,10 +268,11 @@ def build() -> bytes:
     runtime_public = runtime.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     rogue_public = rogue.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
-    def signed(pairs: list[tuple[str, str]], use_rogue: bool = False) -> dict:
+    def signed(pairs: list[tuple[str, str]], use_rogue: bool | str = False) -> dict:
         body = obj_bytes(pairs)
-        key = rogue if use_rogue else runtime
-        signature_b64 = base64.b64encode(key.sign(body)).decode("ascii")
+        key = rogue if use_rogue is True else runtime
+        form = use_rogue if isinstance(use_rogue, str) else "liveness"
+        signature_b64 = base64.b64encode(key.sign(PREIMAGES[form](body))).decode("ascii")
         message = b'{"liveness":' + body + b',"signature":"ed25519:' + signature_b64.encode() + b'"}'
         return {
             "input": json.loads(body),
@@ -262,7 +287,7 @@ def build() -> bytes:
                       **signed(pairs), "expected_held_nonce": held_after})
     reject_cases = []
     for name, reason, pairs, ctx, use_rogue, note in REJECT:
-        reject_cases.append({"name": name, "reason": reason, "signature_valid": not use_rogue,
+        reject_cases.append({"name": name, "reason": reason, "signature_valid": use_rogue is False,
                              "note": note, "verifier_context": ctx, **signed(pairs, use_rogue),
                              "expected_held_nonce": ctx["held_nonce"]})
     precedence_cases = []
@@ -315,8 +340,9 @@ def build() -> bytes:
             "nonce its 'expected_held_nonce' gives, and refuse every case in 'reject_cases', "
             "'precedence_cases' and 'transport_reject_cases' with the declared reason, leaving the held nonce "
             "unchanged. Each case is evaluated against its own verifier_context. Signed with "
-            "the TEST-ONLY runtime and rogue seeds of the v 1 liveness corpus; never use them "
-            "in production. Nonces are fixed fixture values; a runtime draws its own from a "
+            "the TEST-ONLY runtime and rogue seeds of the v 1 liveness corpus, in the liveness "
+            "domain of Signing Domains unless a case's note names another preimage; never use "
+            "them in production. Nonces are fixed fixture values; a runtime draws its own from a "
             "cryptographically secure source. Each rollout sequence is a run of "
             "deliveries to one device that accepts the listed versions, starting from its "
             "verifier_context; each delivery gives its reason, null when accepted, and the "
@@ -351,19 +377,252 @@ def build() -> bytes:
     return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+# --- liveness at v 1 ------------------------------------------------------------------
+
+def ctx1(device_id: str, boot_id: int, capability_hash: str, last: int) -> dict:
+    return {"device_id": device_id, "boot_id": boot_id, "capability_hash": capability_hash,
+            "last_accepted_runtime_seq": last}
+
+
+# (name, note, verifier_context, object bytes) of v 1's accepted cases
+V1_ACCEPT = (
+    ('liveness_first_after_boot',
+     'runtime_seq issues from one upward against a fresh boot whose counter is zero; zero is not itself a valid runtime_seq',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 0),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":1,"v":1}'),
+    ('liveness_steady_state',
+     'the ordinary republication that keeps runtime_reachable true',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 1),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":2,"v":1}'),
+    ('liveness_after_sequence_gap',
+     'a gap is accepted: message loss is expected and only strict monotonicity within the boot is required',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":9007,"v":1}'),
+    ('liveness_low_seq_in_a_new_boot',
+     'the counter is per-boot and is not persisted, so a low seq is accepted after a reboot even though a higher one was accepted in the previous boot; this is what removes the NVS write per message',
+     ctx1('ori-fw-7c9f2b3a', 42, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 0),
+     '{"boot_id":42,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":1,"v":1}'),
+    ('liveness_bench_manifest_epoch',
+     'liveness binds to capability_hash, so a manifest transition needs a message under the new epoch',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:943dadca53c0890a5afe2aed44cbb4942779f2a697cdaccd92b78cfe4fb1fa8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:943dadca53c0890a5afe2aed44cbb4942779f2a697cdaccd92b78cfe4fb1fa8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('liveness_development_device',
+     'development posture uses the same grammar; posture is not a liveness field',
+     ctx1('ori-fw-dev00001', 7, 'sha256:abcacedd4f1632e5db3c604fb63356d9f8bc8b567ac6a3e524a284a416681330', 0),
+     '{"boot_id":7,"capability_hash":"sha256:abcacedd4f1632e5db3c604fb63356d9f8bc8b567ac6a3e524a284a416681330","device_id":"ori-fw-dev00001","runtime_seq":1,"v":1}'),
+    ('liveness_max_boot_id',
+     'boot_id upper bound, 2^32-1',
+     ctx1('ori-fw-7c9f2b3a', 4294967295, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 4),
+     '{"boot_id":4294967295,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":5,"v":1}'),
+    ('liveness_max_runtime_seq',
+     'runtime_seq upper bound, 2^53-1, the end of the sequence space',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 9007199254740990),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":9007199254740991,"v":1}'),
+)
+# (name, reason, signature source, note, verifier_context, object bytes)
+V1_REJECT = (
+    ('reject_replayed_runtime_seq', 'seq_not_increasing', "own",
+     'the exact message the device already accepted, replayed. Equal is not above: a verifier using >= would let a captured message suppress a backstop indefinitely',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":2,"v":1}'),
+    ('reject_regressing_runtime_seq', 'seq_not_increasing', "own",
+     'an older message arriving after a newer one, which reordering or a deliberate replay both produce',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 9007),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_high_seq_from_previous_boot', 'boot_mismatch', "own",
+     'a very high seq captured from the previous boot, replayed after the device rebooted. The boot check is what stops it, which is why the counter never has to be persisted',
+     ctx1('ori-fw-7c9f2b3a', 42, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 1),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":9007199254740991,"v":1}'),
+    ('reject_wrong_device_id', 'device_mismatch', "own",
+     'correctly signed for a different device; a device must not accept supervision addressed to its neighbour',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-dev00001","runtime_seq":3,"v":1}'),
+    ('reject_wrong_boot_id', 'boot_mismatch', "own",
+     "valid signature for a boot that is not the device's current one",
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":46,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_manifest_epoch_mismatch', 'capability_hash_mismatch', "own",
+     'valid signature under a manifest epoch the device has not accepted',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:943dadca53c0890a5afe2aed44cbb4942779f2a697cdaccd92b78cfe4fb1fa8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_rogue_key', 'signature_invalid', "rogue",
+     'well-formed message signed by a key the device was never provisioned with',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 1),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":2,"v":1}'),
+    ('reject_runtime_seq_zero', 'malformed', "liveness_steady_state",
+     'zero is refused, matching provision_seq and unlike cmd_seq',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":0,"v":1}'),
+    ('reject_boot_id_zero', 'malformed', "liveness_steady_state",
+     'device boot counters persist a boot before use and issue from one',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":0,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_boot_id_above_max', 'malformed', "liveness_steady_state",
+     'boot_id is a 32-bit counter; 2^32 does not fit the field',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":4294967296,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_runtime_seq_above_max', 'malformed', "liveness_steady_state",
+     'beyond 2^53-1 an integer is no longer exactly representable everywhere in the fleet, so the contract stops there',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":9007199254740992,"v":1}'),
+    ('reject_unsupported_version', 'malformed', "liveness_steady_state",
+     'a device must not guess at a grammar it does not implement',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":2}'),
+    ('reject_device_id_grammar', 'malformed', "liveness_steady_state",
+     'space and slash are outside the fleet-identifier alphabet, and a slash would also change the topic the message belongs on',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori fw/7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_capability_hash_grammar', 'malformed', "liveness_steady_state",
+     'uppercase hex is a second spelling of the same hash; accepting it would admit two byte strings for one manifest epoch',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751B5335CCEDCD4FFCC82BBDA28EBFB7558859F36A74E710F1A0B0AB23DA8D","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_non_canonical_integer', 'malformed', "liveness_steady_state",
+     'leading zeros are not the canonical integer form',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":041,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}'),
+    ('reject_reordered_fields', 'malformed', "liveness_steady_state",
+     'the grammar is a byte sequence, not an object: reordering changes the signed bytes even though the JSON is equivalent',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"device_id":"ori-fw-7c9f2b3a","boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","runtime_seq":3,"v":1}'),
+    ('reject_extra_field', 'malformed', "liveness_steady_state",
+     'there is deliberately no TTL field; a publisher-chosen window would let a misconfigured runtime suppress backstops indefinitely',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"ttl":600,"v":1}'),
+    ('reject_missing_field', 'malformed', "liveness_steady_state",
+     'every field is required; an absent runtime_seq has no default',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","v":1}'),
+    ('reject_malformed_signature', 'malformed', 'ed25519:not-base64!!',
+     'refused before any curve operation is attempted',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":2,"v":1}'),
+    ('reject_signature_wrong_length', 'malformed', 'ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+     'a 32-byte signature is not short-form; length is part of the grammar',
+     ctx1('ori-fw-7c9f2b3a', 41, 'sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d', 2),
+     '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":2,"v":1}'),
+)
+
+# Each signed by the runtime key over the same bytes in a form the device refuses.
+V1_SIGNATURE_REFUSALS = (
+    ("reject_signed_over_object_alone", "alone",
+     "signed by the runtime key over the object bytes alone, v1's form, which no domain "
+     "begins"),
+    ("reject_signed_in_command_domain", "command",
+     "signed by the runtime key in the command domain: a command signature is never a "
+     "liveness signature"),
+    ("reject_liveness_domain_without_nul", "liveness_no_nul",
+     "signed by the runtime key over the liveness domain and the object bytes with no NUL "
+     "between them"),
+)
+V1_SIGNATURE_REFUSAL_OBJECT = (
+    '{"boot_id":41,"capability_hash":"sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e7'
+    '10f1a0b0ab23da8d","device_id":"ori-fw-7c9f2b3a","runtime_seq":3,"v":1}')
+V1_RETAINED = (
+    "reject_retained_delivery",
+    "byte-identical to a message the device must accept when delivered live. A device "
+    "reconnecting after the runtime died would otherwise suppress its own backstop for a full "
+    "expiry window on the strength of a stored message",
+    V1_SIGNATURE_REFUSAL_OBJECT,
+)
+
+
+def build_v1() -> bytes:
+    runtime = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(RUNTIME_SEED_HEX))
+    rogue = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(ROGUE_SEED_HEX))
+    runtime_public = runtime.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    rogue_public = rogue.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    def sign(body: bytes, key: Ed25519PrivateKey = runtime, form: str = "liveness") -> str:
+        return "ed25519:" + base64.b64encode(key.sign(PREIMAGES[form](body))).decode("ascii")
+
+    def wire(body: bytes, signature: str) -> str:
+        return (b'{"liveness":' + body + b',"signature":"' + signature.encode() + b'"}').hex()
+
+    accepted = {}
+    cases = []
+    for name, note, ctx, obj in V1_ACCEPT:
+        body = obj.encode()
+        signature = sign(body)
+        accepted[name] = signature
+        cases.append({"name": name, "note": note, "input": json.loads(body),
+                      "verifier_context": ctx, "liveness_hex": body.hex(),
+                      "signature_b64": signature[len("ed25519:"):],
+                      "message_hex": wire(body, signature)})
+    reject_cases = []
+    for name, reason, source, note, ctx, obj in V1_REJECT:
+        body = obj.encode()
+        if source == "own":
+            signature = sign(body)
+        elif source == "rogue":
+            signature = sign(body, rogue)
+        elif source in accepted:
+            signature = accepted[source]
+        else:
+            signature = source
+        reject_cases.append({"name": name, "reason": reason,
+                             "signature_valid": source == "own", "verifier_context": ctx,
+                             "message_hex": wire(body, signature), "note": note})
+    for name, form, note in V1_SIGNATURE_REFUSALS:
+        body = V1_SIGNATURE_REFUSAL_OBJECT.encode()
+        reject_cases.append({"name": name, "reason": "signature_invalid",
+                             "signature_valid": False,
+                             "verifier_context": ctx1(DEVICE_ID, BOOT_ID, CAPABILITY_HASH, 2),
+                             "message_hex": wire(body, sign(body, form=form)), "note": note})
+    name, note, obj = V1_RETAINED
+    transport = [{"name": name, "reason": "retained", "signature_valid": True,
+                  "verifier_context": ctx1(DEVICE_ID, BOOT_ID, CAPABILITY_HASH, 2),
+                  "transport": {"topic": f"ori/fw/{DEVICE_ID}/runtime", "retain": True},
+                  "message_hex": wire(obj.encode(), sign(obj.encode())), "note": note}]
+    corpus = {
+        "contract": "ori-specs/firmware-commands/v2.md#runtime-liveness",
+        "version": 1,
+        "comment": (
+            "Cross-language golden vectors for runtime liveness. The runtime signer (Python) "
+            "must produce these exact bytes; the device verifier (C) must accept every case in "
+            "'cases' and refuse every case in 'reject_cases' and 'transport_reject_cases', with "
+            "the declared reason, evaluated against the declared verifier_context. Signed with "
+            "the TEST-ONLY runtime command seed below - never use it in production - in the "
+            "liveness domain of Signing Domains unless a case's note names another preimage. "
+            "Liveness reuses the runtime command key deliberately: the device pins one runtime "
+            "key and there is no second trust root, and the domain keeps a liveness signature "
+            "from ever being a command signature."
+        ),
+        "acceptance_order": ["parses", "device_id", "signature", "boot_id", "capability_hash",
+                             "runtime_seq"],
+        "runtime_test_seed_hex": RUNTIME_SEED_HEX,
+        "runtime_public_key_hex": runtime_public.hex(),
+        "runtime_public_key_b64": base64.b64encode(runtime_public).decode("ascii"),
+        "rogue_test_seed_hex": ROGUE_SEED_HEX,
+        "rogue_public_key_hex": rogue_public.hex(),
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "topic": "ori/fw/<device_id>/runtime",
+        "retain": False,
+        "qos": 1,
+        "cases": cases,
+        "reject_cases": reject_cases,
+        "transport_reject_cases": transport,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def main(argv: list[str]) -> int:
-    data = build()
+    outputs = ((OUT_V1, build_v1()), (OUT, build()))
     if argv == ["--check"]:
-        if not OUT.exists() or OUT.read_bytes() != data:
-            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
-            return 1
-        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
-        return 0
+        failed = 0
+        for out, data in outputs:
+            if not out.exists() or out.read_bytes() != data:
+                print(f"{out.relative_to(ROOT)} does not reproduce from its generator")
+                failed = 1
+            else:
+                print(f"{out.relative_to(ROOT)} reproduces byte for byte")
+        return failed
     if argv:
         print(__doc__)
         return 2
-    OUT.write_bytes(data)
-    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    for out, data in outputs:
+        out.write_bytes(data)
+        print(f"wrote {out.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
     return 0
 
 
