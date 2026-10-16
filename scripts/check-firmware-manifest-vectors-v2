@@ -66,6 +66,7 @@ import multiprocessing
 import os
 import pathlib
 import re
+import unicodedata
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -173,19 +174,33 @@ def exact(value: object, allowed: object, model: dict, rule: str) -> bool:
         return any(value.startswith(n) for n in names)
     if how == "strip":
         return value.strip() in names
+    if how == "truncate":
+        return any(n.startswith(value) for n in names)
+    if how == "nul":
+        return value.split("\x00", 1)[0] in names
+    if how == "casefold":
+        return value.casefold() in [n.casefold() for n in names]
+    if how == "nfkc":
+        return unicodedata.normalize("NFKC", value) in names
     return value in names
 
 
 def exactness_cases(values: list[object], allowed: object) -> dict[str, bool]:
-    """Whether refused values include one extending an allowed string and one padded."""
+    """Which mistaken comparisons the refused values would each catch.
+
+    Each form is defined so that no other form's value counts for it: a padded
+    value is not extended, a value cut at a NUL is not extended, and only a
+    non-empty proper prefix is truncated."""
     names = [allowed] if isinstance(allowed, str) else list(allowed)
     strings = [v for v in values if type(v) is str and v not in names]
     return {
-        # Characters appended that are not only whitespace, so a padded value
-        # never counts as the extended one.
-        "extended": any(any(v.startswith(n) and v[len(n):].strip() for n in names)
-                        for v in strings),
+        "extended": any(any(v.startswith(n) and v[len(n):].strip() and "\x00" not in v
+                            for n in names) for v in strings),
         "padded": any(v.strip() in names for v in strings),
+        "truncated": any(v and any(n.startswith(v) for n in names) for v in strings),
+        "cut at a NUL": any("\x00" in v and v.split("\x00", 1)[0] in names for v in strings),
+        "case-folded": any(v.casefold() in [n.casefold() for n in names] for v in strings),
+        "normalized": any(unicodedata.normalize("NFKC", v) in names for v in strings),
     }
 
 
@@ -1224,14 +1239,24 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         (f"{rule} compared {label}", model_mutant(
             lambda m, r=rule, h=how: m.update(compare={r: h})))
         for rule in ("mode", "qualification", "domains")
-        for how, label in (("prefix", "by prefix"), ("strip", "after trimming"))
+        for how, label in (("prefix", "by prefix"), ("strip", "after trimming"),
+                           ("truncate", "over the received length"),
+                           ("nul", "up to a NUL"), ("casefold", "case-folded"),
+                           ("nfkc", "after NFKC normalization"))
     ]
     exact_mutants += [
         (f"{name} dropped", corpus_mutant(lambda c, n=name: c.update(reject_cases=[
             x for x in c["reject_cases"] if x["name"] != n])))
         for name in ("reject_mode_defined_value_extended", "reject_mode_padded",
+                     "reject_mode_truncated", "reject_mode_nul", "reject_mode_wrong_case",
+                     "reject_mode_fullwidth",
                      "reject_qualification_extended", "reject_qualification_padded",
-                     "reject_runtime_key_domains_extended", "reject_runtime_key_domains_padded")
+                     "reject_qualification_truncated", "reject_qualification_nul",
+                     "reject_qualification_letter_case", "reject_qualification_fullwidth",
+                     "reject_runtime_key_domains_extended", "reject_runtime_key_domains_padded",
+                     "reject_runtime_key_domains_truncated", "reject_runtime_key_domains_nul",
+                     "reject_runtime_key_domains_letter_case",
+                     "reject_runtime_key_domains_fullwidth")
     ]
     cases: list[tuple[str, Callable[[], None]]] = exact_mutants + [
         ("signature bit flipped", corpus_mutant(flip_signature)),
