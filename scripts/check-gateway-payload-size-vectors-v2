@@ -39,6 +39,23 @@ CONTRACT = ROOT / "gateway-api" / "v2.md"
 CORPUS = ROOT / "gateway-api" / "vectors" / "payload-size-v2.json"
 DIRECTIONS = {"Gateway -> Runtime": "gateway_to_runtime",
               "Runtime -> Gateway": "runtime_to_gateway"}
+# The rule's own sentences, held word for word: the order, the length basis,
+# the refusal's silence, the record, and the lower-only configuration. A data
+# check cannot see any of them change.
+HELD = (
+    "A payload's length is the length of the MQTT application message exactly as "
+    "delivered, before it is decrypted, decoded or read.",
+    "Size is the first check, because it bounds the cost of every check after it.",
+    "A receiver compares a payload's length with its topic's maximum before it parses, "
+    "decodes, decrypts or verifies anything.",
+    "It is not answered, since none of its members can be relied on, and it changes no "
+    "state.",
+    "The refusal is recorded with the topic family and the payload's size class, the least "
+    "power of two not below its length, and never with its contents or a device identifier.",
+    "Where an implementation offers a setting for a topic's maximum, a deployment may "
+    "configure a lower maximum, never a higher one, and never below 4096 bytes.",
+    "A producer never publishes a payload longer than its topic's maximum.",
+)
 
 
 class Failure(Exception):
@@ -72,18 +89,23 @@ def contract_model(text: str | None = None) -> dict:
     fill = re.search(r"`invalid_utf8`: the byte `0x([0-9A-F]{2})` repeated", flat)
     pin = re.search(r"\[vectors/payload-size-v2\.json\]\(vectors/payload-size-v2\.json\) holds "
                     r"this section's cases\. Its SHA-256 is `([0-9a-f]{64})`", flat)
-    lower = "may configure a lower maximum for a topic, never a higher one" in flat
+    lower = "may configure a lower maximum, never a higher one" in flat
+    for sentence in HELD:
+        if sentence not in flat:
+            raise Failure(f"Payload Size no longer says: {sentence!r}")
+    floor = re.search(r"never below (\d+) bytes", flat)
+    if floor is None:
+        raise Failure("Payload Size states no floor for a configured maximum")
     if None in (reason, verdicts, head, fill, pin) or not lower:
         raise Failure("Payload Size changed shape: reason, verdicts, constructions, pin or "
                       "the lower-only rule")
     assert reason and verdicts and head and fill and pin
     if verdicts.group(2) != reason.group(1):
         raise Failure("the corpus verdict for an oversized payload is not the refusal reason")
-    # Every topic the contract defines has a maximum, and every maximum names one.
-    defined = set(re.findall(r"^\| [^|]+\| (?:Gateway -> Runtime|Runtime -> Gateway)\s*\| `([^`]+)`",
-                             _section(text, "## Topics"), re.M))
-    defined |= set(re.findall(r"^\| Enrichment (?:request|response)\s*\| [^|]+\| `([^`]+)`",
-                              text, re.M))
+    # Every topic the contract names anywhere has a maximum, and every maximum
+    # names one: literal topics only, since a filter with + or # is a
+    # subscription, not a topic a payload travels on.
+    defined = {topic for topic in re.findall(r"`(ori/[A-Za-z0-9_{}/]+)`", text)}
     if defined != set(table):
         raise Failure(f"topics without a maximum {sorted(defined - set(table))}, maxima for no "
                       f"topic {sorted(set(table) - defined)}")
@@ -97,6 +119,7 @@ def contract_model(text: str | None = None) -> dict:
         "json_tail": head.group(3).encode(),
         "invalid_byte": bytes.fromhex(fill.group(1)),
         "pin": pin.group(1),
+        "floor": int(floor.group(1)),
     }
 
 
@@ -113,7 +136,7 @@ def build(model: dict, kind: str, length: int) -> bytes:
 
 def verdict(model: dict, topic: str, configured: int | None, length: int) -> str:
     maximum = model["table"][topic][1]
-    if configured is not None and configured > maximum:
+    if configured is not None and (configured > maximum or configured < model["floor"]):
         return model["config_refused"]
     in_force = maximum if configured is None else configured
     return model["admitted"] if length <= in_force else model["too_large"]
@@ -153,8 +176,10 @@ def check(corpus: dict, model: dict) -> None:
                 seen[c["topic"]].add("configured_over")
         if configured == maximum + 1:
             seen[c["topic"]].add("configured_above")
+        if configured == model["floor"] - 1:
+            seen[c["topic"]].add("configured_below_floor")
     wanted = {"at", "one_over", "four_times", "invalid_one_over", "configured_at",
-              "configured_over", "configured_above"}
+              "configured_over", "configured_above", "configured_below_floor"}
     for topic, got in seen.items():
         if got != wanted:
             raise Failure(f"coverage: {topic} lacks {sorted(wanted - got)}")
@@ -185,10 +210,13 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         return go
 
     def text_mutant(old: str, new: str) -> Callable[[], None]:
+        """Replace ``old`` matched word by word, whatever the line wrapping."""
+        pattern = re.compile(r"\s+".join(re.escape(w) for w in old.split()))
+
         def go() -> None:
-            if old not in text:
+            if pattern.search(text) is None:
                 raise AssertionError(f"mutant target missing: {old!r}")
-            run(corpus_bytes, contract_model(text.replace(old, new, 1)))
+            run(corpus_bytes, contract_model(pattern.sub(lambda _: new, text, count=1)))
         return go
 
     def by_name(c: dict, name: str) -> dict:
@@ -232,14 +260,34 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("text: a maximum changed", text_mutant(
             "| `ori/gateway/health` | Gateway -> Runtime | 16384 |",
             "| `ori/gateway/health` | Gateway -> Runtime | 16385 |")),
+        ("floor ignored", model_mutant(lambda m: m.update(floor=0))),
         ("text: a topic dropped from the table", text_mutant(
             "| `ori/{device_id}/evidence/outbound/ack` | Gateway -> Runtime | 16384 | Fixed members. |\n",
             "")),
         ("text: reason renamed", text_mutant(
             "refused as `payload_too_large`", "refused as `too_large`")),
         ("text: raising allowed", text_mutant(
-            "may configure a lower maximum for a topic, never a higher one",
-            "may configure any maximum for a topic")),
+            "may configure a lower maximum, never a higher one",
+            "may configure any maximum")),
+        ("text: size checked after verification", text_mutant(
+            "before it parses, decodes, decrypts or verifies anything",
+            "after it verifies the envelope")),
+        ("text: length after decryption", text_mutant(
+            "exactly as delivered, before it is decrypted, decoded or read",
+            "after it is decrypted and decoded")),
+        ("text: refusal answered", text_mutant(
+            "It is not answered, since none of its members can be relied on",
+            "It is answered with an error, since none of its members can be relied on")),
+        ("text: record carries the device", text_mutant(
+            "never with its contents or a device identifier",
+            "with its device identifier")),
+        ("text: exact length recorded", text_mutant(
+            "the least power of two not below its length", "its exact length")),
+        ("text: floor removed", text_mutant(
+            ", and never below 4096 bytes", "")),
+        ("a topic named only in another section", text_mutant(
+            "| `ori/{device_id}/evidence/inbound/ack` | Runtime -> Gateway | 16384 | Fixed members. |\n",
+            "")),
         ("text: construction changed", text_mutant(
             "`json_object`: the bytes `{\"pad\":\"`", "`json_object`: the bytes `{\"p\":\"`")),
     ]
