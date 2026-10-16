@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Independently verify the tier-c-approvers/v1 transition corpus.
+
+The generator is not imported. This is a small state model, not a runtime,
+gateway, local-presence, channel-authenticator or database consumer test.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import sys
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "tier-c-approvers" / "vectors" / "transitions.json"
+PUBLIC_KEY = "CoCYmi2u1NnDLsVzNMglg2Ied+0M9Z74rgNvSGRBAdg="
+NAMES = {
+    "bootstrap_once",
+    "bootstrap_requires_local_confirmation",
+    "bootstrap_requires_authenticated_local_request",
+    "unknown_history_refuses_bootstrap",
+    "empty_registry_admits_nobody",
+    "loss_requires_recovery_not_reseed",
+    "enrol_requires_existing_authorizer",
+    "enrol_requires_presence",
+    "enrol_requires_possession",
+    "enrol_and_admit",
+    "enrolled_after_proposal_refused",
+    "replacement_does_not_inherit_cutoff",
+    "revocation_repeat_regression_conflict",
+    "revocation_unknown_target",
+    "approver_revocation_removes_all_credentials",
+    "revocation_wrong_epoch",
+    "revocation_before_admission",
+    "admission_before_revocation_stands",
+}
+REVOKE_FIELDS = {
+    "v",
+    "device_id",
+    "site_id",
+    "identity_epoch",
+    "revision",
+    "targets",
+    "signing_key_id",
+    "signature",
+}
+
+
+def strict_b64(value: str) -> bytes:
+    decoded = base64.b64decode(value, validate=True)
+    if base64.b64encode(decoded).decode() != value:
+        raise ValueError("noncanonical Base64")
+    return decoded
+
+
+def verify_revocation(document: dict[str, Any]) -> bool:
+    if set(document) != REVOKE_FIELDS:
+        return False
+    if (
+        type(document["v"]) is not int
+        or document["v"] != 1
+        or type(document["revision"]) is not int
+        or document["revision"] < 1
+        or document["signing_key_id"] != "test-provisioning"
+        or not isinstance(document["targets"], list)
+        or not document["targets"]
+        or any(
+            not isinstance(x, str)
+            or not x.startswith(("credential:", "approver:"))
+            or not x.split(":", 1)[1]
+            for x in document["targets"]
+        )
+        or document["targets"] != sorted(set(document["targets"]))
+    ):
+        return False
+    unsigned = {key: value for key, value in document.items() if key != "signature"}
+    payload = json.dumps(
+        unsigned,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+    try:
+        Ed25519PublicKey.from_public_bytes(strict_b64(PUBLIC_KEY)).verify(
+            strict_b64(document["signature"]),
+            b"ori.tier_c_approver.revoke.v1\0" + payload,
+        )
+    except (InvalidSignature, ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+class Registry:
+    def __init__(self, initial_mode: str) -> None:
+        if initial_mode not in {"factory_fresh", "unknown"}:
+            raise ValueError("invalid initial mode")
+        self.initialized = False
+        self.factory_fresh = initial_mode == "factory_fresh"
+        self.epoch = "epoch-1"
+        self.revision = 0
+        self.external_revision = 0
+        self.last_external_document: str | None = None
+        self.sequence = 0
+        self.active: dict[str, int] = {}
+        self.tombstones: set[str] = set()
+        self.approvers: dict[str, str] = {}
+        self.approver_tombstones: set[str] = set()
+        self.proposals: dict[str, dict[str, Any]] = {}
+
+    def apply(self, operation: dict[str, Any]) -> str:
+        kind = operation["op"]
+        if kind == "bootstrap":
+            if self.initialized:
+                return "already_initialized"
+            if not self.factory_fresh:
+                return "recovery_required"
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            if operation.get("presence") is not True:
+                return "presence_required"
+            self.initialized = True
+            self.factory_fresh = False
+            self.revision = 1
+            for identifier in operation["contacts"]:
+                self.sequence += 1
+                self.active[identifier] = self.sequence
+                self.approvers[identifier] = identifier
+            return "bootstrapped"
+        if kind == "lose":
+            self.initialized = False
+            self.factory_fresh = False
+            self.active.clear()
+            self.approvers.clear()
+            self.proposals.clear()
+            return "locked"
+        if kind == "recover":
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            if operation.get("presence") is not True:
+                return "presence_required"
+            if self.initialized:
+                return "recovery_not_available"
+            if operation["epoch"] == self.epoch:
+                return "epoch_not_advanced"
+            self.epoch = operation["epoch"]
+            self.initialized = True
+            self.revision = 1
+            self.external_revision = 0
+            self.last_external_document = None
+            self.sequence = 0
+            return "recovered"
+        if not self.initialized:
+            return "registry_unavailable"
+        if kind == "enrol":
+            if operation["authorizer"] not in self.active:
+                return "authorizer_unavailable"
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            if operation.get("presence") is not True:
+                return "presence_required"
+            if operation.get("possession") is not True:
+                return "possession_invalid"
+            identifier = operation["credential"]
+            approver_id = operation.get("approver_id", identifier)
+            if approver_id in self.approver_tombstones:
+                return "approver_revoked"
+            if identifier in self.active or identifier in self.tombstones:
+                return "credential_reused"
+            self.sequence += 1
+            self.active[identifier] = self.sequence
+            self.approvers[identifier] = approver_id
+            self.revision += 1
+            return "enrolled"
+        if kind == "open":
+            if operation["proposal"] in self.proposals:
+                return "proposal_exists"
+            self.proposals[operation["proposal"]] = {
+                "cutoff": self.sequence,
+                "approved": False,
+            }
+            return "opened"
+        if kind == "revoke":
+            document = operation["document"]
+            if not verify_revocation(document):
+                return "signature_invalid"
+            if (
+                document["device_id"] != "edge-1"
+                or document["site_id"] != "site-1"
+                or document["identity_epoch"] != self.epoch
+            ):
+                return "binding_mismatch"
+            revision = document["revision"]
+            fingerprint = hashlib.sha256(
+                json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            if revision < self.external_revision:
+                return "revision_regressed"
+            if revision == self.external_revision:
+                return (
+                    "replayed"
+                    if fingerprint == self.last_external_document
+                    else "revision_conflict"
+                )
+            for target in document["targets"]:
+                kind, identifier = target.split(":", 1)
+                if kind == "credential":
+                    if identifier not in self.active and identifier not in self.tombstones:
+                        return "unknown_target"
+                elif identifier not in self.approvers.values() and identifier not in self.approver_tombstones:
+                    return "unknown_target"
+            for target in document["targets"]:
+                kind, identifier = target.split(":", 1)
+                if kind == "credential":
+                    self.active.pop(identifier, None)
+                    self.tombstones.add(identifier)
+                else:
+                    self.approver_tombstones.add(identifier)
+                    for credential, owner in self.approvers.items():
+                        if owner == identifier:
+                            self.active.pop(credential, None)
+                            self.tombstones.add(credential)
+            self.external_revision = revision
+            self.last_external_document = fingerprint
+            self.revision += 1
+            return "revoked"
+        if kind == "admit":
+            proposal = self.proposals.get(operation["proposal"])
+            if proposal is None:
+                return "proposal_unavailable"
+            if proposal["approved"]:
+                return "already_decided"
+            sequence = self.active.get(operation["credential"])
+            if sequence is None:
+                return "credential_unavailable"
+            if sequence > proposal["cutoff"]:
+                return "enrolled_after_proposal"
+            proposal["approved"] = True
+            proposal["credential_id"] = operation["credential"]
+            proposal["registry_revision"] = self.revision
+            return "approved"
+        raise ValueError(f"unknown operation: {kind}")
+
+
+def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
+    if corpus["contract"] != "tier-c-approvers/v1":
+        raise AssertionError("wrong contract")
+    if corpus["provisioning_test_public_key_b64"] != PUBLIC_KEY:
+        raise AssertionError("unexpected test anchor")
+    scenarios = corpus["scenarios"]
+    if len(scenarios) != len(NAMES) or {x["name"] for x in scenarios} != NAMES:
+        raise AssertionError("required transition coverage changed")
+    total = 0
+    for scenario in scenarios:
+        model = Registry(scenario["initial_mode"])
+        for operation in scenario["steps"]:
+            actual = model.apply(operation)
+            total += 1
+            if actual != operation["expect"]:
+                raise AssertionError(
+                    f"{scenario['name']} {operation['op']}: "
+                    f"{actual} != {operation['expect']}"
+                )
+    if announce:
+        print(
+            f"tier-c-approvers/v1: {len(scenarios)} scenarios, {total} transitions verified"
+        )
+
+
+def mutations(corpus: dict[str, Any]) -> None:
+    mutants = []
+    missing = copy.deepcopy(corpus)
+    missing["scenarios"].pop()
+    mutants.append(missing)
+    false_approval = copy.deepcopy(corpus)
+    next(
+        scenario
+        for scenario in false_approval["scenarios"]
+        if scenario["name"] == "empty_registry_admits_nobody"
+    )["steps"][-1]["expect"] = "approved"
+    mutants.append(false_approval)
+    forged = copy.deepcopy(corpus)
+    next(
+        scenario
+        for scenario in forged["scenarios"]
+        if scenario["name"] == "revocation_repeat_regression_conflict"
+    )["steps"][1]["document"]["signature"] = "AA=="
+    mutants.append(forged)
+    for mutant in mutants:
+        try:
+            check(mutant, announce=False)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            continue
+        raise AssertionError("mutated corpus was accepted")
+    print(f"tier-c-approvers/v1: {len(mutants)} mutations refused")
+
+
+if __name__ == "__main__":
+    try:
+        source = json.loads(CORPUS.read_text())
+        check(source)
+        if "--mutations" in sys.argv[1:]:
+            mutations(source)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        print(f"tier-c-approvers vectors failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

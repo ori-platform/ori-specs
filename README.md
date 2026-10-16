@@ -77,6 +77,7 @@ below are checked against those records.
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
 | Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `pending` |
+| Tier C approver registry | [tier-c-approvers/v1.md](tier-c-approvers/v1.md) | `draft` | none recorded | `amendable` |
 
 Companion documents carry no record of their own; see
 [VERSIONING.md](VERSIONING.md#companion-documents):

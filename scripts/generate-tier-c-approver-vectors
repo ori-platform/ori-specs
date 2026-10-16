@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Generate deterministic tier-c-approvers/v1 state-model fixtures."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+OUT = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "tier-c-approvers"
+    / "vectors"
+    / "transitions.json"
+)
+KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"ori tier-c-approvers/v1 published test key").digest()
+)
+
+
+def revoke(revision: int, targets: list[str], *, epoch: str = "epoch-1") -> dict:
+    unsigned = {
+        "v": 1,
+        "device_id": "edge-1",
+        "site_id": "site-1",
+        "identity_epoch": epoch,
+        "revision": revision,
+        "targets": sorted(
+            target if target.startswith("approver:") else f"credential:{target}"
+            for target in targets
+        ),
+        "signing_key_id": "test-provisioning",
+    }
+    canonical = json.dumps(
+        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    signature = KEY.sign(b"ori.tier_c_approver.revoke.v1\0" + canonical)
+    return {**unsigned, "signature": base64.b64encode(signature).decode()}
+
+
+def scenario(name: str, steps: list[dict], *, initial_mode: str = "factory_fresh") -> dict:
+    return {"name": name, "initial_mode": initial_mode, "steps": steps}
+
+
+def step(op: str, expect: str, **data: object) -> dict:
+    return {"op": op, "expect": expect, **data}
+
+
+def base() -> list[dict]:
+    return [
+        step(
+            "bootstrap",
+            "bootstrapped",
+            local_request=True,
+            presence=True,
+            contacts=["owner-phone"],
+        ),
+    ]
+
+
+def make() -> dict:
+    cases = [
+        scenario(
+            "bootstrap_once",
+            base()
+            + [
+                step(
+                    "bootstrap",
+                    "already_initialized",
+                    local_request=True,
+                    presence=True,
+                )
+            ],
+        ),
+        scenario(
+            "bootstrap_requires_local_confirmation",
+            [
+                step(
+                    "bootstrap", "presence_required", local_request=True, presence=False
+                )
+            ],
+        ),
+        scenario(
+            "bootstrap_requires_authenticated_local_request",
+            [
+                step(
+                    "bootstrap",
+                    "local_auth_required",
+                    local_request=False,
+                    presence=True,
+                )
+            ],
+        ),
+        scenario(
+            "unknown_history_refuses_bootstrap",
+            [
+                step("bootstrap", "recovery_required", local_request=True, presence=True),
+                step("recover", "recovered", local_request=True, presence=True, epoch="epoch-2"),
+            ],
+            initial_mode="unknown",
+        ),
+        scenario(
+            "empty_registry_admits_nobody",
+            [
+                step(
+                    "bootstrap",
+                    "bootstrapped",
+                    local_request=True,
+                    presence=True,
+                    contacts=[],
+                ),
+                step("open", "opened", proposal="p1"),
+                step("admit", "credential_unavailable", proposal="p1", credential="x"),
+            ],
+        ),
+        scenario(
+            "loss_requires_recovery_not_reseed",
+            base()
+            + [
+                step("lose", "locked"),
+                step(
+                    "bootstrap", "recovery_required", local_request=True, presence=True
+                ),
+                step(
+                    "recover",
+                    "presence_required",
+                    local_request=True,
+                    presence=False,
+                    epoch="epoch-2",
+                ),
+                step(
+                    "recover",
+                    "recovered",
+                    local_request=True,
+                    presence=True,
+                    epoch="epoch-2",
+                ),
+            ],
+        ),
+        scenario(
+            "enrol_requires_existing_authorizer",
+            base()
+            + [
+                step(
+                    "enrol",
+                    "authorizer_unavailable",
+                    credential="app-1",
+                    authorizer="none",
+                    local_request=True,
+                    presence=True,
+                    possession=True,
+                ),
+            ],
+        ),
+        scenario(
+            "enrol_requires_presence",
+            base()
+            + [
+                step(
+                    "enrol",
+                    "presence_required",
+                    credential="app-1",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=False,
+                    possession=True,
+                ),
+            ],
+        ),
+        scenario(
+            "enrol_requires_possession",
+            base()
+            + [
+                step(
+                    "enrol",
+                    "possession_invalid",
+                    credential="app-1",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=True,
+                    possession=False,
+                ),
+            ],
+        ),
+        scenario(
+            "enrol_and_admit",
+            base()
+            + [
+                step(
+                    "enrol",
+                    "enrolled",
+                    credential="app-1",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=True,
+                    possession=True,
+                ),
+                step("open", "opened", proposal="p1"),
+                step("admit", "approved", proposal="p1", credential="app-1"),
+            ],
+        ),
+        scenario(
+            "enrolled_after_proposal_refused",
+            base()
+            + [
+                step("open", "opened", proposal="p1"),
+                step(
+                    "enrol",
+                    "enrolled",
+                    credential="app-1",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=True,
+                    possession=True,
+                ),
+                step(
+                    "admit",
+                    "enrolled_after_proposal",
+                    proposal="p1",
+                    credential="app-1",
+                ),
+            ],
+        ),
+        scenario(
+            "replacement_does_not_inherit_cutoff",
+            base()
+            + [
+                step(
+                    "enrol",
+                    "enrolled",
+                    credential="app-old",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=True,
+                    possession=True,
+                ),
+                step("open", "opened", proposal="p1"),
+                step("revoke", "revoked", document=revoke(1, ["app-old"])),
+                step(
+                    "enrol",
+                    "enrolled",
+                    credential="app-new",
+                    authorizer="owner-phone",
+                    local_request=True,
+                    presence=True,
+                    possession=True,
+                ),
+                step(
+                    "admit",
+                    "enrolled_after_proposal",
+                    proposal="p1",
+                    credential="app-new",
+                ),
+            ],
+        ),
+        scenario(
+            "revocation_repeat_regression_conflict",
+            base()
+            + [
+                step("revoke", "revoked", document=revoke(2, ["owner-phone"])),
+                step("revoke", "replayed", document=revoke(2, ["owner-phone"])),
+                step(
+                    "revoke", "revision_regressed", document=revoke(1, ["owner-phone"])
+                ),
+                step("revoke", "revision_conflict", document=revoke(2, ["other"])),
+            ],
+        ),
+        scenario(
+            "revocation_unknown_target",
+            base() + [step("revoke", "unknown_target", document=revoke(1, ["absent"]))],
+        ),
+        scenario(
+            "approver_revocation_removes_all_credentials",
+            [
+                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=["owner-phone", "secondary-phone"]),
+                step("enrol", "enrolled", credential="app-1", approver_id="owner-phone", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("revoke", "revoked", document=revoke(1, ["approver:owner-phone"])),
+                step("open", "opened", proposal="p1"),
+                step("admit", "credential_unavailable", proposal="p1", credential="app-1"),
+                step("enrol", "approver_revoked", credential="app-2", approver_id="owner-phone", authorizer="secondary-phone", local_request=True, presence=True, possession=True),
+            ],
+        ),
+        scenario(
+            "revocation_wrong_epoch",
+            base()
+            + [
+                step(
+                    "revoke",
+                    "binding_mismatch",
+                    document=revoke(1, ["owner-phone"], epoch="epoch-2"),
+                )
+            ],
+        ),
+        scenario(
+            "revocation_before_admission",
+            base()
+            + [
+                step("open", "opened", proposal="p1"),
+                step("revoke", "revoked", document=revoke(1, ["owner-phone"])),
+                step(
+                    "admit",
+                    "credential_unavailable",
+                    proposal="p1",
+                    credential="owner-phone",
+                ),
+            ],
+        ),
+        scenario(
+            "admission_before_revocation_stands",
+            base()
+            + [
+                step("open", "opened", proposal="p1"),
+                step("admit", "approved", proposal="p1", credential="owner-phone"),
+                step("revoke", "revoked", document=revoke(1, ["owner-phone"])),
+                step(
+                    "admit", "already_decided", proposal="p1", credential="owner-phone"
+                ),
+            ],
+        ),
+    ]
+    return {
+        "contract": "tier-c-approvers/v1",
+        "proof": "state-model representability only; no runtime or gateway consumer",
+        "provisioning_test_public_key_b64": base64.b64encode(
+            KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        ).decode(),
+        "scenarios": cases,
+    }
+
+
+def main() -> int:
+    rendered = json.dumps(make(), indent=2, sort_keys=True) + "\n"
+    if "--check" in sys.argv[1:]:
+        if not OUT.exists() or OUT.read_text() != rendered:
+            print("tier-c-approvers/v1 corpus differs from generator", file=sys.stderr)
+            return 1
+        print("tier-c-approvers/v1 corpus reproduces")
+        return 0
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(rendered)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
