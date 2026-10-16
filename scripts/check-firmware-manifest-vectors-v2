@@ -159,6 +159,36 @@ class Failure(Exception):
     pass
 
 
+def exact(value: object, allowed: object, model: dict, rule: str) -> bool:
+    """A string the grammar names, compared whole: never by prefix, never trimmed.
+
+    `model["compare"]` exists only so a mutant can swap in, for one rule at
+    every site that rule compares, the comparisons a verifier gets wrong; the
+    contract's comparison is "exact"."""
+    if type(value) is not str or allowed is None:
+        return False
+    names = [allowed] if isinstance(allowed, str) else list(allowed)
+    how = model.get("compare", {}).get(rule, "exact")
+    if how == "prefix":
+        return any(value.startswith(n) for n in names)
+    if how == "strip":
+        return value.strip() in names
+    return value in names
+
+
+def exactness_cases(values: list[object], allowed: object) -> dict[str, bool]:
+    """Whether refused values include one extending an allowed string and one padded."""
+    names = [allowed] if isinstance(allowed, str) else list(allowed)
+    strings = [v for v in values if type(v) is str and v not in names]
+    return {
+        # Characters appended that are not only whitespace, so a padded value
+        # never counts as the extended one.
+        "extended": any(any(v.startswith(n) and v[len(n):].strip() for n in names)
+                        for v in strings),
+        "padded": any(v.strip() in names for v in strings),
+    }
+
+
 # --- Ed25519, affine -------------------------------------------------------
 
 def _add(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
@@ -655,13 +685,13 @@ def profile_faults(binding: object, channel: dict, model: dict,
             if not set(digest[len(prefix):]) <= digits:
                 faults.add("digest_digits")
     qualification = binding.get("qualification")
-    known = type(qualification) is str and qualification in g["qualifications"]
+    known = exact(qualification, g["qualifications"], model, "qualification")
     content = "type_also_content" in off
     if (type(qualification) is str or (content and "qualification" in binding)) and not known:
         faults.add("qualification")
     elif known and "record" in binding and (
             content or type(binding["record"]) in (str, type(None))):
-        unrecorded = qualification == g["unrecorded"]
+        unrecorded = exact(qualification, g["unrecorded"], model, "qualification")
         if binding["record"] is None and not unrecorded:
             faults.add("record_missing")
         if binding["record"] is not None and unrecorded:
@@ -688,10 +718,10 @@ def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
     """Every v2 manifest rule the manifest breaks, not only the first."""
     mode = manifest["device_mode"]
     broken = set()
-    defined = type(mode) is str and mode in model["modes"]
+    defined = exact(mode, model["modes"], model, "mode")
     if not defined:
         broken.add("mode_undefined")
-    elif mode != derive_mode(manifest, model):
+    elif not exact(mode, derive_mode(manifest, model), model, "mode"):
         broken.add("mode_disagrees")
     if not manifest["channels"]:
         broken.add("channels_empty")
@@ -711,8 +741,7 @@ def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
     if consistency_faults(manifest, model) and "profile_consistency" not in off:
         broken.add("profile_invalid")
     d = model["domains"]
-    if d["field"] in manifest and not (type(manifest[d["field"]]) is str
-                                       and manifest[d["field"]] == d["value"]):
+    if d["field"] in manifest and not exact(manifest[d["field"]], d["value"], model, "domains"):
         broken.add("domains_invalid")
     return broken - off
 
@@ -895,6 +924,11 @@ def check(corpus: dict, model: dict, profiles: dict,
         if not any(r == undefined and type(m["device_mode"]) is kind
                    for r, m in refused):
             raise Failure(f"coverage: no undefined {kind.__name__} mode")
+    forms = exactness_cases([m["device_mode"] for r, m in refused if r == undefined],
+                            model["modes"])
+    for form, ok in forms.items():
+        if not ok:
+            raise Failure(f"coverage: no device_mode refusal that is a defined value {form}")
     if not any(m["device_mode"] == "sensor_node" and m["actions"] for _, m in refused):
         raise Failure("coverage: sensor_node with an action is not refused")
     if not any(r == model["reasons"]["channels_empty"] and m["actions"]
@@ -920,6 +954,8 @@ def _domains_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
             for v in values),
         "a value of another JSON type refused": any(type(v) is not str for v in values),
         "null refused": any(v is None for v in values),
+        **{f"the value {form} refused": ok
+           for form, ok in exactness_cases(values, d["value"]).items()},
     }
     missing = sorted(k for k, ok in wanted.items() if not ok)
     if missing:
@@ -990,6 +1026,11 @@ def _profile_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
                 alone |= faults
     for clause in PROFILE_CLAUSES:
         wanted[f"a refusal breaking {clause} alone"] = clause in alone
+    qualifications = [b.get("qualification") for r, m in refused if r == invalid
+                      for c in m["channels"]
+                      if type(b := c.get(g["field"])) is dict]
+    for form, ok in exactness_cases(qualifications, g["qualifications"]).items():
+        wanted[f"a qualification refused that is a value {form}"] = ok
     # "even inside a segment": the parent token within a segment, not as one.
     _, _, separator, parent = g["record"]
     wanted[f"a refusal with {parent} inside a record segment"] = any(
@@ -1177,7 +1218,22 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         return go
 
     bridge_row = "| `bridge_node` | Bridged channels only, and no actions. |\n"
-    cases: list[tuple[str, Callable[[], None]]] = [
+    # Each closed-string rule compared as a verifier gets it wrong, at every site
+    # that rule compares: its own superstring and padded refusals must catch it.
+    exact_mutants = [
+        (f"{rule} compared {label}", model_mutant(
+            lambda m, r=rule, h=how: m.update(compare={r: h})))
+        for rule in ("mode", "qualification", "domains")
+        for how, label in (("prefix", "by prefix"), ("strip", "after trimming"))
+    ]
+    exact_mutants += [
+        (f"{name} dropped", corpus_mutant(lambda c, n=name: c.update(reject_cases=[
+            x for x in c["reject_cases"] if x["name"] != n])))
+        for name in ("reject_mode_defined_value_extended", "reject_mode_padded",
+                     "reject_qualification_extended", "reject_qualification_padded",
+                     "reject_runtime_key_domains_extended", "reject_runtime_key_domains_padded")
+    ]
+    cases: list[tuple[str, Callable[[], None]]] = exact_mutants + [
         ("signature bit flipped", corpus_mutant(flip_signature)),
         ("mode edited after signing", corpus_mutant(
             lambda c: bridge(c)["message"]["manifest"].update(device_mode="sensor_node"))),
