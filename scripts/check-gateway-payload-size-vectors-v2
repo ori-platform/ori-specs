@@ -55,6 +55,24 @@ HELD = (
     "Where an implementation offers a setting for a topic's maximum, a deployment may "
     "configure a lower maximum, never a higher one, and never below 4096 bytes.",
     "A producer never publishes a payload longer than its topic's maximum.",
+    "A producer sizes and pages against the maximum in force for the topic it publishes, "
+    "its own configured value where one is set, so a deployment that lowers a receiver's "
+    "maximum lowers the producer's to match; a receiver that applies a lower maximum than "
+    "its producer refuses conforming payloads above it.",
+    "a courier cannot shrink a conforming artifact, and an inbound artifact refused for size "
+    "would be redelivered without end.",
+    "The runtime treats the escalation or the enrichment as unavailable at once, without "
+    "waiting out its timeout.",
+    "lists in `active_triggers` at most 64 names, in the order the runtime holds them, and "
+    "only those that keep the payload within its maximum; it never omits another member to "
+    "make room.",
+    "A consumer reads the number of names as a lower bound on the triggers active, never as "
+    "their count.",
+    "A runtime reports them under [runtime-health/v4.md](../runtime-health/v4.md) once that "
+    "contract names the field; until it does, a runtime records each refusal in its own log, "
+    "by topic family, and reports nothing else about them.",
+    "whose value is an object with exactly two integer members, `payload_too_large` and "
+    "`volume_dropped`",
 )
 
 
@@ -90,9 +108,10 @@ def contract_model(text: str | None = None) -> dict:
     pin = re.search(r"\[vectors/payload-size-v2\.json\]\(vectors/payload-size-v2\.json\) holds "
                     r"this section's cases\. Its SHA-256 is `([0-9a-f]{64})`", flat)
     lower = "may configure a lower maximum, never a higher one" in flat
+    whole = " ".join(text.split())
     for sentence in HELD:
-        if sentence not in flat:
-            raise Failure(f"Payload Size no longer says: {sentence!r}")
+        if sentence not in whole:
+            raise Failure(f"gateway-api/v2 no longer says: {sentence!r}")
     floor = re.search(r"never below (\d+) bytes", flat)
     if floor is None:
         raise Failure("Payload Size states no floor for a configured maximum")
@@ -105,7 +124,17 @@ def contract_model(text: str | None = None) -> dict:
     # Every topic the contract names anywhere has a maximum, and every maximum
     # names one: literal topics only, since a filter with + or # is a
     # subscription, not a topic a payload travels on.
-    defined = {topic for topic in re.findall(r"`(ori/[A-Za-z0-9_{}/]+)`", text)}
+    # Every backticked ori/ string, whatever characters it holds, so a topic
+    # spelled with a hyphen or a dot is not skipped; only subscription filters,
+    # source paths and the namespace placeholder are not topics.
+    defined = {
+        s for s in re.findall(r"`(ori/[^`]*)`", text)
+        if not ("+" in s or "#" in s or s.endswith(".py") or s.endswith("/..."))
+    }
+    lowered = re.search(r"The evidence topics, `([^`]+)` and `([^`]+)`, are never lowered", flat)
+    if lowered is None:
+        raise Failure("Payload Size names no topic that is never lowered")
+    never_lowered = set(lowered.groups())
     if defined != set(table):
         raise Failure(f"topics without a maximum {sorted(defined - set(table))}, maxima for no "
                       f"topic {sorted(set(table) - defined)}")
@@ -120,6 +149,7 @@ def contract_model(text: str | None = None) -> dict:
         "invalid_byte": bytes.fromhex(fill.group(1)),
         "pin": pin.group(1),
         "floor": int(floor.group(1)),
+        "never_lowered": never_lowered,
     }
 
 
@@ -136,7 +166,11 @@ def build(model: dict, kind: str, length: int) -> bytes:
 
 def verdict(model: dict, topic: str, configured: int | None, length: int) -> str:
     maximum = model["table"][topic][1]
-    if configured is not None and (configured > maximum or configured < model["floor"]):
+    if configured is not None and (
+        configured > maximum
+        or configured < model["floor"]
+        or (configured < maximum and topic in model["never_lowered"])
+    ):
         return model["config_refused"]
     in_force = maximum if configured is None else configured
     return model["admitted"] if length <= in_force else model["too_large"]
@@ -261,6 +295,30 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "| `ori/gateway/health` | Gateway -> Runtime | 16384 |",
             "| `ori/gateway/health` | Gateway -> Runtime | 16385 |")),
         ("floor ignored", model_mutant(lambda m: m.update(floor=0))),
+        ("evidence lowered", model_mutant(lambda m: m.update(never_lowered=set()))),
+        ("text: a hyphenated topic with no row", text_mutant(
+            "| `ori/gateway/health` |", "| `ori/gateway/health` | `ori/{device_id}/tier-c/relay` |")),
+        ("text: a dotted topic with no row", text_mutant(
+            "## Payload Volume", "## Payload Volume\n\nSee `ori/{device_id}/relay.v1`.")),
+        ("text: heartbeat cap removed", text_mutant(
+            "at most 64 names, in the order", "names in the order")),
+        ("text: heartbeat may drop members", text_mutant(
+            "it never omits another member to make room", "it may omit other members to make room")),
+        ("text: ingress shape opened", text_mutant(
+            "with exactly two integer members", "with integer members including")),
+        ("text: producer sizes against the table", text_mutant(
+            "its own configured value where one is set", "never its own configured value")),
+        ("text: Tier 3 waits out its timeout", text_mutant(
+            "unavailable at once, without waiting out its timeout",
+            "unavailable once its timeout has passed")),
+        ("text: runtime deferral removed", text_mutant(
+            "until it does, a runtime records each refusal in its own log, by topic family, and reports nothing else about them.",
+            "")),
+        ("text: evidence lowerable", text_mutant(
+            "are never lowered: a courier", "may be lowered: a courier")),
+        ("text: count read as exact", text_mutant(
+            "as a lower bound on the triggers active, never as their count",
+            "as the count of the triggers active")),
         ("text: a topic dropped from the table", text_mutant(
             "| `ori/{device_id}/evidence/outbound/ack` | Gateway -> Runtime | 16384 | Fixed members. |\n",
             "")),
