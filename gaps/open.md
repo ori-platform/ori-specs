@@ -513,13 +513,16 @@ accurate description of what a repo implements.
 - **Signing-purpose separation**
   ([firmware-commands/v2.md](../firmware-commands/v2.md#signing-domains)):
   firmware-commands/v2 signs commands and liveness in separate domains, only
-  for a device whose manifest declares them in `runtime_key_domains`
+  for a device whose manifest carries `runtime_key_domains`
   ([firmware-telemetry/v2.md](../firmware-telemetry/v2.md#runtime-key-domains)),
   and its command corpus and both liveness corpora refuse each cross-purpose
-  signature. Neither implementation signs, verifies or declares in those
-  domains yet: the runtime signer and the edge firmware verifier still use the
-  object bytes alone, so the separation is defined and not enforced. The
-  runtime adopts first. Tracked in `ori-runtime` and `ori-edge-firmware`.
+  signature. Both implementations enforce it on their main branches, and no
+  release of either does: the runtime signs in the domains only for a
+  declaring device, and the edge firmware verifies only in them and declares
+  them in every manifest. Declaring the domains also declares that the device
+  accepts runtime liveness at `v` `2`, and no edge firmware test yet ties the
+  declaration to that acceptance. Tracked in `ori-runtime` and
+  `ori-edge-firmware`.
 
 ## firmware-mqtt-provisioning/v1 implementation targets
 
