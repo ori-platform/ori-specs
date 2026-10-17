@@ -49,7 +49,7 @@ def sign(
     signature_field: str = "signature",
 ) -> dict[str, object]:
     unsigned = copy.deepcopy(value)
-    signed = purpose.encode("utf-8") + b"\n" + canonical(unsigned)
+    signed = purpose.encode("utf-8") + b"\x00" + canonical(unsigned)
     return {**unsigned, signature_field: b64(signer.sign(signed))}
 
 
@@ -70,7 +70,6 @@ def sha256(data: bytes) -> str:
 def make() -> dict[str, object]:
     grant_key = key("grant")
     time_key = key("time")
-    approver_key = key("approvers")
     app_key = key("application")
     gateway_key = key("gateway")
     grant = sign(
@@ -86,7 +85,7 @@ def make() -> dict[str, object]:
             "app_spki_sha256": sha256(spki(app_key)),
             "gateway_spki_sha256": sha256(spki(gateway_key)),
             "code_sha256": sha256(
-                ("ori.lan.code.v1\n" + "grant-001\n" + CODE).encode()
+                ("ori.lan.code.v1\x00" + "grant-001\x00" + CODE).encode()
             ),
             "issued_at_ms": NOW,
             "not_before_ms": NOW,
@@ -108,37 +107,30 @@ def make() -> dict[str, object]:
         purpose="ori.lan.time-assertion.v1",
         signer=time_key,
     )
-    approvers = sign(
-        {
-            "v": 1,
-            "tenant_id": "tenant-a",
-            "site_id": "site-a",
-            "revision": 7,
-            "issued_at_ms": NOW,
-            "entries": [{"customer_id": "customer-a", "role": "owner"}],
-            "signing_key_id": "test-approver-key",
-        },
-        purpose="ori.lan.site-approvers.v1",
-        signer=approver_key,
-    )
     reply = sign(
         {
             "v": 1,
-            "tenant_id": "tenant-a",
             "site_id": "site-a",
             "device_id": "edge-01",
-            "customer_id": "customer-a",
-            "role": "owner",
-            "grant_id": "grant-001",
-            "session_id": "session-001",
-            "proposal_id": "proposal-001",
+            "identity_epoch": b64(bytes(range(16))),
+            "proposal_id": "AB12CD34",
             "reply": "yes",
-            "client_nonce": "nonce-001",
-            "approver_revision": 7,
+            "client_nonce": b64(bytes(range(16, 32))),
         },
         purpose="ori.lan.reply.v1",
         signer=app_key,
         signature_field="app_signature",
+    )
+    session_proof = sign(
+        {
+            "v": 1,
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "challenge": b64(bytes(range(48, 64))),
+            "app_spki_sha256": sha256(spki(app_key)),
+        },
+        purpose="ori.lan.proposal-session.v1",
+        signer=app_key,
     )
     context: dict[str, object] = {
         "site_id": "site-a",
@@ -155,6 +147,17 @@ def make() -> dict[str, object]:
         "storage_ok": True,
     }
     pairing_cases: list[dict[str, object]] = [{"name": "accept", "expect": "accept"}]
+    session_cases: list[dict[str, object]] = [
+        {"name": "offline_key_session", "expect": "session"},
+        {"name": "expired_challenge", "context": {"age_ms": 30001}, "expect": "session_expired"},
+        {"name": "replayed_challenge", "context": {"used": True}, "expect": "nonce_reused"},
+        {"name": "restart_loses_challenge", "context": {"restarted": True}, "expect": "session_expired"},
+        {"name": "different_client_key", "context": {"app_spki_sha256": sha256(spki(key("other application")))}, "expect": "unauthenticated"},
+        {"name": "storage_failure", "context": {"storage_ok": False}, "expect": "storage_unavailable"},
+        {"name": "malformed_proof", "proof": {**session_proof, "extra": True}, "expect": "malformed"},
+    ]
+    tampered_session = {**session_proof, "site_id": "site-b"}
+    session_cases.append({"name": "tampered_session_proof", "proof": tampered_session, "expect": "unauthenticated"})
 
     def pair_case(name: str, expect: str, **changes: object) -> None:
         pairing_cases.append({"name": name, "context": changes, "expect": expect})
@@ -184,9 +187,16 @@ def make() -> dict[str, object]:
             "expect": "signature_invalid",
         }
     )
+    pairing_cases.append(
+        {
+            "name": "malformed_grant_member",
+            "grant": {**grant, "unexpected": True},
+            "expect": "malformed",
+        }
+    )
     wrong_purpose_grant = sign(
         {k: v for k, v in grant.items() if k != "signature"},
-        purpose="ori.lan.site-approvers.v1",
+        purpose="ori.lan.time-assertion.v1",
         signer=grant_key,
     )
     pairing_cases.append(
@@ -222,22 +232,44 @@ def make() -> dict[str, object]:
             "expect": "no_trusted_time",
         }
     )
+    pairing_cases.append(
+        {
+            "name": "malformed_time_assertion",
+            "time_assertion": {**time_assertion, "unexpected": True},
+            "expect": "malformed",
+        }
+    )
 
     reply_cases: list[dict[str, object]] = [
-        {"name": "valid_owner_reply", "expect": "relay"},
+        {"name": "valid_enrolled_reply", "expect": "relay"},
         {
-            "name": "expired_approver_lease",
-            "context": {"lease_valid": False},
-            "expect": "approver_list_unavailable",
+            "name": "registry_unavailable",
+            "context": {"registry_available": False},
+            "expect": "credential_unavailable",
         },
         {
-            "name": "stale_approver_revision",
-            "context": {"approver_revision": 8},
-            "expect": "approver_list_unavailable",
+            "name": "key_not_enrolled",
+            "context": {"credential_active": False},
+            "expect": "credential_unavailable",
+        },
+        {
+            "name": "revoked_key",
+            "context": {"credential_active": False, "revoked": True},
+            "expect": "credential_unavailable",
+        },
+        {
+            "name": "enrolled_after_proposal",
+            "context": {"credential_sequence": 9, "proposal_cutoff": 8},
+            "expect": "credential_unavailable",
+        },
+        {
+            "name": "old_epoch",
+            "context": {"identity_epoch": b64(bytes(range(1, 17)))},
+            "expect": "credential_unavailable",
         },
         {
             "name": "different_proposal",
-            "context": {"proposal_id": "proposal-002"},
+            "context": {"proposal_id": "AB12CD35"},
             "expect": "proposal_mismatch",
         },
         {
@@ -246,24 +278,11 @@ def make() -> dict[str, object]:
             "expect": "unauthenticated",
         },
     ]
-    bad_approvers = copy.deepcopy(approvers)
-    altered_list_signature = bytearray(
-        base64.b64decode(str(bad_approvers["signature"]))
-    )
-    altered_list_signature[0] ^= 1
-    bad_approvers["signature"] = b64(bytes(altered_list_signature))
-    reply_cases.append(
-        {
-            "name": "tampered_approver_signature",
-            "approvers": bad_approvers,
-            "expect": "approver_list_unavailable",
-        }
-    )
     negative_reply = sign(
         {
             **{k: v for k, v in reply.items() if k != "app_signature"},
             "reply": "no",
-            "client_nonce": "nonce-002",
+            "client_nonce": b64(bytes(range(32, 48))),
         },
         purpose="ori.lan.reply.v1",
         signer=app_key,
@@ -276,45 +295,51 @@ def make() -> dict[str, object]:
             "expect": "relay",
         }
     )
-    viewer_grant = sign(
-        {**{k: v for k, v in grant.items() if k != "signature"}, "role": "viewer"},
-        purpose="ori.lan.pairing-grant.v1",
-        signer=grant_key,
-    )
-    viewer_reply = sign(
-        {**{k: v for k, v in reply.items() if k != "app_signature"}, "role": "viewer"},
-        purpose="ori.lan.reply.v1",
-        signer=app_key,
-        signature_field="app_signature",
-    )
-    reply_cases.append(
-        {
-            "name": "viewer_cannot_answer",
-            "grant": viewer_grant,
-            "reply": viewer_reply,
-            "expect": "role_not_permitted",
-        }
-    )
+    reply_cases.append({"name": "no_product_grant_needed", "grant": None, "expect": "relay"})
+    reply_cases.extend([
+        {"name": "session_expired", "context": {"session_live": False}, "expect": "session_expired"},
+        {"name": "session_lost_on_restart", "context": {"session_live": False, "restarted": True}, "expect": "session_expired"},
+        {"name": "nonce_reused_with_changed_bytes", "context": {"nonce_conflict": True}, "expect": "nonce_reused"},
+        {"name": "malformed_reply_member", "reply": {**reply, "unexpected": True}, "expect": "malformed"},
+        {"name": "nonce_retry_same_bytes", "context": {"nonce_duplicate": True}, "expect": "stored_relay"},
+        {"name": "revoked_session", "context": {"session_live": False}, "expect": "session_expired"},
+    ])
+    disclosure_cases = [
+        {"name": "active_key_open_proposal", "context": {}, "expect": "allow"},
+        {"name": "runtime_timeout", "context": {"response_ms": 2001}, "expect": "deny"},
+        {"name": "runtime_no_reply", "context": {"response_ms": None}, "expect": "deny"},
+        {"name": "registry_unavailable", "context": {"registry_available": False}, "expect": "deny"},
+        {"name": "revoked_key", "context": {"credential_active": False}, "expect": "deny"},
+        {"name": "new_key_old_proposal", "context": {"credential_sequence": 9, "proposal_cutoff": 8}, "expect": "deny"},
+        {"name": "closed_proposal", "context": {"proposal_open": False}, "expect": "deny"},
+        {"name": "mismatched_response", "context": {"response_matches": False}, "expect": "deny"},
+    ]
+    relay_status_cases = [
+        {"name": "queued_only", "response": {"status": "queued", "proposal_id": "AB12CD34", "client_nonce": reply["client_nonce"]}, "expect": "valid"},
+        {"name": "gateway_claims_approved", "response": {"status": "approved", "proposal_id": "AB12CD34", "client_nonce": reply["client_nonce"]}, "expect": "malformed"},
+    ]
     return {
         "contract": "lan-app-api/v1",
         "note": "Representability vectors only; no gateway or runtime conformance claim.",
         "public_keys": {
             "grant": public_key(grant_key),
             "time": public_key(time_key),
-            "approvers": public_key(approver_key),
             "app": public_key(app_key),
         },
         "fixtures": {
             "grant": grant,
             "time_assertion": time_assertion,
-            "approvers": approvers,
             "reply": reply,
+            "session_proof": session_proof,
             "app_spki_b64": b64(spki(app_key)),
             "gateway_spki_b64": b64(spki(gateway_key)),
         },
         "pairing_context": context,
         "pairing_cases": pairing_cases,
+        "session_cases": session_cases,
         "reply_cases": reply_cases,
+        "disclosure_cases": disclosure_cases,
+        "relay_status_cases": relay_status_cases,
     }
 
 

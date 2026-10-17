@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 Payload Size corpus.
+
+Nothing here is shared with scripts/check-gateway-payload-size-vectors-v2,
+which reads the table, the verdicts and the constructions from the contract.
+
+    python3 scripts/generate-gateway-payload-size-vectors-v2          # write
+    python3 scripts/generate-gateway-payload-size-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "payload-size-v2.json"
+
+# (topic, direction, maximum): the Payload Size table.
+TOPICS = (
+    ("ori/gateway/health", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/runtime/heartbeat", "runtime_to_gateway", 65536),
+    ("ori/{device_id}/reasoning/request", "runtime_to_gateway", 262144),
+    ("ori/{device_id}/reasoning/response", "gateway_to_runtime", 262144),
+    ("ori/{device_id}/tier_c/enrichment/request", "runtime_to_gateway", 262144),
+    ("ori/{device_id}/tier_c/enrichment/response", "gateway_to_runtime", 262144),
+    ("ori/{device_id}/export/request", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/export/response/{request_id}", "runtime_to_gateway", 4194304),
+    ("ori/{device_id}/evidence/outbound", "runtime_to_gateway", 1572864),
+    ("ori/{device_id}/evidence/outbound/ack", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/evidence/inbound", "gateway_to_runtime", 1114112),
+    ("ori/{device_id}/evidence/inbound/ack", "runtime_to_gateway", 16384),
+    ("ori/{device_id}/lan/proposal", "runtime_to_gateway", 16384),
+    ("ori/{device_id}/lan/reply", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/lan/disclosure/request", "gateway_to_runtime", 16384),
+    ("ori/{device_id}/lan/disclosure/response/{request_id}", "runtime_to_gateway", 16384),
+)
+FLOOR = 4096
+# Never lowered: a courier cannot shrink a conforming artifact.
+NOT_LOWERED = {"ori/{device_id}/evidence/outbound", "ori/{device_id}/evidence/inbound"}
+
+
+def construct(kind: str, length: int) -> bytes:
+    if kind == "json_object":
+        head, tail = b'{"pad":"', b'"}'
+        return head + b"a" * (length - len(head) - len(tail)) + tail
+    if kind == "invalid_utf8":
+        return b"\xff" * length
+    raise ValueError(kind)
+
+
+def case(name: str, topic: str, direction: str, configured: int | None, kind: str,
+         length: int, verdict: str, note: str) -> dict:
+    return {
+        "name": name,
+        "topic": topic,
+        "direction": direction,
+        "configured_maximum": configured,
+        "construction": kind,
+        "length": length,
+        "sha256": hashlib.sha256(construct(kind, length)).hexdigest(),
+        "verdict": verdict,
+        "note": note,
+    }
+
+
+# (name, fixed bytes, item bytes, maximum, note): export pages filled by size.
+PAGING = (
+    ("pages_of_three", 100, [300] * 10, 1000,
+     "three items fill a page exactly; the last page holds the remainder"),
+    ("an_item_too_large_alone", 100, [200, 2000, 100], 1000,
+     "the second item cannot fit beside the fixed bytes, so the export ends there"),
+    ("a_page_filled_to_the_byte", 100, [450, 450, 1], 1000,
+     "two items reach the maximum exactly; the third goes to the next page"),
+    ("one_item_at_the_limit", 100, [900, 900], 1000,
+     "each item alone fills its page"),
+    ("small_items", 100, [10] * 95, 1000,
+     "ninety items fit; five remain"),
+)
+
+
+def pages(fixed: int, items: list[int], maximum: int) -> tuple[list[dict], dict | None]:
+    """Pages by cumulative size: each ends at the last item whose running total fits."""
+    out: list[dict] = []
+    start = 0
+    while start < len(items):
+        total = fixed
+        end = start
+        for size in items[start:]:
+            if total + size > maximum:
+                break
+            total += size
+            end += 1
+        if end == start:
+            return out, {"at": start, "error": "item_exceeds_payload_maximum"}
+        out.append({"items": end - start, "next": end})
+        start = end
+    return out, None
+
+
+# Evidence payloads at their bounds.
+SCALAR = "a"
+SCALARS = 128
+ARTIFACT_BYTES = 1048576
+TOP_INT = 9007199254740991
+AUTH = {"scheme": "hmac-sha256", "signature": "hmac-sha256:" + "0" * 64,
+        "signed_at_ms": TOP_INT}
+# (name, topic, encoding, artifact_type, outcome, reason)
+ENVELOPES = (
+    ("evidence_outbound_at_bound", "ori/{device_id}/evidence/outbound", "escaped",
+     "anchor_registration", None, None),
+    ("evidence_outbound_ack_at_bound", "ori/{device_id}/evidence/outbound/ack", "escaped",
+     "anchor_registration", "refused", "binding_mismatch"),
+    ("evidence_inbound_canonical_at_bound", "ori/{device_id}/evidence/inbound", "canonical",
+     "custody_acknowledgement", None, None),
+    ("evidence_inbound_escaped_at_bound", "ori/{device_id}/evidence/inbound", "escaped",
+     "custody_acknowledgement", None, None),
+    ("evidence_inbound_ack_at_bound", "ori/{device_id}/evidence/inbound/ack", "escaped",
+     "custody_acknowledgement", "refused", "restatement_conflict"),
+)
+
+
+def envelope(topic: str, artifact_type: str, outcome: str | None,
+             reason: str | None) -> dict:
+    device_id = SCALAR * SCALARS
+    if topic.endswith("/outbound"):
+        raw = b"\x00" * ARTIFACT_BYTES
+        return {"device_id": device_id, "artifact_type": artifact_type,
+                "artifact_b64": base64.b64encode(raw).decode()}
+    if topic.endswith("/inbound"):
+        # {"pad":"…"} of 2-byte characters, ARTIFACT_BYTES long in canonical form.
+        pad = "\u00e9" * ((ARTIFACT_BYTES - len('{"pad":""}')) // 2)
+        return {"device_id": device_id, "artifact_type": artifact_type,
+                "artifact": {"pad": pad}, "auth": AUTH}
+    return {"device_id": device_id, "artifact_type": artifact_type,
+            "artifact_digest": "sha256:" + "0" * 64, "outcome": outcome, "reason": reason,
+            "acknowledged_at_ms": TOP_INT, "auth": AUTH}
+
+
+def encode(payload: dict, encoding: str) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=encoding == "escaped").encode("utf-8")
+
+
+# Required replies at their bounds, against a maximum at the floor.
+ROUTING = "a" * 128
+ERROR = "\U0001F600" * 128
+DEGRADATION = (
+    "action_log_records_lost", "alert_delivery_overdue", "action_log_records_stalled",
+    "commissioning_problem", "community_skills_refused", "config_unsigned_value_source",
+    "decision_record_lost", "evidence_application_storage_fault",
+    "evidence_contributor_link_unresolved", "evidence_courier_answer_unrecognised",
+    "evidence_posture_problem", "firmware_liveness_degraded",
+    "firmware_liveness_device_expired", "firmware_liveness_over_capacity",
+    "firmware_liveness_stopped", "firmware_liveness_tick_failures",
+    "firmware_liveness_tick_stale", "safety_zone_activation_refused",
+    "safety_zone_active_unprotected", "safety_zone_trip_unresolved", "sensor_stale",
+    "sensor_measurement_degraded", "sensor_unconnected", "health_snapshot_invalid",
+    "subsystem_starting", "subsystem_state_unknown", "subsystem_state_unknown_critical",
+    "tier_c_records_degraded", "skill_optional_hooks_unavailable",
+    "skill_required_hooks_unavailable", "tier_c_recovery_failed",
+    "tier_d_alert_delivery_unconfirmed",
+)
+
+
+def replies() -> list[tuple[str, str, dict]]:
+    export_plain = {"request_id": ROUTING, "export_type": "tier_c_decision_log",
+                    "device_id": ROUTING, "items": [], "next_page_token": "", "complete": True,
+                    "error": ERROR}
+    sealed = len(encode(export_plain, "escaped")) + 16
+    return [
+        ("reasoning_error", "ori/{device_id}/reasoning/response", {
+            "request_id": ROUTING, "device_id": ROUTING, "text": "", "model": "",
+            "tokens_used": TOP_INT, "latency_ms": TOP_INT, "confidence": 0.0,
+            "action_tier": "A", "proposed_action": None, "error": ERROR, "auth": AUTH}),
+        ("enrichment_error", "ori/{device_id}/tier_c/enrichment/response", {
+            "request_id": ROUTING, "proposal_id": "A" * 8, "device_id": ROUTING,
+            "tokens_used": TOP_INT, "latency_ms": TOP_INT, "error": ERROR, "auth": AUTH}),
+        ("export_error_encrypted", "ori/{device_id}/export/response/{request_id}", {
+            "request_id": ROUTING, "export_type": "tier_c_decision_log", "device_id": ROUTING,
+            "encrypted": True,
+            "encryption": {"scheme": "aes-256-gcm",
+                           "nonce": base64.b64encode(bytes(12)).decode(),
+                           "ciphertext": base64.b64encode(bytes(sealed)).decode()},
+            "auth": AUTH}),
+        ("runtime_heartbeat_no_triggers", "ori/{device_id}/runtime/heartbeat", {
+            "device_id": ROUTING, "status": "critical", "last_seen_ms": TOP_INT,
+            "gateway_seen_ms": TOP_INT, "active_triggers": [],
+            "degradation_reasons": list(DEGRADATION),
+            "evidence": {"chain_head_hash": "0" * 64, "attestation_gap_count": TOP_INT,
+                         "available": True, "action_event_type": "A" * 64},
+            "auth": AUTH}),
+        ("gateway_heartbeat", "ori/gateway/health", {
+            "status": "starting", "uptime_s": 1.7976931348623157e308, "provider": "llama_cpp",
+            "sim_available": False, "timestamp_ms": TOP_INT,
+            "webhook_bridge": {"enabled": False, "ready": False, "loopback_only": False,
+                               "source_cidrs_configured": False, "provider_cidr_count": TOP_INT,
+                               "runtime_target_configured": False, "body_limit_bytes": TOP_INT,
+                               "request_timeout_ms": TOP_INT},
+            "auth": AUTH}),
+    ]
+
+
+def build() -> bytes:
+    cases = []
+    for topic, direction, maximum in TOPICS:
+        family = topic.replace("ori/", "").replace("{device_id}/", "").replace(
+            "/{request_id}", "").replace("/", "_")
+        half = maximum // 2
+        lowered = topic not in NOT_LOWERED
+        cases += [
+            case(f"{family}_at_maximum", topic, direction, None, "json_object", maximum,
+                 "admitted", "exactly the maximum"),
+            case(f"{family}_one_over", topic, direction, None, "json_object", maximum + 1,
+                 "payload_too_large", "one byte over the maximum"),
+            case(f"{family}_four_times", topic, direction, None, "json_object", 4 * maximum,
+                 "payload_too_large", "refused without reading past the length"),
+            case(f"{family}_invalid_utf8_one_over", topic, direction, None, "invalid_utf8",
+                 maximum + 1, "payload_too_large",
+                 "size is decided before the Payload Member Rule's invalid_unicode"),
+            case(f"{family}_configured_half_at", topic, direction, half, "json_object", half,
+                 "admitted" if lowered else "configuration_refused",
+                 "a configured lower maximum admits a payload at it" if lowered
+                 else "an evidence topic is never lowered"),
+            case(f"{family}_configured_half_over", topic, direction, half, "json_object",
+                 half + 1, "payload_too_large" if lowered else "configuration_refused",
+                 "a configured lower maximum refuses a conforming payload above it" if lowered
+                 else "an evidence topic is never lowered"),
+            case(f"{family}_configured_above_table", topic, direction, maximum + 1,
+                 "json_object", maximum, "configuration_refused",
+                 "configuration may lower a maximum, never raise it"),
+            case(f"{family}_configured_below_floor", topic, direction, FLOOR - 1,
+                 "json_object", FLOOR - 1, "configuration_refused",
+                 "configuration never lowers a maximum below the floor"),
+        ]
+    paging = []
+    for name, fixed, items, maximum, note in PAGING:
+        produced, error = pages(fixed, items, maximum)
+        paging.append({"name": name, "fixed_bytes": fixed, "item_bytes": items,
+                       "maximum": maximum, "pages": produced, "error": error, "note": note})
+    maxima = {topic: maximum for topic, _, maximum in TOPICS}
+    envelopes = []
+    for name, topic, encoding, artifact_type, outcome, reason in ENVELOPES:
+        data = encode(envelope(topic, artifact_type, outcome, reason), encoding)
+        envelopes.append({
+            "name": name, "topic": topic, "encoding": encoding,
+            "device_id_scalar": f"U+{ord(SCALAR):04X}", "device_id_scalars": SCALARS,
+            "artifact_type": artifact_type, "outcome": outcome, "reason": reason,
+            "artifact_bytes": ARTIFACT_BYTES if "/ack" not in topic else None,
+            "length": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "verdict": "admitted" if len(data) <= maxima[topic] else "payload_too_large",
+        })
+    reply_cases = []
+    for name, topic, payload in replies():
+        data = encode(payload, "escaped")
+        reply_cases.append({
+            "name": name, "topic": topic, "configured_maximum": FLOOR,
+            "length": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+            "verdict": "admitted" if len(data) <= FLOOR else "payload_too_large",
+        })
+    corpus = {
+        "contract": "ori-specs/gateway-api/v2.md#payload-size",
+        "version": 2,
+        "comment": (
+            "Golden vectors for gateway-api/v2 Payload Size. Build each payload from its "
+            "construction and length, confirm its SHA-256, and apply the topic's maximum, "
+            "or the configured maximum when one is given, before anything else: the verdict "
+            "is admitted, payload_too_large, or configuration_refused for a configured "
+            "maximum above the table or below the floor."
+        ),
+        "constructions": {
+            "json_object": "{\"pad\":\" then 'a' repeated then \"}",
+            "invalid_utf8": "the byte 0xFF repeated",
+        },
+        "cases": cases,
+        "paging": paging,
+        "envelopes": envelopes,
+        "replies": reply_cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import pathlib
+import re
 import sys
 from typing import Any
 
@@ -30,7 +31,6 @@ CORPUS = ROOT / "lan-app-api" / "vectors" / "admission.json"
 KEYS = {
     "grant": "Ivrv7OOWgXx81rkTaGW76TY0BMh9zArRuUYgBq9AQIo=",
     "time": "jaN06VRrm5dXjrhDIe089oN2ydgPq35Lccdr3IxrPsA=",
-    "approvers": "QhA2E6BLH2GWcbQJivmMM5Wa6y87u/s/UzJj0jcwkso=",
     "app": "g6ppXyKTkZzeuq5ublPBoHrg01ffRaoXCM2j8eFph9s=",
 }
 GRANT_FIELDS = {
@@ -60,31 +60,17 @@ TIME_FIELDS = {
     "signing_key_id",
     "signature",
 }
-APPROVER_FIELDS = {
-    "v",
-    "tenant_id",
-    "site_id",
-    "revision",
-    "issued_at_ms",
-    "entries",
-    "signing_key_id",
-    "signature",
-}
 REPLY_FIELDS = {
     "v",
-    "tenant_id",
     "site_id",
     "device_id",
-    "customer_id",
-    "role",
-    "grant_id",
-    "session_id",
+    "identity_epoch",
     "proposal_id",
     "reply",
     "client_nonce",
-    "approver_revision",
     "app_signature",
 }
+SESSION_FIELDS = {"v", "site_id", "device_id", "challenge", "app_spki_sha256", "signature"}
 PAIR_CASES = {
     "accept",
     "different_gateway",
@@ -98,20 +84,41 @@ PAIR_CASES = {
     "revoked",
     "storage_failure",
     "tampered_grant_signature",
+    "malformed_grant_member",
     "wrong_signing_purpose",
     "unknown_signing_key_id",
     "tampered_time_assertion",
+    "malformed_time_assertion",
+}
+SESSION_CASES = {
+    "offline_key_session", "expired_challenge", "replayed_challenge",
+    "restart_loses_challenge", "different_client_key", "storage_failure",
+    "malformed_proof", "tampered_session_proof",
 }
 REPLY_CASES = {
-    "valid_owner_reply",
-    "expired_approver_lease",
-    "stale_approver_revision",
+    "valid_enrolled_reply",
+    "registry_unavailable",
+    "key_not_enrolled",
+    "revoked_key",
+    "enrolled_after_proposal",
+    "old_epoch",
     "different_proposal",
     "altered_reply",
-    "viewer_cannot_answer",
-    "tampered_approver_signature",
     "signed_no_is_only_relayed",
+    "no_product_grant_needed",
+    "session_expired",
+    "session_lost_on_restart",
+    "nonce_reused_with_changed_bytes",
+    "malformed_reply_member",
+    "nonce_retry_same_bytes",
+    "revoked_session",
 }
+DISCLOSURE_CASES = {
+    "active_key_open_proposal", "runtime_timeout", "runtime_no_reply",
+    "registry_unavailable", "revoked_key", "new_key_old_proposal",
+    "closed_proposal", "mismatched_response",
+}
+RELAY_STATUS_CASES = {"queued_only", "gateway_claims_approved"}
 
 
 def decode_b64(value: str) -> bytes:
@@ -148,7 +155,7 @@ def signed_ok(
             allow_nan=False,
         ).encode("utf-8")
         Ed25519PublicKey.from_public_bytes(decode_b64(public_key_b64)).verify(
-            signature, purpose.encode() + b"\n" + serialized
+            signature, purpose.encode() + b"\x00" + serialized
         )
     except (InvalidSignature, ValueError, TypeError, KeyError):
         return False
@@ -164,6 +171,8 @@ def pairing_reason(
     assertion: dict[str, Any],
     ctx: dict[str, Any],
 ) -> str:
+    if set(grant) != GRANT_FIELDS or grant.get("v") != 1:
+        return "malformed"
     if not signed_ok(
         grant,
         fields=GRANT_FIELDS,
@@ -182,6 +191,8 @@ def pairing_reason(
         return "binding_mismatch"
     if grant["app_spki_sha256"] != ctx["app_spki_sha256"]:
         return "wrong_application_key"
+    if set(assertion) != TIME_FIELDS or assertion.get("v") != 1:
+        return "malformed"
     if not ctx["trusted_time"] or not signed_ok(
         assertion,
         fields=TIME_FIELDS,
@@ -210,7 +221,7 @@ def pairing_reason(
         return "expired"
     if ctx["wrong_attempts"] >= 5:
         return "code_attempts_exhausted"
-    code_input = ("ori.lan.code.v1\n" + grant["grant_id"] + "\n" + ctx["code"]).encode(
+    code_input = ("ori.lan.code.v1\x00" + grant["grant_id"] + "\x00" + ctx["code"]).encode(
         "utf-8"
     )
     if digest(code_input) != grant["code_sha256"]:
@@ -225,21 +236,23 @@ def pairing_reason(
 
 
 def reply_reason(
-    grant: dict[str, Any],
-    approvers: dict[str, Any],
     reply: dict[str, Any],
     spki_b64: str,
     ctx: dict[str, Any],
 ) -> str:
-    if not signed_ok(
-        grant,
-        fields=GRANT_FIELDS,
-        signature_field="signature",
-        purpose="ori.lan.pairing-grant.v1",
-        public_key_b64=KEYS["grant"],
-        expected_key_id="test-grant-key",
-    ):
-        return "unauthenticated"
+    if set(reply) != REPLY_FIELDS:
+        return "malformed"
+    try:
+        if (type(reply["v"]) is not int or reply["v"] != 1
+                or reply["reply"] not in {"yes", "no"}
+                or not re.fullmatch(r"[A-Z0-9]{8}", reply["proposal_id"])
+                or len(decode_b64(reply["identity_epoch"])) != 16
+                or len(decode_b64(reply["client_nonce"])) != 16):
+            return "malformed"
+    except (TypeError, ValueError):
+        return "malformed"
+    if not ctx["session_live"]:
+        return "session_expired"
     if not signed_ok(
         reply,
         fields=REPLY_FIELDS,
@@ -254,49 +267,67 @@ def reply_reason(
         not isinstance(public_key, Ed25519PublicKey)
         or public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
         != decode_b64(KEYS["app"])
-        or digest(app_spki) != grant["app_spki_sha256"]
+        or digest(app_spki) != ctx["app_spki_sha256"]
     ):
         return "unauthenticated"
-    for member in (
-        "tenant_id",
-        "site_id",
-        "device_id",
-        "customer_id",
-        "role",
-        "grant_id",
-    ):
-        if grant[member] != reply[member]:
-            return "unauthenticated"
-    if reply["role"] == "viewer":
-        return "role_not_permitted"
-    if not signed_ok(
-        approvers,
-        fields=APPROVER_FIELDS,
-        signature_field="signature",
-        purpose="ori.lan.site-approvers.v1",
-        public_key_b64=KEYS["approvers"],
-        expected_key_id="test-approver-key",
-    ):
-        return "approver_list_unavailable"
-    entries = approvers["entries"]
-    if (
-        approvers["tenant_id"] != reply["tenant_id"]
-        or approvers["site_id"] != reply["site_id"]
-        or not ctx["lease_valid"]
-        or ctx["approver_revision"] != approvers["revision"]
-        or reply["approver_revision"] != approvers["revision"]
-        or entries != sorted(entries, key=lambda x: x["customer_id"])
-        or len({x["customer_id"] for x in entries}) != len(entries)
-        or any(x["role"] not in {"owner", "manager"} for x in entries)
-        or not any(
-            x == {"customer_id": reply["customer_id"], "role": reply["role"]}
-            for x in entries
-        )
-    ):
-        return "approver_list_unavailable"
+    if reply["site_id"] != ctx["site_id"] or reply["device_id"] != ctx["device_id"]:
+        return "proposal_mismatch"
+    if (not ctx["registry_available"] or not ctx["credential_active"]
+            or ctx["credential_sequence"] > ctx["proposal_cutoff"]
+            or reply["identity_epoch"] != ctx["identity_epoch"]):
+        return "credential_unavailable"
     if ctx["proposal_id"] != reply["proposal_id"]:
         return "proposal_mismatch"
+    if ctx["nonce_conflict"]:
+        return "nonce_reused"
+    if ctx["nonce_duplicate"]:
+        return "stored_relay"
     return "relay"
+
+
+def session_reason(proof: dict[str, Any], ctx: dict[str, Any]) -> str:
+    if set(proof) != SESSION_FIELDS or proof.get("v") != 1:
+        return "malformed"
+    try:
+        if len(decode_b64(proof["challenge"])) != 16:
+            return "malformed"
+    except (ValueError, TypeError):
+        return "malformed"
+    if (not signed_ok(proof, fields=SESSION_FIELDS,
+                      signature_field="signature",
+                      purpose="ori.lan.proposal-session.v1",
+                      public_key_b64=KEYS["app"])
+            or proof["app_spki_sha256"] != ctx["app_spki_sha256"]):
+        return "unauthenticated"
+    if (proof["site_id"] != ctx["site_id"]
+            or proof["device_id"] != ctx["device_id"]
+            or proof["challenge"] != ctx["challenge"]):
+        return "binding_mismatch"
+    if ctx["restarted"] or ctx["age_ms"] > 30000:
+        return "session_expired"
+    if ctx["used"]:
+        return "nonce_reused"
+    if not ctx["storage_ok"]:
+        return "storage_unavailable"
+    return "session"
+
+
+def disclosure_reason(ctx: dict[str, Any]) -> str:
+    if (ctx["response_ms"] is None or ctx["response_ms"] > 2000
+            or not ctx["response_matches"] or not ctx["registry_available"]
+            or not ctx["credential_active"] or not ctx["proposal_open"]
+            or ctx["credential_sequence"] > ctx["proposal_cutoff"]):
+        return "deny"
+    return "allow"
+
+
+def relay_status_reason(response: dict[str, Any], reply: dict[str, Any]) -> str:
+    if (set(response) != {"status", "proposal_id", "client_nonce"}
+            or response["status"] != "queued"
+            or response["proposal_id"] != reply["proposal_id"]
+            or response["client_nonce"] != reply["client_nonce"]):
+        return "malformed"
+    return "valid"
 
 
 def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
@@ -306,10 +337,19 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
     base_context = corpus["pairing_context"]
     pair_names = {case["name"] for case in corpus["pairing_cases"]}
     reply_names = {case["name"] for case in corpus["reply_cases"]}
+    session_names = {case["name"] for case in corpus["session_cases"]}
+    disclosure_names = {case["name"] for case in corpus["disclosure_cases"]}
+    relay_status_names = {case["name"] for case in corpus["relay_status_cases"]}
     if pair_names != PAIR_CASES or len(corpus["pairing_cases"]) != len(PAIR_CASES):
         raise AssertionError("pairing refusal coverage changed")
     if reply_names != REPLY_CASES or len(corpus["reply_cases"]) != len(REPLY_CASES):
         raise AssertionError("reply refusal coverage changed")
+    if session_names != SESSION_CASES or len(corpus["session_cases"]) != len(SESSION_CASES):
+        raise AssertionError("session coverage changed")
+    if disclosure_names != DISCLOSURE_CASES or len(corpus["disclosure_cases"]) != len(DISCLOSURE_CASES):
+        raise AssertionError("disclosure coverage changed")
+    if relay_status_names != RELAY_STATUS_CASES or len(corpus["relay_status_cases"]) != len(RELAY_STATUS_CASES):
+        raise AssertionError("relay status coverage changed")
     for case in corpus["pairing_cases"]:
         context = {**base_context, **case.get("context", {})}
         actual = pairing_reason(
@@ -319,26 +359,67 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
         )
         if actual != case["expect"]:
             raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["session_cases"]:
+        context = {
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "challenge": "MDEyMzQ1Njc4OTo7PD0+Pw==",
+            "app_spki_sha256": fixtures["grant"]["app_spki_sha256"],
+            "age_ms": 100,
+            "used": False,
+            "restarted": False,
+            "storage_ok": True,
+            **case.get("context", {}),
+        }
+        actual = session_reason(case.get("proof", fixtures["session_proof"]), context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
     for case in corpus["reply_cases"]:
         context = {
-            "lease_valid": True,
-            "approver_revision": 7,
-            "proposal_id": "proposal-001",
+            "session_live": True,
+            "registry_available": True,
+            "credential_active": True,
+            "credential_sequence": 1,
+            "proposal_cutoff": 8,
+            "identity_epoch": "AAECAwQFBgcICQoLDA0ODw==",
+            "proposal_id": "AB12CD34",
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "nonce_conflict": False,
+            "nonce_duplicate": False,
+            "app_spki_sha256": fixtures["grant"]["app_spki_sha256"],
             **case.get("context", {}),
         }
         actual = reply_reason(
-            case.get("grant", fixtures["grant"]),
-            case.get("approvers", fixtures["approvers"]),
             case.get("reply", fixtures["reply"]),
             fixtures["app_spki_b64"],
             context,
         )
         if actual != case["expect"]:
             raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["disclosure_cases"]:
+        context = {
+            "response_ms": 100,
+            "response_matches": True,
+            "registry_available": True,
+            "credential_active": True,
+            "proposal_open": True,
+            "credential_sequence": 1,
+            "proposal_cutoff": 8,
+            **case.get("context", {}),
+        }
+        actual = disclosure_reason(context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["relay_status_cases"]:
+        actual = relay_status_reason(case["response"], fixtures["reply"])
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
     if announce:
         print(
-            f"lan-app-api/v1: {len(PAIR_CASES)} pairing and "
-            f"{len(REPLY_CASES)} reply vectors verified"
+            f"lan-app-api/v1: {len(PAIR_CASES)} pairing, {len(SESSION_CASES)} session and "
+            f"{len(REPLY_CASES)} reply, {len(DISCLOSURE_CASES)} disclosure, and "
+            f"{len(RELAY_STATUS_CASES)} relay status vectors verified"
         )
 
 
@@ -358,6 +439,21 @@ def check_mutations(corpus: dict[str, Any]) -> None:
         "fixtures"
     ]["grant"]["signature"]
     mutants.append(changed_signature)
+    timeout_allowed = copy.deepcopy(corpus)
+    next(c for c in timeout_allowed["disclosure_cases"] if c["name"] == "runtime_timeout")["expect"] = "allow"
+    mutants.append(timeout_allowed)
+    missing_registry_accepted = copy.deepcopy(corpus)
+    next(c for c in missing_registry_accepted["reply_cases"] if c["name"] == "registry_unavailable")["expect"] = "relay"
+    mutants.append(missing_registry_accepted)
+    gateway_approved = copy.deepcopy(corpus)
+    next(c for c in gateway_approved["relay_status_cases"] if c["name"] == "gateway_claims_approved")["expect"] = "valid"
+    mutants.append(gateway_approved)
+    session_tampered = copy.deepcopy(corpus)
+    session_tampered["fixtures"]["session_proof"]["signature"] = session_tampered["fixtures"]["grant"]["signature"]
+    mutants.append(session_tampered)
+    expired_session_admitted = copy.deepcopy(corpus)
+    next(c for c in expired_session_admitted["session_cases"] if c["name"] == "expired_challenge")["expect"] = "session"
+    mutants.append(expired_session_admitted)
     for mutant in mutants:
         try:
             check(mutant, announce=False)
