@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Independently check lan-app-api/v1 signed fixtures and refusal reasons.
+
+This verifier imports nothing from the vector generator. It checks contract
+representability, not a gateway, backend, application or runtime consumer.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+    load_der_public_key,
+)
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "lan-app-api" / "vectors" / "admission.json"
+KEYS = {
+    "grant": "Ivrv7OOWgXx81rkTaGW76TY0BMh9zArRuUYgBq9AQIo=",
+    "time": "jaN06VRrm5dXjrhDIe089oN2ydgPq35Lccdr3IxrPsA=",
+    "app": "g6ppXyKTkZzeuq5ublPBoHrg01ffRaoXCM2j8eFph9s=",
+}
+GRANT_FIELDS = {
+    "v",
+    "grant_id",
+    "tenant_id",
+    "site_id",
+    "gateway_id",
+    "device_id",
+    "customer_id",
+    "role",
+    "app_spki_sha256",
+    "gateway_spki_sha256",
+    "code_sha256",
+    "issued_at_ms",
+    "not_before_ms",
+    "expires_at_ms",
+    "signing_key_id",
+    "signature",
+}
+TIME_FIELDS = {
+    "v",
+    "site_id",
+    "gateway_id",
+    "nonce",
+    "utc_ms",
+    "signing_key_id",
+    "signature",
+}
+REPLY_FIELDS = {
+    "v",
+    "site_id",
+    "device_id",
+    "identity_epoch",
+    "proposal_id",
+    "reply",
+    "client_nonce",
+    "app_signature",
+}
+SESSION_FIELDS = {"v", "site_id", "device_id", "challenge", "app_spki_sha256", "signature"}
+PAIR_CASES = {
+    "accept",
+    "different_gateway",
+    "different_application_key",
+    "untrusted_clock",
+    "not_yet_valid",
+    "expired",
+    "five_wrong_codes",
+    "wrong_code",
+    "redeemed",
+    "revoked",
+    "storage_failure",
+    "tampered_grant_signature",
+    "malformed_grant_member",
+    "wrong_signing_purpose",
+    "unknown_signing_key_id",
+    "tampered_time_assertion",
+    "malformed_time_assertion",
+}
+SESSION_CASES = {
+    "offline_key_session", "expired_challenge", "replayed_challenge",
+    "restart_loses_challenge", "different_client_key", "storage_failure",
+    "malformed_proof", "tampered_session_proof",
+}
+REPLY_CASES = {
+    "valid_enrolled_reply",
+    "registry_unavailable",
+    "key_not_enrolled",
+    "revoked_key",
+    "enrolled_after_proposal",
+    "old_epoch",
+    "different_proposal",
+    "altered_reply",
+    "signed_no_is_only_relayed",
+    "no_product_grant_needed",
+    "session_expired",
+    "session_lost_on_restart",
+    "nonce_reused_with_changed_bytes",
+    "malformed_reply_member",
+    "nonce_retry_same_bytes",
+    "revoked_session",
+}
+DISCLOSURE_CASES = {
+    "active_key_open_proposal", "runtime_timeout", "runtime_no_reply",
+    "registry_unavailable", "revoked_key", "new_key_old_proposal",
+    "closed_proposal", "mismatched_response",
+}
+RELAY_STATUS_CASES = {"queued_only", "gateway_claims_approved"}
+
+
+def decode_b64(value: str) -> bytes:
+    raw = base64.b64decode(value, validate=True)
+    if base64.b64encode(raw).decode("ascii") != value:
+        raise ValueError("base64 is not canonical")
+    return raw
+
+
+def signed_ok(
+    document: dict[str, Any],
+    *,
+    fields: set[str],
+    signature_field: str,
+    purpose: str,
+    public_key_b64: str,
+    expected_key_id: str | None = None,
+) -> bool:
+    if set(document) != fields or document.get("v") != 1:
+        return False
+    if (
+        expected_key_id is not None
+        and document.get("signing_key_id") != expected_key_id
+    ):
+        return False
+    try:
+        signature = decode_b64(document[signature_field])
+        unsigned = {k: v for k, v in document.items() if k != signature_field}
+        serialized = json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        Ed25519PublicKey.from_public_bytes(decode_b64(public_key_b64)).verify(
+            signature, purpose.encode() + b"\x00" + serialized
+        )
+    except (InvalidSignature, ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
+def digest(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def pairing_reason(
+    grant: dict[str, Any],
+    assertion: dict[str, Any],
+    ctx: dict[str, Any],
+) -> str:
+    if set(grant) != GRANT_FIELDS or grant.get("v") != 1:
+        return "malformed"
+    if not signed_ok(
+        grant,
+        fields=GRANT_FIELDS,
+        signature_field="signature",
+        purpose="ori.lan.pairing-grant.v1",
+        public_key_b64=KEYS["grant"],
+        expected_key_id="test-grant-key",
+    ):
+        return "signature_invalid"
+    if (
+        grant["gateway_id"] != ctx["gateway_id"]
+        or grant["site_id"] != ctx["site_id"]
+        or grant["device_id"] != ctx["device_id"]
+        or grant["gateway_spki_sha256"] != ctx["gateway_spki_sha256"]
+    ):
+        return "binding_mismatch"
+    if grant["app_spki_sha256"] != ctx["app_spki_sha256"]:
+        return "wrong_application_key"
+    if set(assertion) != TIME_FIELDS or assertion.get("v") != 1:
+        return "malformed"
+    if not ctx["trusted_time"] or not signed_ok(
+        assertion,
+        fields=TIME_FIELDS,
+        signature_field="signature",
+        purpose="ori.lan.time-assertion.v1",
+        public_key_b64=KEYS["time"],
+        expected_key_id="test-time-key",
+    ):
+        return "no_trusted_time"
+    if (
+        assertion["site_id"] != ctx["site_id"]
+        or assertion["gateway_id"] != ctx["gateway_id"]
+        or assertion["nonce"] != "00112233445566778899aabbccddeeff"
+    ):
+        return "no_trusted_time"
+    if (
+        type(grant["not_before_ms"]) is not int
+        or type(grant["expires_at_ms"]) is not int
+        or grant["expires_at_ms"] - grant["not_before_ms"] > 600_000
+    ):
+        return "malformed"
+    now = ctx["now_ms"]
+    if now < grant["not_before_ms"] - 30_000:
+        return "not_yet_valid"
+    if now > grant["expires_at_ms"] + 30_000:
+        return "expired"
+    if ctx["wrong_attempts"] >= 5:
+        return "code_attempts_exhausted"
+    code_input = ("ori.lan.code.v1\x00" + grant["grant_id"] + "\x00" + ctx["code"]).encode(
+        "utf-8"
+    )
+    if digest(code_input) != grant["code_sha256"]:
+        return "code_mismatch"
+    if ctx["redeemed"]:
+        return "already_redeemed"
+    if ctx["revoked"]:
+        return "revoked"
+    if not ctx["storage_ok"]:
+        return "storage_unavailable"
+    return "accept"
+
+
+def reply_reason(
+    reply: dict[str, Any],
+    spki_b64: str,
+    ctx: dict[str, Any],
+) -> str:
+    if set(reply) != REPLY_FIELDS:
+        return "malformed"
+    try:
+        if (type(reply["v"]) is not int or reply["v"] != 1
+                or reply["reply"] not in {"yes", "no"}
+                or not re.fullmatch(r"[A-Z0-9]{8}", reply["proposal_id"])
+                or len(decode_b64(reply["identity_epoch"])) != 16
+                or len(decode_b64(reply["client_nonce"])) != 16):
+            return "malformed"
+    except (TypeError, ValueError):
+        return "malformed"
+    if not ctx["session_live"]:
+        return "session_expired"
+    if not signed_ok(
+        reply,
+        fields=REPLY_FIELDS,
+        signature_field="app_signature",
+        purpose="ori.lan.reply.v1",
+        public_key_b64=KEYS["app"],
+    ):
+        return "unauthenticated"
+    app_spki = decode_b64(spki_b64)
+    public_key = load_der_public_key(app_spki)
+    if (
+        not isinstance(public_key, Ed25519PublicKey)
+        or public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+        != decode_b64(KEYS["app"])
+        or digest(app_spki) != ctx["app_spki_sha256"]
+    ):
+        return "unauthenticated"
+    if reply["site_id"] != ctx["site_id"] or reply["device_id"] != ctx["device_id"]:
+        return "proposal_mismatch"
+    if (not ctx["registry_available"] or not ctx["credential_active"]
+            or ctx["credential_sequence"] > ctx["proposal_cutoff"]
+            or reply["identity_epoch"] != ctx["identity_epoch"]):
+        return "credential_unavailable"
+    if ctx["proposal_id"] != reply["proposal_id"]:
+        return "proposal_mismatch"
+    if ctx["nonce_conflict"]:
+        return "nonce_reused"
+    if ctx["nonce_duplicate"]:
+        return "stored_relay"
+    return "relay"
+
+
+def session_reason(proof: dict[str, Any], ctx: dict[str, Any]) -> str:
+    if set(proof) != SESSION_FIELDS or proof.get("v") != 1:
+        return "malformed"
+    try:
+        if len(decode_b64(proof["challenge"])) != 16:
+            return "malformed"
+    except (ValueError, TypeError):
+        return "malformed"
+    if (not signed_ok(proof, fields=SESSION_FIELDS,
+                      signature_field="signature",
+                      purpose="ori.lan.proposal-session.v1",
+                      public_key_b64=KEYS["app"])
+            or proof["app_spki_sha256"] != ctx["app_spki_sha256"]):
+        return "unauthenticated"
+    if (proof["site_id"] != ctx["site_id"]
+            or proof["device_id"] != ctx["device_id"]
+            or proof["challenge"] != ctx["challenge"]):
+        return "binding_mismatch"
+    if ctx["restarted"] or ctx["age_ms"] > 30000:
+        return "session_expired"
+    if ctx["used"]:
+        return "nonce_reused"
+    if not ctx["storage_ok"]:
+        return "storage_unavailable"
+    return "session"
+
+
+def disclosure_reason(ctx: dict[str, Any]) -> str:
+    if (ctx["response_ms"] is None or ctx["response_ms"] > 2000
+            or not ctx["response_matches"] or not ctx["registry_available"]
+            or not ctx["credential_active"] or not ctx["proposal_open"]
+            or ctx["credential_sequence"] > ctx["proposal_cutoff"]):
+        return "deny"
+    return "allow"
+
+
+def relay_status_reason(response: dict[str, Any], reply: dict[str, Any]) -> str:
+    if (set(response) != {"status", "proposal_id", "client_nonce"}
+            or response["status"] != "queued"
+            or response["proposal_id"] != reply["proposal_id"]
+            or response["client_nonce"] != reply["client_nonce"]):
+        return "malformed"
+    return "valid"
+
+
+def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
+    if corpus["contract"] != "lan-app-api/v1" or corpus["public_keys"] != KEYS:
+        raise AssertionError("contract or pinned test anchors changed")
+    fixtures = corpus["fixtures"]
+    base_context = corpus["pairing_context"]
+    pair_names = {case["name"] for case in corpus["pairing_cases"]}
+    reply_names = {case["name"] for case in corpus["reply_cases"]}
+    session_names = {case["name"] for case in corpus["session_cases"]}
+    disclosure_names = {case["name"] for case in corpus["disclosure_cases"]}
+    relay_status_names = {case["name"] for case in corpus["relay_status_cases"]}
+    if pair_names != PAIR_CASES or len(corpus["pairing_cases"]) != len(PAIR_CASES):
+        raise AssertionError("pairing refusal coverage changed")
+    if reply_names != REPLY_CASES or len(corpus["reply_cases"]) != len(REPLY_CASES):
+        raise AssertionError("reply refusal coverage changed")
+    if session_names != SESSION_CASES or len(corpus["session_cases"]) != len(SESSION_CASES):
+        raise AssertionError("session coverage changed")
+    if disclosure_names != DISCLOSURE_CASES or len(corpus["disclosure_cases"]) != len(DISCLOSURE_CASES):
+        raise AssertionError("disclosure coverage changed")
+    if relay_status_names != RELAY_STATUS_CASES or len(corpus["relay_status_cases"]) != len(RELAY_STATUS_CASES):
+        raise AssertionError("relay status coverage changed")
+    for case in corpus["pairing_cases"]:
+        context = {**base_context, **case.get("context", {})}
+        actual = pairing_reason(
+            case.get("grant", fixtures["grant"]),
+            case.get("time_assertion", fixtures["time_assertion"]),
+            context,
+        )
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["session_cases"]:
+        context = {
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "challenge": "MDEyMzQ1Njc4OTo7PD0+Pw==",
+            "app_spki_sha256": fixtures["grant"]["app_spki_sha256"],
+            "age_ms": 100,
+            "used": False,
+            "restarted": False,
+            "storage_ok": True,
+            **case.get("context", {}),
+        }
+        actual = session_reason(case.get("proof", fixtures["session_proof"]), context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["reply_cases"]:
+        context = {
+            "session_live": True,
+            "registry_available": True,
+            "credential_active": True,
+            "credential_sequence": 1,
+            "proposal_cutoff": 8,
+            "identity_epoch": "AAECAwQFBgcICQoLDA0ODw==",
+            "proposal_id": "AB12CD34",
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "nonce_conflict": False,
+            "nonce_duplicate": False,
+            "app_spki_sha256": fixtures["grant"]["app_spki_sha256"],
+            **case.get("context", {}),
+        }
+        actual = reply_reason(
+            case.get("reply", fixtures["reply"]),
+            fixtures["app_spki_b64"],
+            context,
+        )
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["disclosure_cases"]:
+        context = {
+            "response_ms": 100,
+            "response_matches": True,
+            "registry_available": True,
+            "credential_active": True,
+            "proposal_open": True,
+            "credential_sequence": 1,
+            "proposal_cutoff": 8,
+            **case.get("context", {}),
+        }
+        actual = disclosure_reason(context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["relay_status_cases"]:
+        actual = relay_status_reason(case["response"], fixtures["reply"])
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    if announce:
+        print(
+            f"lan-app-api/v1: {len(PAIR_CASES)} pairing, {len(SESSION_CASES)} session and "
+            f"{len(REPLY_CASES)} reply, {len(DISCLOSURE_CASES)} disclosure, and "
+            f"{len(RELAY_STATUS_CASES)} relay status vectors verified"
+        )
+
+
+def check_mutations(corpus: dict[str, Any]) -> None:
+    mutants = []
+    altered_key = copy.deepcopy(corpus)
+    altered_key["public_keys"]["grant"] = KEYS["app"]
+    mutants.append(altered_key)
+    missing_case = copy.deepcopy(corpus)
+    missing_case["pairing_cases"].pop()
+    mutants.append(missing_case)
+    false_accept = copy.deepcopy(corpus)
+    false_accept["pairing_cases"][1]["expect"] = "accept"
+    mutants.append(false_accept)
+    changed_signature = copy.deepcopy(corpus)
+    changed_signature["fixtures"]["reply"]["app_signature"] = changed_signature[
+        "fixtures"
+    ]["grant"]["signature"]
+    mutants.append(changed_signature)
+    timeout_allowed = copy.deepcopy(corpus)
+    next(c for c in timeout_allowed["disclosure_cases"] if c["name"] == "runtime_timeout")["expect"] = "allow"
+    mutants.append(timeout_allowed)
+    missing_registry_accepted = copy.deepcopy(corpus)
+    next(c for c in missing_registry_accepted["reply_cases"] if c["name"] == "registry_unavailable")["expect"] = "relay"
+    mutants.append(missing_registry_accepted)
+    gateway_approved = copy.deepcopy(corpus)
+    next(c for c in gateway_approved["relay_status_cases"] if c["name"] == "gateway_claims_approved")["expect"] = "valid"
+    mutants.append(gateway_approved)
+    session_tampered = copy.deepcopy(corpus)
+    session_tampered["fixtures"]["session_proof"]["signature"] = session_tampered["fixtures"]["grant"]["signature"]
+    mutants.append(session_tampered)
+    expired_session_admitted = copy.deepcopy(corpus)
+    next(c for c in expired_session_admitted["session_cases"] if c["name"] == "expired_challenge")["expect"] = "session"
+    mutants.append(expired_session_admitted)
+    for mutant in mutants:
+        try:
+            check(mutant, announce=False)
+        except (AssertionError, KeyError, TypeError, ValueError):
+            continue
+        raise AssertionError("a mutated corpus was accepted")
+    print(f"lan-app-api/v1: {len(mutants)} mutations refused")
+
+
+if __name__ == "__main__":
+    try:
+        source = json.loads(CORPUS.read_text())
+        check(source)
+        if "--mutations" in sys.argv[1:]:
+            check_mutations(source)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        print(f"lan-app-api vectors failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
