@@ -21,6 +21,7 @@ OUT = (
 SITE_ID = "site-1"
 EPOCH_1 = base64.b64encode(bytes(range(32, 48))).decode("ascii")
 EPOCH_2 = base64.b64encode(bytes(range(48, 64))).decode("ascii")
+EPOCH_3 = base64.b64encode(bytes(range(64, 80))).decode("ascii")
 KEY = Ed25519PrivateKey.from_private_bytes(
     hashlib.sha256(b"ori tier-c-approvers/v1 published test key").digest()
 )
@@ -147,7 +148,7 @@ def revoke(
     revision: int,
     targets: list[str],
     *,
-    epoch: str = EPOCH_1,
+    epoch: str = EPOCH_2,
     site: str = SITE_ID,
     key: Ed25519PrivateKey = KEY,
     domain: bytes = b"ori.tier_c_approver.revoke.v1",
@@ -168,12 +169,14 @@ def revoke(
     return {**unsigned, "signature": base64.b64encode(signature).decode()}
 
 
-def scenario(name: str, steps: list[dict], *, initial_mode: str = "factory_fresh") -> dict:
+def scenario(name: str, steps: list[dict], *, initial_mode: str = "locked") -> dict:
     expanded = []
     for index, operation in enumerate(steps):
-        if operation["op"] in {"bootstrap", "recover", "enrol", "local_seed"} and "challenge_id" not in operation:
+        if operation["op"] in {"recover", "enrol", "local_seed"} and "challenge_id" not in operation:
             challenge_id = f"{name}.{index}"
             issue_data = {"challenge_id": challenge_id, "kind": operation["op"], "candidate": candidate_of(operation)}
+            if operation["op"] == "recover":
+                issue_data["proposed_epoch"] = operation["epoch"]
             if operation["op"] == "enrol" and operation.get("channel") in {"sms", "whatsapp"}:
                 code = base64.b64encode(hashlib.sha256(challenge_id.encode("ascii")).digest()[:16]).decode("ascii")
                 issue_data["phone_code_sha256"] = hashlib.sha256(code.encode("ascii")).hexdigest()
@@ -191,6 +194,7 @@ def scenario(name: str, steps: list[dict], *, initial_mode: str = "factory_fresh
                     "authenticated": case != "unauthenticated",
                     "text": f"ORI-POSSESS-V1 {challenge_id} " + ("AAAAAAAAAAAAAAAAAAAAAA==" if case == "wrong_code" else code),
                 }
+                operation["phone_elapsed_ms"] = 600001 if case == "late" else 1000
         expanded.append(operation)
     return {"name": name, "initial_mode": initial_mode, "steps": expanded}
 
@@ -207,8 +211,6 @@ def step(op: str, expect: str, **data: object) -> dict:
 
 
 def candidate_of(operation: dict) -> object:
-    if operation["op"] == "bootstrap":
-        return operation.get("contacts", [])
     if operation["op"] == "recover":
         return []
     return {
@@ -222,78 +224,68 @@ def candidate_of(operation: dict) -> object:
 def base() -> list[dict]:
     return [
         step(
-            "bootstrap",
-            "bootstrapped",
+            "recover",
+            "recovered",
             local_request=True,
-            presence=True,
+            epoch=EPOCH_2,
             contacts=[],
         ),
-        step("local_seed", "seeded", credential="owner-key", approver_id="owner-key", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+        step("local_seed", "seeded", credential="owner-key", approver_id="owner-key", channel="lan_ed25519", local_request=True, possession=True),
     ]
 
 
 def make() -> dict:
     cases = [
         scenario(
-            "bootstrap_once",
+            "recovery_once",
             base()
             + [
                 step(
-                    "bootstrap",
-                    "already_initialized",
+                    "recover",
+                    "recovery_not_available",
                     local_request=True,
-                    presence=True,
+                    epoch=EPOCH_3,
                 )
             ],
         ),
         scenario(
-            "bootstrap_requires_local_confirmation",
+            "first_setup_requires_authenticated_local_request",
             [
                 step(
-                    "bootstrap", "presence_required", local_request=True, presence=False
-                )
-            ],
-        ),
-        scenario(
-            "bootstrap_requires_authenticated_local_request",
-            [
-                step(
-                    "bootstrap",
+                    "recover",
                     "local_auth_required",
                     local_request=False,
-                    presence=True,
+                    epoch=EPOCH_2,
                 )
             ],
         ),
         scenario(
-            "bootstrap_refuses_provisioning_contacts",
+            "recovery_refuses_provisioning_contacts",
             [
-                step("bootstrap", "contacts_forbidden", local_request=True, presence=True, contacts=["owner-key"]),
-                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=[]),
+                step("recover", "contacts_forbidden", local_request=True, epoch=EPOCH_2, contacts=["owner-key"]),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_2, contacts=[]),
             ],
         ),
         scenario(
-            "bootstrap_refuses_multiple_contacts",
+            "recovery_refuses_multiple_contacts",
             [
-                step("bootstrap", "contacts_forbidden", local_request=True, presence=True, contacts=["one", "two", "three"]),
+                step("recover", "contacts_forbidden", local_request=True, epoch=EPOCH_2, contacts=["one", "two", "three"]),
             ],
         ),
         scenario(
-            "unknown_history_refuses_bootstrap",
+            "first_setup_uses_recovery",
             [
-                step("bootstrap", "recovery_required", local_request=True, presence=True),
-                step("recover", "recovered", local_request=True, presence=True, epoch=EPOCH_2),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_2),
             ],
-            initial_mode="unknown",
         ),
         scenario(
             "empty_registry_admits_nobody",
             [
                 step(
-                    "bootstrap",
-                    "bootstrapped",
+                    "recover",
+                    "recovered",
                     local_request=True,
-                    presence=True,
+                    epoch=EPOCH_2,
                     contacts=[],
                 ),
                 step("open", "opened", proposal="p1"),
@@ -303,7 +295,7 @@ def make() -> dict:
         scenario(
             "local_console_requires_registered_human",
             [
-                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=[]),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_2, contacts=[]),
                 step("open", "opened", proposal="p1"),
                 step("admit", "ingress_unauthenticated", proposal="p1", credential="x", channel="local_console", authenticated=False),
                 step("admit", "credential_unavailable", proposal="p1", credential="x", channel="local_console", authenticated=True),
@@ -312,17 +304,16 @@ def make() -> dict:
         scenario(
             "empty_registry_local_seed_requires_site_proofs",
             [
-                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=[]),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_2, contacts=[]),
                 step("open", "opened", proposal="before-seed"),
-                step("local_seed", "local_auth_required", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=False, presence=True, possession=True),
-                step("local_seed", "presence_required", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=False, possession=True),
-                step("local_seed", "lan_key_required", credential="app-1", approver_id="new-owner", channel="sms", local_request=True, presence=True, possession=True),
-                step("local_seed", "possession_invalid", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=False),
-                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("local_seed", "local_auth_required", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=False, possession=True),
+                step("local_seed", "lan_key_required", credential="app-1", approver_id="new-owner", channel="sms", local_request=True, possession=True),
+                step("local_seed", "possession_invalid", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=False),
+                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=True),
                 step("admit", "enrolled_after_proposal", proposal="before-seed", credential="app-1"),
                 step("open", "opened", proposal="after-seed"),
                 step("admit", "approved", proposal="after-seed", credential="app-1"),
-                step("local_seed", "active_authorizer_exists", credential="app-2", approver_id="other-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("local_seed", "active_authorizer_exists", credential="app-2", approver_id="other-owner", channel="lan_ed25519", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -331,9 +322,9 @@ def make() -> dict:
             + [
                 step("open", "opened", proposal="old"),
                 step("lose", "locked"),
-                step("local_seed", "registry_unavailable", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
-                step("recover", "recovered", local_request=True, presence=True, epoch=EPOCH_2),
-                step("local_seed", "seeded", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("local_seed", "registry_unavailable", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=True),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_3),
+                step("local_seed", "seeded", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=True),
                 step("admit", "proposal_unavailable", proposal="old", credential="new-app"),
             ],
         ),
@@ -342,8 +333,8 @@ def make() -> dict:
             base()
             + [
                 step("revoke", "revoked", document=revoke(1, ["approver:owner-key"])),
-                step("local_seed", "approver_revoked", credential="app-1", approver_id="owner-key", channel="lan_ed25519", local_request=True, presence=True, possession=True),
-                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("local_seed", "approver_revoked", credential="app-1", approver_id="owner-key", channel="lan_ed25519", local_request=True, possession=True),
+                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -352,21 +343,16 @@ def make() -> dict:
             + [
                 step("lose", "locked"),
                 step(
-                    "bootstrap", "recovery_required", local_request=True, presence=True
-                ),
-                step(
                     "recover",
-                    "presence_required",
-                    local_request=True,
-                    presence=False,
-                    epoch=EPOCH_2,
+                    "local_auth_required",
+                    local_request=False,
+                    epoch=EPOCH_3,
                 ),
                 step(
                     "recover",
                     "recovered",
                     local_request=True,
-                    presence=True,
-                    epoch=EPOCH_2,
+                    epoch=EPOCH_3,
                 ),
             ],
         ),
@@ -380,22 +366,20 @@ def make() -> dict:
                     credential="app-1",
                     authorizer="none",
                     local_request=True,
-                    presence=True,
-                    possession=True,
+                            possession=True,
                 ),
             ],
         ),
         scenario(
-            "enrol_requires_presence",
+            "enrol_requires_local_request",
             base()
             + [
                 step(
                     "enrol",
-                    "presence_required",
+                    "local_auth_required",
                     credential="app-1",
                     authorizer="owner-key",
-                    local_request=True,
-                    presence=False,
+                    local_request=False,
                     possession=True,
                 ),
             ],
@@ -410,8 +394,7 @@ def make() -> dict:
                     credential="app-1",
                     authorizer="owner-key",
                     local_request=True,
-                    presence=True,
-                    possession=False,
+                            possession=False,
                 ),
             ],
         ),
@@ -419,29 +402,38 @@ def make() -> dict:
             "phone_candidate_requires_channel_possession",
             base()
             + [
-                step("enrol", "possession_required", credential="phone-missing", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="missing"),
-                step("enrol", "enrolled", credential="new-phone", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="valid"),
+                step("enrol", "possession_required", credential="phone-missing", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="missing"),
+                step("enrol", "enrolled", credential="new-phone", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="valid"),
             ],
         ),
         scenario(
             "phone_candidate_rejects_wrong_code_and_sender",
             base()
             + [
-                step("enrol", "possession_invalid", credential="phone-wrong-code", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="wrong_code"),
-                step("enrol", "possession_invalid", credential="phone-wrong-sender", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="wrong_sender"),
-                step("enrol", "possession_invalid", credential="phone-wrong-channel", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="wrong_channel"),
-                step("enrol", "possession_invalid", credential="phone-unauthed", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="unauthenticated"),
-                step("enrol", "enrolled", credential="phone-good", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, presence=True, phone_case="valid"),
+                step("enrol", "possession_invalid", credential="phone-wrong-code", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="wrong_code"),
+                step("enrol", "possession_invalid", credential="phone-wrong-sender", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="wrong_sender"),
+                step("enrol", "possession_invalid", credential="phone-wrong-channel", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="wrong_channel"),
+                step("enrol", "possession_invalid", credential="phone-unauthed", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="unauthenticated"),
+                step("enrol", "enrolled", credential="phone-good", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="valid"),
+            ],
+        ),
+        scenario(
+            "phone_candidate_late_reply_refused",
+            base()
+            + [
+                step("enrol", "possession_expired", credential="phone-late", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="late"),
+                step("open", "opened", proposal="after-late"),
+                step("admit", "credential_unavailable", proposal="after-late", credential="phone-late"),
             ],
         ),
         scenario(
             "duplicate_credential_and_value_refused",
             base()
             + [
-                step("enrol", "credential_reused", credential="owner-key", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "duplicate_value", credential="app-1", value="owner-key", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "enrolled", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "credential_reused", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "credential_reused", credential="owner-key", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "duplicate_value", credential="app-1", value="owner-key", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "enrolled", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "credential_reused", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -450,16 +442,16 @@ def make() -> dict:
             + [
                 step("issue", "issued", challenge_id="expiring", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
                 step("expire", "expired", challenge_id="expiring"),
-                step("enrol", "challenge_expired", challenge_id="expiring", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "challenge_expired", challenge_id="expiring", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
                 step("issue", "issued", challenge_id="changed", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
-                step("enrol", "candidate_changed", challenge_id="changed", credential="app-1", value="altered-key", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "challenge_reused", challenge_id="changed", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "candidate_changed", challenge_id="changed", credential="app-1", value="altered-key", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "challenge_reused", challenge_id="changed", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
                 step("issue", "issued", challenge_id="good", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
-                step("enrol", "enrolled", challenge_id="good", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "challenge_reused", challenge_id="good", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "enrolled", challenge_id="good", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "challenge_reused", challenge_id="good", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
                 step("issue", "issued", challenge_id="restart", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-2"})),
                 step("restart", "restarted"),
-                step("enrol", "challenge_unavailable", challenge_id="restart", credential="app-2", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "challenge_unavailable", challenge_id="restart", credential="app-2", authorizer="owner-key", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -467,8 +459,8 @@ def make() -> dict:
             base()
             + [
                 step("issue", "issued", challenge_id="old-challenge", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-2"})),
-                step("enrol", "enrolled", credential="app-1", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "challenge_stale", challenge_id="old-challenge", credential="app-2", authorizer="app-1", local_request=True, presence=True, possession=True),
+                step("enrol", "enrolled", credential="app-1", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "challenge_stale", challenge_id="old-challenge", credential="app-2", authorizer="app-1", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -481,8 +473,7 @@ def make() -> dict:
                     credential="app-1",
                     authorizer="owner-key",
                     local_request=True,
-                    presence=True,
-                    possession=True,
+                            possession=True,
                 ),
                 step("open", "opened", proposal="p1"),
                 step("admit", "approved", proposal="p1", credential="app-1"),
@@ -499,8 +490,7 @@ def make() -> dict:
                     credential="app-1",
                     authorizer="owner-key",
                     local_request=True,
-                    presence=True,
-                    possession=True,
+                            possession=True,
                 ),
                 step(
                     "admit",
@@ -520,8 +510,7 @@ def make() -> dict:
                     credential="app-old",
                     authorizer="owner-key",
                     local_request=True,
-                    presence=True,
-                    possession=True,
+                            possession=True,
                 ),
                 step("open", "opened", proposal="p1"),
                 step("revoke", "revoked", document=revoke(1, ["app-old"])),
@@ -531,8 +520,7 @@ def make() -> dict:
                     credential="app-new",
                     authorizer="owner-key",
                     local_request=True,
-                    presence=True,
-                    possession=True,
+                            possession=True,
                 ),
                 step(
                     "admit",
@@ -546,9 +534,9 @@ def make() -> dict:
             "revoked_value_cannot_be_relabelled_in_same_epoch",
             base()
             + [
-                step("enrol", "enrolled", credential="app-old", value="key-value", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "enrolled", credential="app-old", value="key-value", authorizer="owner-key", local_request=True, possession=True),
                 step("revoke", "revoked", document=revoke(1, ["app-old"])),
-                step("enrol", "value_tombstoned", credential="app-new", value="key-value", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "value_tombstoned", credential="app-new", value="key-value", authorizer="owner-key", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -609,12 +597,12 @@ def make() -> dict:
         scenario(
             "approver_revocation_removes_all_credentials",
             base() + [
-                step("enrol", "enrolled", credential="secondary-key", approver_id="secondary-key", authorizer="owner-key", local_request=True, presence=True, possession=True),
-                step("enrol", "enrolled", credential="app-1", approver_id="owner-key", authorizer="owner-key", local_request=True, presence=True, possession=True),
+                step("enrol", "enrolled", credential="secondary-key", approver_id="secondary-key", authorizer="owner-key", local_request=True, possession=True),
+                step("enrol", "enrolled", credential="app-1", approver_id="owner-key", authorizer="owner-key", local_request=True, possession=True),
                 step("revoke", "revoked", document=revoke(1, ["approver:owner-key"])),
                 step("open", "opened", proposal="p1"),
                 step("admit", "credential_unavailable", proposal="p1", credential="app-1"),
-                step("enrol", "approver_revoked", credential="app-2", approver_id="owner-key", authorizer="secondary-key", local_request=True, presence=True, possession=True),
+                step("enrol", "approver_revoked", credential="app-2", approver_id="owner-key", authorizer="secondary-key", local_request=True, possession=True),
             ],
         ),
         scenario(
@@ -624,7 +612,7 @@ def make() -> dict:
                 step(
                     "revoke",
                     "binding_mismatch",
-                    document=revoke(1, ["owner-key"], epoch=EPOCH_2),
+                    document=revoke(1, ["owner-key"], epoch=EPOCH_1),
                 )
             ],
         ),
@@ -632,10 +620,10 @@ def make() -> dict:
             "recovery_requires_new_epoch_for_revocation",
             base() + [
                 step("lose", "locked"),
-                step("recover", "recovered", local_request=True, presence=True, epoch=EPOCH_2),
-                step("local_seed", "seeded", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_3),
+                step("local_seed", "seeded", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, possession=True),
                 step("revoke", "binding_mismatch", document=revoke(1, ["new-app"], epoch=EPOCH_1)),
-                step("revoke", "revoked", document=revoke(1, ["new-app"], epoch=EPOCH_2)),
+                step("revoke", "revoked", document=revoke(1, ["new-app"], epoch=EPOCH_3)),
             ],
         ),
         scenario(

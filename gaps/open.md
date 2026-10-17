@@ -4,12 +4,13 @@ New implementation gaps should be added here, naming the owning repository.
 
 ## tier-c-approvers/v1 ratification and adoption
 
-- **Physical-presence input and first-install history**
-  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` has not
-  demonstrated a commissioned directly wired input for challenge-bound site
-  presence, nor an installation-history marker outside the registry failure
-  domain with an authenticated anti-rollback recovery procedure. These are
-  contract ratification blockers; the state-model vectors do not prove them.
+- **V1 procedural presence and rollback limits**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` must
+  authenticate the local operator process; the installer-at-panel requirement
+  is procedural, not software proof of presence. V1 has no installation marker
+  or protected rollback state. An old SD image can resurrect a revoked
+  credential. A later wired-presence input and independent rollback authority
+  require separate signed bindings and review; neither is a v1 dependency.
 - **Runtime and gateway consumers**
   ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` has no
   registry, local first-approver path, signed enrolment consumer, revocation
@@ -31,7 +32,8 @@ New implementation gaps should be added here, naming the owning repository.
   rejects an approver-revocation operation. A successor socket contract and
   runtime consumer must specify the bounded local request and authenticated
   binding readback. No authenticated automatic disclosure to the product or
-  remote revocation route exists, including after recovery.
+  remote revocation route exists, including after recovery. A compromised
+  credential stays active until someone can reach the site for local delivery.
 - **LAN approval reply dependency**
   ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): the signed LAN reply
   lives in the still-open `lan-app-api/v1` PR #344. A locally seeded or

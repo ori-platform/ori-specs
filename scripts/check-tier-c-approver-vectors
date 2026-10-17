@@ -2,7 +2,7 @@
 """Independently verify the tier-c-approvers/v1 transition corpus.
 
 The generator is not imported. This is a small state model, not a runtime,
-gateway, local-presence, channel-authenticator or database consumer test.
+gateway, channel-authenticator or database consumer test.
 """
 
 from __future__ import annotations
@@ -34,12 +34,11 @@ ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 SITE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 PHONE = re.compile(r"\+[1-9][0-9]{1,14}\Z")
 NAMES = {
-    "bootstrap_once",
-    "bootstrap_requires_local_confirmation",
-    "bootstrap_requires_authenticated_local_request",
-    "bootstrap_refuses_provisioning_contacts",
-    "bootstrap_refuses_multiple_contacts",
-    "unknown_history_refuses_bootstrap",
+    "recovery_once",
+    "first_setup_requires_authenticated_local_request",
+    "recovery_refuses_provisioning_contacts",
+    "recovery_refuses_multiple_contacts",
+    "first_setup_uses_recovery",
     "empty_registry_admits_nobody",
     "local_console_requires_registered_human",
     "empty_registry_local_seed_requires_site_proofs",
@@ -47,10 +46,11 @@ NAMES = {
     "all_revoked_can_seed_new_identity",
     "loss_requires_recovery_not_reseed",
     "enrol_requires_existing_authorizer",
-    "enrol_requires_presence",
+    "enrol_requires_local_request",
     "enrol_requires_possession",
     "phone_candidate_requires_channel_possession",
     "phone_candidate_rejects_wrong_code_and_sender",
+    "phone_candidate_late_reply_refused",
     "duplicate_credential_and_value_refused",
     "challenge_expiry_reuse_change_and_restart",
     "late_authorizer_cannot_use_stale_challenge",
@@ -151,12 +151,12 @@ def verify_wire(corpus: dict[str, Any]) -> None:
         or not binding_id(challenge["device_id"])
         or not SITE.fullmatch(challenge["site_id"])
         or len(strict_b64(challenge["identity_epoch"])) != 16
-        or challenge["operation"] not in {"bootstrap", "recover", "enrol", "local_seed"}
+        or challenge["operation"] not in {"recover", "enrol", "local_seed"}
         or not isinstance(challenge["candidates"], list)
     ):
         raise AssertionError("challenge fields")
     candidates = challenge["candidates"]
-    required_count = {"recover": (0,), "enrol": (1,), "local_seed": (1,), "bootstrap": (0,)}
+    required_count = {"recover": (0,), "enrol": (1,), "local_seed": (1,)}
     if len(candidates) not in required_count[challenge["operation"]]:
         raise AssertionError("challenge candidate count")
     ids = []
@@ -316,8 +316,6 @@ def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def candidate_of(operation: dict[str, Any]) -> Any:
-    if operation["op"] == "bootstrap":
-        return operation.get("contacts", [])
     if operation["op"] == "recover":
         return []
     return {
@@ -330,10 +328,9 @@ def candidate_of(operation: dict[str, Any]) -> Any:
 
 class Registry:
     def __init__(self, initial_mode: str) -> None:
-        if initial_mode not in {"factory_fresh", "unknown"}:
+        if initial_mode != "locked":
             raise ValueError("invalid initial mode")
         self.initialized = False
-        self.factory_fresh = initial_mode == "factory_fresh"
         self.epoch = EPOCH_1
         self.config_site = SITE_ID
         self.revision = 0
@@ -358,12 +355,19 @@ class Registry:
         if kind == "config_site_restore":
             self.config_site = SITE_ID
             return "site_restored"
-        if self.initialized and self.config_site != SITE_ID and kind in {"issue", "bootstrap", "recover", "enrol", "local_seed", "revoke", "open", "admit"}:
+        if self.initialized and self.config_site != SITE_ID and kind in {"issue", "recover", "enrol", "local_seed", "revoke", "open", "admit"}:
             return "site_binding_mismatch"
         if kind == "issue":
             challenge_id = operation["challenge_id"]
             if challenge_id in self.challenges or challenge_id in self.used_challenges:
                 return "challenge_reused"
+            if operation["kind"] == "recover":
+                proposed = operation.get("proposed_epoch")
+                try:
+                    if len(strict_b64(proposed)) != 16 or proposed == self.epoch:
+                        return "malformed"
+                except (TypeError, ValueError):
+                    return "malformed"
             if operation["kind"] == "enrol" and isinstance(operation["candidate"], dict) and operation["candidate"].get("channel") in {"sms", "whatsapp"}:
                 digest = operation.get("phone_code_sha256")
                 if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
@@ -373,6 +377,7 @@ class Registry:
                 "candidate": operation["candidate"],
                 "revision": self.revision,
                 "epoch": self.epoch,
+                "proposed_epoch": operation.get("proposed_epoch"),
                 "sequence": self.sequence,
                 "expired": False,
                 "phone_code_sha256": operation.get("phone_code_sha256"),
@@ -388,7 +393,7 @@ class Registry:
             self.challenges.clear()
             self.proposals.clear()
             return "restarted"
-        if kind in {"bootstrap", "recover", "enrol", "local_seed"}:
+        if kind in {"recover", "enrol", "local_seed"}:
             challenge_id = operation.get("challenge_id")
             if challenge_id in self.used_challenges:
                 return "challenge_reused"
@@ -402,25 +407,8 @@ class Registry:
                 return "candidate_changed"
             if challenge["revision"] != self.revision or challenge["epoch"] != self.epoch:
                 return "challenge_stale"
-        if kind == "bootstrap":
-            if self.initialized:
-                return "already_initialized"
-            if not self.factory_fresh:
-                return "recovery_required"
-            if operation.get("local_request") is not True:
-                return "local_auth_required"
-            if operation.get("presence") is not True:
-                return "presence_required"
-            contacts = operation.get("contacts", [])
-            if contacts:
-                return "contacts_forbidden"
-            self.initialized = True
-            self.factory_fresh = False
-            self.revision = 1
-            return "bootstrapped"
         if kind == "lose":
             self.initialized = False
-            self.factory_fresh = False
             self.active.clear()
             self.values.clear()
             self.approvers.clear()
@@ -431,12 +419,14 @@ class Registry:
         if kind == "recover":
             if operation.get("local_request") is not True:
                 return "local_auth_required"
-            if operation.get("presence") is not True:
-                return "presence_required"
-            if self.initialized or self.factory_fresh:
+            if self.initialized:
                 return "recovery_not_available"
             if operation["epoch"] == self.epoch:
                 return "epoch_not_advanced"
+            if operation["epoch"] != challenge["proposed_epoch"]:
+                return "candidate_changed"
+            if operation.get("contacts", []):
+                return "contacts_forbidden"
             self.epoch = operation["epoch"]
             self.initialized = True
             self.revision = 1
@@ -452,8 +442,6 @@ class Registry:
                 return "active_authorizer_exists"
             if operation.get("local_request") is not True:
                 return "local_auth_required"
-            if operation.get("presence") is not True:
-                return "presence_required"
             if operation.get("channel") != "lan_ed25519":
                 return "lan_key_required"
             if operation.get("possession") is not True:
@@ -482,14 +470,17 @@ class Registry:
                 return "authorizer_not_preexisting"
             if operation.get("local_request") is not True:
                 return "local_auth_required"
-            if operation.get("presence") is not True:
-                return "presence_required"
             channel = operation.get("channel", "lan_ed25519")
             if channel == "lan_ed25519":
                 if operation.get("possession") is not True:
                     return "possession_invalid"
             elif channel in {"sms", "whatsapp"}:
                 reply = operation.get("phone_reply")
+                elapsed = operation.get("phone_elapsed_ms", 0)
+                if type(elapsed) is not int or elapsed < 0:
+                    return "malformed"
+                if elapsed > 600000:
+                    return "possession_expired"
                 if reply is None:
                     return "possession_required"
                 if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
@@ -685,8 +676,8 @@ def mutations(corpus: dict[str, Any]) -> None:
     next(operation for operation in next(
         scenario for scenario in false_seed["scenarios"]
         if scenario["name"] == "empty_registry_local_seed_requires_site_proofs"
-    )["steps"] if operation["op"] == "local_seed" and operation["expect"] == "presence_required")["expect"] = "seeded"
-    mutants.append(("missing presence accepted", false_seed))
+    )["steps"] if operation["op"] == "local_seed" and operation["expect"] == "local_auth_required")["expect"] = "seeded"
+    mutants.append(("missing local authentication accepted", false_seed))
     false_expiry = copy.deepcopy(corpus)
     next(operation for operation in next(
         scenario for scenario in false_expiry["scenarios"]
@@ -699,6 +690,12 @@ def mutations(corpus: dict[str, Any]) -> None:
         if scenario["name"] == "phone_candidate_requires_channel_possession"
     )["steps"] if operation["op"] == "enrol" and operation["expect"] == "possession_required")["expect"] = "enrolled"
     mutants.append(("phone without possession accepted", false_phone))
+    late_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in late_phone["scenarios"]
+        if scenario["name"] == "phone_candidate_late_reply_refused"
+    )["steps"] if operation["op"] == "enrol")["expect"] = "enrolled"
+    mutants.append(("late phone reply accepted", late_phone))
     altered_phone_wire = copy.deepcopy(corpus)
     altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
     mutants.append(("phone wire wrong sender", altered_phone_wire))
