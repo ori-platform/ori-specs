@@ -2,6 +2,23 @@
 
 New implementation gaps should be added here, naming the owning repository.
 
+## tier-c-approvers/v1 ratification and adoption
+
+- **Physical-presence input and first-install history**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` has not
+  demonstrated a commissioned directly wired input for challenge-bound site
+  presence, nor an installation-history marker outside the registry failure
+  domain with an authenticated anti-rollback recovery procedure. These are
+  contract ratification blockers; the state-model vectors do not prove them.
+- **Runtime and gateway consumers**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` has no
+  registry, local first-approver path, signed enrolment consumer, revocation
+  consumer or serialized Tier C admission check. Its current phone sender
+  normalization is more permissive than this draft. `ori-gateway` does not
+  perform the per-request runtime disclosure query; its bounded MQTT pair
+  belongs in `gateway-api/v2` before the LAN surface in #344 can be adopted.
+  The signed-reply path for local-console use is also not implemented.
+
 ## skills-package/v2 adoption targets
 
 Downstream repos were surveyed against v2 rather than repointed. A v1 reference

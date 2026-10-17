@@ -21,34 +21,164 @@ OUT = (
 KEY = Ed25519PrivateKey.from_private_bytes(
     hashlib.sha256(b"ori tier-c-approvers/v1 published test key").digest()
 )
+AUTHORIZER_KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"ori tier-c-approvers/v1 authorizer test key").digest()
+)
+CANDIDATE_KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"ori tier-c-approvers/v1 candidate test key").digest()
+)
+PREVIOUS_KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"ori tier-c-approvers/v1 previous provisioning test key").digest()
+)
+COMMERCIAL_KEY = Ed25519PrivateKey.from_private_bytes(
+    hashlib.sha256(b"ori tier-c-approvers/v1 commercial test key").digest()
+)
 
 
-def revoke(revision: int, targets: list[str], *, epoch: str = "epoch-1") -> dict:
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def public_b64(key: Ed25519PrivateKey) -> str:
+    return base64.b64encode(
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode()
+
+
+def signed_proof(unsigned: dict, *, domain: bytes, key: Ed25519PrivateKey) -> dict:
+    preimage = domain + b"\0" + canonical(unsigned)
+    return {
+        "object": {
+            **unsigned,
+            "signature": base64.b64encode(key.sign(preimage)).decode(),
+        },
+        "preimage_hex": preimage.hex(),
+    }
+
+
+def wire_vectors() -> dict:
+    challenge = {
+        "v": 1,
+        "challenge_id": base64.b64encode(bytes(range(16))).decode(),
+        "device_id": "edge-1",
+        "site_id": "site-1",
+        "identity_epoch": "epoch-1",
+        "operation": "enrol",
+        "registry_revision": 1,
+        "candidates": [
+            {
+                "approver_id": "operator-2",
+                "credential_id": "app-2",
+                "channel": "lan_ed25519",
+                "value": "ed25519:" + public_b64(CANDIDATE_KEY),
+            }
+        ],
+    }
+    digest = hashlib.sha256(canonical(challenge)).hexdigest()
+    authorizer = signed_proof(
+        {
+            "v": 1,
+            "challenge_id": challenge["challenge_id"],
+            "challenge_sha256": digest,
+            "authorizer_credential_id": "app-1",
+        },
+        domain=b"ori.tier_c_approver.enrol.v1",
+        key=AUTHORIZER_KEY,
+    )
+    possession = signed_proof(
+        {
+            "v": 1,
+            "challenge_id": challenge["challenge_id"],
+            "challenge_sha256": digest,
+            "candidate_credential_id": "app-2",
+        },
+        domain=b"ori.tier_c_approver.possession.v1",
+        key=CANDIDATE_KEY,
+    )
+    phone_text = f"ORI-ENROL-V1 {challenge['challenge_id']} {digest}"
+    return {
+        "challenge": challenge,
+        "challenge_canonical_hex": canonical(challenge).hex(),
+        "authorizer_public_key_b64": public_b64(AUTHORIZER_KEY),
+        "authorizer": authorizer,
+        "candidate_public_key_b64": public_b64(CANDIDATE_KEY),
+        "candidate_spki_sha256": hashlib.sha256(
+            CANDIDATE_KEY.public_key().public_bytes(
+                Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+            )
+        ).hexdigest(),
+        "possession": possession,
+        "phone_authorization_ascii_hex": phone_text.encode("ascii").hex(),
+        "phone_value_cases": [
+            {"value": "+2348012345678", "valid": True},
+            {"value": "whatsapp:+2348012345678", "valid": False},
+            {"value": "+1 555 0123", "valid": False},
+            {"value": "+01234", "valid": False},
+            {"value": "08012345678", "valid": False},
+        ],
+    }
+
+
+def revoke(
+    revision: int,
+    targets: list[str],
+    *,
+    epoch: str = "epoch-1",
+    site: str = "site-1",
+    key: Ed25519PrivateKey = KEY,
+    domain: bytes = b"ori.tier_c_approver.revoke.v1",
+) -> dict:
     unsigned = {
         "v": 1,
         "device_id": "edge-1",
-        "site_id": "site-1",
+        "site_id": site,
         "identity_epoch": epoch,
         "revision": revision,
         "targets": sorted(
             target if target.startswith("approver:") else f"credential:{target}"
             for target in targets
         ),
-        "signing_key_id": "test-provisioning",
+        "signing_key": "ed25519:" + public_b64(key),
     }
-    canonical = json.dumps(
-        unsigned, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode()
-    signature = KEY.sign(b"ori.tier_c_approver.revoke.v1\0" + canonical)
+    signature = key.sign(domain + b"\0" + canonical(unsigned))
     return {**unsigned, "signature": base64.b64encode(signature).decode()}
 
 
 def scenario(name: str, steps: list[dict], *, initial_mode: str = "factory_fresh") -> dict:
-    return {"name": name, "initial_mode": initial_mode, "steps": steps}
+    expanded = []
+    for index, operation in enumerate(steps):
+        if operation["op"] in {"bootstrap", "recover", "enrol", "local_seed"} and "challenge_id" not in operation:
+            challenge_id = f"{name}.{index}"
+            expanded.append(step("issue", "issued", challenge_id=challenge_id, kind=operation["op"], candidate=candidate_of(operation)))
+            operation = {**operation, "challenge_id": challenge_id}
+        expanded.append(operation)
+    return {"name": name, "initial_mode": initial_mode, "steps": expanded}
 
 
 def step(op: str, expect: str, **data: object) -> dict:
+    if op == "revoke" and "document" in data:
+        unsigned = {
+            key: value for key, value in data["document"].items() if key != "signature"
+        }
+        data["preimage_hex"] = (
+            b"ori.tier_c_approver.revoke.v1\0" + canonical(unsigned)
+        ).hex()
     return {"op": op, "expect": expect, **data}
+
+
+def candidate_of(operation: dict) -> object:
+    if operation["op"] == "bootstrap":
+        return operation.get("contacts", [])
+    if operation["op"] == "recover":
+        return []
+    return {
+        "credential": operation["credential"],
+        "approver_id": operation.get("approver_id", operation["credential"]),
+        "channel": operation.get("channel", "lan_ed25519"),
+        "value": operation.get("value", operation["credential"]),
+    }
 
 
 def base() -> list[dict]:
@@ -97,6 +227,19 @@ def make() -> dict:
             ],
         ),
         scenario(
+            "bootstrap_rejects_duplicate_contacts",
+            [
+                step("bootstrap", "duplicate_value", local_request=True, presence=True, contacts=["owner-phone", "owner-phone"]),
+                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=["owner-phone"]),
+            ],
+        ),
+        scenario(
+            "bootstrap_rejects_excess_contacts",
+            [
+                step("bootstrap", "malformed", local_request=True, presence=True, contacts=["one", "two", "three"]),
+            ],
+        ),
+        scenario(
             "unknown_history_refuses_bootstrap",
             [
                 step("bootstrap", "recovery_required", local_request=True, presence=True),
@@ -116,6 +259,52 @@ def make() -> dict:
                 ),
                 step("open", "opened", proposal="p1"),
                 step("admit", "credential_unavailable", proposal="p1", credential="x"),
+            ],
+        ),
+        scenario(
+            "local_console_requires_registered_human",
+            [
+                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=[]),
+                step("open", "opened", proposal="p1"),
+                step("admit", "ingress_unauthenticated", proposal="p1", credential="x", channel="local_console", authenticated=False),
+                step("admit", "credential_unavailable", proposal="p1", credential="x", channel="local_console", authenticated=True),
+            ],
+        ),
+        scenario(
+            "empty_registry_local_seed_requires_site_proofs",
+            [
+                step("bootstrap", "bootstrapped", local_request=True, presence=True, contacts=[]),
+                step("open", "opened", proposal="before-seed"),
+                step("local_seed", "local_auth_required", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=False, presence=True, possession=True),
+                step("local_seed", "presence_required", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=False, possession=True),
+                step("local_seed", "lan_key_required", credential="app-1", approver_id="new-owner", channel="sms", local_request=True, presence=True, possession=True),
+                step("local_seed", "possession_invalid", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=False),
+                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("admit", "enrolled_after_proposal", proposal="before-seed", credential="app-1"),
+                step("open", "opened", proposal="after-seed"),
+                step("admit", "approved", proposal="after-seed", credential="app-1"),
+                step("local_seed", "active_authorizer_exists", credential="app-2", approver_id="other-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+            ],
+        ),
+        scenario(
+            "recovery_can_seed_but_closes_old_proposals",
+            base()
+            + [
+                step("open", "opened", proposal="old"),
+                step("lose", "locked"),
+                step("local_seed", "registry_unavailable", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("recover", "recovered", local_request=True, presence=True, epoch="epoch-2"),
+                step("local_seed", "seeded", credential="new-app", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("admit", "proposal_unavailable", proposal="old", credential="new-app"),
+            ],
+        ),
+        scenario(
+            "all_revoked_can_seed_new_identity",
+            base()
+            + [
+                step("revoke", "revoked", document=revoke(1, ["approver:owner-phone"])),
+                step("local_seed", "approver_revoked", credential="app-1", approver_id="owner-phone", channel="lan_ed25519", local_request=True, presence=True, possession=True),
+                step("local_seed", "seeded", credential="app-1", approver_id="new-owner", channel="lan_ed25519", local_request=True, presence=True, possession=True),
             ],
         ),
         scenario(
@@ -185,6 +374,50 @@ def make() -> dict:
                     presence=True,
                     possession=False,
                 ),
+            ],
+        ),
+        scenario(
+            "phone_candidate_has_no_ed25519_possession",
+            base()
+            + [
+                step("enrol", "enrolled", credential="new-phone", channel="sms", value="+2348012345678", authorizer="owner-phone", local_request=True, presence=True, possession=False),
+            ],
+        ),
+        scenario(
+            "duplicate_credential_and_value_refused",
+            base()
+            + [
+                step("enrol", "credential_reused", credential="owner-phone", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "duplicate_value", credential="app-1", value="owner-phone", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "enrolled", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "credential_reused", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+            ],
+        ),
+        scenario(
+            "challenge_expiry_reuse_change_and_restart",
+            base()
+            + [
+                step("issue", "issued", challenge_id="expiring", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
+                step("expire", "expired", challenge_id="expiring"),
+                step("enrol", "challenge_expired", challenge_id="expiring", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("issue", "issued", challenge_id="changed", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
+                step("enrol", "candidate_changed", challenge_id="changed", credential="app-1", value="altered-key", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "challenge_reused", challenge_id="changed", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("issue", "issued", challenge_id="good", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-1"})),
+                step("enrol", "enrolled", challenge_id="good", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "challenge_reused", challenge_id="good", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("issue", "issued", challenge_id="restart", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-2"})),
+                step("restart", "restarted"),
+                step("enrol", "challenge_unavailable", challenge_id="restart", credential="app-2", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+            ],
+        ),
+        scenario(
+            "late_authorizer_cannot_use_stale_challenge",
+            base()
+            + [
+                step("issue", "issued", challenge_id="old-challenge", kind="enrol", candidate=candidate_of({"op": "enrol", "credential": "app-2"})),
+                step("enrol", "enrolled", credential="app-1", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("enrol", "challenge_stale", challenge_id="old-challenge", credential="app-2", authorizer="app-1", local_request=True, presence=True, possession=True),
             ],
         ),
         scenario(
@@ -259,11 +492,20 @@ def make() -> dict:
             ],
         ),
         scenario(
+            "revoked_value_cannot_be_relabelled_in_same_epoch",
+            base()
+            + [
+                step("enrol", "enrolled", credential="app-old", value="key-value", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+                step("revoke", "revoked", document=revoke(1, ["app-old"])),
+                step("enrol", "value_tombstoned", credential="app-new", value="key-value", authorizer="owner-phone", local_request=True, presence=True, possession=True),
+            ],
+        ),
+        scenario(
             "revocation_repeat_regression_conflict",
             base()
             + [
                 step("revoke", "revoked", document=revoke(2, ["owner-phone"])),
-                step("revoke", "replayed", document=revoke(2, ["owner-phone"])),
+                step("revoke", "replayed", document=revoke(2, ["owner-phone"]), document_wire=json.dumps(revoke(2, ["owner-phone"]), indent=2)),
                 step(
                     "revoke", "revision_regressed", document=revoke(1, ["owner-phone"])
                 ),
@@ -273,6 +515,43 @@ def make() -> dict:
         scenario(
             "revocation_unknown_target",
             base() + [step("revoke", "unknown_target", document=revoke(1, ["absent"]))],
+        ),
+        scenario(
+            "unsigned_config_cannot_revoke",
+            base() + [step("revoke", "anchor_unavailable", document=revoke(1, ["owner-phone"]), config_signed=False)],
+        ),
+        scenario(
+            "previous_and_wrong_class_anchors_refused",
+            base()
+            + [
+                step("revoke", "superseded_signer", document=revoke(1, ["owner-phone"], key=PREVIOUS_KEY)),
+                step("revoke", "wrong_authority", document=revoke(1, ["owner-phone"], key=COMMERCIAL_KEY)),
+                step("revoke", "revoked", document=revoke(1, ["owner-phone"])),
+            ],
+        ),
+        scenario(
+            "malformed_revocation_documents",
+            base()
+            + [
+                step("revoke", "malformed", document={**revoke(1, ["owner-phone"]), "unexpected": 1}),
+                step("revoke", "malformed", document={**revoke(1, ["owner-phone"]), "targets": ["credential:owner-phone", "credential:owner-phone"]}),
+                step("revoke", "malformed", document={**revoke(1, ["owner-phone"]), "targets": ["credential:z", "credential:a"]}),
+                step("revoke", "malformed", document={**revoke(1, ["owner-phone"]), "revision": True}),
+                step("revoke", "malformed", document={**revoke(1, ["owner-phone"]), "targets": []}),
+                step("revoke", "unknown_signer", document={**revoke(1, ["owner-phone"]), "signing_key": "ed25519:" + public_b64(CANDIDATE_KEY)}),
+                step("revoke", "signature_invalid", document=revoke(1, ["owner-phone"], domain=b"wrong.domain")),
+                step("revoke", "malformed", document=revoke(1, ["owner-phone"]), document_wire='{"v":1,"v":1}'),
+                step("revoke", "revoked", document=revoke(1, ["owner-phone"])),
+            ],
+        ),
+        scenario(
+            "unknown_target_makes_revocation_atomic",
+            base()
+            + [
+                step("revoke", "unknown_target", document=revoke(1, ["owner-phone", "zzz-absent"])),
+                step("open", "opened", proposal="p1"),
+                step("admit", "approved", proposal="p1", credential="owner-phone"),
+            ],
         ),
         scenario(
             "approver_revocation_removes_all_credentials",
@@ -294,6 +573,13 @@ def make() -> dict:
                     "binding_mismatch",
                     document=revoke(1, ["owner-phone"], epoch="epoch-2"),
                 )
+            ],
+        ),
+        scenario(
+            "unicode_binding_is_canonical_but_wrong_site",
+            base()
+            + [
+                step("revoke", "binding_mismatch", document=revoke(1, ["owner-phone"], site="sité")),
             ],
         ),
         scenario(
@@ -329,6 +615,9 @@ def make() -> dict:
         "provisioning_test_public_key_b64": base64.b64encode(
             KEY.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         ).decode(),
+        "previous_test_public_key_b64": public_b64(PREVIOUS_KEY),
+        "commercial_test_public_key_b64": public_b64(COMMERCIAL_KEY),
+        "wire": wire_vectors(),
         "scenarios": cases,
     }
 
