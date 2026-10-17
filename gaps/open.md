@@ -18,6 +18,25 @@ New implementation gaps should be added here, naming the owning repository.
   perform the per-request runtime disclosure query; its bounded MQTT pair
   belongs in `gateway-api/v2` before the LAN surface in #344 can be adopted.
   The signed-reply path for local-console use is also not implemented.
+- **Phone possession and identity-source consumers**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` does not
+  read and enforce the proposed signed site binding, mint epoch/credential IDs,
+  or require the candidate
+  phone's challenge-bound reply before enrolment. First setup must leave the
+  registry empty; existing provisioning contacts cannot be copied into it.
+  The draft `runtime-config/v2` field `device.site_id` has no consumer yet.
+  A signed site-ID change locks Tier C; v1 has no site-transfer operation.
+- **Local revocation delivery and recovery disclosure**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `operator-socket/v2`
+  rejects an approver-revocation operation. A successor socket contract and
+  runtime consumer must specify the bounded local request and authenticated
+  binding readback. No authenticated automatic disclosure to the product or
+  remote revocation route exists, including after recovery.
+- **LAN approval reply dependency**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): the signed LAN reply
+  lives in the still-open `lan-app-api/v1` PR #344. A locally seeded or
+  recovered registry cannot approve Tier C until that contract and its runtime
+  consumer exist; the safe default remains non-actuating.
 
 ## skills-package/v2 adoption targets
 

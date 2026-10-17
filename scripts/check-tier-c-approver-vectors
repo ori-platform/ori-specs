@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import copy
 import hashlib
+import hmac
 import json
 import pathlib
 import re
@@ -21,19 +22,23 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tier-c-approvers" / "vectors" / "transitions.json"
+SITE_ID = "site-1"
+EPOCH_1 = base64.b64encode(bytes(range(32, 48))).decode("ascii")
+EPOCH_2 = base64.b64encode(bytes(range(48, 64))).decode("ascii")
 PUBLIC_KEY = "CoCYmi2u1NnDLsVzNMglg2Ied+0M9Z74rgNvSGRBAdg="
 AUTHORIZER_KEY = "G+iK7S8KwwBgPTDfWHUa2qXxh2r9KBaZmOxrP9PYLW4="
 CANDIDATE_KEY = "8XnYUJphUTQZaYHMhM3opouum4CDrAakyby4v9KuZX0="
 PREVIOUS_KEY = "pATYfctmcQzVhHk+Aa6SZWUQCtxMIBDD2/WXjR68x9k="
 COMMERCIAL_KEY = "CzJf9IyhyTJ8DQpovGI8heykR+smA0porxw3cqIXgMY="
 ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+SITE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 PHONE = re.compile(r"\+[1-9][0-9]{1,14}\Z")
 NAMES = {
     "bootstrap_once",
     "bootstrap_requires_local_confirmation",
     "bootstrap_requires_authenticated_local_request",
-    "bootstrap_rejects_duplicate_contacts",
-    "bootstrap_rejects_excess_contacts",
+    "bootstrap_refuses_provisioning_contacts",
+    "bootstrap_refuses_multiple_contacts",
     "unknown_history_refuses_bootstrap",
     "empty_registry_admits_nobody",
     "local_console_requires_registered_human",
@@ -44,7 +49,8 @@ NAMES = {
     "enrol_requires_existing_authorizer",
     "enrol_requires_presence",
     "enrol_requires_possession",
-    "phone_candidate_has_no_ed25519_possession",
+    "phone_candidate_requires_channel_possession",
+    "phone_candidate_rejects_wrong_code_and_sender",
     "duplicate_credential_and_value_refused",
     "challenge_expiry_reuse_change_and_restart",
     "late_authorizer_cannot_use_stale_challenge",
@@ -60,7 +66,9 @@ NAMES = {
     "unknown_target_makes_revocation_atomic",
     "approver_revocation_removes_all_credentials",
     "revocation_wrong_epoch",
-    "unicode_binding_is_canonical_but_wrong_site",
+    "recovery_requires_new_epoch_for_revocation",
+    "invalid_site_binding_is_malformed",
+    "signed_site_change_locks_admission",
     "revocation_before_admission",
     "admission_before_revocation_stands",
 }
@@ -140,13 +148,15 @@ def verify_wire(corpus: dict[str, Any]) -> None:
         or type(challenge["registry_revision"]) is not int
         or challenge["registry_revision"] < 0
         or len(strict_b64(challenge["challenge_id"])) != 16
-        or any(not binding_id(challenge[name]) for name in ("device_id", "site_id", "identity_epoch"))
+        or not binding_id(challenge["device_id"])
+        or not SITE.fullmatch(challenge["site_id"])
+        or len(strict_b64(challenge["identity_epoch"])) != 16
         or challenge["operation"] not in {"bootstrap", "recover", "enrol", "local_seed"}
         or not isinstance(challenge["candidates"], list)
     ):
         raise AssertionError("challenge fields")
     candidates = challenge["candidates"]
-    required_count = {"recover": (0,), "enrol": (1,), "local_seed": (1,), "bootstrap": (0, 1, 2)}
+    required_count = {"recover": (0,), "enrol": (1,), "local_seed": (1,), "bootstrap": (0,)}
     if len(candidates) not in required_count[challenge["operation"]]:
         raise AssertionError("challenge candidate count")
     ids = []
@@ -211,6 +221,28 @@ def verify_wire(corpus: dict[str, Any]) -> None:
     expected_phone = f"ORI-ENROL-V1 {challenge['challenge_id']} {digest}".encode("ascii")
     if wire["phone_authorization_ascii_hex"] != expected_phone.hex():
         raise AssertionError("phone authorization bytes")
+    phone = wire["phone_candidate"]
+    phone_challenge = phone["challenge"]
+    if set(phone_challenge) != set(challenge) or phone_challenge["operation"] != "enrol":
+        raise AssertionError("phone challenge members")
+    if len(phone_challenge["candidates"]) != 1 or phone_challenge["candidates"][0]["channel"] != "sms":
+        raise AssertionError("phone candidate channel")
+    if len(strict_b64(phone_challenge["challenge_id"])) != 16:
+        raise AssertionError("phone challenge id")
+    if canonical_profile2(phone_challenge).hex() != phone["challenge_canonical_hex"]:
+        raise AssertionError("phone challenge canonical bytes")
+    reply = phone["reply"]
+    if reply["sender"] != phone_challenge["candidates"][0]["value"] or reply["channel"] != "sms":
+        raise AssertionError("phone reply attribution")
+    sent = bytes.fromhex(phone["sent_ascii_hex"])
+    if sent != bytes.fromhex(reply["text_ascii_hex"]):
+        raise AssertionError("phone reply bytes")
+    prefix = f"ORI-POSSESS-V1 {phone_challenge['challenge_id']} ".encode("ascii")
+    if not sent.startswith(prefix):
+        raise AssertionError("phone possession prefix")
+    code = sent[len(prefix):].decode("ascii")
+    if len(strict_b64(code)) != 16 or hashlib.sha256(code.encode("ascii")).hexdigest() != phone["code_sha256"]:
+        raise AssertionError("phone possession code")
     expected_phone_values = {
         "+2348012345678": True,
         "whatsapp:+2348012345678": False,
@@ -240,8 +272,10 @@ def revocation_reason(document: Any) -> str | None:
         if (
             type(document["v"]) is not int or document["v"] != 1
             or type(document["revision"]) is not int or document["revision"] < 1
-            or any(not binding_id(document[name]) for name in ("device_id", "site_id", "identity_epoch"))
-            or not isinstance(targets, list) or not targets
+            or not binding_id(document["device_id"])
+            or not SITE.fullmatch(document["site_id"])
+            or len(strict_b64(document["identity_epoch"])) != 16
+            or not isinstance(targets, list) or not targets or len(targets) > 32
             or any(not isinstance(x, str) or not re.fullmatch(r"(?:credential|approver):[A-Za-z0-9._-]{1,64}", x) for x in targets)
             or targets != sorted(set(targets))
             or not isinstance(document["signing_key"], str)
@@ -300,7 +334,8 @@ class Registry:
             raise ValueError("invalid initial mode")
         self.initialized = False
         self.factory_fresh = initial_mode == "factory_fresh"
-        self.epoch = "epoch-1"
+        self.epoch = EPOCH_1
+        self.config_site = SITE_ID
         self.revision = 0
         self.external_revision = 0
         self.last_external_document: str | None = None
@@ -316,10 +351,23 @@ class Registry:
 
     def apply(self, operation: dict[str, Any]) -> str:
         kind = operation["op"]
+        if kind == "config_site_change":
+            self.config_site = operation["site_id"]
+            self.proposals.clear()
+            return "site_locked"
+        if kind == "config_site_restore":
+            self.config_site = SITE_ID
+            return "site_restored"
+        if self.initialized and self.config_site != SITE_ID and kind in {"issue", "bootstrap", "recover", "enrol", "local_seed", "revoke", "open", "admit"}:
+            return "site_binding_mismatch"
         if kind == "issue":
             challenge_id = operation["challenge_id"]
             if challenge_id in self.challenges or challenge_id in self.used_challenges:
                 return "challenge_reused"
+            if operation["kind"] == "enrol" and isinstance(operation["candidate"], dict) and operation["candidate"].get("channel") in {"sms", "whatsapp"}:
+                digest = operation.get("phone_code_sha256")
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    return "malformed"
             self.challenges[challenge_id] = {
                 "kind": operation["kind"],
                 "candidate": operation["candidate"],
@@ -327,6 +375,7 @@ class Registry:
                 "epoch": self.epoch,
                 "sequence": self.sequence,
                 "expired": False,
+                "phone_code_sha256": operation.get("phone_code_sha256"),
             }
             return "issued"
         if kind == "expire":
@@ -362,19 +411,12 @@ class Registry:
                 return "local_auth_required"
             if operation.get("presence") is not True:
                 return "presence_required"
-            contacts = operation["contacts"]
-            if len(contacts) > 2:
-                return "malformed"
-            if len(contacts) != len(set(contacts)):
-                return "duplicate_value"
+            contacts = operation.get("contacts", [])
+            if contacts:
+                return "contacts_forbidden"
             self.initialized = True
             self.factory_fresh = False
             self.revision = 1
-            for identifier in contacts:
-                self.sequence += 1
-                self.active[identifier] = self.sequence
-                self.values[identifier] = identifier
-                self.approvers[identifier] = identifier
             return "bootstrapped"
         if kind == "lose":
             self.initialized = False
@@ -442,8 +484,34 @@ class Registry:
                 return "local_auth_required"
             if operation.get("presence") is not True:
                 return "presence_required"
-            if operation.get("channel", "lan_ed25519") == "lan_ed25519" and operation.get("possession") is not True:
-                return "possession_invalid"
+            channel = operation.get("channel", "lan_ed25519")
+            if channel == "lan_ed25519":
+                if operation.get("possession") is not True:
+                    return "possession_invalid"
+            elif channel in {"sms", "whatsapp"}:
+                reply = operation.get("phone_reply")
+                if reply is None:
+                    return "possession_required"
+                if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
+                    return "possession_invalid"
+                prefix = f"ORI-POSSESS-V1 {challenge_id} "
+                text = reply["text"]
+                if not isinstance(text, str) or not text.startswith(prefix):
+                    return "possession_invalid"
+                code = text[len(prefix):]
+                try:
+                    if len(strict_b64(code)) != 16:
+                        return "possession_invalid"
+                except (ValueError, TypeError):
+                    return "possession_invalid"
+                if (reply["authenticated"] is not True or
+                    reply["sender"] != operation.get("value") or
+                    reply["channel"] != channel or
+                    challenge["phone_code_sha256"] is None or
+                    not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), challenge["phone_code_sha256"])):
+                    return "possession_invalid"
+            else:
+                return "malformed"
             identifier = operation["credential"]
             approver_id = operation.get("approver_id", identifier)
             value = operation.get("value", identifier)
@@ -462,6 +530,8 @@ class Registry:
             self.revision += 1
             return "enrolled"
         if kind == "open":
+            if self.config_site != SITE_ID:
+                return "site_binding_mismatch"
             if operation["proposal"] in self.proposals:
                 return "proposal_exists"
             self.proposals[operation["proposal"]] = {
@@ -471,6 +541,14 @@ class Registry:
             }
             return "opened"
         if kind == "revoke":
+            request_bytes = operation.get("document_wire")
+            if request_bytes is None:
+                request_bytes = canonical_profile2(operation["document"])
+            else:
+                request_bytes = request_bytes.encode("utf-8")
+            request_bytes = b'{"operation":"approver_registry_revoke","document":' + request_bytes + b'}'
+            if len(request_bytes) > 16_384:
+                return "payload_too_large"
             if operation.get("config_signed", True) is not True:
                 return "anchor_unavailable"
             if "document_wire" in operation:
@@ -485,7 +563,7 @@ class Registry:
                 return reason
             if (
                 document["device_id"] != "edge-1"
-                or document["site_id"] != "site-1"
+                or document["site_id"] != SITE_ID
                 or document["identity_epoch"] != self.epoch
             ):
                 return "binding_mismatch"
@@ -522,6 +600,8 @@ class Registry:
             self.revision += 1
             return "revoked"
         if kind == "admit":
+            if self.config_site != SITE_ID:
+                return "site_binding_mismatch"
             proposal = self.proposals.get(operation["proposal"])
             if proposal is None:
                 return "proposal_unavailable"
@@ -613,6 +693,15 @@ def mutations(corpus: dict[str, Any]) -> None:
         if scenario["name"] == "challenge_expiry_reuse_change_and_restart"
     )["steps"] if operation["op"] == "enrol" and operation["expect"] == "challenge_expired")["expect"] = "enrolled"
     mutants.append(("expired challenge accepted", false_expiry))
+    false_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in false_phone["scenarios"]
+        if scenario["name"] == "phone_candidate_requires_channel_possession"
+    )["steps"] if operation["op"] == "enrol" and operation["expect"] == "possession_required")["expect"] = "enrolled"
+    mutants.append(("phone without possession accepted", false_phone))
+    altered_phone_wire = copy.deepcopy(corpus)
+    altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
+    mutants.append(("phone wire wrong sender", altered_phone_wire))
     for name, mutant in mutants:
         try:
             check(mutant, announce=False)
