@@ -535,16 +535,20 @@ accurate description of what a repo implements.
   So the definition and both implementations exist; what is missing is that
   nothing yet *acts* on it. `ori-edge-firmware` still derives
   `runtime_reachable` from broker connectivity, so a live broker with a dead
-  runtime leaves the Local Interlock suppressed while nothing upstream can
-  respond — the supervision gap this signal exists to close remains open in
+  runtime would leave the Local Interlock suppressed, once an image evaluates
+  one, while nothing upstream can respond — the supervision gap this signal exists to close remains open in
   practice.
 
   Remaining: the `runtime_reachable` switchover, sequenced last because it
   changes when a physical backstop is allowed to act; hardware-in-the-loop
   evidence for the broker-alive/runtime-dead case; and the safe-maintenance
-  lifecycle, since manifest transitions currently lapse supervision and no
-  unattended physical load should depend on it until they do not. Tracked in
-  `ori-edge-firmware` and `ori-specs`.
+  lifecycle. Until that lifecycle exists, firmware-commands/v2 permits the
+  switchover and requires an installation that gates an unattended load on
+  liveness to perform no capability transition without a person at the load
+  or the load held safe by means outside the device. A device that gates its
+  interlock on liveness also needs a decided way to clear a latched trip,
+  which this contract does not define.
+  Tracked in `ori-edge-firmware` and `ori-specs`.
 
 ## firmware-commands/v1 protocol targets
 
@@ -558,7 +562,7 @@ accurate description of what a repo implements.
   release of either does: the runtime signs in the domains only for a
   declaring device, and the edge firmware verifies only in them and declares
   them in every manifest. Declaring the domains also declares that the device
-  accepts runtime liveness at `v` `2`, and no edge firmware test yet ties the
+  accepts runtime liveness at `v` `2`, and an edge firmware host test ties the
   declaration to that acceptance. Tracked in `ori-runtime` and
   `ori-edge-firmware`.
 
