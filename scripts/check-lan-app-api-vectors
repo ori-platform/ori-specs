@@ -16,6 +16,7 @@ import json
 import pathlib
 import re
 import sys
+from functools import lru_cache
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
@@ -66,6 +67,7 @@ REPLY_FIELDS = {
     "device_id",
     "identity_epoch",
     "proposal_id",
+    "authority_snapshot_digest",
     "reply",
     "client_nonce",
     "app_signature",
@@ -93,32 +95,51 @@ PAIR_CASES = {
 SESSION_CASES = {
     "offline_key_session", "expired_challenge", "replayed_challenge",
     "restart_loses_challenge", "different_client_key", "storage_failure",
+    "binding_mismatch_and_expired", "expired_and_replayed_challenge",
     "malformed_proof", "tampered_session_proof",
 }
-REPLY_CASES = {
+RUNTIME_REPLY_CASES = {
     "valid_enrolled_reply",
     "registry_unavailable",
     "key_not_enrolled",
     "revoked_key",
     "enrolled_after_proposal",
-    "old_epoch",
+    "old_epoch", "old_epoch_and_different_proposal",
     "different_proposal",
     "altered_reply",
-    "signed_no_is_only_relayed",
+    "tampered_snapshot_digest",
+    "revoked_key_wrong_site",
+    "signed_other_snapshot", "other_snapshot_and_late_enrolment",
+    "signed_no_records_refusal",
     "no_product_grant_needed",
-    "session_expired",
-    "session_lost_on_restart",
-    "nonce_reused_with_changed_bytes",
     "malformed_reply_member",
-    "nonce_retry_same_bytes",
-    "revoked_session",
+}
+GATEWAY_REPLY_CASES = {
+    "new_reply_queued", "signed_no_queued", "session_expired",
+    "expired_session_and_wrong_key",
+    "session_lost_on_restart", "nonce_reused_with_changed_bytes",
+    "nonce_retry_same_bytes", "nonce_retry_after_registry_revocation",
+    "nonce_retry_different_key",
+    "nonce_retry_different_path",
+    "bad_application_signature", "different_path_proposal", "outbox_unavailable",
 }
 DISCLOSURE_CASES = {
     "active_key_open_proposal", "runtime_timeout", "runtime_no_reply",
     "registry_unavailable", "revoked_key", "new_key_old_proposal",
-    "closed_proposal", "mismatched_response",
+    "closed_proposal", "mismatched_response", "forged_then_valid",
+    "forged_then_timeout", "mismatch_then_valid",
+}
+RUNTIME_REQUEST_CASES = {
+    "verified_request", "topic_mismatch_valid_signature",
+    "valid_topic_bad_signature", "verification_fault", "stale_request",
+    "replayed_request", "oversized_request", "malformed_request",
 }
 RELAY_STATUS_CASES = {"queued_only", "gateway_claims_approved"}
+PROPOSAL_RESPONSE_CASES = {
+    "allowed_proposal", "missing_snapshot_digest", "gateway_inferred_epoch",
+    "gateway_changed_snapshot", "unallowed_id", "more_than_100_candidates",
+    "empty_candidates", "unexpected_outer_member", "oversized_summary",
+}
 
 
 def decode_b64(value: str) -> bytes:
@@ -164,6 +185,70 @@ def signed_ok(
 
 def digest(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+@lru_cache(maxsize=None)
+def check_order(marker: str) -> tuple[tuple[str, str], ...]:
+    """Read the check order and outcomes from the contract, not this model."""
+    section = (ROOT / "lan-app-api" / "v1.md").read_text().split(marker, 1)[1]
+    lines = section[section.index("| Order | Check ID |"):].splitlines()
+    if not lines[1].startswith("| --- | --- | --- |"):
+        raise AssertionError(f"{marker}: malformed order table")
+    order = []
+    for line in lines[2:]:
+        if not line.startswith("|"):
+            break
+        cells = [cell.strip().strip("`") for cell in line.strip("|").split("|")]
+        if len(cells) != 3 or cells[0] != str(len(order) + 1):
+            raise AssertionError(f"{marker}: nonconsecutive or malformed check row")
+        order.append((cells[1], cells[2]))
+    if not order:
+        raise AssertionError(f"{marker}: empty check table")
+    return tuple(order)
+
+
+def ordered_result(marker: str, checks: dict[str, Any], success: str) -> str:
+    order = check_order(marker)
+    if {step for step, _ in order} != set(checks):
+        raise AssertionError(f"{marker}: checker and contract steps disagree")
+    for step, result in order:
+        if checks[step]():
+            return result
+    return success
+
+
+def reply_shape_invalid(reply: dict[str, Any]) -> bool:
+    if set(reply) != REPLY_FIELDS:
+        return True
+    try:
+        return (
+            type(reply["v"]) is not int or reply["v"] != 1
+            or reply["reply"] not in {"yes", "no"}
+            or not re.fullmatch(r"[A-Z0-9]{8}", reply["proposal_id"])
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", reply["authority_snapshot_digest"])
+            or len(decode_b64(reply["identity_epoch"])) != 16
+            or len(decode_b64(reply["client_nonce"])) != 16
+            or not all(isinstance(reply[name], str) and reply[name]
+                       for name in ("site_id", "device_id"))
+        )
+    except (TypeError, ValueError, KeyError):
+        return True
+
+
+def application_proof_ok(reply: dict[str, Any], spki_b64: str) -> bool:
+    if not signed_ok(
+        reply, fields=REPLY_FIELDS, signature_field="app_signature",
+        purpose="ori.lan.reply.v1", public_key_b64=KEYS["app"],
+    ):
+        return False
+    try:
+        spki = decode_b64(spki_b64)
+        public_key = load_der_public_key(spki)
+        return (isinstance(public_key, Ed25519PublicKey)
+                and public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
+                == decode_b64(KEYS["app"]))
+    except (TypeError, ValueError):
+        return False
 
 
 def pairing_reason(
@@ -235,90 +320,129 @@ def pairing_reason(
     return "accept"
 
 
-def reply_reason(
+def gateway_reply_reason(
     reply: dict[str, Any],
     spki_b64: str,
     ctx: dict[str, Any],
 ) -> str:
-    if set(reply) != REPLY_FIELDS:
-        return "malformed"
-    try:
-        if (type(reply["v"]) is not int or reply["v"] != 1
-                or reply["reply"] not in {"yes", "no"}
-                or not re.fullmatch(r"[A-Z0-9]{8}", reply["proposal_id"])
-                or len(decode_b64(reply["identity_epoch"])) != 16
-                or len(decode_b64(reply["client_nonce"])) != 16):
-            return "malformed"
-    except (TypeError, ValueError):
-        return "malformed"
-    if not ctx["session_live"]:
-        return "session_expired"
-    if not signed_ok(
-        reply,
-        fields=REPLY_FIELDS,
-        signature_field="app_signature",
-        purpose="ori.lan.reply.v1",
-        public_key_b64=KEYS["app"],
-    ):
-        return "unauthenticated"
-    app_spki = decode_b64(spki_b64)
-    public_key = load_der_public_key(app_spki)
-    if (
-        not isinstance(public_key, Ed25519PublicKey)
-        or public_key.public_bytes(Encoding.Raw, PublicFormat.Raw)
-        != decode_b64(KEYS["app"])
-        or digest(app_spki) != ctx["app_spki_sha256"]
-    ):
-        return "unauthenticated"
-    if reply["site_id"] != ctx["site_id"] or reply["device_id"] != ctx["device_id"]:
-        return "proposal_mismatch"
-    if (not ctx["registry_available"] or not ctx["credential_active"]
-            or ctx["credential_sequence"] > ctx["proposal_cutoff"]
-            or reply["identity_epoch"] != ctx["identity_epoch"]):
-        return "credential_unavailable"
-    if ctx["proposal_id"] != reply["proposal_id"]:
-        return "proposal_mismatch"
-    if ctx["nonce_conflict"]:
-        return "nonce_reused"
-    if ctx["nonce_duplicate"]:
-        return "stored_relay"
-    return "relay"
+    return ordered_result("For a proposal reply, the gateway HTTP layer", {
+        "http_shape": lambda: reply_shape_invalid(reply),
+        "http_session": lambda: not ctx["session_live"],
+        "http_exact_retry": lambda: ctx.get("stored_reply") == reply,
+        "http_nonce_conflict": lambda: ctx["nonce_conflict"] or
+        (ctx.get("stored_reply") is not None and ctx["stored_reply"] != reply),
+        "http_key_proof": lambda: not application_proof_ok(reply, spki_b64)
+        or digest(decode_b64(spki_b64)) != ctx["app_spki_sha256"],
+        "http_binding": lambda: reply["site_id"] != ctx["site_id"]
+        or reply["device_id"] != ctx["device_id"]
+        or reply["proposal_id"] != ctx["path_proposal_id"],
+        "http_outbox": lambda: not ctx["outbox_ok"],
+    }, "queued")
+
+
+def runtime_reply_reason(reply: dict[str, Any], spki_b64: str,
+                         ctx: dict[str, Any]) -> str:
+    return ordered_result("At runtime, after", {
+        "runtime_shape": lambda: reply_shape_invalid(reply),
+        "runtime_app_signature": lambda: not application_proof_ok(reply, spki_b64),
+        "runtime_active_key": lambda: not ctx["registry_available"]
+        or not ctx["credential_active"]
+        or digest(decode_b64(spki_b64))[7:] != ctx["registry_spki_hex"],
+        "runtime_site_device": lambda: reply["site_id"] != ctx["site_id"]
+        or reply["device_id"] != ctx["device_id"],
+        "runtime_epoch": lambda: reply["identity_epoch"] != ctx["identity_epoch"],
+        "runtime_proposal_id": lambda: reply["proposal_id"] != ctx["proposal_id"],
+        "runtime_snapshot_digest": lambda:
+        reply["authority_snapshot_digest"] != ctx["authority_snapshot_digest"],
+        "runtime_cutoff": lambda:
+        ctx["credential_sequence"] > ctx["proposal_cutoff"],
+    }, "refusal" if reply.get("reply") == "no" else "eligible")
 
 
 def session_reason(proof: dict[str, Any], ctx: dict[str, Any]) -> str:
-    if set(proof) != SESSION_FIELDS or proof.get("v") != 1:
-        return "malformed"
-    try:
-        if len(decode_b64(proof["challenge"])) != 16:
-            return "malformed"
-    except (ValueError, TypeError):
-        return "malformed"
-    if (not signed_ok(proof, fields=SESSION_FIELDS,
-                      signature_field="signature",
-                      purpose="ori.lan.proposal-session.v1",
-                      public_key_b64=KEYS["app"])
-            or proof["app_spki_sha256"] != ctx["app_spki_sha256"]):
-        return "unauthenticated"
-    if (proof["site_id"] != ctx["site_id"]
-            or proof["device_id"] != ctx["device_id"]
-            or proof["challenge"] != ctx["challenge"]):
-        return "binding_mismatch"
-    if ctx["restarted"] or ctx["age_ms"] > 30000:
-        return "session_expired"
-    if ctx["used"]:
-        return "nonce_reused"
-    if not ctx["storage_ok"]:
-        return "storage_unavailable"
-    return "session"
+    def bad_shape() -> bool:
+        if set(proof) != SESSION_FIELDS or proof.get("v") != 1:
+            return True
+        try:
+            return len(decode_b64(proof["challenge"])) != 16
+        except (ValueError, TypeError):
+            return True
+    return ordered_result("For a local proposal session,", {
+        "session_shape": bad_shape,
+        "session_key_proof": lambda: not signed_ok(
+            proof, fields=SESSION_FIELDS, signature_field="signature",
+            purpose="ori.lan.proposal-session.v1", public_key_b64=KEYS["app"])
+        or proof["app_spki_sha256"] != ctx["app_spki_sha256"],
+        "session_binding": lambda: proof["site_id"] != ctx["site_id"]
+        or proof["device_id"] != ctx["device_id"]
+        or proof["challenge"] != ctx["challenge"],
+        "session_challenge_live": lambda: ctx["restarted"] or ctx["age_ms"] > 30000,
+        "session_challenge_unused": lambda: ctx["used"],
+        "session_store": lambda: not ctx["storage_ok"],
+    }, "session")
 
 
 def disclosure_reason(ctx: dict[str, Any]) -> str:
-    if (ctx["response_ms"] is None or ctx["response_ms"] > 2000
-            or not ctx["response_matches"] or not ctx["registry_available"]
-            or not ctx["credential_active"] or not ctx["proposal_open"]
-            or ctx["credential_sequence"] > ctx["proposal_cutoff"]):
-        return "deny"
-    return "allow"
+    eligible = (ctx["registry_available"] and ctx["credential_active"]
+                and ctx["proposal_open"]
+                and ctx["credential_sequence"] <= ctx["proposal_cutoff"])
+    for event in sorted(ctx["response_events"], key=lambda item: item["at_ms"]):
+        if event["at_ms"] > 2000:
+            break
+        if not event["verified"] or not event["matches"]:
+            continue
+        return "allow" if eligible else "deny"
+    return "deny"
+
+
+def runtime_request_outcome(ctx: dict[str, Any]) -> str:
+    return "answer" if all(ctx[key] for key in (
+        "topic_matches", "signature_valid", "verification_ok", "fresh",
+        "replay_valid", "size_ok", "members_ok",
+    )) else "drop_no_answer"
+
+
+def proposal_response_reason(response: dict[str, Any], ctx: dict[str, Any]) -> str:
+    if ctx["projected_count"] > 100:
+        return "refuse_no_metadata"
+    if set(response) != {"v", "site_id", "device_id", "proposals"}:
+        return "malformed"
+    if (type(response["v"]) is not int or response["v"] != 1
+            or response["site_id"] != ctx["site_id"]
+            or response["device_id"] != ctx["device_id"]
+            or not isinstance(response["proposals"], list)
+            or len(response["proposals"]) > 100):
+        return "malformed"
+    ids = []
+    for item in response["proposals"]:
+        if not isinstance(item, dict) or set(item) != {
+            "proposal_id", "created_at_ms", "expires_at_ms", "summary",
+            "authority_snapshot_digest", "identity_epoch",
+        }:
+            return "malformed"
+        try:
+            valid = (
+                re.fullmatch(r"[A-Z0-9]{8}", item["proposal_id"])
+                and type(item["created_at_ms"]) is int
+                and type(item["expires_at_ms"]) is int
+                and item["created_at_ms"] < item["expires_at_ms"]
+                and isinstance(item["summary"], str)
+                and len(item["summary"].encode("utf-8")) <= 256
+                and re.fullmatch(r"sha256:[0-9a-f]{64}", item["authority_snapshot_digest"])
+                and len(decode_b64(item["identity_epoch"])) == 16
+            )
+        except (TypeError, ValueError):
+            return "malformed"
+        if not valid:
+            return "malformed"
+        ids.append(item["proposal_id"])
+        if (item["proposal_id"] not in ctx["allowed_ids"]
+                or item["identity_epoch"] != ctx["runtime_epoch"]
+                or item["authority_snapshot_digest"] != ctx["projection_digest"]):
+            return "unauthorized_metadata"
+    if ids != sorted(set(ids)):
+        return "malformed"
+    return "valid"
 
 
 def relay_status_reason(response: dict[str, Any], reply: dict[str, Any]) -> str:
@@ -336,18 +460,31 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
     fixtures = corpus["fixtures"]
     base_context = corpus["pairing_context"]
     pair_names = {case["name"] for case in corpus["pairing_cases"]}
-    reply_names = {case["name"] for case in corpus["reply_cases"]}
+    gateway_reply_names = {case["name"] for case in corpus["gateway_reply_cases"]}
+    runtime_reply_names = {case["name"] for case in corpus["runtime_reply_cases"]}
     session_names = {case["name"] for case in corpus["session_cases"]}
     disclosure_names = {case["name"] for case in corpus["disclosure_cases"]}
+    runtime_request_names = {case["name"] for case in corpus["runtime_request_cases"]}
+    proposal_response_names = {case["name"] for case in corpus["proposal_response_cases"]}
     relay_status_names = {case["name"] for case in corpus["relay_status_cases"]}
     if pair_names != PAIR_CASES or len(corpus["pairing_cases"]) != len(PAIR_CASES):
         raise AssertionError("pairing refusal coverage changed")
-    if reply_names != REPLY_CASES or len(corpus["reply_cases"]) != len(REPLY_CASES):
-        raise AssertionError("reply refusal coverage changed")
+    if (gateway_reply_names != GATEWAY_REPLY_CASES
+            or len(corpus["gateway_reply_cases"]) != len(GATEWAY_REPLY_CASES)):
+        raise AssertionError("gateway reply coverage changed")
+    if (runtime_reply_names != RUNTIME_REPLY_CASES
+            or len(corpus["runtime_reply_cases"]) != len(RUNTIME_REPLY_CASES)):
+        raise AssertionError("runtime reply coverage changed")
     if session_names != SESSION_CASES or len(corpus["session_cases"]) != len(SESSION_CASES):
         raise AssertionError("session coverage changed")
     if disclosure_names != DISCLOSURE_CASES or len(corpus["disclosure_cases"]) != len(DISCLOSURE_CASES):
         raise AssertionError("disclosure coverage changed")
+    if (runtime_request_names != RUNTIME_REQUEST_CASES
+            or len(corpus["runtime_request_cases"]) != len(RUNTIME_REQUEST_CASES)):
+        raise AssertionError("runtime request coverage changed")
+    if (proposal_response_names != PROPOSAL_RESPONSE_CASES
+            or len(corpus["proposal_response_cases"]) != len(PROPOSAL_RESPONSE_CASES)):
+        raise AssertionError("proposal response coverage changed")
     if relay_status_names != RELAY_STATUS_CASES or len(corpus["relay_status_cases"]) != len(RELAY_STATUS_CASES):
         raise AssertionError("relay status coverage changed")
     for case in corpus["pairing_cases"]:
@@ -374,33 +511,53 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
         actual = session_reason(case.get("proof", fixtures["session_proof"]), context)
         if actual != case["expect"]:
             raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
-    for case in corpus["reply_cases"]:
+    snapshot_bytes = json.dumps(fixtures["authority_snapshot"], sort_keys=True,
+                                separators=(",", ":"), ensure_ascii=False,
+                                allow_nan=False).encode("utf-8")
+    if fixtures["reply"]["authority_snapshot_digest"] != digest(snapshot_bytes):
+        raise AssertionError("reply fixture digest does not bind its snapshot")
+    for case in corpus["gateway_reply_cases"]:
         context = {
             "session_live": True,
-            "registry_available": True,
-            "credential_active": True,
-            "credential_sequence": 1,
-            "proposal_cutoff": 8,
-            "identity_epoch": "AAECAwQFBgcICQoLDA0ODw==",
-            "proposal_id": "AB12CD34",
+            "path_proposal_id": "AB12CD34",
             "site_id": "site-a",
             "device_id": "edge-01",
             "nonce_conflict": False,
-            "nonce_duplicate": False,
+            "stored_reply": None,
+            "outbox_ok": True,
             "app_spki_sha256": fixtures["grant"]["app_spki_sha256"],
             **case.get("context", {}),
         }
-        actual = reply_reason(
+        actual = gateway_reply_reason(
             case.get("reply", fixtures["reply"]),
             fixtures["app_spki_b64"],
             context,
         )
         if actual != case["expect"]:
             raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["runtime_reply_cases"]:
+        context = {
+            "registry_available": True,
+            "credential_active": True,
+            "credential_sequence": 1,
+            "proposal_cutoff": 8,
+            "identity_epoch": "AAECAwQFBgcICQoLDA0ODw==",
+            "proposal_id": "AB12CD34",
+            "authority_snapshot_digest": fixtures["reply"]["authority_snapshot_digest"],
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "registry_spki_hex": fixtures["grant"]["app_spki_sha256"][7:],
+            **case.get("context", {}),
+        }
+        actual = runtime_reply_reason(
+            case.get("reply", fixtures["reply"]), fixtures["app_spki_b64"],
+            context,
+        )
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
     for case in corpus["disclosure_cases"]:
         context = {
-            "response_ms": 100,
-            "response_matches": True,
+            "response_events": [{"at_ms": 100, "verified": True, "matches": True}],
             "registry_available": True,
             "credential_active": True,
             "proposal_open": True,
@@ -411,6 +568,29 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
         actual = disclosure_reason(context)
         if actual != case["expect"]:
             raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["runtime_request_cases"]:
+        context = {key: True for key in (
+            "topic_matches", "signature_valid", "verification_ok", "fresh",
+            "replay_valid", "size_ok", "members_ok",
+        )}
+        context.update(case.get("context", {}))
+        actual = runtime_request_outcome(context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
+    for case in corpus["proposal_response_cases"]:
+        context = {
+            "projected_count": 1,
+            "allowed_ids": ["AB12CD34"],
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "runtime_epoch": fixtures["reply"]["identity_epoch"],
+            "projection_digest": fixtures["reply"]["authority_snapshot_digest"],
+            **case.get("context", {}),
+        }
+        actual = proposal_response_reason(
+            case.get("response", fixtures["proposal_response"]), context)
+        if actual != case["expect"]:
+            raise AssertionError(f"{case['name']}: {actual} != {case['expect']}")
     for case in corpus["relay_status_cases"]:
         actual = relay_status_reason(case["response"], fixtures["reply"])
         if actual != case["expect"]:
@@ -418,7 +598,11 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
     if announce:
         print(
             f"lan-app-api/v1: {len(PAIR_CASES)} pairing, {len(SESSION_CASES)} session and "
-            f"{len(REPLY_CASES)} reply, {len(DISCLOSURE_CASES)} disclosure, and "
+            f"{len(GATEWAY_REPLY_CASES)} gateway reply, "
+            f"{len(RUNTIME_REPLY_CASES)} runtime reply, "
+            f"{len(DISCLOSURE_CASES)} disclosure, "
+            f"{len(RUNTIME_REQUEST_CASES)} runtime request, "
+            f"{len(PROPOSAL_RESPONSE_CASES)} proposal response, and "
             f"{len(RELAY_STATUS_CASES)} relay status vectors verified"
         )
 
@@ -443,7 +627,7 @@ def check_mutations(corpus: dict[str, Any]) -> None:
     next(c for c in timeout_allowed["disclosure_cases"] if c["name"] == "runtime_timeout")["expect"] = "allow"
     mutants.append(timeout_allowed)
     missing_registry_accepted = copy.deepcopy(corpus)
-    next(c for c in missing_registry_accepted["reply_cases"] if c["name"] == "registry_unavailable")["expect"] = "relay"
+    next(c for c in missing_registry_accepted["runtime_reply_cases"] if c["name"] == "registry_unavailable")["expect"] = "eligible"
     mutants.append(missing_registry_accepted)
     gateway_approved = copy.deepcopy(corpus)
     next(c for c in gateway_approved["relay_status_cases"] if c["name"] == "gateway_claims_approved")["expect"] = "valid"
@@ -454,6 +638,27 @@ def check_mutations(corpus: dict[str, Any]) -> None:
     expired_session_admitted = copy.deepcopy(corpus)
     next(c for c in expired_session_admitted["session_cases"] if c["name"] == "expired_challenge")["expect"] = "session"
     mutants.append(expired_session_admitted)
+    wrong_snapshot_admitted = copy.deepcopy(corpus)
+    next(c for c in wrong_snapshot_admitted["runtime_reply_cases"] if c["name"] == "signed_other_snapshot")["expect"] = "eligible"
+    mutants.append(wrong_snapshot_admitted)
+    forged_response_ends_wait = copy.deepcopy(corpus)
+    next(c for c in forged_response_ends_wait["disclosure_cases"] if c["name"] == "forged_then_valid")["expect"] = "deny"
+    mutants.append(forged_response_ends_wait)
+    forged_response_extends_wait = copy.deepcopy(corpus)
+    next(c for c in forged_response_extends_wait["disclosure_cases"] if c["name"] == "forged_then_timeout")["expect"] = "allow"
+    mutants.append(forged_response_extends_wait)
+    bad_request_answered = copy.deepcopy(corpus)
+    next(c for c in bad_request_answered["runtime_request_cases"] if c["name"] == "topic_mismatch_valid_signature")["expect"] = "answer"
+    mutants.append(bad_request_answered)
+    bad_signature_answered = copy.deepcopy(corpus)
+    next(c for c in bad_signature_answered["runtime_request_cases"] if c["name"] == "valid_topic_bad_signature")["expect"] = "answer"
+    mutants.append(bad_signature_answered)
+    missing_digest_accepted = copy.deepcopy(corpus)
+    next(c for c in missing_digest_accepted["proposal_response_cases"] if c["name"] == "missing_snapshot_digest")["expect"] = "valid"
+    mutants.append(missing_digest_accepted)
+    changed_snapshot = copy.deepcopy(corpus)
+    changed_snapshot["fixtures"]["authority_snapshot"]["resource"] = "relay-gpio-27"
+    mutants.append(changed_snapshot)
     for mutant in mutants:
         try:
             check(mutant, announce=False)
