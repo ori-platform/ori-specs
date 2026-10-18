@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-telemetry/v2 profile publication corpus.
+
+Nothing here is shared with scripts/check-firmware-profile-publication-vectors-v2,
+which reads the checks from Controller Profiles > Publication and recomputes
+every hash itself. The documents come from the controller profile corpus, which
+carries each one's canonical bytes and digest.
+
+    python3 scripts/generate-firmware-profile-publication-vectors-v2          # write
+    python3 scripts/generate-firmware-profile-publication-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+PROFILES = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
+OUT = ROOT / "firmware-telemetry" / "profile-publication-vectors-v2.json"
+
+REASONS = ("asset_name_invalid", "asset_digest_mismatch")
+
+
+def documents() -> list[tuple[str, bytes, str]]:
+    corpus = json.loads(PROFILES.read_text())
+    out = []
+    for case in corpus["cases"][:2]:
+        raw = bytes.fromhex(case["canonical_hex"])
+        hexd = case["digest"].removeprefix("sha256:")
+        if hashlib.sha256(raw).hexdigest() != hexd:
+            raise SystemExit(f"{case['name']}: canonical bytes do not hash to the digest")
+        out.append((case["name"], raw, hexd))
+    return out
+
+
+def decide(name: str, raw: bytes) -> str | None:
+    prefix, suffix = "controller-profile-", ".json"
+    middle = name[len(prefix):-len(suffix)] if name.startswith(prefix) and name.endswith(suffix) else None
+    if middle is None or len(middle) != 64 or any(c not in "0123456789abcdef" for c in middle):
+        return "asset_name_invalid"
+    if hashlib.sha256(raw).hexdigest() != middle:
+        return "asset_digest_mismatch"
+    return None
+
+
+def build() -> dict:
+    (name_a, raw_a, hex_a), (name_b, raw_b, hex_b) = documents()
+    good_a = f"controller-profile-{hex_a}.json"
+    good_b = f"controller-profile-{hex_b}.json"
+    flipped = bytearray(raw_a)
+    flipped[-2] ^= 0x01
+    spaced = json.dumps(json.loads(raw_a), indent=1, sort_keys=True, ensure_ascii=False).encode()
+    pos = next(i for i, c in enumerate(hex_a) if c in "abcdef")
+    upper = hex_a[:pos] + hex_a[pos].upper() + hex_a[pos + 1:]
+    dpos = next(i for i, c in enumerate(hex_a) if c in "0123456789")
+    fullwidth = hex_a[:dpos] + chr(0xFF10 + int(hex_a[dpos])) + hex_a[dpos + 1:]
+    fpos = next(i for i in range(63) if hex_a[i:i + 2] == "ff") if "ff" in hex_a[:64] else None
+    if fpos is not None:
+        ligature = hex_a[:fpos] + "\ufb00" + hex_a[fpos + 2:]
+    else:
+        ligature = hex_a[:62] + "\ufb00"
+    rows = [
+        ("exact_name", good_a, raw_a, f"the canonical document {name_a} under its exact name"),
+        ("exact_name_second", good_b, raw_b, f"the canonical document {name_b} under its exact name"),
+        ("uppercase_hex", f"controller-profile-{upper}.json", raw_a, "an uppercase letter among the hex characters"),
+        ("uppercase_prefix", f"CONTROLLER-PROFILE-{hex_a}.json", raw_a, "an uppercase prefix"),
+        ("uppercase_extension", f"controller-profile-{hex_a}.JSON", raw_a, "an uppercase extension"),
+        ("percent_encoded", f"controller-profile-%{ord(hex_a[0]):02X}{hex_a[1:]}.json", raw_a,
+         "the first hex digit percent-encoded, as a URL-decoding receiver would undo it"),
+        ("hex_63", f"controller-profile-{hex_a[:63]}.json", raw_a, "63 hex characters"),
+        ("hex_65", f"controller-profile-{hex_a}0.json", raw_a, "65 hex characters"),
+        ("non_hex_char", f"controller-profile-{hex_a[:63]}g.json", raw_a,
+         "a character outside the hexadecimal digits"),
+        ("fullwidth_digit", f"controller-profile-{fullwidth}.json", raw_a,
+         "a fullwidth digit in place of an ASCII one"),
+        ("folding_ligature", f"controller-profile-{ligature}.json", raw_a,
+         "U+FB00, which case folding and NFKC turn into two hexadecimal digits"),
+        ("trailing_newline", good_a + "\n", raw_a, "the exact name followed by a newline"),
+        ("sha256_prefix_kept", f"controller-profile-sha256:{hex_a}.json", raw_a,
+         "the digest's sha256: prefix kept in the name"),
+        ("other_extension", f"controller-profile-{hex_a}.txt", raw_a, "another extension"),
+        ("directory", f"profiles/controller-profile-{hex_a}.json", raw_a, "a directory in the name"),
+        ("missing_prefix", f"{hex_a}.json", raw_a, "no controller-profile- prefix"),
+        ("byte_flipped", good_a, bytes(flipped), "bytes differing from the named document in one byte"),
+        ("non_canonical", good_a, spaced,
+         "the named document serialised non-canonically, which does not hash to the name"),
+        ("other_valid_document", good_a, raw_b,
+         f"the exact name of {name_a} over the canonical bytes of {name_b}"),
+        ("precedence_name_before_bytes", f"controller-profile-{hex_a[:63]}g.json", bytes(flipped),
+         "a malformed name over bytes that do not match it: refused for the name"),
+    ]
+    cases = []
+    for label, name, raw, note in rows:
+        cases.append({
+            "name": label,
+            "asset_name": name,
+            "asset_b64": base64.b64encode(raw).decode(),
+            "expected": decide(name, raw),
+            "note": note,
+        })
+    return {
+        "contract": "ori-specs/firmware-telemetry/v2.md",
+        "section": "Controller Profiles > Publication",
+        "comment": (
+            "Each case is a listed release asset, by its listed name and its bytes in standard "
+            "Base64. A listing receiver holds the case whose expected is null and refuses every "
+            "other for its declared reason, holding nothing. A fetching receiver's case is the "
+            "second check alone, on a name it built from the digest it needs. The documents are "
+            "the first two accepted documents of controller-profile-vectors-v2.json."
+        ),
+        "reasons": list(REASONS),
+        "cases": cases,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
