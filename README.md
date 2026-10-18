@@ -43,7 +43,7 @@ below are checked against those records.
 | Firmware telemetry / evidence Layer 1 | [firmware-telemetry/v1.md](firmware-telemetry/v1.md) | `draft` | producer (edge-firmware) `implemented-unreleased`, claimed, `unassessed`, verifier (runtime) `shipped` in v2.1.0, claimed, `unassessed`, verifier (sdk-python) `implemented-unreleased`, `unassessed`, verifier (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-07-16), audit `complete` |
 | Firmware telemetry / evidence Layer 1 | [firmware-telemetry/v2.md](firmware-telemetry/v2.md) | `draft` | verifier (runtime) `implemented-unreleased`, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `amendable` |
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | `draft` | runtime `shipped` in v1.0.0, `unassessed`, gateway `implemented-unreleased`, claimed, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed` | `frozen` (2026-06-04), audit `complete` |
-| Gateway API | [gateway-api/v2.md](gateway-api/v2.md) | `draft` | producer (runtime) `implemented-unreleased`, `unassessed` | `amendable` |
+| Gateway API | [gateway-api/v2.md](gateway-api/v2.md) | `draft` | producer (runtime) `implemented-unreleased`, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `amendable` |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed current snapshot `4c28c93` (1 divergence) | `frozen` (2026-06-09), audit `complete` |
 | Gateway config surface | [gateway-config/v2.md](gateway-config/v2.md) | `draft` | none recorded | `amendable` |
 | Gateway Evidence Carriage | [gateway-evidence-carriage/v1.md](gateway-evidence-carriage/v1.md) | `draft` | none recorded | `amendable` |
@@ -78,6 +78,7 @@ below are checked against those records.
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
 | Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `pending` |
+| Tier C approver registry | [tier-c-approvers/v1.md](tier-c-approvers/v1.md) | `draft` | none recorded | `amendable` |
 
 Companion documents carry no record of their own; see
 [VERSIONING.md](VERSIONING.md#companion-documents):

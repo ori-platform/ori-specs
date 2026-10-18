@@ -1,0 +1,1434 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 replay corpus against the contract.
+
+Shares no code with scripts/generate-gateway-replay-vectors-v2, and was written
+without reading it. The order of checks, their bounds and their reason names
+are read from gateway-api/v2.md Envelope Freshness and Replay; every case is
+replayed here under the section's rules and compared event by event.
+
+Held to:
+
+- the text: the section's subsections, the order-of-checks table (four rows,
+  numbered in order, inclusive bounds, one reason each), the retention bounds,
+  the floor, start, eviction and rotation sentences, the event list and the
+  "cases cover" list, each word for word; the two script paths exist;
+- the header: contract, section, the reasons in the table's order, unique
+  case names;
+- every event: its reason (receive, authenticate and commit only; null when
+  accepted), the floor after it and the keys held after it, as the replay
+  here decides them;
+- coverage: every "cases cover" bullet is shown by events whose structure
+  shows it, never by a case's name.
+- one place for replay claims: every other section of gateway-api/v2.md whose
+  own body touches replay, freshness, staleness, skew, signing time, capture or
+  retransmission, the replay-settings obligation in runtime-config/v2.md and
+  the notes in status/gateway-api/v2.json are held sentence by sentence;
+  `--inventory` prints the held digests from the files as they stand.
+
+    python3 scripts/check-gateway-replay-vectors-v2
+    python3 scripts/check-gateway-replay-vectors-v2 --mutations
+    python3 scripts/check-gateway-replay-vectors-v2 --inventory
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-api" / "v2.md"
+CORPUS = ROOT / "gateway-api" / "vectors" / "replay-v2.json"
+RUNTIME_CONFIG = ROOT / "runtime-config" / "v2.md"
+STATUS = ROOT / "status" / "gateway-api" / "v2.json"
+SECTION = "Envelope Freshness and Replay"
+SUBSECTIONS = ("Order of checks", "Retention", "The floor", "What the floor costs",
+               "Recovery", "Senders", "Limits and later versions", "Replay vectors")
+GENERATOR = "scripts/generate-gateway-replay-vectors-v2"
+CHECKER = "scripts/check-gateway-replay-vectors-v2"
+
+# Sentences each rule of the replay below rests on, held word for word
+# (whitespace collapsed). A data check cannot see any of them change.
+HELD = {
+    "": (
+        "This section alone states what replay protection achieves. Every other "
+        "section names an envelope's key and refers here, and whatever this contract "
+        "says replay protection stops, it stops outside the cases "
+        "[Limits and later versions](#limits-and-later-versions) names.",
+        "**The skew** is the receiver's maximum clock skew, never negative;",
+    ),
+    "Order of checks": (
+        "is accepted only if every check holds, in this order. It is refused for "
+        "the first that fails:",
+        "Every bound is inclusive.",
+        "An accepted envelope's key is held from then on.",
+        "in one atomic step with recording, so a key dropped and a floor raised in "
+        "between are both seen. The key's receipt time is the time it was "
+        "authenticated.",
+        "A recorded key is never un-recorded: a receiver that recorded it and then did "
+        "not act on the envelope still holds it, and the sender's next attempt is newly "
+        "signed, as [Senders](#senders) requires.",
+    ),
+    "Retention": (
+        "A held key may be dropped only once both hold:",
+    ),
+    "The floor": (
+        "**A dropped key raises the floor.** Dropping a key raises `F` to at least its "
+        "`signed_at_ms` + 1,",
+        "in the same atomic step, so no verification sees the key gone and the "
+        "floor not yet raised.",
+        "A receiver whose memory is full may drop the held key with the smallest "
+        "signing time, any one of several that share it, before its retention ends, "
+        "by the same step, instead of refusing the new envelope.",
+        "**The stored floor never falls,** except under [Recovery](#recovery).",
+        "**At every start,** `F` becomes the greater of the floor the receiver "
+        "stored, if any, and its clock at that start. A receiver that stores its "
+        "floor stores its held keys with it, and keeps both across a restart; one "
+        "that stores neither starts each run with no stored floor and no held keys, "
+        "so from its clock. A restart discards every authentication not yet recorded.",
+        "**Only a floor raised by a dropped key is stored,** never a clock reading.",
+        "The start rule covers keys dropped while no floor was kept, for envelopes "
+        "signed before that start:",
+        "Because it takes the greater of the two values, a floor stored before a "
+        "rollback can never lower the floor at the next start. A start floor is not "
+        "stored, so it covers its own run only;",
+        "Every key dropped under the narrower skew raised the floor past its envelope, "
+        "so the wider skew readmits none of them. A clock stepped back, live or across "
+        "a start, is covered for every key whose drop raised the stored floor, because "
+        "the stored floor does not follow the clock down.",
+    ),
+    "What the floor costs": (
+        "**An eviction** raises the floor past the evicted envelope, which may have "
+        "been signed up to `S` ahead of the clock.",
+        "across a restart too when the floor is stored. A gateway's floor covers every "
+        "runtime it serves,",
+        "Whenever a receiver refuses an envelope as `before_replay_floor` while `F` > "
+        "`t` − `S`, it logs a warning naming `F` and `t`.",
+        "It also shows the condition in its own health, which it can do without hearing "
+        "from the other party, once its health names a field for it: a gateway in its "
+        "operational posture, and a runtime under "
+        "[runtime-health/v4.md](../runtime-health/v4.md). Until then its log is the "
+        "only record.",
+    ),
+    "Recovery": (
+        "The receiver may drop its stored floor and every held key, and discard every "
+        "authentication not yet recorded, which leaves `F` at its clock, only in one "
+        "atomic step with switching to a new secret generation, under new key "
+        "material, in which no earlier secret verifies, including any configured "
+        "previous secret.",
+        "Nothing signed before it verifies after it, so the reset readmits nothing.",
+        "A receiver cannot tell new key material from a retired secret brought back, so "
+        "an operator MUST NOT bring back a secret retired by a rotation that reset the "
+        "floor, in any later configuration, as the current secret or the previous one: "
+        "doing so readmits envelopes signed under it that were dropped at the reset.",
+        "No verification under the retired generation commits after the switch.",
+        "An ordinary rotation, with the earlier secret kept as the previous one, "
+        "keeps the floor and every held key.",
+        "No other path lowers the stored floor, and no command clears it.",
+    ),
+    "Senders": (
+        "Every sender signs a fresh envelope for every message it publishes, including "
+        "every retry and every redelivery. A fresh envelope is one whose bytes the "
+        "sender has never published: re-signing unchanged content at an unchanged "
+        "`signed_at_ms` gives identical bytes, so reading the clock again is not "
+        "enough when it has not moved. A sender that may sign the same content twice "
+        "in one millisecond, or across a restart with its clock unchanged or set back, "
+        "takes `signed_at_ms` from a signing clock that never repeats a value: one "
+        "millisecond past the previous when the clock has not moved, and durable "
+        "across a restart, as [Outbound acknowledgement](#outbound-acknowledgement) "
+        "requires of the gateway's acknowledgements. It never republishes envelope "
+        "bytes it has already published. A refusal for any reason above is answered, "
+        "if at all, by a newly signed attempt.",
+        "the receiver's deduplication of content is unchanged.",
+    ),
+    "Limits and later versions": (
+        "signed at or after that start, and the receiver kept no copy of its key. It "
+        "can then be replayed after the start until it goes stale, at most `S` past its "
+        "signing time.",
+        "This version accepts the gap.",
+        "**A clock stepped back across a later start reopens what only a start floor "
+        "covered.** A start floor is a clock reading and is not stored. For a receiver "
+        "that stores nothing, a clock stepped back across a restart readmits every "
+        "envelope of earlier runs that its new skew window reaches.",
+        "The floor gives no complete replay protection across the loss of a stored "
+        "floor,",
+    ),
+    "Replay vectors": (
+        "Each case is a receiver context and a run of events in order.",
+        "The context gives the skew, `replay_ttl_ms` or `null`, whether the receiver "
+        "stores its floor and keys, the floor it has stored, its clock at its last "
+        "start, and the keys it holds, each with its signing and receipt times.",
+        "Each event gives its reason, or none when accepted, and the floor and held "
+        "keys after it.",
+    ),
+}
+EVENTS = (
+    (("receive",), "the receiver verifies an envelope and, when it is accepted, holds its key."),
+    (("authenticate", "commit"), "a family that records only once the envelope answers something."),
+    (("prune",), "the receiver drops every key whose retention has ended."),
+    (("evict",), "a full receiver drops its held key with the smallest signing time."),
+    (("restart",), "the receiver starts again, with a new skew where the case gives one."),
+    (("rotate",), "a rotation that keeps the previous secret, or one that keeps none."),
+)
+B_FLOOR = "an envelope signed exactly at the floor, and one millisecond below it"
+B_SKEW = "both skew bounds and one millisecond beyond each"
+B_TTL = ("a replay at the last millisecond its envelope passes check 1, under a "
+         "`replay_ttl_ms` shorter than the skew, and under a longer one")
+B_SENDERS = "senders whose clocks run ahead of and behind the receiver's, across a start"
+B_CLOCK = ("the clock stepped forward and back, live and across a start, and stepped "
+           "back across a later start, by a receiver that stores nothing and by a "
+           "storing receiver after an upgrade")
+B_SKEWCHG = "the skew raised and lowered across a restart"
+B_RESTART = ("a restart that stores its floor and keys, one that stores neither, the "
+             "first start after an upgrade from a release that kept no floor, and a "
+             "rollback and upgrade")
+B_AUTH = "a key dropped between `authenticate` and `commit`"
+B_EVICT = ("a full receiver evicting a key, and an evicted key signed ahead of the clock "
+           "raising the stored floor above a sender behind it, across a restart")
+B_ROTATE = "a rotation that keeps the previous secret and one that keeps none"
+B_COMMIT = "a key recorded at commit, kept for `replay_ttl_ms` from its authentication"
+B_PREC = ("precedence where two checks fail together: stale and below the floor, "
+          "future and below the floor, and below the floor and held. Checks 1 and 2 "
+          "cannot fail together")
+OPS = {"≥": lambda a, b: a >= b, "≤": lambda a, b: a <= b,
+       ">": lambda a, b: a > b, "<": lambda a, b: a < b}
+INCLUSIVE = {"≥", "≤"}
+RHS = {"`t` − `S`": "t-S", "`t` + `S`": "t+S", "`F`": "F"}
+
+
+class Failure(Exception):
+    pass
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+# ---------------------------------------------------------------- the text
+
+def sections(text: str) -> dict[str, list[str]]:
+    lines = text.split("\n")
+    try:
+        start = lines.index(f"## {SECTION}")
+    except ValueError:
+        raise Failure(f"no '## {SECTION}' heading") from None
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
+               len(lines))
+    body = lines[start + 1:end]
+    heads = [i for i, line in enumerate(body) if line.startswith("### ")]
+    names = tuple(body[i][4:].strip() for i in heads)
+    if names != SUBSECTIONS:
+        raise Failure(f"subsections changed: {list(names)}")
+    out = {"": body[:heads[0]]}
+    for n, i in enumerate(heads):
+        out[names[n]] = body[i + 1:heads[n + 1] if n + 1 < len(heads) else len(body)]
+    return out
+
+
+def bullets(lines: list[str], after: Callable[[str], bool]) -> list[str]:
+    """The bullet list that follows the first line matching `after`."""
+    at = next((i for i, line in enumerate(lines) if after(line)), None)
+    if at is None:
+        raise Failure("a list's lead-in line is gone")
+    i = at + 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    items: list[str] = []
+    while i < len(lines) and lines[i].strip():
+        line = lines[i]
+        if line.startswith("- "):
+            items.append(line[2:])
+        elif line.startswith("  ") and items:
+            items[-1] += " " + line.strip()
+        else:
+            raise Failure(f"unrecognised line in a list: {line!r}")
+        i += 1
+    return [flat(item) for item in items]
+
+
+def contract_model(text: str) -> dict:
+    sec = sections(text)
+    norm = {name: flat("\n".join(lines)) for name, lines in sec.items()}
+    for name, phrases in HELD.items():
+        for phrase in phrases:
+            if flat(phrase) not in norm[name]:
+                raise Failure(f"{name}: rule text changed: {phrase!r}")
+
+    # Order of checks: the table, its shape and its bounds.
+    rows = [line for line in sec["Order of checks"] if line.startswith("|")]
+    if len(rows) != 6 or rows[0] != "| Order | Check | Reason |" \
+            or rows[1] != "| --- | --- | --- |":
+        raise Failure("order-of-checks table changed shape")
+    checks = []
+    for n, row in enumerate(rows[2:], 1):
+        m = re.fullmatch(r"\| (\d+) \| (.+?) \| `([a-z_]+)` \|", row)
+        if not m:
+            raise Failure(f"order-of-checks row unrecognised: {row!r}")
+        if int(m.group(1)) != n:
+            raise Failure(f"order-of-checks rows out of order at row {n}: {row!r}")
+        cell, reason = m.group(2), m.group(3)
+        if cell == "its key is not held":
+            checks.append({"rhs": "held", "op": None, "reason": reason})
+            continue
+        b = re.fullmatch(r"`signed_at_ms` (≥|≤|>|<) (.+)", cell)
+        if not b or b.group(2) not in RHS:
+            raise Failure(f"order-of-checks check unrecognised: {cell!r}")
+        if b.group(1) not in INCLUSIVE:
+            raise Failure(f"'Every bound is inclusive' but row {n} reads {b.group(1)}")
+        checks.append({"rhs": RHS[b.group(2)], "op": b.group(1), "reason": reason})
+    if sorted(c["rhs"] for c in checks) != sorted(["t-S", "t+S", "F", "held"]):
+        raise Failure("order-of-checks table does not name the four checks once each")
+    if len({c["reason"] for c in checks}) != 4:
+        raise Failure("order-of-checks reasons are not distinct")
+    # The two skew bounds must face the right way for "within the skew".
+    for c in checks:
+        want = {"t-S": "≥", "t+S": "≤", "F": "≥"}.get(c["rhs"])
+        if want and c["op"] != want:
+            raise Failure(f"check against {c['rhs']} reads {c['op']}")
+    m = re.search(r"It then makes checks (\d) and (\d) again when it records",
+                  norm["Order of checks"])
+    if not m:
+        raise Failure("the recheck at recording is not stated as two numbered checks")
+    recheck = (int(m.group(1)) - 1, int(m.group(2)) - 1)
+    if {checks[i]["rhs"] for i in recheck} != {"F", "held"}:
+        raise Failure("the checks rechecked at recording are not the floor and the key")
+
+    # Retention: both bounds.
+    r1 = re.search(r"- `t` (>|≥) `signed_at_ms` \+ `S`, so the envelope is stale;",
+                   "\n".join(sec["Retention"]))
+    r2 = re.search(r"- `t` (>|≥) its receipt time plus `gateway\.auth\.replay_ttl_ms`, "
+                   r"where the receiver has that setting\.", norm["Retention"])
+    if not r1 or not r2:
+        raise Failure("retention bounds unrecognised")
+
+    # The floor: what a drop raises it to.
+    g = re.search(r"\*\*At every start,\*\* `F` becomes the (greater|lesser) of the floor "
+                  r"the receiver stored, if any, and its clock at that start\.",
+                  norm["The floor"])
+    if not g:
+        raise Failure("the start rule is unrecognised")
+    d = re.search(r"Dropping a key raises `F` to at least its `signed_at_ms` \+ (\d+), "
+                  r"in the same atomic step", norm["The floor"])
+    if not d:
+        raise Failure("the floor raise on a drop is unrecognised")
+
+    # Replay vectors: the event list, the cover list, the scripts.
+    rv = sec["Replay vectors"]
+    events = []
+    for item in bullets(rv, lambda line: line.rstrip().endswith("The events are:")):
+        m = re.fullmatch(r"((?:`[a-z]+`(?: and |, )?)+): (.+)", item)
+        if not m:
+            raise Failure(f"event bullet unrecognised: {item!r}")
+        events.append((tuple(re.findall(r"`([a-z]+)`", m.group(1))), m.group(2)))
+    if tuple(events) != EVENTS:
+        raise Failure(f"event list changed: {events}")
+    cover = [b.rstrip(";.") for b in bullets(rv, lambda line: line.strip() == "The cases cover:")]
+    if len(cover) != len(set(cover)) or set(cover) != set(COVERAGE):
+        unknown = [b for b in cover if b not in COVERAGE]
+        gone = [b for b in COVERAGE if b not in cover]
+        raise Failure(f"cover list changed: unrecognised {unknown}, missing {gone}")
+    # Bullet B_TTL names check 1 as the stale bound.
+    if checks[0]["rhs"] != "t-S":
+        raise Failure("a cover bullet names check 1 for the stale bound, which it no longer is")
+    if {checks[0]["rhs"], checks[1]["rhs"]} != {"t-S", "t+S"}:
+        raise Failure("a cover bullet says checks 1 and 2 cannot fail together; they are no "
+                      "longer the two skew bounds")
+    rvn = norm["Replay vectors"]
+    if "[vectors/replay-v2.json](vectors/replay-v2.json) holds this section's cases." not in rvn:
+        raise Failure("the corpus path changed")
+    for path, claim in ((GENERATOR, "reproduces the file byte for byte."),
+                        (CHECKER, "shares no code with it:")):
+        if f"`{path}` {claim}" not in rvn:
+            raise Failure(f"the claim for {path} changed")
+        if not (ROOT / path).is_file():
+            raise Failure(f"{path} named by the section does not exist")
+
+    return {"checks": checks, "recheck": recheck,
+            "stale_op": r1.group(1), "ttl_op": r2.group(1), "raise_by": int(d.group(1)),
+            "start": max if g.group(1) == "greater" else min}
+
+
+# ---------------------------------------------------------------- the inventory
+# Whatever this contract says replay protection stops is stated in this section
+# alone. Every other section whose own body touches replay, freshness,
+# staleness, skew, signing time, capture or retransmission is held sentence by
+# sentence, in order, as the SHA-256 of each sentence (whitespace collapsed),
+# so an added, removed or changed sentence fails and is printed. A section that
+# starts touching those stems fails until it is added here.
+# `--inventory` prints the block below from the files as they stand.
+
+STEMS = re.compile(r"replay|fresh|stale|skew|signed_at|captur|resubmi|redeliver|retransmi",
+                   re.I)
+RUNTIME_BULLET = (
+    "- Read `gateway.auth.max_clock_skew_ms`, `gateway.auth.replay_ttl_ms` and "
+    "`gateway.auth.persistent_replay_cache` under "
+    "[gateway-api/v2.md](../gateway-api/v2.md#envelope-freshness-and-replay). "
+    "`replay_ttl_ms` is a lower bound on how long a replay key is kept after receipt. "
+    "A key is also kept until its envelope is stale, so no value of it opens a replay "
+    "window. `persistent_replay_cache` stores the replay floor with the keys, and a "
+    "runtime that stores neither starts each run from its clock."
+)
+
+
+def sentences(text: str) -> list[str]:
+    return [x for x in re.split(r"(?<=[.!?])\s+", flat(text)) if x]
+
+
+def digest(sentence: str) -> str:
+    return hashlib.sha256(sentence.encode("utf-8")).hexdigest()[:16]
+
+
+def guarded_sections(text: str) -> dict[str, list[str]]:
+    """Each section's own body (to the next heading of any level), by heading,
+    for every section outside this one whose body touches the stems."""
+    lines, fence, heads = text.split("\n"), False, []
+    for i, line in enumerate(lines):
+        if line.startswith("```"):
+            fence = not fence
+        elif not fence and re.match(r"#{1,6} ", line):
+            heads.append(i)
+    out: dict[str, list[str]] = {}
+    inside = False
+    for n, i in enumerate(heads):
+        head = lines[i]
+        if head.startswith("## "):
+            inside = head == f"## {SECTION}"
+        if inside:
+            continue
+        end = heads[n + 1] if n + 1 < len(heads) else len(lines)
+        body = "\n".join(lines[i + 1:end])
+        if STEMS.search(body):
+            if head in out:
+                raise Failure(f"two guarded sections share the heading {head!r}")
+            out[head] = sentences(body)
+    return out
+
+
+def status_notes(status: dict) -> dict[str, list[str]]:
+    out = {"notes": sentences(status["notes"])}
+    for n, entry in enumerate(status["adoption"]):
+        out[f"adoption[{n}] {entry['repository']} {entry['role']}"] = sentences(entry["notes"])
+    return out
+
+
+def compare(where: str, held: tuple[str, ...], now: list[str]) -> None:
+    got = [digest(x) for x in now]
+    if tuple(got) == held:
+        return
+    i = next((k for k in range(min(len(got), len(held))) if got[k] != held[k]),
+             min(len(got), len(held)))
+    if len(got) > len(held) and got[i + 1:] == list(held[i:]):
+        raise Failure(f"{where}: sentence {i + 1} added: {now[i]!r}")
+    if len(got) < len(held) and got[i:] == list(held[i + 1:]):
+        raise Failure(f"{where}: sentence {i + 1} removed (now before {now[i]!r})"
+                      if i < len(now) else f"{where}: its last sentence removed")
+    raise Failure(f"{where}: sentence {i + 1} changed: "
+                  f"{now[i]!r}" if i < len(now) else f"{where}: sentences removed")
+
+
+def check_inventory(text: str, runtime_config: str, status: dict) -> None:
+    now = guarded_sections(text)
+    if set(now) != set(INVENTORY):
+        raise Failure(f"guarded sections changed: new {sorted(set(now) - set(INVENTORY))}, "
+                      f"gone {sorted(set(INVENTORY) - set(now))}")
+    for head, held in INVENTORY.items():
+        compare(f"gateway-api/v2.md {head}", held, now[head])
+    notes = status_notes(status)
+    if set(notes) != set(STATUS_NOTES):
+        raise Failure(f"status/gateway-api/v2.json notes changed: {sorted(notes)}")
+    for key, held in STATUS_NOTES.items():
+        compare(f"status/gateway-api/v2.json {key}", held, notes[key])
+    rc = re.search(r"^## Consumer Obligations\n(.*?)^## ", runtime_config, re.S | re.M)
+    if not rc:
+        raise Failure("runtime-config/v2.md: no Consumer Obligations section")
+    items = [flat(b) for b in re.findall(r"^- .*(?:\n  .*)*", rc.group(1), re.M)]
+    if items.count(RUNTIME_BULLET) != 1:
+        raise Failure("runtime-config/v2.md: the replay settings bullet changed")
+    others = [b for b in items if b != RUNTIME_BULLET and STEMS.search(b)]
+    if others:
+        raise Failure(f"runtime-config/v2.md: another obligation touches replay: {others[0]!r}")
+
+
+def print_inventory(text: str, status: dict) -> None:
+    def block(name: str, table: dict[str, list[str]]) -> None:
+        print(f"{name} = {{")
+        for key, now in table.items():
+            print(f"    {key!r}: (")
+            hs = [digest(x) for x in now]
+            for k in range(0, len(hs), 4):
+                print("        " + " ".join(f'"{h}",' for h in hs[k:k + 4]))
+            print("    ),")
+        print("}")
+    print("# BEGIN INVENTORY")
+    block("INVENTORY", guarded_sections(text))
+    block("STATUS_NOTES", status_notes(status))
+    print("# END INVENTORY")
+
+
+# BEGIN INVENTORY
+INVENTORY = {
+    '## Payload Size': (
+        "8fb413e789d21543", "07d81a4822fb0416", "0ff7c50b42a790a6", "2fd9a0ae867e87fb",
+        "a39f7876e124336b", "f11583a194bd7b91", "1977b77ac579a07d", "0f23f9b407d7f56f",
+        "ffc07f1152fcc054", "e453c7369da5e193", "dbb15ba0119873c0", "c632975699939a98",
+        "ebc342459fb50cd9", "050bc72f85ddc82e", "8c9f3047c8a254de", "f5ba1df5368bcc50",
+        "2e491a92a6db808e", "a2cf4073812e4c2d", "c82801db42728f4b", "96f407cae70c003d",
+        "8b14fc0f558bc653", "4975a4447d902d53", "6a98f91bf0808431", "bfd24c4012bc1f86",
+        "4e1bd735e50e2ff9", "f036d9316ce9e707", "c4097b7c5d75fb53", "7f30c0782257fc84",
+        "dd349a5a98be8123", "3d01d7e175cc3cb6", "e2bca7df02d1ec21", "aa0635659d28934e",
+        "3510f343af56f945", "331e21e452c9ae91", "458403c67812828f", "16b41e481f31c27a",
+        "db2c8f6ffcf52c83", "8a3a33c49bb441da", "4926e10d6f4b24a9", "a25fa9a31a6560c2",
+        "65793a48e8ab710f", "1aebbd801d0ac14e", "c797bde00b84b748", "7616514fc27d35ee",
+        "7863728b3427584c", "a31c5446ef76656e", "3440a82f2956cc94", "16000f76acbd4d96",
+        "b5f9a24207a7b863", "f4a81c86ddde154d", "6eb02ca72e59dcb2",
+    ),
+    '### Size vectors': (
+        "b48c74258c767c81", "b7217a9032e69ec2", "9aca1c1de61fe25b", "8e3355fb5cc115df",
+        "749c3052cb3741fe", "9e02de36c9f41262", "09b93701aaeeebf9", "2b7e79d161198c70",
+        "f0a632bfa64ad2e0", "4bd38dfcf5276c7e", "9ce6a120a881f836", "459603942af535ac",
+        "a64880117a72c1b6", "1ba995927ab6ce51", "ecdc263a460eaab1", "74a0ba665e5da392",
+    ),
+    '### Envelope Members': (
+        "766e99bf601bc523", "f5bf7826e399548a", "d8753affe89f7911",
+    ),
+    '### Reasoning Auth Envelope': (
+        "bbfd15169431f723", "2448979c275b4177", "26e234527a9c3fc3", "b6b94ccbd7a789e6",
+        "3cc5ad86ae6ad3de", "270167b8bdd1a2e8", "18975aeb2546e58c", "d4a91d5a26239d4c",
+    ),
+    '## Heartbeat Payload': (
+        "1b15716c8252a154", "5efe608e5ff1e149", "8cdaa85afc12a5e9", "1a68288f3ab71ec6",
+        "e603466d8f24ba8d", "df7c511321770e75", "52f5ca00774dcd04",
+    ),
+    '### Heartbeat Auth Envelope': (
+        "8e80143578569b8e", "3c55b3ebaa240b54", "ad40dbce6598a9ad", "e7dbc69232f0cff7",
+        "66352e223a26e91e", "bdb571f6a803526c", "56e40bee14711b7f", "07f633e7878ddf4c",
+        "12f64d0bf998add3", "89e96f6eb6d925b0", "dd6293ca8bfd7bd8",
+    ),
+    '## Runtime Node Heartbeat Payload': (
+        "69ba6e138a03611c", "d6e8de7cd4159d3c", "d0258a92bf98e2d8", "9996006f8c4176f6",
+        "bb04b590a19bf699", "ddb7f8e04e7f2813", "d5df07a1f834c0f3", "06f7d5f57cf81fc3",
+        "fdecb576b4dbea08", "7e602dd3b11d850d", "797a903e502f0f25", "21fad9f81d0b8408",
+        "e2507e6f0d9b50a7", "4b379f2fd3a7b4bc", "d91f2c6be1c4aaee",
+    ),
+    '### `degradation_reasons`': (
+        "61b31248245be8d8", "8a315aa0344d7c5c", "371830a16dd41ff0", "69709183ac1e8a9f",
+        "b64ba0563ebdcfb9", "7f7dfe89953c68d6", "a7940dbb436fdf4e", "8d26a59f2bd5d665",
+        "477dc6d95a769660", "d82941a7e70d5bc6", "516277fd3bf1a1d4", "8291f409763ae4ae",
+        "342614159f2b01b0", "db438e13074dffa0", "c2118bfeecb828c8", "5bde63dba668d43f",
+        "c89343fb69411b85", "458893bf867faccd", "4ac24c83da585862", "5f009fa20a2c1671",
+        "0b405e9bc773128a", "1bc1c0c25c743376", "08580a9d55286b8e", "8c58d25a9a5fa485",
+        "db035d0509bedbea", "91c71b1de7d629d4", "4a5eeaa60a835981", "48a671a19dc8c300",
+        "ec53820445de7529", "82d34f7e8f621011", "8b0436a98123efd0", "f86e8e6f756451e1",
+        "b30fa9a4e8988125", "82f4aca20266070f", "8d62f04611899a2d", "00f910704604e18c",
+        "7ac61116b21b8b93", "39856e7ff7d78f96", "b62d0e9e922ca3c3", "bf0dafa2e51d65f4",
+        "a55140bc29a453c4", "1828d2161950ac23", "a2ff374d31fdf3df", "51881f252b019edb",
+        "39067f9091e3bcb3", "81713b7b8d20cfc5", "03285484d1024106", "7b2b6633fdf8eb35",
+        "db90459c7ebb441e", "f79efacd884a01c8", "831f2ee186f245dc", "d4ffdca1087cd665",
+        "379342a3f2428138", "77eb993e7e5b9580", "e372694680c4cc68", "42dfa32fe7a90114",
+        "b524a58f20ff2019", "7a19d1c69219d95a", "6b2f6c38139f923b", "7abc7df81ad5bb8a",
+        "ce4de1c20e7424d5", "13e49951d6843f55", "f0a45942724b445c", "452103f555f86171",
+        "708661ec3a1383b6", "3a92a6f15c8ff68d", "29b0a125cc671f41", "4cac674ffc8cc8db",
+        "c7713e2b5b05bb22", "b222f3c45f24e05d", "311fc70a54c458e9", "b5a1853421960974",
+        "dbd724b24655938f", "5e5797663a7c00d8", "56de9f63114ec9a1", "d2ca949ba96ed1a9",
+        "d0cf61ae03570bbb", "33806a5777752b63", "e0c7c7ef9fb703e1", "13d259d5b98f7bf4",
+        "24f296420b19a7e7", "34d062f93872db4e", "d84db359b2037743", "e03412375ff5c465",
+        "0a681b6b28db0ce4", "6fdd24ec425c6085", "33d6d2b80125a2a0", "e5c35981a79fca6f",
+        "968011f7747582f9", "f1d967d4a3a7f9f4", "8fc20cd8e28ced77", "12c03f565484b7cf",
+        "7d3ad25feea43c90", "68dd6526f498d957", "a595bacde995ab73", "22a7737271b9383a",
+        "db739814c7ed8c7b", "66f7e47e582d2fa1", "c04c6c5a24344e6a", "5dae5b4fb14ab03e",
+        "770540cc7cae0d09", "0d71bb5a86ceda62", "7cfbeda7f222f7f0", "6bd01f51816d6d19",
+        "89054a0489547a70", "b73d7234232fb6eb", "19e216aaff693458", "d37634c18ed0b01b",
+    ),
+    '### Export Auth Envelope': (
+        "8a464792bbfae995", "75c79e7ac8cf3e79", "d9c0bd1269c12728", "e1f94c5084858923",
+        "445bf0ea1e89640c", "5d9b699583fa8f50", "807a8e3e735a1528", "fff01644bef92774",
+        "21cdb4e13ef72524", "8833609e1a8bc8df", "ca9535bdfb42ba99", "6f945f446697a2c3",
+        "a61a27ab319580c1", "e06fe44841d4c386", "0776f88e222935e9", "69b0c5b72ddab0cc",
+        "2f24fa0b1eec2b57", "ec3c1f834c94338c", "727e16955389fe28", "093bcff6ce25f830",
+        "dfca74d290eb307e", "9dc10a7de324536c", "8f61817ca0856b3d", "15e0216947c56dd1",
+        "c5771c09e1654ebc", "4e9d7bed0063a667", "00ce6a45ba90298f", "fc180126796a3b8f",
+        "38f84aeec2c102e4",
+    ),
+    '### Enrichment Auth Envelope': (
+        "78cd707f6bf74877", "5438d96b05e68e08", "31ca26107a2763f3", "e55a30b15c4ebaf4",
+        "3cc5ad86ae6ad3de", "17f48b53760fcdb3", "bb759623255183f8", "8833609e1a8bc8df",
+        "b05ab93993e7fdcf", "ac41f0786c896b6b", "bdb41543f790214e", "837d780cdc49542b",
+        "202df59528110ebd", "dc08909071552d30", "33c287415dbd902c", "597a58f2db11d617",
+        "cb3f91d54eee30e5",
+    ),
+    '## Site Health HTTP Projection': (
+        "e550fac5ceb31644", "7ca86a7ae4040333", "ad9cd62b7d55233e", "549684e5fec20990",
+        "32c5fff7decbd1d8", "db20ad09019ebecb", "f8595d7ddb489bb6", "7842c43ae90efecb",
+        "3c4d70cce4e44463", "d5d7d83918e1839c", "dac1e2dbda1a49f3", "b25f609d4146d937",
+        "ea969d27f1433ba8", "40acc21c8ae733a0", "1f9b138a2ea51620", "7c00063d250e2f13",
+        "ec58d097c6928528", "ba8198c7919b3fee", "a22ffc1fbc93d8d3",
+    ),
+    '### Outbound acknowledgement': (
+        "a60a4d06386f3979", "87bf7c3fbce540e2", "d7990f9d5c80cf14", "d457f53f98b57d61",
+        "7ffc13d55bb50637", "92f0b1fd29c52d80", "f92198622f97c6ff", "df17979b57036aba",
+        "0f4535a4e9cc2d27", "b5d823c2a5293c81", "b4d998c04dc60fdc", "ab900fde568a3e50",
+        "951def4ea058d5c4", "4ee3596debf1d01b", "7843fc55b94c9e1a", "5f1f08d8d78bf15b",
+        "ac0a7b0febbafd0c", "71c92fdbaa200e9b", "6fa367cb99f1b792", "fdaafbfbd20eab19",
+        "cb3f91d54eee30e5",
+    ),
+    '### Topic and Delivery': (
+        "e1e9e197da80ee43", "2be36fbeefeb4ed7", "597dce9ad491a394", "c87af99f696ee5e3",
+        "7233f10b245b5877", "958aa769041721ca",
+    ),
+    '### Durability and Retirement': (
+        "26f0501949613e47", "3e25791daf82704d", "bde527086720520b", "c4dbdaaf220d0f61",
+        "dfa83ab898c138c5", "b608a039a20b9005", "d6cc9487f71db3a4", "f45656305c1f9f1f",
+        "f501fc7c85e79b9d", "8618c3d7a8213107", "39294a2d301207c8", "792029172e21a44f",
+        "43471b6ac754def1", "96edab94562c1c14", "ce3a416dfb645e8c", "419c5d98dd3f4cf7",
+        "df17979b57036aba", "caff772a1187b672", "76c36933c8c19dac", "4f35844ca11788f1",
+        "91a19818de1b8242", "30f0c0892de3a420", "54f8444d6b1f27c1", "be2c3bfde9b927c2",
+        "ec522f2a261ee367", "a234a676697996dc", "bf16128e523574bb", "926bbd5c6047511f",
+        "e507c45b40e3ab56", "8cf57071acda0dd6", "0aef517e4926d758", "b518faf41e45631c",
+        "67848ccebb0d832e", "6733abce8a2a7a11", "38320bbcbca19438", "b80b8ce9a8db7113",
+        "3a07d29f3c7e536a", "76a91cb95ece93e1", "bec107885b186605", "f00dfc58790a69ee",
+        "2782d4e34046ff23", "5178e5d39570d67a", "d17291c4efa4102f", "365c61f2965e622d",
+        "3789932b6529cfc1", "8363f78a690dd75c", "d8ed03adf47f8654", "8f1ae5b5496a77a8",
+        "24c19fb5188fd56a", "a1294246b1c2293b", "23118ea1165f189f", "41af89e346b0ea8c",
+        "a3f7daa7025f8d4b", "db826eb9ad9cc2dc", "e4c8a071ed2909b0", "3dd9e4f0478a4488",
+        "48179f3f0e56f0aa", "e3f8aec1d53c5246", "41e1ca4308cf0215", "050a248504b5a930",
+        "83e91b6620f1144c", "9682e1de2bf6f5e2", "2301016aefcd50c7", "6b68bcc36d112546",
+        "d925c087445d8281", "f1bd1c7ed6044ed6", "40c184dc6a3b9bc7",
+    ),
+    '### Envelope': (
+        "e5d5f8dcefcd40d9", "5f5c2be6140020ce", "50acd7cafe0f4e0e", "16c834b2e01b5dde",
+        "79531446b8543728", "fa6050a1ea44fc6c", "7ee570afd68d4fa1", "994cb30c8d3dc3ae",
+        "5c6f166654f66175",
+    ),
+    '### Envelope Auth Envelope': (
+        "da4b7efe2c88622f", "672c7aaaade87fbe", "89e96f6eb6d925b0", "176acbe13d494241",
+    ),
+    '### Invariants': (
+        "f1f1bdb8b5f6fc93", "8dfae1923865362f", "39a0e3e6cbd2aaf5", "3085940f06cc99b5",
+        "463040d2f80e7dcc", "b9fcdb79efd00eca", "d24701496123e5b3", "db06a705570adbf3",
+        "7c84b62f8ac3ec76", "882c734c1989e7ec", "0b98d93f2a749fe2",
+    ),
+}
+STATUS_NOTES = {
+    'notes': (
+        "c23f5b11f87f4cd5", "fd4c0cc4ec7b0e67", "8b44e91a0de5c383", "335e932dee5c88d9",
+        "ab919dab43807152", "add759b75fd43016", "e9dee82d572d9643", "699ec6ae65179732",
+        "62d8d62370e56d5f", "be13eeed235f37a5", "3ee7f3771de15906", "e830250a4e8af075",
+        "083ec5e4a5c1cfe2",
+    ),
+    'adoption[0] runtime producer': (
+        "7636f71480c9589d", "b9ae8504f83fa8cf", "f57e5d580dc008a9", "5ba4982f3de818da",
+        "880478bb6349bcbe", "c45b450e17a8a728",
+    ),
+    'adoption[1] gateway gateway': (
+        "5c380aab69df24f7", "763600babc148902", "9d326ad342737521", "c60c28a6f9a05d70",
+        "7c16fa8bc07fa16d", "ee4f679718d2b728", "954af56656fa9e9a",
+    ),
+}
+# END INVENTORY
+
+
+# ---------------------------------------------------------------- the replay
+
+class Receiver:
+    def __init__(self, model: dict, ctx: dict) -> None:
+        self.m = model
+        self.skew = ctx["skew_ms"]
+        self.ttl = ctx["replay_ttl_ms"]
+        self.stores = ctx["stores"]
+        self.raised = ctx["stored_floor_ms"]      # only a floor raised by a drop
+        self.base = ctx["start_clock_ms"]         # the clock at the last start
+        self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
+        self.pending: dict[str, tuple[str, int, int]] = {}
+
+    @property
+    def floor(self) -> int:
+        return self.base if self.raised is None else self.m["start"](self.raised, self.base)
+
+    def fails(self, c: dict, key: str, s: int, t: int) -> bool:
+        if c["rhs"] == "held":
+            return key in self.held
+        rhs = {"t-S": t - self.skew, "t+S": t + self.skew, "F": self.floor}[c["rhs"]]
+        return not OPS[c["op"]](s, rhs)
+
+    def verify(self, rows: list[int], key: str, s: int, t: int) -> str | None:
+        for i in rows:
+            if self.fails(self.m["checks"][i], key, s, t):
+                return self.m["checks"][i]["reason"]
+        return None
+
+    def drop(self, key: str) -> tuple:
+        s, r = self.held.pop(key)
+        up = s + self.m["raise_by"]
+        self.raised = up if self.raised is None else max(self.raised, up)
+        return (key, s, r)
+
+    def retention_ended(self, s: int, r: int, t: int) -> bool:
+        if not OPS[self.m["stale_op"]](t, s + self.skew):
+            return False
+        return self.ttl is None or OPS[self.m["ttl_op"]](t, r + self.ttl)
+
+
+def replay(model: dict, case: dict) -> list[dict]:
+    rx = Receiver(model, case["context"])
+    trace = []
+    for i, ev in enumerate(case["events"]):
+        kind, t = ev["event"], ev["t"]
+        rec = {"i": i, "kind": kind, "t": t, "ev": ev, "pre_floor": rx.floor,
+               "pre_raised": rx.raised, "pre_skew": rx.skew, "pre_held": dict(rx.held),
+               "reason": None, "dropped": [], "fails": None, "key": ev.get("key"),
+               "s": ev.get("signed_at_ms")}
+        if kind in ("receive", "authenticate"):
+            rec["fails"] = [rx.fails(c, ev["key"], ev["signed_at_ms"], t)
+                            for c in model["checks"]]
+            rec["reason"] = rx.verify(list(range(4)), ev["key"], ev["signed_at_ms"], t)
+            if rec["reason"] is None:
+                if kind == "receive":
+                    rx.held[ev["key"]] = (ev["signed_at_ms"], t)
+                else:
+                    if ev["handle"] in rx.pending:
+                        raise Failure(f"event {i}: handle {ev['handle']} already pending")
+                    rx.pending[ev["handle"]] = (ev["key"], ev["signed_at_ms"], t)
+        elif kind == "commit":
+            if ev["handle"] not in rx.pending:
+                raise Failure(f"event {i}: commit of handle {ev['handle']} that is not pending")
+            key, s, r = rx.pending.pop(ev["handle"])
+            if key != ev["key"]:
+                raise Failure(f"event {i}: commit key {ev['key']} is not its authenticate's {key}")
+            rec["s"], rec["auth_t"] = s, r
+            rec["reason"] = rx.verify(list(model["recheck"]), key, s, t)
+            if rec["reason"] is None:
+                rx.held[key] = (s, r)              # receipt time from the authenticate
+        elif kind == "prune":
+            for key in [k for k, (s, r) in rx.held.items() if rx.retention_ended(s, r, t)]:
+                rec["dropped"].append(rx.drop(key))
+        elif kind == "evict":
+            if not rx.held:
+                raise Failure(f"event {i}: evict with nothing held")
+            least = min(s for s, _ in rx.held.values())
+            ties = sorted(k for k, (s, _) in rx.held.items() if s == least)
+            # Any one of several sharing the smallest signing time may go; the
+            # declared held keys name which, and must be one of them.
+            want = set(ev["expected"]["held"])
+            pick = next((k for k in ties if set(rx.held) - {k} == want), ties[0])
+            rec["dropped"].append(rx.drop(pick))
+        elif kind == "restart":
+            if not rx.stores:
+                rx.raised, rx.held = None, {}
+            rx.base = t
+            if "skew_ms" in ev:
+                rx.skew = ev["skew_ms"]
+            rx.pending = {}
+        elif kind == "rotate":
+            if not ev["keeps_previous"]:
+                rx.raised, rx.held, rx.base, rx.pending = None, {}, t, {}
+        rec.update(floor=rx.floor, raised=rx.raised, skew=rx.skew, held=dict(rx.held))
+        trace.append(rec)
+    return trace
+
+
+# ---------------------------------------------------------------- the corpus
+
+EVENT_FIELDS = {
+    "receive": ({"event", "key", "signed_at_ms", "t", "expected"}, set()),
+    "authenticate": ({"event", "handle", "key", "signed_at_ms", "t", "expected"}, set()),
+    "commit": ({"event", "handle", "key", "t", "expected"}, set()),
+    "prune": ({"event", "t", "expected"}, set()),
+    "evict": ({"event", "t", "expected"}, set()),
+    "restart": ({"event", "t", "expected"}, {"skew_ms"}),
+    "rotate": ({"event", "keeps_previous", "t", "expected"}, set()),
+}
+REASONED = {"receive", "authenticate", "commit"}
+
+
+def is_int(x: object) -> bool:
+    return type(x) is int
+
+
+def check_shape(corpus: dict, model: dict) -> None:
+    if set(corpus) != {"contract", "section", "comment", "reasons", "cases"}:
+        raise Failure(f"corpus top-level keys: {sorted(corpus)}")
+    if corpus["contract"] != "ori-specs/gateway-api/v2.md":
+        raise Failure(f"corpus contract: {corpus['contract']!r}")
+    if corpus["section"] != SECTION:
+        raise Failure(f"corpus section: {corpus['section']!r}")
+    order = [c["reason"] for c in model["checks"]]
+    if corpus["reasons"] != order:
+        raise Failure(f"corpus reasons {corpus['reasons']} are not the table's {order}")
+    names = [c["name"] for c in corpus["cases"]]
+    if len(names) != len(set(names)):
+        raise Failure("case names are not unique")
+    for case in corpus["cases"]:
+        name = case["name"]
+        if set(case) != {"name", "note", "context", "events"} or not case["events"]:
+            raise Failure(f"{name}: case fields")
+        ctx = case["context"]
+        if set(ctx) != {"skew_ms", "replay_ttl_ms", "stores", "stored_floor_ms",
+                        "start_clock_ms", "held"}:
+            raise Failure(f"{name}: context fields {sorted(ctx)}")
+        if not (is_int(ctx["skew_ms"]) and ctx["skew_ms"] >= 0 and is_int(ctx["start_clock_ms"])
+                and type(ctx["stores"]) is bool
+                and (ctx["replay_ttl_ms"] is None or is_int(ctx["replay_ttl_ms"]))
+                and (ctx["stored_floor_ms"] is None or is_int(ctx["stored_floor_ms"]))):
+            raise Failure(f"{name}: context types")
+        if not ctx["stores"] and ctx["stored_floor_ms"] is not None:
+            raise Failure(f"{name}: a receiver that stores nothing has a stored floor")
+        sig: dict[str, int] = {}
+        for h in ctx["held"]:
+            if set(h) != {"key", "signed_at_ms", "received_at_ms"} or h["key"] in sig \
+                    or not is_int(h["signed_at_ms"]) or not is_int(h["received_at_ms"]):
+                raise Failure(f"{name}: context held entry {h}")
+            sig[h["key"]] = h["signed_at_ms"]
+        for i, ev in enumerate(case["events"]):
+            kind = ev.get("event")
+            if kind not in EVENT_FIELDS:
+                raise Failure(f"{name} event {i}: kind {kind!r}")
+            need, may = EVENT_FIELDS[kind]
+            if not need <= set(ev) <= need | may:
+                raise Failure(f"{name} event {i}: fields {sorted(ev)}")
+            if not is_int(ev["t"]) or ("skew_ms" in ev and not (is_int(ev["skew_ms"])
+                                                                and ev["skew_ms"] >= 0)):
+                raise Failure(f"{name} event {i}: types")
+            if kind == "rotate" and type(ev["keeps_previous"]) is not bool:
+                raise Failure(f"{name} event {i}: keeps_previous")
+            if "signed_at_ms" in ev:
+                if not is_int(ev["signed_at_ms"]):
+                    raise Failure(f"{name} event {i}: signed_at_ms")
+                # A key includes its signing time: one label, one signing time.
+                if sig.setdefault(ev["key"], ev["signed_at_ms"]) != ev["signed_at_ms"]:
+                    raise Failure(f"{name} event {i}: key {ev['key']} with two signing times")
+            exp = ev["expected"]
+            want = {"floor_ms", "held"} | ({"reason"} if kind in REASONED else set())
+            if set(exp) != want:
+                raise Failure(f"{name} event {i}: expected fields {sorted(exp)}")
+            if kind in REASONED and exp["reason"] is not None and exp["reason"] not in order:
+                raise Failure(f"{name} event {i}: reason {exp['reason']!r}")
+            if not is_int(exp["floor_ms"]) or len(set(exp["held"])) != len(exp["held"]):
+                raise Failure(f"{name} event {i}: floor or held malformed")
+
+
+def check_replay(corpus: dict, model: dict) -> dict[str, list[dict]]:
+    traces = {}
+    for case in corpus["cases"]:
+        trace = replay(model, case)
+        for rec in trace:
+            exp, where = rec["ev"]["expected"], f"{case['name']} event {rec['i']} ({rec['kind']})"
+            if rec["kind"] in REASONED and exp["reason"] != rec["reason"]:
+                raise Failure(f"{where}: reason {exp['reason']!r}, replay gives {rec['reason']!r}")
+            if exp["floor_ms"] != rec["floor"]:
+                raise Failure(f"{where}: floor {exp['floor_ms']}, replay gives {rec['floor']}")
+            if set(exp["held"]) != set(rec["held"]):
+                raise Failure(f"{where}: held {sorted(exp['held'])}, replay gives "
+                              f"{sorted(rec['held'])}")
+        traces[case["name"]] = trace
+    return traces
+
+
+# ---------------------------------------------------------------- coverage
+# Each bullet is held as parts; each part is a test over one case's context
+# and trace. A bullet is shown when every part is shown by some case.
+
+def _reason(model: dict, rhs: str) -> str:
+    return next(c["reason"] for c in model["checks"] if c["rhs"] == rhs)
+
+
+def _after(trace: list[dict], i: int) -> list[dict]:
+    return trace[i + 1:]
+
+
+def _segment_after(trace: list[dict], i: int) -> list[dict]:
+    """Events after i up to the next restart."""
+    out = []
+    for rec in trace[i + 1:]:
+        if rec["kind"] == "restart":
+            break
+        out.append(rec)
+    return out
+
+
+def _verifies(trace):
+    return [r for r in trace if r["kind"] in ("receive", "authenticate")]
+
+
+def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]], bool]]]]:
+    STALE, FUTURE = _reason(model, "t-S"), _reason(model, "t+S")
+    FLOOR, REPLAY = _reason(model, "F"), _reason(model, "held")
+
+    def at_floor(ctx, tr):
+        return any(r["reason"] is None and r["s"] == r["pre_floor"] for r in _verifies(tr))
+
+    def below_floor(ctx, tr):
+        return any(r["reason"] == FLOOR and r["s"] == r["pre_floor"] - 1 for r in _verifies(tr))
+
+    def edge(reason, off, side):
+        def test(ctx, tr):
+            return any(r["reason"] == reason
+                       and r["s"] == r["t"] + side * (r["pre_skew"] + off)
+                       for r in _verifies(tr))
+        return test
+
+    def ttl_last_ms(shorter):
+        def test(ctx, tr):
+            for r in tr:
+                if r["kind"] != "receive" or r["reason"] != REPLAY:
+                    continue
+                ttl = ctx["replay_ttl_ms"]
+                if ttl is None or r["t"] != r["s"] + r["pre_skew"]:
+                    continue
+                if (ttl < r["pre_skew"]) != shorter or ttl == r["pre_skew"]:
+                    continue
+                received = r["pre_held"][r["key"]][1]
+                pruned = any(x["kind"] == "prune" and x["t"] == r["t"]
+                             and r["key"] in x["pre_held"] for x in tr[:r["i"]])
+                if pruned and (not shorter or r["t"] >= received + ttl):
+                    return True
+            return False
+        return test
+
+    def ahead(ctx, tr):
+        for j, rs in enumerate(tr):
+            if rs["kind"] != "restart":
+                continue
+            for a in tr[:j]:
+                if a["kind"] == "receive" and a["reason"] is None and a["s"] > a["t"] \
+                        and a["s"] >= rs["t"] and any(
+                            b["kind"] == "receive" and b["key"] == a["key"]
+                            for b in _after(tr, j)):
+                    return True
+        return False
+
+    def behind(ctx, tr):
+        for j, rs in enumerate(tr):
+            if rs["kind"] != "restart":
+                continue
+            seg = _segment_after(tr, j)
+            if any(r["kind"] == "receive" and r["reason"] == FLOOR and r["s"] < r["t"]
+                   and r["s"] < rs["t"] for r in seg) and any(
+                       r["kind"] == "receive" and r["reason"] is None and r["s"] < r["t"]
+                       for r in seg):
+                return True
+        return False
+
+    def forward(kind):
+        def test(ctx, tr):
+            for r in tr[1:]:
+                if r["kind"] == kind and r["t"] > tr[r["i"] - 1]["t"] + 2 * r["pre_skew"] \
+                        and (kind == "restart" or r["dropped"]):
+                    return True
+            return False
+        return test
+
+    def back_live(ctx, tr):
+        top = None
+        for r in tr:
+            if r["kind"] == "restart":
+                top = None
+                continue
+            if top is not None and r["t"] < top and r["kind"] == "receive" \
+                    and r["reason"] == FLOOR:
+                return True
+            top = r["t"] if top is None else max(top, r["t"])
+        return False
+
+    def back_start(ctx, tr):
+        for j, rs in enumerate(tr):
+            if rs["kind"] == "restart" and j and rs["t"] < max(x["t"] for x in tr[:j]) \
+                    and any(r["kind"] == "receive" and r["reason"] == FLOOR
+                            for r in _segment_after(tr, j)):
+                return True
+        return False
+
+    def back_unstored(ctx, tr):
+        if ctx["stores"]:
+            return False
+        for j, rs in enumerate(tr):
+            if rs["kind"] == "restart" and j and rs["t"] < max(x["t"] for x in tr[:j]) \
+                    and any(r["kind"] == "receive" and r["reason"] is None
+                            and r["key"] in rs["pre_held"] for r in _segment_after(tr, j)):
+                return True
+        return False
+
+    def back_upgrade(ctx, tr):
+        if not ctx["stores"] or ctx["stored_floor_ms"] is not None:
+            return False
+        starts = [r for r in tr if r["kind"] == "restart"]
+        for a, first in enumerate(starts):
+            for later in starts[a + 1:]:
+                if later["t"] >= first["t"]:
+                    continue
+                refused = {r["key"] for r in tr[first["i"] + 1:later["i"]]
+                           if r["kind"] == "receive" and r["reason"] == FLOOR
+                           and r["s"] < first["t"] and r["key"] not in r["pre_held"]}
+                if any(r["kind"] == "receive" and r["reason"] is None and r["key"] in refused
+                       for r in _segment_after(tr, later["i"])):
+                    return True
+        return False
+
+    def evict_ahead(ctx, tr):
+        if not ctx["stores"]:
+            return False
+        for e in tr:
+            if e["kind"] != "evict" or e["dropped"][0][1] <= e["t"]:
+                continue
+            s = e["dropped"][0][1]
+            live = any(r["kind"] == "receive" and r["reason"] == FLOOR and r["s"] <= s
+                       and r["s"] >= r["t"] - r["pre_skew"] for r in _segment_after(tr, e["i"]))
+            for rs in _after(tr, e["i"]):
+                if rs["kind"] == "restart" and rs["raised"] is not None and rs["raised"] > s \
+                        and live and any(
+                            r["kind"] == "receive" and r["reason"] == FLOOR
+                            and rs["t"] <= r["s"] <= s for r in _segment_after(tr, rs["i"])):
+                    return True
+        return False
+
+    def skew_raised(ctx, tr):
+        for j, rs in enumerate(tr):
+            if rs["kind"] == "restart" and rs["skew"] > rs["pre_skew"]:
+                old, new = rs["pre_skew"], rs["skew"]
+                if any(r["kind"] == "receive" and r["reason"] == FLOOR
+                       and r["s"] < r["t"] - old and r["s"] >= r["t"] - new
+                       for r in _segment_after(tr, j)):
+                    return True
+        return False
+
+    def skew_lowered(ctx, tr):
+        for j, rs in enumerate(tr):
+            if rs["kind"] == "restart" and rs["skew"] < rs["pre_skew"]:
+                old = rs["pre_skew"]
+                if any(r["kind"] == "prune" and any(r["t"] <= s + old for _, s, _ in r["dropped"])
+                       for r in _segment_after(tr, j)):
+                    return True
+        return False
+
+    def restart_where(stores, test):
+        def go(ctx, tr):
+            return ctx["stores"] == stores and any(
+                r["kind"] == "restart" and test(r) for r in tr)
+        return go
+
+    def upgrade(ctx, tr):
+        if not (ctx["stores"] and ctx["stored_floor_ms"] is None and ctx["held"]
+                and tr[0]["kind"] == "restart"):
+            return False
+        start, kept = tr[0]["t"], {h["key"] for h in ctx["held"]}
+        seg = _segment_after(tr, 0)
+        return any(r["kind"] == "receive" and r["reason"] == REPLAY and r["key"] in kept
+                   for r in seg) and any(
+                       r["kind"] == "receive" and r["reason"] == FLOOR
+                       and r["key"] not in r["pre_held"] and r["s"] < start for r in seg)
+
+    def rollback(ctx, tr):
+        stored = ctx["stored_floor_ms"]
+        j = next((r["i"] for r in tr if r["kind"] == "restart"), None)
+        if stored is None or j is None or tr[j]["t"] <= stored:
+            return False
+        return any(r["kind"] == "receive" and r["reason"] == FLOOR
+                   and stored <= r["s"] < tr[j]["t"] for r in _segment_after(tr, j))
+
+    def auth_drop(ctx, tr):
+        for c in tr:
+            if c["kind"] != "commit" or c["reason"] != FLOOR:
+                continue
+            a = next(x for x in reversed(tr[:c["i"]]) if x["kind"] == "authenticate"
+                     and x["ev"]["handle"] == c["ev"]["handle"])
+            if any(x["dropped"] for x in tr[a["i"] + 1:c["i"]]) \
+                    and a["s"] >= a["floor"] and c["s"] < c["pre_floor"]:
+                return True
+        return False
+
+    def evicts(ctx, tr):
+        for e in tr:
+            if e["kind"] != "evict":
+                continue
+            key, s, r = e["dropped"][0]
+            early = not (OPS[model["stale_op"]](e["t"], s + e["pre_skew"]) and (
+                ctx["replay_ttl_ms"] is None
+                or OPS[model["ttl_op"]](e["t"], r + ctx["replay_ttl_ms"])))
+            if early and any(x["kind"] == "receive" and x["key"] == key
+                             and x["reason"] == FLOOR for x in _after(tr, e["i"])):
+                return True
+        return False
+
+    def rotation(keeps):
+        def test(ctx, tr):
+            for r in tr:
+                if r["kind"] != "rotate" or r["ev"]["keeps_previous"] != keeps \
+                        or not r["pre_held"] or r["pre_floor"] <= r["t"]:
+                    continue
+                if keeps and r["held"] == r["pre_held"] and r["floor"] == r["pre_floor"]:
+                    return True
+                if not keeps and not r["held"] and r["floor"] == r["t"]:
+                    return True
+            return False
+        return test
+
+    idx = {c["rhs"]: n for n, c in enumerate(model["checks"])}
+
+    def precedence(a, b):
+        first, second = sorted((idx[a], idx[b]))
+
+        def test(ctx, tr):
+            reason = model["checks"][first]["reason"]
+            return any(r["reason"] == reason and r["fails"][second] for r in _verifies(tr))
+        return test
+
+    def commit_receipt(ctx, tr):
+        ttl = ctx["replay_ttl_ms"]
+        if ttl is None:
+            return False
+        for c in tr:
+            if c["kind"] != "commit" or c["reason"] is not None or c["auth_t"] >= c["t"]:
+                continue
+            # dropped by a prune the authenticate's receipt allows and the
+            # commit's would not
+            if any(p["kind"] == "prune" and any(k == c["key"] for k, _, _ in p["dropped"])
+                   and c["auth_t"] + ttl <= p["t"] < c["t"] + ttl
+                   for p in _after(tr, c["i"])):
+                return True
+        return False
+
+    return {
+        B_FLOOR: [("accepted at the floor", at_floor),
+                  (f"{FLOOR} one ms below the floor", below_floor)],
+        B_SKEW: [("accepted at t - S", edge(None, 0, -1)),
+                 (f"{STALE} at t - S - 1", edge(STALE, 1, -1)),
+                 ("accepted at t + S", edge(None, 0, 1)),
+                 (f"{FUTURE} at t + S + 1", edge(FUTURE, 1, 1))],
+        B_TTL: [("replay at s + S after a prune at it, ttl < S", ttl_last_ms(True)),
+                ("replay at s + S after a prune at it, ttl > S", ttl_last_ms(False))],
+        B_SENDERS: [("sender ahead: accepted with s > t and s past a later start, "
+                     "received again after it", ahead),
+                    ("sender behind: refused at a start floor with s < t, then accepted "
+                     "with s < t", behind)],
+        B_CLOCK: [("clock forward live: a prune more than 2S after the last event drops "
+                   "keys", forward("prune")),
+                  ("clock back live: a receive below an earlier clock, refused at the "
+                   "floor", back_live),
+                  ("clock forward across a start: a restart more than 2S after the last "
+                   "event", forward("restart")),
+                  ("clock back across a non-storing restart: a key of the earlier run is "
+                   "accepted again", back_unstored),
+                  ("clock back across a later start by a storing receiver after an "
+                   "upgrade: a key refused at the first start floor is accepted",
+                   back_upgrade),
+                  ("clock back across a start: a restart below an earlier clock, then a "
+                   "floor refusal", back_start)],
+        B_SKEWCHG: [("skew raised: a key stale under the old skew is refused at the floor "
+                     "under the new", skew_raised),
+                    ("skew lowered: a prune drops a key the old skew would keep",
+                     skew_lowered)],
+        B_RESTART: [("a storing restart keeps held keys", restart_where(
+                        True, lambda r: r["pre_held"] and r["held"] == r["pre_held"])),
+                    ("a storing restart keeps a raised floor above its clock", restart_where(
+                        True, lambda r: r["pre_raised"] is not None
+                        and r["raised"] == r["pre_raised"] and r["raised"] > r["t"])),
+                    ("a non-storing restart loses held keys", restart_where(
+                        False, lambda r: r["pre_held"] and not r["held"])),
+                    ("a non-storing restart loses a raised floor", restart_where(
+                        False, lambda r: r["pre_raised"] is not None and r["raised"] is None)),
+                    ("first start with keys and no stored floor: a kept key is a replay, "
+                     "a dropped one is refused at the start floor", upgrade),
+                    ("a stored floor below the start clock: an envelope it would admit is "
+                     "refused at the start floor", rollback)],
+        B_AUTH: [("a drop between authenticate and commit raises the floor past the "
+                  "envelope", auth_drop)],
+        B_EVICT: [("an evict before retention ends, and the evicted key refused at the "
+                   "floor", evicts),
+                  ("an evicted key signed ahead of the clock refuses a sender behind it, "
+                   "and again after a storing restart, above the start floor", evict_ahead)],
+        B_ROTATE: [("a keeping rotation keeps a floor ahead of the clock and its keys",
+                    rotation(True)),
+                   ("a non-keeping rotation clears both, the floor at the clock",
+                    rotation(False))],
+        B_COMMIT: [("a committed key dropped at its authentication's receipt plus ttl, "
+                    "before its commit's", commit_receipt)],
+        B_PREC: [("stale and below the floor", precedence("t-S", "F")),
+                 ("future and below the floor", precedence("t+S", "F")),
+                 ("below the floor and held", precedence("F", "held"))],
+    }
+
+
+COVERAGE = (B_FLOOR, B_SKEW, B_TTL, B_COMMIT, B_SENDERS, B_CLOCK, B_SKEWCHG, B_RESTART,
+            B_AUTH, B_EVICT, B_ROTATE, B_PREC)
+
+
+def witnesses(corpus: dict, model: dict, traces: dict) -> dict[tuple[str, str], list[str]]:
+    out = {}
+    for bullet, ps in parts(model).items():
+        for label, test in ps:
+            out[(bullet, label)] = [c["name"] for c in corpus["cases"]
+                                    if test(c["context"], traces[c["name"]])]
+    return out
+
+
+def check_coverage(corpus: dict, model: dict, traces: dict) -> None:
+    missing = [f"{bullet!r}: {label}" for (bullet, label), w
+               in witnesses(corpus, model, traces).items() if not w]
+    if missing:
+        raise Failure("cover bullets not shown by any case:\n  " + "\n  ".join(missing))
+
+
+# ---------------------------------------------------------------- run
+
+def check(text: str, corpus: dict, rc: str | None = None,
+          st: dict | None = None) -> tuple[dict, dict]:
+    model = contract_model(text)
+    check_inventory(text, rc if rc is not None else RUNTIME_CONFIG.read_text(encoding="utf-8"),
+                    st if st is not None else json.loads(STATUS.read_text(encoding="utf-8")))
+    check_shape(corpus, model)
+    traces = check_replay(corpus, model)
+    check_coverage(corpus, model, traces)
+    return model, traces
+
+
+def outcome(text: str, corpus: dict, rc: str | None = None,
+            st: dict | None = None) -> str | None:
+    try:
+        check(text, corpus, rc, st)
+    except Failure as failure:
+        return str(failure)
+    except (KeyError, TypeError, ValueError, IndexError, StopIteration) as failure:
+        return f"malformed: {failure!r}"
+    return None
+
+
+def mutations(text: str, corpus: dict) -> int:
+    base = outcome(text, corpus)
+    if base is not None:
+        print("baseline fails; a mutant is refused only when its outcome differs from it")
+    try:
+        model = contract_model(text)
+    except Failure:
+        print("the contract does not parse; no mutant can be judged")
+        return -1
+    cases: list[tuple[str, Callable[[], tuple[str, dict]]]] = []
+
+    def cm(label: str, edit: Callable[[dict], None]) -> None:
+        def go():
+            c = copy.deepcopy(corpus)
+            edit(c)
+            return text, c
+        cases.append((label, go))
+
+    sec_at = text.index(f"## {SECTION}\n")     # every text mutant lands in the section
+
+    def tm(label: str, old: str, new: str) -> None:
+        if old not in text[sec_at:]:
+            raise SystemExit(f"text mutant {label!r}: {old!r} not in the section")
+
+        def go():
+            return text[:sec_at] + text[sec_at:].replace(old, new, 1), corpus
+        cases.append((label, go))
+
+    reasons = [c["reason"] for c in model["checks"]]
+    for ci, case in enumerate(corpus["cases"]):
+        names = sorted({e["key"] for e in case["events"] if "key" in e}
+                       | {h["key"] for h in case["context"]["held"]})
+        for ei, ev in enumerate(case["events"]):
+            where = f"{case['name']}#{ei}"
+            exp = ev["expected"]
+
+            def at(c, ci=ci, ei=ei):
+                return c["cases"][ci]["events"][ei]["expected"]
+            if "reason" in exp:
+                for r in [None] + reasons:
+                    if r != exp["reason"]:
+                        cm(f"{where} reason -> {r}",
+                           lambda c, r=r, at=at: at(c).__setitem__("reason", r))
+            for d in (1, -1):
+                cm(f"{where} floor {d:+d}",
+                   lambda c, d=d, at=at: at(c).__setitem__("floor_ms", at(c)["floor_ms"] + d))
+            extra = next((n for n in names if n not in exp["held"]), "zz-mutant")
+            cm(f"{where} held + {extra}",
+               lambda c, k=extra, at=at: at(c)["held"].append(k))
+            for k in exp["held"]:
+                cm(f"{where} held - {k}", lambda c, k=k, at=at: at(c)["held"].remove(k))
+
+    cm("header: contract", lambda c: c.__setitem__("contract", "ori-specs/gateway-api/v1.md"))
+    cm("header: section", lambda c: c.__setitem__("section", "Envelope Freshness"))
+    cm("header: reasons reordered", lambda c: c["reasons"].reverse())
+    cm("header: reason renamed", lambda c: c["reasons"].__setitem__(0, "stale"))
+    cm("header: duplicate case name",
+       lambda c: c["cases"][1].__setitem__("name", c["cases"][0]["name"]))
+
+    # Cases that are the only witness of some coverage part.
+    _, traces = (model, check_replay(corpus, model)) if base is None or \
+        base.startswith("cover bullets") else (model, None)
+    equivalent = []
+    if traces is not None:
+        sole: dict[str, list[str]] = {}
+        for (bullet, label), w in witnesses(corpus, model, traces).items():
+            if len(w) == 1:
+                sole.setdefault(w[0], []).append(label)
+        for case in corpus["cases"]:
+            n = case["name"]
+            if n in sole:
+                cm(f"case {n} deleted (sole witness: {'; '.join(sole[n])})",
+                   lambda c, n=n: c.__setitem__(
+                       "cases", [x for x in c["cases"] if x["name"] != n]))
+            else:
+                equivalent.append(f"case {n} deleted: witnesses no part alone")
+
+    # Text mutants.
+    rows = [line for line in sections(text)["Order of checks"]
+            if re.fullmatch(r"\| \d \| .+ \|", line)]
+    cells = [re.fullmatch(r"\| (\d) \| (.+) \|", r).groups() for r in rows]
+    for i in range(3):
+        a, b = rows[i], rows[i + 1]
+        tm(f"text: table rows {i + 1} and {i + 2} swapped", a + "\n" + b, b + "\n" + a)
+        tm(f"text: checks {i + 1} and {i + 2} swapped, numbers kept", a + "\n" + b,
+           f"| {cells[i][0]} | {cells[i + 1][1]} |\n| {cells[i + 1][0]} | {cells[i][1]} |")
+    for r in reasons:
+        tm(f"text: reason {r} renamed", f"| `{r}` |", f"| `{r}_x` |")
+    for row in rows:
+        for old, new in (("≥", ">"), ("≤", "<")):
+            if old in row:
+                tm(f"text: {row.split('|')[1].strip()} {old} -> {new}",
+                   row, row.replace(old, new))
+    tm("text: bounds exclusive", "Every bound is inclusive.", "Every bound is exclusive.")
+    tm("text: retention stale bound inclusive", "- `t` > `signed_at_ms` + `S`, so",
+       "- `t` ≥ `signed_at_ms` + `S`, so")
+    tm("text: retention ttl bound exclusive", "- `t` ≥ its receipt time plus",
+       "- `t` > its receipt time plus")
+    tm("text: recheck names other checks", "makes checks 3 and 4 again",
+       "makes checks 2 and 4 again")
+    tm("text: recheck one check", "makes checks 3 and 4 again", "makes check 4 again")
+    tm("text: drop raises by 2", "`signed_at_ms` + 1, in the same",
+       "`signed_at_ms` + 2, in the same")
+    for name, phrases in HELD.items():
+        for p in phrases:
+            first = p.split(" ")[:6]
+            # Delete the held sentence's opening words in the file's own wrapping.
+            pat = r"\s+".join(re.escape(w) for w in first)
+            m = re.compile(pat).search(text, sec_at)
+            if m:
+                cases.append((f"text: {name} sentence cut: {' '.join(first)}…",
+                              lambda m=m: (text[:m.start()] + "XX" + text[m.end():], corpus)))
+    tm("text: earlier secret may verify", "in which no earlier secret verifies",
+       "in which an earlier secret may verify")
+    tm("text: drop may raise", "**A dropped key raises the floor.**",
+       "**A dropped key may raise the floor.**")
+    tm("text: sender republishes", "It never republishes envelope bytes",
+       "It may republish envelope bytes")
+    tm("text: limit 2S", "at most `S` past its signing time",
+       "at most 2 × `S` past its signing time")
+    tm("text: start takes the lesser", "`F` becomes the greater of", "`F` becomes the lesser of")
+    tm("text: un-record allowed", "A recorded key is never un-recorded:",
+       "A recorded key may be un-recorded:")
+    tm("text: MUST NOT bring back", "MUST NOT bring back a secret", "may bring back a secret")
+    tm("text: bring back only as current", "secret or the previous one:", "secret:")
+    tm("text: limits no longer bound claims", "it stops outside the cases",
+       "it stops in every case, even the cases")
+    tm("text: skew may be negative", "maximum clock skew, never negative;",
+       "maximum clock skew;")
+
+    def om(label: str, edit: Callable[[str], str]) -> None:
+        cases.append((label, lambda: (edit(text), corpus)))
+    dur = text.index("### Durability and Retirement\n")
+    hostile = text.index("from a hostile one.", dur) + len("from a hostile one.")
+    om("codex: custody rationale claims restore safety", lambda x: x[:hostile] + (
+        " This protection is guaranteed even after restoring an older state store.")
+        + x[hostile:])
+    om("outside: replay claim under a guarded heading", lambda x: x.replace(
+        "### Heartbeat Auth Envelope\n", "### Heartbeat Auth Envelope\n\n"
+        "A heartbeat is never replayed.\n", 1))
+    om("outside: an unguarded section starts naming replay", lambda x: x.replace(
+        "## Producer Time\n", "## Producer Time\n\nThe clock here is not a replay "
+        "defence.\n", 1))
+    om("outside: a guarded sentence removed", lambda x: x.replace(
+        "from a hostile one.", "from a hostile one", 1))
+    rc_text = RUNTIME_CONFIG.read_text(encoding="utf-8")
+    st_obj = json.loads(STATUS.read_text(encoding="utf-8"))
+    cases.append(("runtime-config: ttl opens a window", lambda: (text, corpus, rc_text.replace(
+        "so no value of it\n  opens a replay window", "so a short value\n  opens a replay window",
+        1), None)))
+    cases.append(("runtime-config: a second replay obligation", lambda: (
+        text, corpus, rc_text.replace("## Producer Obligations", "- Keep the replay cache "
+                                      "small.\n\n## Producer Obligations", 1), None)))
+
+    def stm(label: str, edit: Callable[[dict], None]) -> None:
+        def go():
+            c = copy.deepcopy(st_obj)
+            edit(c)
+            return text, corpus, None, c
+        cases.append((label, go))
+    stm("status: top-level notes claim restore safety", lambda c: c.__setitem__(
+        "notes", c["notes"] + " Replay protection survives a restored state store."))
+    stm("status: adoption notes changed", lambda c: c["adoption"][0].__setitem__(
+        "notes", c["adoption"][0]["notes"].replace(".", ";", 1)))
+    sd = text.index("### Senders\n")
+    for old, new in (("whose bytes the\nsender has never published", "whose bytes differ\nfrom "
+                      "the last it published"),
+                     ("never repeats a value", "rarely repeats a value"),
+                     ("one\nmillisecond past the previous", "one\nmillisecond past or at the "
+                      "previous"),
+                     ("and durable\nacross a restart", "and kept in memory\nacross a restart"),
+                     ("in one millisecond, or across a restart", "in one millisecond"),
+                     ("so reading the clock again is not\nenough", "so reading the clock again "
+                      "is\nenough")):
+        if old not in text[sd:]:
+            raise SystemExit(f"senders mutant: {old!r} not found")
+        om(f"text: senders loosened: {flat(new)[:40]}",
+           lambda x, old=old, new=new: x[:sd] + x[sd:].replace(old, new, 1))
+    tm("text: subsection renamed", "### The floor\n", "### The replay floor\n")
+    tm("text: section renamed", f"## {SECTION}\n", "## Envelope Freshness\n")
+    tm("text: checker path renamed", "`scripts/check-gateway-replay-vectors-v2` shares",
+       "`scripts/check-gateway-replay-vector-v2` shares")
+    tm("text: generator path renamed", "`scripts/generate-gateway-replay-vectors-v2` reproduces",
+       "`scripts/generate-gateway-replay-vector-v2` reproduces")
+    sec = sections(text)["Replay vectors"]
+    joined = "\n".join(sec)
+    blocks = re.findall(r"^- .*(?:\n  .*)*", joined, re.M)
+    for blk in blocks:
+        label = flat(blk)[2:42]
+        tm(f"text: bullet deleted: {label}…", blk + "\n", "")
+        reworded = blk.replace(" and ", " or ", 1) if " and " in blk else blk.replace(
+            ":", ": also", 1) if blk.startswith("- `") else blk + " too"
+        tm(f"text: bullet reworded: {label}…", blk, reworded)
+
+    survived = 0
+    for label, make in cases:
+        got = outcome(*make())
+        if got is None if base is None else got == base:
+            print(f"SURVIVED {label}")
+            survived += 1
+    print(f"{len(cases)} mutants, {len(cases) - survived} refused, {survived} survived")
+    for e in equivalent:
+        print(f"not a mutant: {e}")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--mutations"], ["--inventory"]):
+        print(__doc__)
+        return 2
+    text = CONTRACT.read_text(encoding="utf-8")
+    if argv == ["--inventory"]:
+        print_inventory(text, json.loads(STATUS.read_text(encoding="utf-8")))
+        return 0
+    corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    failed = outcome(text, corpus)
+    if failed is None:
+        events = sum(len(c["events"]) for c in corpus["cases"])
+        print(f"gateway-api/v2 replay corpus: {len(corpus['cases'])} cases, {events} "
+              f"events replayed from the contract; {len(COVERAGE)} cover bullets shown")
+    else:
+        print(f"gateway-api/v2 replay corpus: {failed}")
+    if argv == ["--mutations"]:
+        survived = mutations(text, corpus)
+        if survived < 0:
+            return 1
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    return 0 if failed is None else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
