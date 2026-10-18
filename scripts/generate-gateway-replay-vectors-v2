@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 Envelope Freshness and Replay corpus.
+
+Nothing here is shared with scripts/check-gateway-replay-vectors-v2, which
+reads the order of checks from the contract and replays every case itself.
+
+    python3 scripts/generate-gateway-replay-vectors-v2          # write
+    python3 scripts/generate-gateway-replay-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "replay-v2.json"
+
+REASONS = ("stale_timestamp", "future_timestamp", "before_replay_floor", "replay_detected")
+
+
+class Receiver:
+    def __init__(self, ctx: dict) -> None:
+        self.skew = ctx["skew_ms"]
+        self.ttl = ctx["replay_ttl_ms"]
+        self.stores = ctx["stores"]
+        self.stored_floor = ctx["stored_floor_ms"]
+        self.start = ctx["start_clock_ms"]
+        self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
+        self.pending: dict[str, tuple[int, int]] = {}
+
+    def floor(self) -> int:
+        if self.stored_floor is None:
+            return self.start
+        return max(self.stored_floor, self.start)
+
+    def _raise(self, signed: int) -> None:
+        value = signed + 1
+        if self.stored_floor is None or value > self.stored_floor:
+            self.stored_floor = value
+
+    def _skew(self, signed: int, t: int) -> str | None:
+        if signed < t - self.skew:
+            return "stale_timestamp"
+        if signed > t + self.skew:
+            return "future_timestamp"
+        return None
+
+    def _tail(self, key: str, signed: int) -> str | None:
+        if signed < self.floor():
+            return "before_replay_floor"
+        if key in self.held:
+            return "replay_detected"
+        return None
+
+    def apply(self, ev: dict) -> str | None:
+        kind = ev["event"]
+        if kind == "receive":
+            reason = self._skew(ev["signed_at_ms"], ev["t"]) or self._tail(ev["key"], ev["signed_at_ms"])
+            if reason is None:
+                self.held[ev["key"]] = (ev["signed_at_ms"], ev["t"])
+            return reason
+        if kind == "authenticate":
+            reason = self._skew(ev["signed_at_ms"], ev["t"]) or self._tail(ev["key"], ev["signed_at_ms"])
+            if reason is None:
+                self.pending[ev["handle"]] = (ev["signed_at_ms"], ev["t"])
+            return reason
+        if kind == "commit":
+            signed, received = self.pending.pop(ev["handle"])
+            reason = self._tail(ev["key"], signed)
+            if reason is None:
+                self.held[ev["key"]] = (signed, received)
+            return reason
+        if kind == "prune":
+            t = ev["t"]
+            for key, (signed, received) in sorted(self.held.items()):
+                if t > signed + self.skew and (self.ttl is None or t >= received + self.ttl):
+                    del self.held[key]
+                    self._raise(signed)
+            return None
+        if kind == "evict":
+            key = min(self.held, key=lambda k: (self.held[k][0], k))
+            signed, _ = self.held.pop(key)
+            self._raise(signed)
+            return None
+        if kind == "restart":
+            if not self.stores:
+                self.stored_floor = None
+                self.held = {}
+            self.pending = {}
+            self.start = ev["t"]
+            if "skew_ms" in ev:
+                self.skew = ev["skew_ms"]
+            return None
+        if kind == "rotate":
+            if not ev["keeps_previous"]:
+                self.stored_floor = None
+                self.held = {}
+                self.pending = {}
+                self.start = ev["t"]
+            return None
+        raise ValueError(kind)
+
+
+def ctx(skew: int = 300, ttl: int | None = None, stores: bool = True, stored: int | None = None,
+        start: int = 0, held: tuple = ()) -> dict:
+    return {
+        "skew_ms": skew,
+        "replay_ttl_ms": ttl,
+        "stores": stores,
+        "stored_floor_ms": stored,
+        "start_clock_ms": start,
+        "held": [{"key": k, "signed_at_ms": s, "received_at_ms": r} for k, s, r in held],
+    }
+
+
+def rx(key: str, signed: int, t: int) -> dict:
+    return {"event": "receive", "key": key, "signed_at_ms": signed, "t": t}
+
+
+def auth(handle: str, key: str, signed: int, t: int) -> dict:
+    return {"event": "authenticate", "handle": handle, "key": key, "signed_at_ms": signed, "t": t}
+
+
+def commit(handle: str, key: str, t: int) -> dict:
+    return {"event": "commit", "handle": handle, "key": key, "t": t}
+
+
+def prune(t: int) -> dict:
+    return {"event": "prune", "t": t}
+
+
+def evict(t: int) -> dict:
+    return {"event": "evict", "t": t}
+
+
+def restart(t: int, skew: int | None = None) -> dict:
+    ev = {"event": "restart", "t": t}
+    if skew is not None:
+        ev["skew_ms"] = skew
+    return ev
+
+
+def rotate(t: int, keeps_previous: bool) -> dict:
+    return {"event": "rotate", "keeps_previous": keeps_previous, "t": t}
+
+
+CASES = (
+    ("floor_equality", "an envelope signed exactly at the floor is accepted; one millisecond below it is refused",
+     ctx(stored=10000, start=0),
+     [rx("a", 10000, 10100), rx("b", 9999, 10100)]),
+    ("skew_bounds", "both skew bounds are inclusive; one millisecond beyond each is refused",
+     ctx(start=0),
+     [rx("a", 9700, 10000), rx("b", 9699, 10000), rx("c", 10300, 10000), rx("d", 10301, 10000)]),
+    ("short_ttl_last_millisecond",
+     "replay_ttl_ms shorter than the skew: the key of an envelope signed at the future edge is held "
+     "until the last millisecond it passes check 1, and its drop raises the floor",
+     ctx(ttl=100, start=0),
+     [rx("a", 10300, 10000), prune(10599), rx("a", 10300, 10599), prune(10600),
+      rx("a", 10300, 10600), prune(10601), rx("a", 10300, 10601)]),
+    ("long_ttl_only_delays",
+     "replay_ttl_ms longer than the skew keeps a key whose envelope is already stale",
+     ctx(ttl=5000, start=0),
+     [rx("a", 10300, 10000), prune(10600), rx("a", 10300, 10600), prune(10601), rx("a", 10300, 10601),
+      prune(14999), prune(15000)]),
+    ("sender_ahead_lost_history",
+     "the stated limit: a future-dated envelope accepted before a start, by a receiver that stores "
+     "nothing, is replayable after the start until it goes stale",
+     ctx(stores=False, start=0),
+     [rx("a", 10200, 10000), restart(10100), rx("a", 10200, 10150), rx("a", 10200, 10200)]),
+    ("sender_ahead_stored_history",
+     "the same envelope, by a receiver that stores its keys, stays a replay after the start",
+     ctx(stores=True, start=0),
+     [rx("a", 10200, 10000), restart(10100), rx("a", 10200, 10150)]),
+    ("sender_behind_after_start",
+     "a sender 200 ms behind signs below the start floor for 200 ms after the start; fresh attempts "
+     "are refused until its clock passes the start",
+     ctx(start=0),
+     [restart(10000), rx("a", 9850, 10050), rx("b", 9950, 10150), rx("c", 10000, 10200),
+      rx("d", 10010, 10210)]),
+    ("clock_step_back_live",
+     "the clock steps back after a drop raised the floor: the replay passes the skew check and is "
+     "refused at the floor, and so is a fresh envelope until the clock passes it",
+     ctx(start=0),
+     [rx("a", 20000, 20000), prune(20301), rx("a", 20000, 19900), rx("b", 19905, 19905),
+      rx("c", 20001, 20001)]),
+    ("clock_step_back_across_start",
+     "the clock is restored backwards across a start; the stored floor stays above the start clock",
+     ctx(stores=True, start=0),
+     [rx("a", 20000, 20000), prune(20301), restart(19000), rx("a", 20000, 19800),
+      rx("b", 19100, 19100)]),
+    ("clock_step_back_across_start_unstored",
+     "the stated limit: a receiver that stores nothing, its clock stepped back across a restart, "
+     "readmits an envelope of the earlier run",
+     ctx(stores=False, start=0),
+     [rx("a", 20000, 20000), restart(19800), rx("a", 20000, 19800)]),
+    ("clock_step_back_after_upgrade_stored",
+     "the stated limit: a storing receiver's start floor covers a key the earlier release dropped; "
+     "at a later start with the clock stepped back, that envelope is readmitted",
+     ctx(stores=True, stored=None, start=0),
+     [restart(10000), rx("old", 9900, 10050), restart(9800), rx("old", 9900, 9800)]),
+    ("clock_step_forward",
+     "the clock steps forward: the held key's envelope is stale, its drop raises the floor, and "
+     "fresh envelopes are accepted",
+     ctx(start=0),
+     [rx("a", 10000, 10000), prune(50000), rx("a", 10000, 50000), rx("b", 50000, 50000)]),
+    ("clock_step_forward_across_start",
+     "the clock is far ahead at a start: the stored key's envelope is stale, its drop raises the "
+     "stored floor below the start clock, and fresh envelopes are accepted",
+     ctx(stores=True, start=0),
+     [rx("a", 10000, 10000), restart(50000), rx("a", 10000, 50000), prune(50000),
+      rx("b", 50000, 50000)]),
+    ("skew_raised_across_restart_stored",
+     "a key dropped under a 100 ms skew stays refused under 1000 ms after a restart that stores its floor",
+     ctx(skew=100, stores=True, start=0),
+     [rx("a", 10000, 10000), prune(10101), restart(10102, skew=1000), rx("a", 10000, 10500)]),
+    ("skew_raised_across_restart_unstored",
+     "the same, by a receiver that stores nothing: the start floor refuses it",
+     ctx(skew=100, stores=False, start=0),
+     [rx("a", 10000, 10000), prune(10101), restart(10102, skew=1000), rx("a", 10000, 10500)]),
+    ("skew_lowered_across_restart",
+     "the skew is lowered across a restart: a held key is dropped once stale under the new skew",
+     ctx(skew=1000, stores=True, start=0),
+     [rx("a", 10050, 10000), restart(10100, skew=100), rx("a", 10050, 10120), prune(10150),
+      prune(10151), rx("b", 10151, 10151)]),
+    ("upgrade_without_floor",
+     "the first start after an upgrade from a release that kept no floor: stored keys are held, and "
+     "an envelope whose key that release dropped is refused at the start floor",
+     ctx(stores=True, stored=None, start=0, held=(("kept", 10150, 9950),)),
+     [restart(10000), rx("kept", 10150, 10050), rx("dropped", 9900, 10050)]),
+    ("rollback_and_upgrade",
+     "a floor stored before a rollback is lower than the keys the older release dropped; the start "
+     "clock wins",
+     ctx(stores=True, stored=5000, start=0),
+     [restart(10000), rx("dropped", 9900, 10050), rx("fresh", 10050, 10050)]),
+    ("key_dropped_between_authenticate_and_commit",
+     "another key's drop raises the floor past an authenticated envelope before it is recorded",
+     ctx(start=0),
+     [rx("b", 10005, 9800), auth("h1", "a", 10000, 10000), prune(10306), commit("h1", "a", 10306)]),
+    ("commit_keeps_authentication_receipt",
+     "a key recorded at commit is kept for replay_ttl_ms from its authentication, not from its commit",
+     ctx(ttl=1000, start=0),
+     [auth("h1", "a", 10000, 10000), commit("h1", "a", 10500), prune(10999), prune(11000)]),
+    ("concurrent_authentication_of_one_envelope",
+     "two deliveries of one envelope both authenticate; the first to record wins and the second is a replay",
+     ctx(start=0),
+     [auth("h1", "a", 10000, 10000), auth("h2", "a", 10000, 10001), commit("h1", "a", 10002),
+      commit("h2", "a", 10003)]),
+    ("full_receiver_evicts",
+     "a full receiver drops its key with the smallest signing time and raises the floor past it",
+     ctx(start=0),
+     [rx("a", 10000, 10000), rx("b", 10100, 10100), evict(10150), rx("a", 10000, 10150),
+      rx("c", 10150, 10150)]),
+    ("future_dated_eviction_survives_restart",
+     "an evicted key signed ahead of the clock raises the stored floor above it; a sender behind is "
+     "refused, across a restart too",
+     ctx(stores=True, start=0),
+     [rx("a", 10250, 10000), rx("b", 10260, 10000), evict(10000), rx("c", 10100, 10100),
+      restart(10120), rx("d", 10200, 10200), rx("e", 10251, 10251)]),
+    ("rotate_keeping_previous",
+     "a rotation that keeps the previous secret keeps the floor and every held key",
+     ctx(stored=50000, start=0, held=(("a", 49900, 49900),)),
+     [rotate(20000, keeps_previous=True), rx("b", 20000, 20000)]),
+    ("rotate_keeping_none",
+     "a rotation that keeps no earlier secret drops the stored floor and every held key, leaving the "
+     "floor at the clock",
+     ctx(stored=50000, start=0, held=(("a", 49900, 49900),)),
+     [rotate(20000, keeps_previous=False), rx("b", 20000, 20000), rx("c", 19999, 20001)]),
+    ("precedence_stale_before_floor",
+     "an envelope both stale and below the floor is refused as stale",
+     ctx(stored=20000, start=0),
+     [rx("a", 9000, 10000)]),
+    ("precedence_future_before_floor",
+     "an envelope both future-dated and below the floor is refused as future",
+     ctx(stored=20000, start=0),
+     [rx("a", 15000, 10000)]),
+    ("precedence_floor_before_replay",
+     "a held key below the floor is refused at the floor, not as a replay",
+     ctx(stores=True, start=0, held=(("a", 10200, 10000),)),
+     [restart(10300), rx("a", 10200, 10350)]),
+)
+
+
+def build() -> dict:
+    cases = []
+    for name, note, context, events in CASES:
+        receiver = Receiver(context)
+        out = []
+        for ev in events:
+            reason = receiver.apply(ev)
+            entry = dict(ev)
+            expected: dict = {}
+            if ev["event"] in ("receive", "authenticate", "commit"):
+                expected["reason"] = reason
+            expected["floor_ms"] = receiver.floor()
+            expected["held"] = sorted(receiver.held)
+            entry["expected"] = expected
+            out.append(entry)
+        cases.append({"name": name, "note": note, "context": context, "events": out})
+    return {
+        "contract": "ori-specs/gateway-api/v2.md",
+        "section": "Envelope Freshness and Replay",
+        "comment": (
+            "Each case is a receiver context and a run of events in order. Every envelope's signature "
+            "and topic-device check hold. A receiver replaying a case reproduces each event's reason "
+            "(receive, authenticate and commit only; null when accepted), its floor and its held keys "
+            "afterwards. Times are milliseconds on the receiver's clock; a commit records with the "
+            "receipt time of its authenticate."
+        ),
+        "reasons": list(REASONS),
+        "cases": cases,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
