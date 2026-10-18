@@ -182,7 +182,21 @@ def scenario(name: str, steps: list[dict], *, initial_mode: str = "locked") -> d
                 issue_data["phone_code_sha256"] = hashlib.sha256(code.encode("ascii")).hexdigest()
             expanded.append(step("issue", "issued", **issue_data))
             operation = {**operation, "challenge_id": challenge_id}
-        if operation["op"] == "enrol" and "phone_case" in operation:
+        if operation["op"] == "enrol" and operation.get("channel") in {"sms", "whatsapp"}:
+            expanded.append({
+                **{key: value for key, value in operation.items() if key not in {"expect", "phone_case"}},
+                "op": "phone_authorize",
+                "expect": "phone_pending",
+            })
+            operation = {
+                "op": "phone_commit",
+                "expect": operation["expect"],
+                "challenge_id": operation["challenge_id"],
+                "value": operation["value"],
+                "channel": operation["channel"],
+                "phone_case": operation["phone_case"],
+            }
+        if operation["op"] == "phone_commit" and "phone_case" in operation:
             case = operation["phone_case"]
             operation = {key: value for key, value in operation.items() if key != "phone_case"}
             challenge_id = operation["challenge_id"]
@@ -219,6 +233,15 @@ def candidate_of(operation: dict) -> object:
         "channel": operation.get("channel", "lan_ed25519"),
         "value": operation.get("value", operation["credential"]),
     }
+
+
+def phone_issue(challenge_id: str, credential: str, value: str, *, channel: str = "sms") -> dict:
+    code = base64.b64encode(hashlib.sha256(challenge_id.encode("ascii")).digest()[:16]).decode("ascii")
+    return step(
+        "issue", "issued", challenge_id=challenge_id, kind="enrol",
+        candidate=candidate_of({"op": "enrol", "credential": credential, "channel": channel, "value": value}),
+        phone_code_sha256=hashlib.sha256(code.encode("ascii")).hexdigest(),
+    )
 
 
 def base() -> list[dict]:
@@ -424,6 +447,78 @@ def make() -> dict:
                 step("enrol", "possession_expired", credential="phone-late", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True, phone_case="late"),
                 step("open", "opened", proposal="after-late"),
                 step("admit", "credential_unavailable", proposal="after-late", credential="phone-late"),
+            ],
+        ),
+        scenario(
+            "phone_authorizer_revoked_before_commit",
+            base() + [
+                phone_issue("pending-revoked", "phone-revoked", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="pending-revoked", credential="phone-revoked", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("revoke", "revoked", document=revoke(1, ["owner-key"])),
+                step("phone_commit", "authorizer_unavailable", challenge_id="pending-revoked", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-revoke"),
+                step("admit", "credential_unavailable", proposal="after-revoke", credential="phone-revoked"),
+            ],
+        ),
+        scenario(
+            "phone_recovery_before_commit",
+            base() + [
+                phone_issue("pending-recovery", "phone-old-epoch", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="pending-recovery", credential="phone-old-epoch", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("lose", "locked"),
+                step("recover", "recovered", local_request=True, epoch=EPOCH_3),
+                step("phone_commit", "epoch_changed", challenge_id="pending-recovery", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-recovery"),
+                step("admit", "credential_unavailable", proposal="after-recovery", credential="phone-old-epoch"),
+            ],
+        ),
+        scenario(
+            "one_pending_phone_per_candidate_value",
+            base() + [
+                phone_issue("first-pending", "phone-first", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="first-pending", credential="phone-first", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                phone_issue("second-pending", "phone-second", "+2348012345678", channel="whatsapp"),
+                step("phone_authorize", "phone_pending_for_value", challenge_id="second-pending", credential="phone-second", channel="whatsapp", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("phone_commit", "enrolled", challenge_id="first-pending", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-one"),
+                step("admit", "credential_unavailable", proposal="after-one", credential="phone-second"),
+            ],
+        ),
+        scenario(
+            "phone_registry_change_before_commit",
+            base() + [
+                phone_issue("pending-revision", "phone-revision", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="pending-revision", credential="phone-revision", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("enrol", "enrolled", credential="app-other", authorizer="owner-key", local_request=True, possession=True),
+                step("phone_commit", "registry_changed", challenge_id="pending-revision", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-registry-change"),
+                step("admit", "credential_unavailable", proposal="after-registry-change", credential="phone-revision"),
+            ],
+        ),
+        scenario(
+            "phone_site_change_before_commit",
+            base() + [
+                phone_issue("pending-site", "phone-site", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="pending-site", credential="phone-site", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("config_site_change", "site_locked", site_id="site-2"),
+                step("config_site_restore", "site_restored"),
+                step("phone_commit", "site_binding_mismatch", challenge_id="pending-site", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-site-change"),
+                step("admit", "credential_unavailable", proposal="after-site-change", credential="phone-site"),
+            ],
+        ),
+        scenario(
+            "phone_pending_expiry_releases_value",
+            base() + [
+                phone_issue("pending-expiry", "phone-expired", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="pending-expiry", credential="phone-expired", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("expire_phone", "not_expired", challenge_id="pending-expiry", phone_elapsed_ms=600000),
+                step("expire_phone", "expired", challenge_id="pending-expiry", phone_elapsed_ms=600001),
+                phone_issue("after-expiry", "phone-after-expiry", "+2348012345678"),
+                step("phone_authorize", "phone_pending", challenge_id="after-expiry", credential="phone-after-expiry", channel="sms", value="+2348012345678", authorizer="owner-key", local_request=True),
+                step("phone_commit", "enrolled", challenge_id="after-expiry", channel="sms", value="+2348012345678", phone_case="valid"),
+                step("open", "opened", proposal="after-expiry-proposal"),
+                step("admit", "credential_unavailable", proposal="after-expiry-proposal", credential="phone-expired"),
             ],
         ),
         scenario(

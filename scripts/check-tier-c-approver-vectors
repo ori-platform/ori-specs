@@ -51,6 +51,12 @@ NAMES = {
     "phone_candidate_requires_channel_possession",
     "phone_candidate_rejects_wrong_code_and_sender",
     "phone_candidate_late_reply_refused",
+    "phone_authorizer_revoked_before_commit",
+    "phone_recovery_before_commit",
+    "one_pending_phone_per_candidate_value",
+    "phone_registry_change_before_commit",
+    "phone_site_change_before_commit",
+    "phone_pending_expiry_releases_value",
     "duplicate_credential_and_value_refused",
     "challenge_expiry_reuse_change_and_restart",
     "late_authorizer_cannot_use_stale_challenge",
@@ -345,12 +351,17 @@ class Registry:
         self.proposals: dict[str, dict[str, Any]] = {}
         self.challenges: dict[str, dict[str, Any]] = {}
         self.used_challenges: set[str] = set()
+        self.pending_phone: dict[str, dict[str, Any]] = {}
+        self.invalidated_phone: dict[str, str] = {}
 
     def apply(self, operation: dict[str, Any]) -> str:
         kind = operation["op"]
         if kind == "config_site_change":
             self.config_site = operation["site_id"]
             self.proposals.clear()
+            for challenge_id in self.pending_phone:
+                self.invalidated_phone[challenge_id] = "site_binding_mismatch"
+            self.pending_phone.clear()
             return "site_locked"
         if kind == "config_site_restore":
             self.config_site = SITE_ID
@@ -391,9 +402,18 @@ class Registry:
             return "expired"
         if kind == "restart":
             self.challenges.clear()
+            self.pending_phone.clear()
+            self.invalidated_phone.clear()
             self.proposals.clear()
             return "restarted"
-        if kind in {"recover", "enrol", "local_seed"}:
+        if kind == "expire_phone":
+            elapsed = operation.get("phone_elapsed_ms")
+            if type(elapsed) is not int or elapsed <= 600000:
+                return "not_expired"
+            if self.pending_phone.pop(operation["challenge_id"], None) is None:
+                return "pending_unavailable"
+            return "expired"
+        if kind in {"recover", "enrol", "local_seed", "phone_authorize"}:
             challenge_id = operation.get("challenge_id")
             if challenge_id in self.used_challenges:
                 return "challenge_reused"
@@ -403,7 +423,8 @@ class Registry:
             self.used_challenges.add(challenge_id)
             if challenge["expired"]:
                 return "challenge_expired"
-            if challenge["kind"] != kind or challenge["candidate"] != candidate_of(operation):
+            challenge_kind = "enrol" if kind == "phone_authorize" else kind
+            if challenge["kind"] != challenge_kind or challenge["candidate"] != candidate_of(operation):
                 return "candidate_changed"
             if challenge["revision"] != self.revision or challenge["epoch"] != self.epoch:
                 return "challenge_stale"
@@ -434,7 +455,73 @@ class Registry:
             self.last_external_document = None
             self.sequence = 0
             self.proposals.clear()
+            for challenge_id in self.pending_phone:
+                self.invalidated_phone[challenge_id] = "epoch_changed"
+            self.pending_phone.clear()
             return "recovered"
+        if kind == "phone_commit":
+            challenge_id = operation["challenge_id"]
+            invalidated = self.invalidated_phone.pop(challenge_id, None)
+            if invalidated is not None:
+                return invalidated
+            pending = self.pending_phone.pop(challenge_id, None)
+            if pending is None:
+                return "pending_unavailable"
+            elapsed = operation.get("phone_elapsed_ms", 0)
+            if type(elapsed) is not int or elapsed < 0:
+                return "malformed"
+            if elapsed > 600000:
+                return "possession_expired"
+            if not self.initialized:
+                return "registry_unavailable"
+            if self.config_site != pending["site"]:
+                return "site_binding_mismatch"
+            if self.epoch != pending["epoch"]:
+                return "epoch_changed"
+            if pending["authorizer"] not in self.active:
+                return "authorizer_unavailable"
+            if self.revision != pending["revision"]:
+                return "registry_changed"
+            candidate = pending["candidate"]
+            if operation.get("value") != candidate["value"] or operation.get("channel") != candidate["channel"]:
+                return "candidate_changed"
+            reply = operation.get("phone_reply")
+            if reply is None:
+                return "possession_required"
+            if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
+                return "possession_invalid"
+            prefix = f"ORI-POSSESS-V1 {challenge_id} "
+            text = reply["text"]
+            if not isinstance(text, str) or not text.startswith(prefix):
+                return "possession_invalid"
+            code = text[len(prefix):]
+            try:
+                if len(strict_b64(code)) != 16:
+                    return "possession_invalid"
+            except (ValueError, TypeError):
+                return "possession_invalid"
+            if (reply["authenticated"] is not True or
+                reply["sender"] != candidate["value"] or
+                reply["channel"] != candidate["channel"] or
+                not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), pending["phone_code_sha256"])):
+                return "possession_invalid"
+            identifier = candidate["credential"]
+            approver_id = candidate["approver_id"]
+            value = candidate["value"]
+            if approver_id in self.approver_tombstones:
+                return "approver_revoked"
+            if identifier in self.approvers or identifier in self.tombstones:
+                return "credential_reused"
+            if value in (self.values[x] for x in self.tombstones if x in self.values):
+                return "value_tombstoned"
+            if value in (self.values[x] for x in self.active):
+                return "duplicate_value"
+            self.sequence += 1
+            self.active[identifier] = self.sequence
+            self.values[identifier] = value
+            self.approvers[identifier] = approver_id
+            self.revision += 1
+            return "enrolled"
         if not self.initialized:
             return "registry_unavailable"
         if kind == "local_seed":
@@ -463,7 +550,7 @@ class Registry:
             self.approvers[identifier] = approver_id
             self.revision += 1
             return "seeded"
-        if kind == "enrol":
+        if kind in {"enrol", "phone_authorize"}:
             if operation["authorizer"] not in self.active:
                 return "authorizer_unavailable"
             if self.active[operation["authorizer"]] > challenge["sequence"]:
@@ -471,38 +558,25 @@ class Registry:
             if operation.get("local_request") is not True:
                 return "local_auth_required"
             channel = operation.get("channel", "lan_ed25519")
-            if channel == "lan_ed25519":
-                if operation.get("possession") is not True:
-                    return "possession_invalid"
-            elif channel in {"sms", "whatsapp"}:
-                reply = operation.get("phone_reply")
-                elapsed = operation.get("phone_elapsed_ms", 0)
-                if type(elapsed) is not int or elapsed < 0:
+            if kind == "phone_authorize":
+                if channel not in {"sms", "whatsapp"} or challenge["phone_code_sha256"] is None:
                     return "malformed"
-                if elapsed > 600000:
-                    return "possession_expired"
-                if reply is None:
-                    return "possession_required"
-                if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
-                    return "possession_invalid"
-                prefix = f"ORI-POSSESS-V1 {challenge_id} "
-                text = reply["text"]
-                if not isinstance(text, str) or not text.startswith(prefix):
-                    return "possession_invalid"
-                code = text[len(prefix):]
-                try:
-                    if len(strict_b64(code)) != 16:
-                        return "possession_invalid"
-                except (ValueError, TypeError):
-                    return "possession_invalid"
-                if (reply["authenticated"] is not True or
-                    reply["sender"] != operation.get("value") or
-                    reply["channel"] != channel or
-                    challenge["phone_code_sha256"] is None or
-                    not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), challenge["phone_code_sha256"])):
-                    return "possession_invalid"
-            else:
+                candidate = candidate_of(operation)
+                if any(pending["candidate"]["value"] == candidate["value"] for pending in self.pending_phone.values()):
+                    return "phone_pending_for_value"
+                self.pending_phone[challenge_id] = {
+                    "candidate": candidate,
+                    "authorizer": operation["authorizer"],
+                    "revision": self.revision,
+                    "epoch": self.epoch,
+                    "site": self.config_site,
+                    "phone_code_sha256": challenge["phone_code_sha256"],
+                }
+                return "phone_pending"
+            if channel != "lan_ed25519":
                 return "malformed"
+            if operation.get("possession") is not True:
+                return "possession_invalid"
             identifier = operation["credential"]
             approver_id = operation.get("approver_id", identifier)
             value = operation.get("value", identifier)
@@ -688,14 +762,44 @@ def mutations(corpus: dict[str, Any]) -> None:
     next(operation for operation in next(
         scenario for scenario in false_phone["scenarios"]
         if scenario["name"] == "phone_candidate_requires_channel_possession"
-    )["steps"] if operation["op"] == "enrol" and operation["expect"] == "possession_required")["expect"] = "enrolled"
+    )["steps"] if operation["op"] == "phone_commit" and operation["expect"] == "possession_required")["expect"] = "enrolled"
     mutants.append(("phone without possession accepted", false_phone))
     late_phone = copy.deepcopy(corpus)
     next(operation for operation in next(
         scenario for scenario in late_phone["scenarios"]
         if scenario["name"] == "phone_candidate_late_reply_refused"
-    )["steps"] if operation["op"] == "enrol")["expect"] = "enrolled"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
     mutants.append(("late phone reply accepted", late_phone))
+    revoked_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in revoked_phone["scenarios"]
+        if scenario["name"] == "phone_authorizer_revoked_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("revoked authorizer accepted at phone commit", revoked_phone))
+    recovered_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in recovered_phone["scenarios"]
+        if scenario["name"] == "phone_recovery_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("old epoch phone commit accepted", recovered_phone))
+    duplicate_pending = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in duplicate_pending["scenarios"]
+        if scenario["name"] == "one_pending_phone_per_candidate_value"
+    )["steps"] if operation["op"] == "phone_authorize" and operation["expect"] == "phone_pending_for_value")["expect"] = "phone_pending"
+    mutants.append(("second pending phone for value accepted", duplicate_pending))
+    changed_registry = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in changed_registry["scenarios"]
+        if scenario["name"] == "phone_registry_change_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("changed registry accepted at phone commit", changed_registry))
+    changed_site = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in changed_site["scenarios"]
+        if scenario["name"] == "phone_site_change_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("changed site accepted at phone commit", changed_site))
     altered_phone_wire = copy.deepcopy(corpus)
     altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
     mutants.append(("phone wire wrong sender", altered_phone_wire))
