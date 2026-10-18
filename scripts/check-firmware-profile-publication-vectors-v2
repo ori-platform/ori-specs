@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-telemetry/v2 profile publication corpus against the contract.
+
+Shares no code with scripts/generate-firmware-profile-publication-vectors-v2.
+The listing receiver's checks, their order and their reasons are read from
+firmware-telemetry/v2.md Controller Profiles > Publication; every case is
+decided here from its listed name and the SHA-256 of its bytes, in table
+order, first failure winning.
+
+Held to:
+
+- the section: its table has the held shape, rows and reasons, and its prose
+  is the held sentences word for word;
+- every case: its verdict is the one the checks decide, its declared reason
+  and no other, or null when both pass;
+- coverage, read from the section's "The corpus covers:" bullets and detected
+  from the data, never from case names: two or more canonical documents under
+  their exact names; each named malformed-name kind, built from the hex of the
+  case's own bytes and differing from it only at the malformation (for every
+  kind but the folding character, repairing the malformation gives a name the
+  bytes match); an exact name over bytes one byte off at the same length,
+  over the document serialised non-canonically, and over another valid
+  document's canonical bytes; and a malformed name over bytes whose SHA-256
+  differs from the name's 64 characters in more than the malformation,
+  refused for the name;
+- every held asset is the canonical bytes of a document in
+  controller-profile-vectors-v2.json, with its canonical_hex and digest, and is
+  printable ASCII as every profile document's strings are;
+- the header names the contract and section, its reasons are the table's in
+  order, and case names are unique;
+- the corpus file's SHA-256 is the one Golden Vectors pins.
+
+    python3 scripts/check-firmware-profile-publication-vectors-v2
+    python3 scripts/check-firmware-profile-publication-vectors-v2 --mutations
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+import unicodedata
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "firmware-telemetry" / "v2.md"
+CORPUS = ROOT / "firmware-telemetry" / "profile-publication-vectors-v2.json"
+PROFILES = ROOT / "firmware-telemetry" / "controller-profile-vectors-v2.json"
+PARENT = "## Controller Profiles"
+HEADING = "### Publication"
+CONTRACT_ID = "ori-specs/firmware-telemetry/v2.md"
+SECTION_ID = "Controller Profiles > Publication"
+PREFIX = "controller-profile-"
+SUFFIX = ".json"
+DIGEST_PREFIX = "sha256:"
+HEX = "0123456789abcdef"
+PIN = re.compile(
+    r"The authoritative corpus for \[Publication\]\(#publication\) is\s+"
+    r"\[profile-publication-vectors-v2\.json\]\(profile-publication-vectors-v2\.json\),\s+"
+    r"held beside them\.\s+Its SHA-256 is\s+`([0-9a-f]{64})`\.")
+
+# The listing receiver's table, held row by row. Each check text maps to the
+# predicate this checker implements for it; order and reason come from the table.
+TABLE_HEADER = ("| Order | Check | Reason |", "| --- | --- | --- |")
+CHECK_NAME = ("the name is exactly `controller-profile-`, then 64 characters each one of "
+              "`0`-`9` or `a`-`f`, then `.json`")
+CHECK_BYTES = "the SHA-256 of the bytes is the 64 characters in the name"
+HELD_TABLE = (
+    (1, CHECK_NAME, "asset_name_invalid"),
+    (2, CHECK_BYTES, "asset_digest_mismatch"),
+)
+
+# The section's prose, sentence by sentence, word for word. Table rows are
+# held above; list items keep their leading "- ".
+HELD = (
+    "A release that ships controller profiles publishes each profile document as a "
+    "release asset of its own:",
+    "- **Name.** The asset is named `controller-profile-<hex>.json`, where `<hex>` is the "
+    "64 lowercase hexadecimal characters of the `digest` a manifest's `controller_profile` "
+    "names for that document, without its `sha256:` prefix.",
+    "Release assets are flat, so the name carries no directory.",
+    "- **Bytes.** The asset's bytes are exactly the canonical bytes the digest covers, so "
+    "their SHA-256 is the hex in the name.",
+    "- **One asset per document.** A release publishes each document once, under that "
+    "name, and no copy of it under any other name.",
+    "The name is a lookup key and carries no authority.",
+    "A receiver trusts a document's bytes only because they hash to a digest a signed "
+    "manifest named, and whether the document is a valid profile is decided under "
+    "[The profile document](#the-profile-document) and [Receivers](#receivers), as for "
+    "any document it holds.",
+    "The rules below apply to a receiver that takes profile documents from a release.",
+    "Whichever kind it is, it reads no more of an asset than a size it derives from "
+    "[The profile document](#the-profile-document)'s grammar, stops reading at that size, "
+    "and keeps nothing of an asset that reaches it:",
+    "- **A receiver that fetches a document it needs** builds the asset's name from the "
+    "digest it needs, by the rule above, and never takes a name from the server, a "
+    "redirect or a final URL.",
+    "It accepts the bytes it receives only if their SHA-256 is that digest, and otherwise "
+    "holds nothing, refusing them as `asset_digest_mismatch`.",
+    "- **A receiver that takes a release's assets as listed,** before any device names "
+    "them, judges each listed asset by its listed name and its bytes, and holds a document "
+    "only if both checks below hold.",
+    "It refuses an asset for the first that fails:",
+    "A receiver that holds profile documents another way, such as a store of documents "
+    "keyed by the hash of their bytes, is not affected by these rules: it holds a document "
+    "by its digest, under whatever naming its own store uses.",
+    "This version does not say which release a receiver takes documents from.",
+    "A manifest names a digest and a firmware version, not a repository or a release, so "
+    "a receiver is configured with where to look.",
+    "That is a stated limit.",
+    "[profile-publication-vectors-v2.json](profile-publication-vectors-v2.json) holds "
+    "listed assets, each a name and bytes with the reason a listing receiver refuses it, "
+    "or none when it holds it.",
+    "A fetching receiver's case is check 2 alone, on a name it built.",
+    "The corpus covers:",
+    "- canonical documents under their exact names;",
+    "- names with an uppercase letter among the hex characters, an uppercase prefix, an "
+    "uppercase extension, a percent-encoded hex digit, 63 and 65 hex characters, "
+    "a character outside the hexadecimal digits, fullwidth digits, a character that folds "
+    "to two hexadecimal digits, a trailing newline, the `sha256:` prefix kept, another "
+    "extension, a directory, and a missing prefix;",
+    "- an exact name whose bytes differ from its document in one byte, its length "
+    "unchanged;",
+    "- an exact name over the document serialised non-canonically;",
+    "- an exact name over the canonical bytes of another valid document;",
+    "- a malformed name over bytes that do not match it, refused for the name.",
+    "`scripts/generate-firmware-profile-publication-vectors-v2` reproduces the file byte "
+    "for byte.",
+    "`scripts/check-firmware-profile-publication-vectors-v2` shares no code with it: it "
+    "reads the checks from this section, recomputes every hash, and confirms each case is "
+    "held or refused for its declared reason and for no other.",
+)
+COVER_LEAD = "The corpus covers:"
+
+# Cover bullets this checker understands, each to the requirements it demands
+# and how many distinct witnesses each needs. The malformed-name bullet is
+# parsed phrase by phrase instead.
+COVER = {
+    "canonical documents under their exact names": {"accepted_canonical": 2},
+    "an exact name whose bytes differ from its document in one byte, its length "
+    "unchanged": {"one_byte_off": 1},
+    "an exact name over the document serialised non-canonically": {"non_canonical": 1},
+    "an exact name over the canonical bytes of another valid document":
+        {"other_document": 1},
+    "a malformed name over bytes that do not match it, refused for the name":
+        {"precedence": 1},
+}
+NAMES_LEAD = "names with "
+NAME_KINDS = {
+    "an uppercase letter among the hex characters": ["name_uppercase"],
+    "an uppercase prefix": ["name_uppercase_prefix"],
+    "an uppercase extension": ["name_uppercase_extension"],
+    "a percent-encoded hex digit": ["name_percent"],
+    "63 and 65 hex characters": ["name_hex_63", "name_hex_65"],
+    "a character outside the hexadecimal digits": ["name_non_hex"],
+    "fullwidth digits": ["name_fullwidth"],
+    "a character that folds to two hexadecimal digits": ["name_folding"],
+    "a trailing newline": ["name_trailing_newline"],
+    "the `sha256:` prefix kept": ["name_prefix_kept"],
+    "another extension": ["name_extension"],
+    "a directory": ["name_directory"],
+    "a missing prefix": ["name_missing_prefix"],
+}
+CASE_KEYS = {"name", "asset_name", "asset_b64", "expected", "note"}
+HEADER_KEYS = {"contract", "section", "comment", "reasons", "cases"}
+
+
+class Failure(Exception):
+    pass
+
+
+def _section(text: str) -> str:
+    parent = text.index("\n" + PARENT + "\n")
+    start = text.index("\n" + HEADING + "\n", parent)
+    if re.search(r"^## ", text[parent + len(PARENT) + 2:start], re.M):
+        raise Failure(f"{HEADING} is no longer under {PARENT}")
+    body = text[start + len(HEADING) + 2:]
+    stop = re.search(r"^#{2,3} ", body, re.M)
+    return body if stop is None else body[:stop.start()]
+
+
+def _sentences(body: str) -> list[str]:
+    blocks: list[str] = []
+    current: list[str] = []
+    for line in body.split("\n"):
+        if line.lstrip().startswith("|"):
+            continue
+        if not line.strip() or line.startswith("- "):
+            if current:
+                blocks.append(" ".join(current))
+            current = [line.strip()] if line.startswith("- ") else []
+        else:
+            current.append(line.strip())
+    if current:
+        blocks.append(" ".join(current))
+    out: list[str] = []
+    for block in blocks:
+        flat = re.sub(r"\s+", " ", block).strip()
+        out.extend(re.split(r"(?<=\.)\s+(?=[A-Z`\[])", flat))
+    return out
+
+
+def _table(body: str) -> list[tuple[int, str, str]]:
+    lines = [line.strip() for line in body.split("\n") if line.lstrip().startswith("|")]
+    if tuple(lines[:2]) != TABLE_HEADER:
+        raise Failure(f"the check table's header is not {TABLE_HEADER}")
+    rows = []
+    for line in lines[2:]:
+        found = re.fullmatch(r"\| (\d+) \| (.+?) \| `([a-z_]+)` \|", line)
+        if found is None:
+            raise Failure(f"check table row has an unrecognised shape: {line!r}")
+        rows.append((int(found.group(1)), found.group(2), found.group(3)))
+    if [r[0] for r in rows] != list(range(1, len(rows) + 1)):
+        raise Failure("check table orders are not 1..n in sequence")
+    if sorted(r[1] for r in rows) != sorted([CHECK_NAME, CHECK_BYTES]):
+        raise Failure(f"check table checks differ from the two this checker implements: "
+                      f"{[r[1] for r in rows]}")
+    if len({r[2] for r in rows}) != len(rows):
+        raise Failure("check table reuses a reason")
+    return rows
+
+
+def _cover(sentences: list[str]) -> dict[str, int]:
+    try:
+        start = sentences.index(COVER_LEAD) + 1
+    except ValueError:
+        raise Failure(f"the section no longer says {COVER_LEAD!r}") from None
+    bullets = []
+    for s in sentences[start:]:
+        if not s.startswith("- "):
+            break
+        bullets.append(s[2:].rstrip(";."))
+    demanded: dict[str, int] = {}
+    seen_kinds: set[str] = set()
+    for bullet in bullets:
+        if bullet in COVER:
+            demanded.update(COVER[bullet])
+            continue
+        if not bullet.startswith(NAMES_LEAD):
+            raise Failure(f"cover bullet not understood: {bullet!r}")
+        for phrase in re.split(r", and |, ", bullet[len(NAMES_LEAD):]):
+            if phrase not in NAME_KINDS:
+                raise Failure(f"malformed-name kind not understood: {phrase!r}")
+            seen_kinds.add(phrase)
+            demanded.update({need: 1 for need in NAME_KINDS[phrase]})
+    missing = [b for b in COVER if b not in bullets]
+    if missing:
+        raise Failure(f"cover bullets removed: {missing}")
+    if seen_kinds != set(NAME_KINDS):
+        raise Failure(f"malformed-name kinds removed: {sorted(set(NAME_KINDS) - seen_kinds)}")
+    return demanded
+
+
+def contract_model(text: str | None = None, hold: bool = True) -> dict:
+    """With ``hold`` false the verbatim checks are skipped, so a mutant shows
+    whether the structural reading alone refuses it."""
+    text = CONTRACT.read_text() if text is None else text
+    body = _section(text)
+    sentences = _sentences(body)
+    rows = _table(body)
+    if hold:
+        if tuple(rows) != HELD_TABLE:
+            raise Failure(f"check table differs from the held table: {rows}")
+        if tuple(sentences) != HELD:
+            added = [s for s in sentences if s not in HELD]
+            removed = [s for s in HELD if s not in sentences]
+            raise Failure(f"section prose differs from the held sentences: added {added}, "
+                          f"removed {removed}" if added or removed else
+                          "section prose sentences reordered")
+    link = re.search(r"\[profile-publication-vectors-v2\.json\]\(([^)]+)\)", body)
+    if link is None or (CONTRACT.parent / link.group(1)).resolve() != CORPUS.resolve():
+        raise Failure("the section no longer links the corpus this checker reads")
+    pins = PIN.findall(text)
+    if len(pins) != 1:
+        raise Failure(f"Golden Vectors pins the publication corpus {len(pins)} times, not once")
+    return {"rows": rows, "reasons": [r[2] for r in rows], "demanded": _cover(sentences),
+            "pin": pins[0]}
+
+
+# The two checks, and the parts of a name they read.
+
+def name_hex(name: str) -> str | None:
+    """The hex of a name check 1 accepts, or None."""
+    found = re.fullmatch(r"controller-profile-([0-9a-f]{64})\.json", name)
+    return None if found is None else found.group(1)
+
+
+def middle(name: str) -> str | None:
+    """Whatever stands between the prefix and `.json`, when the name has
+    exactly that shape; check 2's "64 characters in the name" when it has 64."""
+    if name.startswith(PREFIX) and name.endswith(SUFFIX) and len(name) > len(PREFIX + SUFFIX):
+        return name[len(PREFIX):-len(SUFFIX)]
+    return None
+
+
+def fails(check: str, name: str, data: bytes) -> bool:
+    if check == CHECK_NAME:
+        return name_hex(name) is None
+    if check == CHECK_BYTES:
+        inner = middle(name)
+        return inner is None or len(inner) != 64 \
+            or hashlib.sha256(data).hexdigest() != inner
+    raise Failure(f"no predicate for check {check!r}")
+
+
+def decide(model: dict, name: str, data: bytes) -> str | None:
+    for _, check, reason in model["rows"]:
+        if fails(check, name, data):
+            return reason
+    return None
+
+
+def _bytes(c: dict) -> bytes:
+    raw = c["asset_b64"]
+    data = base64.b64decode(raw, validate=True)
+    if base64.b64encode(data).decode() != raw:
+        raise Failure(f"{c['name']}: asset_b64 is not standard padded Base64")
+    return data
+
+
+def _canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False).encode()
+
+
+def _printable_ascii(data: bytes) -> bool:
+    return all(0x20 <= b <= 0x7E for b in data)
+
+
+def _profiles(profiles: dict) -> dict[str, bytes]:
+    """Hex to canonical bytes, for every accepted profile document."""
+    out = {}
+    for p in profiles["cases"]:
+        data = bytes.fromhex(p["canonical_hex"])
+        if DIGEST_PREFIX + hashlib.sha256(data).hexdigest() != p["digest"]:
+            raise Failure(f"profile {p['name']}: canonical_hex does not hash to its digest")
+        if data != _canonical(p["document"]):
+            raise Failure(f"profile {p['name']}: canonical_hex is not the canonical bytes "
+                          f"of its document")
+        out[p["digest"][len(DIGEST_PREFIX):]] = data
+    return out
+
+
+def _malformed_kinds(name: str, h: str) -> set[str]:
+    """The malformations of `h`, the hex of the case's own bytes, that `name` is."""
+    got: set[str] = set()
+    exact = PREFIX + h + SUFFIX
+    inner = middle(name)
+    if inner is not None:
+        if inner.isascii() and inner != inner.lower() and inner.lower() == h:
+            got.add("name_uppercase")
+        if re.fullmatch(r"[0-9a-f]{63}", inner) and h.startswith(inner):
+            got.add("name_hex_63")
+        if re.fullmatch(r"[0-9a-f]{65}", inner) and inner.startswith(h):
+            got.add("name_hex_65")
+        if len(inner) == 64:
+            diff = [(a, b) for a, b in zip(inner, h, strict=True) if a != b]
+            if len(diff) == 1:
+                odd, want = diff[0]
+                if odd.isascii() and odd.lower() not in HEX:
+                    got.add("name_non_hex")
+                if 0xFF10 <= ord(odd) <= 0xFF19 and unicodedata.normalize("NFKC", odd) == want:
+                    got.add("name_fullwidth")
+        for i, ch in enumerate(inner):
+            fold = ch.casefold()
+            # The folded name need not be h: no document in the profile corpus has
+            # "ff" in its digest. Outside the folded character the name is h.
+            if not ch.isascii() and len(fold) == 2 and all(f in HEX for f in fold) \
+                    and len(inner) == 63 and inner[:i] == h[:i] and inner[i + 1:] == h[i + 2:]:
+                got.add("name_folding")
+        if inner == DIGEST_PREFIX + h:
+            got.add("name_prefix_kept")
+    if name == exact + "\n":
+        got.add("name_trailing_newline")
+    if name == PREFIX.upper() + h + SUFFIX:
+        got.add("name_uppercase_prefix")
+    if name == PREFIX + h + SUFFIX.upper():
+        got.add("name_uppercase_extension")
+    # Decoding each %XX that encodes a hex digit gives the exact name for h.
+    if "%" in name and re.sub(
+            r"%([0-9A-Fa-f]{2})",
+            lambda m: chr(int(m.group(1), 16)) if chr(int(m.group(1), 16)) in HEX
+            else m.group(0), name) == exact:
+        got.add("name_percent")
+    if name.startswith(PREFIX) and "/" not in name:
+        stem, dot, ext = name[len(PREFIX):].rpartition(".")
+        if dot and stem == h and re.fullmatch(r"[a-z0-9]+", ext) and ext != SUFFIX[1:]:
+            got.add("name_extension")
+    if "/" in name and name.rsplit("/", 1)[1] == exact:
+        got.add("name_directory")
+    if name == h + SUFFIX:
+        got.add("name_missing_prefix")
+    return got
+
+
+def witnesses(model: dict, c: dict, docs: dict[str, bytes]) -> set[str]:
+    """The coverage requirements one case meets, from its data alone."""
+    name, expected, data = c["asset_name"], c["expected"], _bytes(c)
+    h = hashlib.sha256(data).hexdigest()
+    hex_ = name_hex(name)
+    name_reason, bytes_reason = (dict((chk, r) for _, chk, r in model["rows"])[k]
+                                 for k in (CHECK_NAME, CHECK_BYTES))
+    got: set[str] = set()
+    if expected is None and hex_ == h and data == docs.get(h):
+        got.add("accepted_canonical")
+    if expected == name_reason:
+        got |= _malformed_kinds(name, h)
+        inner = middle(name)
+        if inner is not None and len(inner) == 64 \
+                and sum(a != b for a, b in zip(inner, h, strict=True)) > 1:
+            got.add("precedence")
+    if expected == bytes_reason and hex_ is not None and hex_ in docs:
+        named = docs[hex_]
+        if len(data) == len(named) and \
+                sum(x != y for x, y in zip(data, named, strict=True)) == 1:
+            got.add("one_byte_off")
+        try:
+            same = json.loads(data) == json.loads(named)
+        except ValueError:
+            same = False
+        if same and data != named:
+            got.add("non_canonical")
+        if h != hex_ and docs.get(h) == data:
+            got.add("other_document")
+    return got
+
+
+def check(corpus: dict, model: dict, profiles: dict) -> dict[str, set[str]]:
+    docs = _profiles(profiles)
+    if set(corpus) - HEADER_KEYS or not {"contract", "section", "reasons", "cases"} <= set(corpus):
+        raise Failure(f"header keys {sorted(corpus)} are not {sorted(HEADER_KEYS)}")
+    if corpus["contract"] != CONTRACT_ID:
+        raise Failure(f"header contract {corpus['contract']!r} is not {CONTRACT_ID!r}")
+    if corpus["section"] != SECTION_ID:
+        raise Failure(f"header section {corpus['section']!r} is not {SECTION_ID!r}")
+    if corpus["reasons"] != model["reasons"]:
+        raise Failure(f"header reasons {corpus['reasons']} are not the table's "
+                      f"{model['reasons']}")
+    names = [c["name"] for c in corpus["cases"]]
+    if len(set(names)) != len(names):
+        raise Failure("case names are not unique")
+    met: dict[str, set[str]] = {}
+    for c in corpus["cases"]:
+        if set(c) != CASE_KEYS:
+            raise Failure(f"{c['name']}: keys {sorted(c)} are not {sorted(CASE_KEYS)}")
+        if c["expected"] is not None and c["expected"] not in model["reasons"]:
+            raise Failure(f"{c['name']}: expected {c['expected']!r} is not a table reason")
+        data = _bytes(c)
+        got = decide(model, c["asset_name"], data)
+        if got != c["expected"]:
+            raise Failure(f"{c['name']}: decided {got!r}, declared {c['expected']!r}")
+        if got is None:
+            if docs.get(name_hex(c["asset_name"])) != data:
+                raise Failure(f"{c['name']}: held bytes are not a document of "
+                              f"controller-profile-vectors-v2.json")
+            if data != _canonical(json.loads(data)):
+                raise Failure(f"{c['name']}: held bytes are not the canonical bytes of the "
+                              f"object they parse to")
+            if not _printable_ascii(data):
+                raise Failure(f"{c['name']}: held bytes are not printable ASCII, as The "
+                              f"profile document's string rules make every profile document")
+        for need in witnesses(model, c, docs):
+            met.setdefault(need, set()).add(c["name"])
+    short = [f"{need} ({len(met.get(need, ()))} of {n})"
+             for need, n in model["demanded"].items() if len(met.get(need, ())) < n]
+    if short:
+        raise Failure(f"coverage missing: {short}")
+    return met
+
+
+def run(model: dict, corpus_bytes: bytes | None = None) -> dict[str, set[str]]:
+    corpus_bytes = CORPUS.read_bytes() if corpus_bytes is None else corpus_bytes
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus SHA-256 differs from the one Golden Vectors pins")
+    return check(json.loads(corpus_bytes), model, json.loads(PROFILES.read_bytes()))
+
+
+# Survivors that are a different conforming corpus, not a hole in the checker.
+EQUIVALENT: dict[tuple[str, str], str] = {
+    ("precedence_name_before_bytes", label):
+        "its first character changed, the name is still malformed and its 64 characters "
+        "still differ from its bytes' hex in more than one place: the same case"
+    for label in ("name: a non-hex character", "name: another hex digit",
+                  "name: a fullwidth digit")
+}
+
+
+def mutations(model: dict) -> int:
+    corpus_bytes = CORPUS.read_bytes()
+    base = json.loads(corpus_bytes)
+    profiles = json.loads(PROFILES.read_bytes())
+    text = CONTRACT.read_text()
+    met = check(copy.deepcopy(base), model, profiles)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model, profiles)
+        return go
+
+    def profile_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(profiles)
+            edit(mutated)
+            check(copy.deepcopy(base), model, mutated)
+        return go
+
+    def text_mutant(old: str, new: str, hold: bool = True, align: bool = False,
+                    pinned: bool = False) -> Callable[[], None]:
+        """With ``align``, the corpus header's reasons are set to the mutated
+        table's, so only the case decisions can refuse it."""
+        def go() -> None:
+            if old not in text:
+                raise AssertionError(f"mutation target missing: {old!r}")
+            mutated = contract_model(text.replace(old, new, 1), hold=hold)
+            if pinned:
+                run(mutated)
+                return
+            corpus = copy.deepcopy(base)
+            if align:
+                corpus["reasons"] = list(mutated["reasons"])
+            check(corpus, mutated, profiles)
+        return go
+
+    def sentence_mutant(sentence: str, new: str, hold: bool = True) -> Callable[[], None]:
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split(" "))
+
+        def go() -> None:
+            found = re.search(pattern, text)
+            if found is None:
+                raise AssertionError(f"sentence not found: {sentence!r}")
+            end = found.end()
+            if not new and text[end:end + 1] == "\n":
+                end += 1
+            mutated = text[:found.start()] + new + text[end:]
+            check(copy.deepcopy(base), contract_model(mutated, hold=hold), profiles)
+        return go
+
+    def set_case(i: int, key: str, value: object) -> Callable[[dict], None]:
+        def edit(m: dict) -> None:
+            m["cases"][i][key] = value
+        return edit
+
+    cases: list[tuple[tuple[str, str], Callable[[], None]]] = []
+    for i, c in enumerate(base["cases"]):
+        for value in model["reasons"] + [None]:
+            if value != c["expected"]:
+                cases.append(((c["name"], f"expected -> {value}"),
+                              corpus_mutant(set_case(i, "expected", value))))
+        name = c["asset_name"]
+        at = name.find(PREFIX) + len(PREFIX) if PREFIX in name else 0
+        hexchar = "1" if name[at] != "1" else "2"
+        edits = {
+            "name: upper case": name.upper(),
+            "name: lower case": name.lower(),
+            "name: one character shorter": name[:at] + name[at + 1:],
+            "name: one character longer": name[:at] + "0" + name[at:],
+            "name: a non-hex character": name[:at] + "g" + name[at + 1:],
+            "name: another hex digit": name[:at] + hexchar + name[at + 1:],
+            "name: a fullwidth digit": name[:at] + "１" + name[at + 1:],
+            "name: prefix dropped": name[at:],
+            "name: trailing newline": name + "\n",
+            "name: trailing newline removed": name.rstrip("\n"),
+            "name: extension upper case": name.replace(SUFFIX, SUFFIX.upper()),
+        }
+        for label, new in edits.items():
+            if new != name:
+                cases.append(((c["name"], label), corpus_mutant(set_case(i, "asset_name", new))))
+        data = _bytes(c)
+        if c["expected"] is None:
+            for where in (0, len(data) // 2, len(data) - 1):
+                flipped = bytearray(data)
+                flipped[where] ^= 0x01
+                cases.append(((c["name"], f"held byte {where} flipped"), corpus_mutant(
+                    set_case(i, "asset_b64", base64.b64encode(bytes(flipped)).decode()))))
+            cases.append(((c["name"], "held asset re-serialised with spaces"), corpus_mutant(
+                set_case(i, "asset_b64", base64.b64encode(
+                    json.dumps(json.loads(data), sort_keys=True).encode()).decode()))))
+    # Delete every case without which a requirement falls short.
+    for c in base["cases"]:
+        bearing = [need for need, n in model["demanded"].items()
+                   if c["name"] in met.get(need, ()) and len(met[need]) - 1 < n]
+        if bearing:
+            def drop(m: dict, n: str = c["name"]) -> None:
+                m["cases"] = [x for x in m["cases"] if x["name"] != n]
+            cases.append(((c["name"], f"deleted (needed for {', '.join(sorted(bearing))})"),
+                          corpus_mutant(drop)))
+
+    def pin_mutant(new_bytes: bytes) -> Callable[[], None]:
+        def go() -> None:
+            run(model, new_bytes)
+        return go
+
+    cases += [
+        (("header", "duplicate case name"), corpus_mutant(
+            lambda m: m["cases"][1].__setitem__("name", m["cases"][0]["name"]))),
+        (("header", "contract renamed"), corpus_mutant(
+            lambda m: m.__setitem__("contract", "ori-specs/firmware-telemetry/v1.md"))),
+        (("header", "section renamed"), corpus_mutant(
+            lambda m: m.__setitem__("section", "Controller Profiles > Receivers"))),
+        (("header", "reasons reordered"), corpus_mutant(lambda m: m["reasons"].reverse())),
+        (("header", "reason dropped"), corpus_mutant(lambda m: m["reasons"].pop())),
+        (("header", "a fetched_digest field restored"), corpus_mutant(
+            lambda m: m["cases"][0].__setitem__("fetched_digest", "sha256:" + "0" * 64))),
+        (("profiles", "canonical_hex of a held document changed"), profile_mutant(
+            lambda p: p["cases"][0].__setitem__(
+                "canonical_hex", p["cases"][0]["canonical_hex"][:-2] + "7e"))),
+        (("profiles", "held document removed"), profile_mutant(lambda p: p["cases"].pop(0))),
+        (("pin", "corpus file re-serialised"), pin_mutant(
+            json.dumps(base, indent=1).encode() + b"\n")),
+        (("pin", "corpus file one byte appended"), pin_mutant(corpus_bytes + b" ")),
+        (("pin", "pinned digest changed"), text_mutant(model["pin"], "0" * 64, pinned=True)),
+        (("pin", "pin paragraph removed"), text_mutant(
+            "The authoritative corpus for [Publication](#publication) is", "The corpus is")),
+    ]
+    row = {n: f"| {n} | {chk} | `{r}` |" for n, chk, r in HELD_TABLE}
+    rest = {n: f"| {chk} | `{r}` |" for n, chk, r in HELD_TABLE}
+    swap = (row[1] + "\n  " + row[2], "| 1 " + rest[2] + "\n  | 2 " + rest[1])
+    cases.append((("table rows 1 and 2", "swapped"), text_mutant(*swap)))
+    cases.append((("table rows 1 and 2", "swapped (structural)"),
+                  text_mutant(*swap, hold=False)))
+    cases.append((("table rows 1 and 2", "swapped (decisions only)"),
+                  text_mutant(*swap, hold=False, align=True)))
+    for n, _, reason in HELD_TABLE:
+        for hold in (True, False):
+            cases.append(((f"table row {n}", "reason renamed" + ("" if hold else
+                                                                 " (structural)")),
+                          text_mutant(row[n], row[n].replace(reason, reason + "_x"), hold=hold)))
+        cases.append(((f"table row {n}", "check reworded (structural)"), text_mutant(
+            row[n], row[n].replace(" the ", " a ", 1), hold=False)))
+        cases.append(((f"table row {n}", "deleted (structural)"), text_mutant(
+            "  " + row[n] + "\n", "", hold=False)))
+    cases.append((("table", "a third row (structural)"), text_mutant(
+        row[2], row[2] + "\n  | 3 | the name is the hex of the digest fetched | "
+        "`asset_not_requested` |", hold=False)))
+    start = HELD.index(COVER_LEAD) + 1
+    bullets = [s for s in HELD[start:] if s.startswith("- ")]
+    for bullet in bullets:
+        for hold in (True, False):
+            tag = "" if hold else " (structural)"
+            cases.append(((f"cover bullet {bullet[2:30]!r}", "deleted" + tag),
+                          sentence_mutant(bullet, "", hold)))
+            cases.append(((f"cover bullet {bullet[2:30]!r}", "reworded" + tag),
+                          sentence_mutant(bullet, bullet.replace(" a", " one", 1)
+                                          if " a" in bullet else bullet + " x", hold)))
+    names_bullet = next(b for b in bullets if b.startswith("- " + NAMES_LEAD))
+    for kind in NAME_KINDS:
+        new = names_bullet.replace(kind + ", ", "", 1) if kind + ", " in names_bullet \
+            else names_bullet.replace(", and " + kind, "", 1)
+        cases.append(((f"malformed-name kind {kind!r}", "deleted (structural)"),
+                      sentence_mutant(names_bullet, new, False)))
+    for sentence in HELD:
+        cases.append(((f"held sentence {sentence[:40]!r}", "deleted"),
+                      sentence_mutant(sentence, "")))
+        words = sentence.split(" ")
+        k = len(words) // 2
+        cases.append(((f"held sentence {sentence[:40]!r}", "altered"),
+                      sentence_mutant(sentence, " ".join(words[:k] + ["not"] + words[k:]))))
+    cases.append((("section", "a sentence added"), text_mutant(
+        "This version does not say",
+        "A receiver may also accept an asset by its profile id. This version does not say")))
+
+    survived = 0
+    equivalents = []
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError, IndexError) as refused:
+            print(f"refused  {label[0]}: {label[1]}: {refused}")
+        else:
+            if label in EQUIVALENT:
+                equivalents.append(label)
+            else:
+                print(f"SURVIVED {label[0]}: {label[1]}")
+                survived += 1
+    print(f"{len(cases)} mutants")
+    for label in equivalents:
+        print(f"equivalent {label[0]}: {label[1]}: {EQUIVALENT[label]}")
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    try:
+        model = contract_model()
+    except (Failure, ValueError) as failure:
+        print(f"firmware-telemetry/v2 profile publication contract: {failure}")
+        return 1
+    try:
+        met = run(model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-telemetry/v2 profile publication corpus: {failure!r}")
+        return 1
+    corpus = json.loads(CORPUS.read_bytes())
+    print(f"firmware-telemetry/v2 profile publication corpus: {len(corpus['cases'])} cases "
+          f"under {len(model['rows'])} checks, each decided from the contract; "
+          f"{len(met)} coverage requirements met; digest matches the pin")
+    if argv == ["--mutations"]:
+        survived = mutations(model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    elif argv:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
