@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""Independently verify the tier-c-approvers/v1 transition corpus.
+
+The generator is not imported. This is a small state model, not a runtime,
+gateway, channel-authenticator or database consumer test.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import re
+import sys
+from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "tier-c-approvers" / "vectors" / "transitions.json"
+SITE_ID = "site-1"
+EPOCH_1 = base64.b64encode(bytes(range(32, 48))).decode("ascii")
+EPOCH_2 = base64.b64encode(bytes(range(48, 64))).decode("ascii")
+PUBLIC_KEY = "CoCYmi2u1NnDLsVzNMglg2Ied+0M9Z74rgNvSGRBAdg="
+AUTHORIZER_KEY = "G+iK7S8KwwBgPTDfWHUa2qXxh2r9KBaZmOxrP9PYLW4="
+CANDIDATE_KEY = "8XnYUJphUTQZaYHMhM3opouum4CDrAakyby4v9KuZX0="
+PREVIOUS_KEY = "pATYfctmcQzVhHk+Aa6SZWUQCtxMIBDD2/WXjR68x9k="
+COMMERCIAL_KEY = "CzJf9IyhyTJ8DQpovGI8heykR+smA0porxw3cqIXgMY="
+ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+SITE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+PHONE = re.compile(r"\+[1-9][0-9]{1,14}\Z")
+NAMES = {
+    "recovery_once",
+    "first_setup_requires_authenticated_local_request",
+    "recovery_refuses_provisioning_contacts",
+    "recovery_refuses_multiple_contacts",
+    "first_setup_uses_recovery",
+    "empty_registry_admits_nobody",
+    "local_console_requires_registered_human",
+    "empty_registry_local_seed_requires_site_proofs",
+    "recovery_can_seed_but_closes_old_proposals",
+    "all_revoked_can_seed_new_identity",
+    "loss_requires_recovery_not_reseed",
+    "enrol_requires_existing_authorizer",
+    "enrol_requires_local_request",
+    "enrol_requires_possession",
+    "phone_candidate_requires_channel_possession",
+    "phone_candidate_rejects_wrong_code_and_sender",
+    "phone_candidate_late_reply_refused",
+    "phone_authorizer_revoked_before_commit",
+    "phone_recovery_before_commit",
+    "one_pending_phone_per_candidate_value",
+    "phone_registry_change_before_commit",
+    "phone_site_change_before_commit",
+    "phone_pending_expiry_releases_value",
+    "duplicate_credential_and_value_refused",
+    "challenge_expiry_reuse_change_and_restart",
+    "late_authorizer_cannot_use_stale_challenge",
+    "enrol_and_admit",
+    "enrolled_after_proposal_refused",
+    "replacement_does_not_inherit_cutoff",
+    "revoked_value_cannot_be_relabelled_in_same_epoch",
+    "revocation_repeat_regression_conflict",
+    "revocation_unknown_target",
+    "unsigned_config_cannot_revoke",
+    "previous_and_wrong_class_anchors_refused",
+    "malformed_revocation_documents",
+    "unknown_target_makes_revocation_atomic",
+    "approver_revocation_removes_all_credentials",
+    "revocation_wrong_epoch",
+    "recovery_requires_new_epoch_for_revocation",
+    "invalid_site_binding_is_malformed",
+    "signed_site_change_locks_admission",
+    "revocation_before_admission",
+    "admission_before_revocation_stands",
+}
+REVOKE_FIELDS = {
+    "v",
+    "device_id",
+    "site_id",
+    "identity_epoch",
+    "revision",
+    "targets",
+    "signing_key",
+    "signature",
+}
+
+
+def json_string(value: str) -> bytes:
+    result = bytearray(b'"')
+    escapes = {'"': b'\\"', "\\": b'\\\\', "\b": b"\\b", "\f": b"\\f", "\n": b"\\n", "\r": b"\\r", "\t": b"\\t"}
+    for char in value:
+        if char in escapes:
+            result.extend(escapes[char])
+        elif ord(char) < 32:
+            result.extend(f"\\u{ord(char):04x}".encode("ascii"))
+        else:
+            try:
+                result.extend(char.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("invalid Unicode scalar") from exc
+    result.extend(b'"')
+    return bytes(result)
+
+
+def canonical_profile2(value: Any) -> bytes:
+    """Independent Profile 2 encoder for the integer-only objects in this corpus."""
+    if value is None:
+        return b"null"
+    if value is True:
+        return b"true"
+    if value is False:
+        return b"false"
+    if type(value) is int:
+        return str(value).encode("ascii")
+    if isinstance(value, str):
+        return json_string(value)
+    if isinstance(value, list):
+        return b"[" + b",".join(canonical_profile2(item) for item in value) + b"]"
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("non-string object key")
+        return b"{" + b",".join(
+            canonical_profile2(key) + b":" + canonical_profile2(value[key])
+            for key in sorted(value)
+        ) + b"}"
+    raise ValueError("non-JSON value")
+
+
+def binding_id(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return len(encoded) <= 256 and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+
+
+def verify_wire(corpus: dict[str, Any]) -> None:
+    wire = corpus["wire"]
+    challenge = wire["challenge"]
+    if set(challenge) != {
+        "v", "challenge_id", "device_id", "site_id", "identity_epoch",
+        "operation", "registry_revision", "candidates",
+    }:
+        raise AssertionError("challenge members")
+    if (
+        type(challenge["v"]) is not int or challenge["v"] != 1
+        or type(challenge["registry_revision"]) is not int
+        or challenge["registry_revision"] < 0
+        or len(strict_b64(challenge["challenge_id"])) != 16
+        or not binding_id(challenge["device_id"])
+        or not SITE.fullmatch(challenge["site_id"])
+        or len(strict_b64(challenge["identity_epoch"])) != 16
+        or challenge["operation"] not in {"recover", "enrol", "local_seed"}
+        or not isinstance(challenge["candidates"], list)
+    ):
+        raise AssertionError("challenge fields")
+    candidates = challenge["candidates"]
+    required_count = {"recover": (0,), "enrol": (1,), "local_seed": (1,)}
+    if len(candidates) not in required_count[challenge["operation"]]:
+        raise AssertionError("challenge candidate count")
+    ids = []
+    values = []
+    for candidate in candidates:
+        if set(candidate) != {"approver_id", "credential_id", "channel", "value"}:
+            raise AssertionError("candidate members")
+        if not ID.fullmatch(candidate["approver_id"]) or not ID.fullmatch(candidate["credential_id"]):
+            raise AssertionError("candidate ids")
+        if candidate["channel"] in {"sms", "whatsapp"}:
+            if not PHONE.fullmatch(candidate["value"]):
+                raise AssertionError("phone value")
+        elif candidate["channel"] == "lan_ed25519":
+            if not candidate["value"].startswith("ed25519:") or len(strict_b64(candidate["value"][8:])) != 32:
+                raise AssertionError("LAN value")
+        else:
+            raise AssertionError("channel")
+        ids.append(candidate["credential_id"])
+        values.append((candidate["channel"], candidate["value"]))
+    if ids != sorted(set(ids)) or len(values) != len(set(values)):
+        raise AssertionError("candidate order or duplicate")
+    challenge_bytes = canonical_profile2(challenge)
+    if challenge_bytes.hex() != wire["challenge_canonical_hex"]:
+        raise AssertionError("challenge canonical bytes")
+    digest = hashlib.sha256(challenge_bytes).hexdigest()
+    if wire["authorizer_public_key_b64"] != AUTHORIZER_KEY or wire["candidate_public_key_b64"] != CANDIDATE_KEY:
+        raise AssertionError("unexpected test keys")
+    for name, id_field, domain, public_key in (
+        ("authorizer", "authorizer_credential_id", b"ori.tier_c_approver.enrol.v1", wire["authorizer_public_key_b64"]),
+        ("possession", "candidate_credential_id", b"ori.tier_c_approver.possession.v1", wire["candidate_public_key_b64"]),
+    ):
+        fixture = wire[name]
+        document = fixture["object"]
+        if set(document) != {"v", "challenge_id", "challenge_sha256", id_field, "signature"}:
+            raise AssertionError(f"{name} members")
+        if (
+            type(document["v"]) is not int or document["v"] != 1
+            or document["challenge_id"] != challenge["challenge_id"]
+            or document["challenge_sha256"] != digest
+            or not ID.fullmatch(document[id_field])
+        ):
+            raise AssertionError(f"{name} binding")
+        unsigned = {key: value for key, value in document.items() if key != "signature"}
+        preimage = domain + b"\0" + canonical_profile2(unsigned)
+        if preimage.hex() != fixture["preimage_hex"]:
+            raise AssertionError(f"{name} preimage")
+        try:
+            Ed25519PublicKey.from_public_bytes(strict_b64(public_key)).verify(
+                strict_b64(document["signature"]), preimage
+            )
+        except (InvalidSignature, ValueError) as exc:
+            raise AssertionError(f"{name} signature") from exc
+    candidate = candidates[0]
+    if candidate["value"] != "ed25519:" + wire["candidate_public_key_b64"]:
+        raise AssertionError("possession key is not candidate key")
+    if wire["possession"]["object"]["candidate_credential_id"] != candidate["credential_id"]:
+        raise AssertionError("possession candidate id")
+    # RFC 8410 Ed25519 SPKI DER is this fixed 12-byte prefix plus the raw key.
+    spki = bytes.fromhex("302a300506032b6570032100") + strict_b64(CANDIDATE_KEY)
+    if hashlib.sha256(spki).hexdigest() != wire["candidate_spki_sha256"]:
+        raise AssertionError("candidate SPKI digest")
+    expected_phone = f"ORI-ENROL-V1 {challenge['challenge_id']} {digest}".encode("ascii")
+    if wire["phone_authorization_ascii_hex"] != expected_phone.hex():
+        raise AssertionError("phone authorization bytes")
+    phone = wire["phone_candidate"]
+    phone_challenge = phone["challenge"]
+    if set(phone_challenge) != set(challenge) or phone_challenge["operation"] != "enrol":
+        raise AssertionError("phone challenge members")
+    if len(phone_challenge["candidates"]) != 1 or phone_challenge["candidates"][0]["channel"] != "sms":
+        raise AssertionError("phone candidate channel")
+    if len(strict_b64(phone_challenge["challenge_id"])) != 16:
+        raise AssertionError("phone challenge id")
+    if canonical_profile2(phone_challenge).hex() != phone["challenge_canonical_hex"]:
+        raise AssertionError("phone challenge canonical bytes")
+    reply = phone["reply"]
+    if reply["sender"] != phone_challenge["candidates"][0]["value"] or reply["channel"] != "sms":
+        raise AssertionError("phone reply attribution")
+    sent = bytes.fromhex(phone["sent_ascii_hex"])
+    if sent != bytes.fromhex(reply["text_ascii_hex"]):
+        raise AssertionError("phone reply bytes")
+    prefix = f"ORI-POSSESS-V1 {phone_challenge['challenge_id']} ".encode("ascii")
+    if not sent.startswith(prefix):
+        raise AssertionError("phone possession prefix")
+    code = sent[len(prefix):].decode("ascii")
+    if len(strict_b64(code)) != 16 or hashlib.sha256(code.encode("ascii")).hexdigest() != phone["code_sha256"]:
+        raise AssertionError("phone possession code")
+    expected_phone_values = {
+        "+2348012345678": True,
+        "whatsapp:+2348012345678": False,
+        "+1 555 0123": False,
+        "+01234": False,
+        "08012345678": False,
+    }
+    if {case["value"]: case["valid"] for case in wire["phone_value_cases"]} != expected_phone_values:
+        raise AssertionError("phone cases changed")
+    for case in wire["phone_value_cases"]:
+        if bool(PHONE.fullmatch(case["value"])) is not case["valid"]:
+            raise AssertionError("phone normalization case")
+
+
+def strict_b64(value: str) -> bytes:
+    decoded = base64.b64decode(value, validate=True)
+    if base64.b64encode(decoded).decode() != value:
+        raise ValueError("noncanonical Base64")
+    return decoded
+
+
+def revocation_reason(document: Any) -> str | None:
+    if not isinstance(document, dict) or set(document) != REVOKE_FIELDS:
+        return "malformed"
+    try:
+        targets = document["targets"]
+        if (
+            type(document["v"]) is not int or document["v"] != 1
+            or type(document["revision"]) is not int or document["revision"] < 1
+            or not binding_id(document["device_id"])
+            or not SITE.fullmatch(document["site_id"])
+            or len(strict_b64(document["identity_epoch"])) != 16
+            or not isinstance(targets, list) or not targets or len(targets) > 32
+            or any(not isinstance(x, str) or not re.fullmatch(r"(?:credential|approver):[A-Za-z0-9._-]{1,64}", x) for x in targets)
+            or targets != sorted(set(targets))
+            or not isinstance(document["signing_key"], str)
+            or not document["signing_key"].startswith("ed25519:")
+            or len(strict_b64(document["signing_key"][8:])) != 32
+            or not isinstance(document["signature"], str)
+            or len(strict_b64(document["signature"])) != 64
+        ):
+            return "malformed"
+        unsigned = {key: value for key, value in document.items() if key != "signature"}
+        payload = canonical_profile2(unsigned)
+    except (ValueError, TypeError):
+        return "malformed"
+    key = document["signing_key"][8:]
+    if key not in {PUBLIC_KEY, PREVIOUS_KEY, COMMERCIAL_KEY}:
+        return "unknown_signer"
+    try:
+        Ed25519PublicKey.from_public_bytes(strict_b64(key)).verify(
+            strict_b64(document["signature"]),
+            b"ori.tier_c_approver.revoke.v1\0" + payload,
+        )
+    except (InvalidSignature, ValueError):
+        return "signature_invalid"
+    if key == PREVIOUS_KEY:
+        return "superseded_signer"
+    if key == COMMERCIAL_KEY:
+        return "wrong_authority"
+    return None
+
+
+def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON member")
+        result[key] = value
+    return result
+
+
+def candidate_of(operation: dict[str, Any]) -> Any:
+    if operation["op"] == "recover":
+        return []
+    return {
+        "credential": operation["credential"],
+        "approver_id": operation.get("approver_id", operation["credential"]),
+        "channel": operation.get("channel", "lan_ed25519"),
+        "value": operation.get("value", operation["credential"]),
+    }
+
+
+class Registry:
+    def __init__(self, initial_mode: str) -> None:
+        if initial_mode != "locked":
+            raise ValueError("invalid initial mode")
+        self.initialized = False
+        self.epoch = EPOCH_1
+        self.config_site = SITE_ID
+        self.revision = 0
+        self.external_revision = 0
+        self.last_external_document: str | None = None
+        self.sequence = 0
+        self.active: dict[str, int] = {}
+        self.values: dict[str, str] = {}
+        self.tombstones: set[str] = set()
+        self.approvers: dict[str, str] = {}
+        self.approver_tombstones: set[str] = set()
+        self.proposals: dict[str, dict[str, Any]] = {}
+        self.challenges: dict[str, dict[str, Any]] = {}
+        self.used_challenges: set[str] = set()
+        self.pending_phone: dict[str, dict[str, Any]] = {}
+        self.invalidated_phone: dict[str, str] = {}
+
+    def apply(self, operation: dict[str, Any]) -> str:
+        kind = operation["op"]
+        if kind == "config_site_change":
+            self.config_site = operation["site_id"]
+            self.proposals.clear()
+            for challenge_id in self.pending_phone:
+                self.invalidated_phone[challenge_id] = "site_binding_mismatch"
+            self.pending_phone.clear()
+            return "site_locked"
+        if kind == "config_site_restore":
+            self.config_site = SITE_ID
+            return "site_restored"
+        if self.initialized and self.config_site != SITE_ID and kind in {"issue", "recover", "enrol", "local_seed", "revoke", "open", "admit"}:
+            return "site_binding_mismatch"
+        if kind == "issue":
+            challenge_id = operation["challenge_id"]
+            if challenge_id in self.challenges or challenge_id in self.used_challenges:
+                return "challenge_reused"
+            if operation["kind"] == "recover":
+                proposed = operation.get("proposed_epoch")
+                try:
+                    if len(strict_b64(proposed)) != 16 or proposed == self.epoch:
+                        return "malformed"
+                except (TypeError, ValueError):
+                    return "malformed"
+            if operation["kind"] == "enrol" and isinstance(operation["candidate"], dict) and operation["candidate"].get("channel") in {"sms", "whatsapp"}:
+                digest = operation.get("phone_code_sha256")
+                if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                    return "malformed"
+            self.challenges[challenge_id] = {
+                "kind": operation["kind"],
+                "candidate": operation["candidate"],
+                "revision": self.revision,
+                "epoch": self.epoch,
+                "proposed_epoch": operation.get("proposed_epoch"),
+                "sequence": self.sequence,
+                "expired": False,
+                "phone_code_sha256": operation.get("phone_code_sha256"),
+            }
+            return "issued"
+        if kind == "expire":
+            challenge = self.challenges.get(operation["challenge_id"])
+            if challenge is None:
+                return "challenge_unavailable"
+            challenge["expired"] = True
+            return "expired"
+        if kind == "restart":
+            self.challenges.clear()
+            self.pending_phone.clear()
+            self.invalidated_phone.clear()
+            self.proposals.clear()
+            return "restarted"
+        if kind == "expire_phone":
+            elapsed = operation.get("phone_elapsed_ms")
+            if type(elapsed) is not int or elapsed <= 600000:
+                return "not_expired"
+            if self.pending_phone.pop(operation["challenge_id"], None) is None:
+                return "pending_unavailable"
+            return "expired"
+        if kind in {"recover", "enrol", "local_seed", "phone_authorize"}:
+            challenge_id = operation.get("challenge_id")
+            if challenge_id in self.used_challenges:
+                return "challenge_reused"
+            challenge = self.challenges.pop(challenge_id, None)
+            if challenge is None:
+                return "challenge_unavailable"
+            self.used_challenges.add(challenge_id)
+            if challenge["expired"]:
+                return "challenge_expired"
+            challenge_kind = "enrol" if kind == "phone_authorize" else kind
+            if challenge["kind"] != challenge_kind or challenge["candidate"] != candidate_of(operation):
+                return "candidate_changed"
+            if challenge["revision"] != self.revision or challenge["epoch"] != self.epoch:
+                return "challenge_stale"
+        if kind == "lose":
+            self.initialized = False
+            self.active.clear()
+            self.values.clear()
+            self.approvers.clear()
+            self.tombstones.clear()
+            self.approver_tombstones.clear()
+            self.challenges.clear()
+            return "locked"
+        if kind == "recover":
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            if self.initialized:
+                return "recovery_not_available"
+            if operation["epoch"] == self.epoch:
+                return "epoch_not_advanced"
+            if operation["epoch"] != challenge["proposed_epoch"]:
+                return "candidate_changed"
+            if operation.get("contacts", []):
+                return "contacts_forbidden"
+            self.epoch = operation["epoch"]
+            self.initialized = True
+            self.revision = 1
+            self.external_revision = 0
+            self.last_external_document = None
+            self.sequence = 0
+            self.proposals.clear()
+            for challenge_id in self.pending_phone:
+                self.invalidated_phone[challenge_id] = "epoch_changed"
+            self.pending_phone.clear()
+            return "recovered"
+        if kind == "phone_commit":
+            challenge_id = operation["challenge_id"]
+            invalidated = self.invalidated_phone.pop(challenge_id, None)
+            if invalidated is not None:
+                return invalidated
+            pending = self.pending_phone.pop(challenge_id, None)
+            if pending is None:
+                return "pending_unavailable"
+            elapsed = operation.get("phone_elapsed_ms", 0)
+            if type(elapsed) is not int or elapsed < 0:
+                return "malformed"
+            if elapsed > 600000:
+                return "possession_expired"
+            if not self.initialized:
+                return "registry_unavailable"
+            if self.config_site != pending["site"]:
+                return "site_binding_mismatch"
+            if self.epoch != pending["epoch"]:
+                return "epoch_changed"
+            if pending["authorizer"] not in self.active:
+                return "authorizer_unavailable"
+            if self.revision != pending["revision"]:
+                return "registry_changed"
+            candidate = pending["candidate"]
+            if operation.get("value") != candidate["value"] or operation.get("channel") != candidate["channel"]:
+                return "candidate_changed"
+            reply = operation.get("phone_reply")
+            if reply is None:
+                return "possession_required"
+            if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
+                return "possession_invalid"
+            prefix = f"ORI-POSSESS-V1 {challenge_id} "
+            text = reply["text"]
+            if not isinstance(text, str) or not text.startswith(prefix):
+                return "possession_invalid"
+            code = text[len(prefix):]
+            try:
+                if len(strict_b64(code)) != 16:
+                    return "possession_invalid"
+            except (ValueError, TypeError):
+                return "possession_invalid"
+            if (reply["authenticated"] is not True or
+                reply["sender"] != candidate["value"] or
+                reply["channel"] != candidate["channel"] or
+                not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), pending["phone_code_sha256"])):
+                return "possession_invalid"
+            identifier = candidate["credential"]
+            approver_id = candidate["approver_id"]
+            value = candidate["value"]
+            if approver_id in self.approver_tombstones:
+                return "approver_revoked"
+            if identifier in self.approvers or identifier in self.tombstones:
+                return "credential_reused"
+            if value in (self.values[x] for x in self.tombstones if x in self.values):
+                return "value_tombstoned"
+            if value in (self.values[x] for x in self.active):
+                return "duplicate_value"
+            self.sequence += 1
+            self.active[identifier] = self.sequence
+            self.values[identifier] = value
+            self.approvers[identifier] = approver_id
+            self.revision += 1
+            return "enrolled"
+        if not self.initialized:
+            return "registry_unavailable"
+        if kind == "local_seed":
+            if self.active:
+                return "active_authorizer_exists"
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            if operation.get("channel") != "lan_ed25519":
+                return "lan_key_required"
+            if operation.get("possession") is not True:
+                return "possession_invalid"
+            identifier = operation["credential"]
+            approver_id = operation["approver_id"]
+            value = operation.get("value", identifier)
+            if approver_id in self.approver_tombstones:
+                return "approver_revoked"
+            if identifier in self.tombstones or identifier in self.approvers:
+                return "credential_reused"
+            if value in (self.values[x] for x in self.tombstones if x in self.values):
+                return "value_tombstoned"
+            if value in (self.values[x] for x in self.active):
+                return "duplicate_value"
+            self.sequence += 1
+            self.active[identifier] = self.sequence
+            self.values[identifier] = value
+            self.approvers[identifier] = approver_id
+            self.revision += 1
+            return "seeded"
+        if kind in {"enrol", "phone_authorize"}:
+            if operation["authorizer"] not in self.active:
+                return "authorizer_unavailable"
+            if self.active[operation["authorizer"]] > challenge["sequence"]:
+                return "authorizer_not_preexisting"
+            if operation.get("local_request") is not True:
+                return "local_auth_required"
+            channel = operation.get("channel", "lan_ed25519")
+            if kind == "phone_authorize":
+                if channel not in {"sms", "whatsapp"} or challenge["phone_code_sha256"] is None:
+                    return "malformed"
+                candidate = candidate_of(operation)
+                if any(pending["candidate"]["value"] == candidate["value"] for pending in self.pending_phone.values()):
+                    return "phone_pending_for_value"
+                self.pending_phone[challenge_id] = {
+                    "candidate": candidate,
+                    "authorizer": operation["authorizer"],
+                    "revision": self.revision,
+                    "epoch": self.epoch,
+                    "site": self.config_site,
+                    "phone_code_sha256": challenge["phone_code_sha256"],
+                }
+                return "phone_pending"
+            if channel != "lan_ed25519":
+                return "malformed"
+            if operation.get("possession") is not True:
+                return "possession_invalid"
+            identifier = operation["credential"]
+            approver_id = operation.get("approver_id", identifier)
+            value = operation.get("value", identifier)
+            if approver_id in self.approver_tombstones:
+                return "approver_revoked"
+            if identifier in self.approvers or identifier in self.tombstones:
+                return "credential_reused"
+            if value in (self.values[x] for x in self.tombstones if x in self.values):
+                return "value_tombstoned"
+            if value in (self.values[x] for x in self.active):
+                return "duplicate_value"
+            self.sequence += 1
+            self.active[identifier] = self.sequence
+            self.values[identifier] = value
+            self.approvers[identifier] = approver_id
+            self.revision += 1
+            return "enrolled"
+        if kind == "open":
+            if self.config_site != SITE_ID:
+                return "site_binding_mismatch"
+            if operation["proposal"] in self.proposals:
+                return "proposal_exists"
+            self.proposals[operation["proposal"]] = {
+                "cutoff": self.sequence,
+                "epoch": self.epoch,
+                "approved": False,
+            }
+            return "opened"
+        if kind == "revoke":
+            request_bytes = operation.get("document_wire")
+            if request_bytes is None:
+                request_bytes = canonical_profile2(operation["document"])
+            else:
+                request_bytes = request_bytes.encode("utf-8")
+            request_bytes = b'{"operation":"approver_registry_revoke","document":' + request_bytes + b'}'
+            if len(request_bytes) > 16_384:
+                return "payload_too_large"
+            if operation.get("config_signed", True) is not True:
+                return "anchor_unavailable"
+            if "document_wire" in operation:
+                try:
+                    document = json.loads(operation["document_wire"], object_pairs_hook=unique_pairs)
+                except (ValueError, TypeError):
+                    return "malformed"
+            else:
+                document = operation["document"]
+            reason = revocation_reason(document)
+            if reason is not None:
+                return reason
+            if (
+                document["device_id"] != "edge-1"
+                or document["site_id"] != SITE_ID
+                or document["identity_epoch"] != self.epoch
+            ):
+                return "binding_mismatch"
+            revision = document["revision"]
+            fingerprint = hashlib.sha256(canonical_profile2(document)).hexdigest()
+            if revision < self.external_revision:
+                return "revision_regressed"
+            if revision == self.external_revision:
+                return (
+                    "replayed"
+                    if fingerprint == self.last_external_document
+                    else "revision_conflict"
+                )
+            for target in document["targets"]:
+                kind, identifier = target.split(":", 1)
+                if kind == "credential":
+                    if identifier not in self.active and identifier not in self.tombstones:
+                        return "unknown_target"
+                elif identifier not in self.approvers.values() and identifier not in self.approver_tombstones:
+                    return "unknown_target"
+            for target in document["targets"]:
+                kind, identifier = target.split(":", 1)
+                if kind == "credential":
+                    self.active.pop(identifier, None)
+                    self.tombstones.add(identifier)
+                else:
+                    self.approver_tombstones.add(identifier)
+                    for credential, owner in self.approvers.items():
+                        if owner == identifier:
+                            self.active.pop(credential, None)
+                            self.tombstones.add(credential)
+            self.external_revision = revision
+            self.last_external_document = fingerprint
+            self.revision += 1
+            return "revoked"
+        if kind == "admit":
+            if self.config_site != SITE_ID:
+                return "site_binding_mismatch"
+            proposal = self.proposals.get(operation["proposal"])
+            if proposal is None:
+                return "proposal_unavailable"
+            if proposal["approved"]:
+                return "already_decided"
+            if operation.get("channel") == "local_console" and operation.get("authenticated") is not True:
+                return "ingress_unauthenticated"
+            if proposal["epoch"] != self.epoch:
+                return "epoch_changed"
+            sequence = self.active.get(operation["credential"])
+            if sequence is None:
+                return "credential_unavailable"
+            if sequence > proposal["cutoff"]:
+                return "enrolled_after_proposal"
+            proposal["approved"] = True
+            proposal["credential_id"] = operation["credential"]
+            proposal["registry_revision"] = self.revision
+            return "approved"
+        raise ValueError(f"unknown operation: {kind}")
+
+
+def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
+    if corpus["contract"] != "tier-c-approvers/v1":
+        raise AssertionError("wrong contract")
+    if corpus["provisioning_test_public_key_b64"] != PUBLIC_KEY:
+        raise AssertionError("unexpected test anchor")
+    if corpus["previous_test_public_key_b64"] != PREVIOUS_KEY or corpus["commercial_test_public_key_b64"] != COMMERCIAL_KEY:
+        raise AssertionError("unexpected alternate test anchors")
+    verify_wire(corpus)
+    scenarios = corpus["scenarios"]
+    if len(scenarios) != len(NAMES) or {x["name"] for x in scenarios} != NAMES:
+        raise AssertionError("required transition coverage changed")
+    total = 0
+    for scenario in scenarios:
+        model = Registry(scenario["initial_mode"])
+        for operation in scenario["steps"]:
+            if operation["op"] == "revoke" and "preimage_hex" in operation:
+                unsigned = {key: value for key, value in operation["document"].items() if key != "signature"}
+                if (b"ori.tier_c_approver.revoke.v1\0" + canonical_profile2(unsigned)).hex() != operation["preimage_hex"]:
+                    raise AssertionError(f"{scenario['name']}: revocation preimage")
+            actual = model.apply(operation)
+            total += 1
+            if actual != operation["expect"]:
+                raise AssertionError(
+                    f"{scenario['name']} {operation['op']}: "
+                    f"{actual} != {operation['expect']}"
+                )
+    if announce:
+        print(
+            f"tier-c-approvers/v1: {len(scenarios)} scenarios, {total} transitions verified"
+        )
+
+
+def mutations(corpus: dict[str, Any]) -> None:
+    mutants: list[tuple[str, dict[str, Any]]] = []
+    missing = copy.deepcopy(corpus)
+    missing["scenarios"].pop()
+    mutants.append(("missing scenario", missing))
+    false_approval = copy.deepcopy(corpus)
+    next(
+        scenario
+        for scenario in false_approval["scenarios"]
+        if scenario["name"] == "empty_registry_admits_nobody"
+    )["steps"][-1]["expect"] = "approved"
+    mutants.append(("false approval", false_approval))
+    forged = copy.deepcopy(corpus)
+    next(
+        operation for operation in next(
+            scenario for scenario in forged["scenarios"]
+            if scenario["name"] == "revocation_repeat_regression_conflict"
+        )["steps"] if operation["op"] == "revoke"
+    )["document"]["signature"] = "AA=="
+    mutants.append(("forged revocation", forged))
+    altered_preimage = copy.deepcopy(corpus)
+    altered_preimage["wire"]["authorizer"]["preimage_hex"] = "00" + altered_preimage["wire"]["authorizer"]["preimage_hex"][2:]
+    mutants.append(("authorizer preimage", altered_preimage))
+    altered_candidate = copy.deepcopy(corpus)
+    altered_candidate["wire"]["challenge"]["candidates"][0]["credential_id"] = "other-app"
+    mutants.append(("challenge candidate", altered_candidate))
+    false_seed = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in false_seed["scenarios"]
+        if scenario["name"] == "empty_registry_local_seed_requires_site_proofs"
+    )["steps"] if operation["op"] == "local_seed" and operation["expect"] == "local_auth_required")["expect"] = "seeded"
+    mutants.append(("missing local authentication accepted", false_seed))
+    false_expiry = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in false_expiry["scenarios"]
+        if scenario["name"] == "challenge_expiry_reuse_change_and_restart"
+    )["steps"] if operation["op"] == "enrol" and operation["expect"] == "challenge_expired")["expect"] = "enrolled"
+    mutants.append(("expired challenge accepted", false_expiry))
+    false_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in false_phone["scenarios"]
+        if scenario["name"] == "phone_candidate_requires_channel_possession"
+    )["steps"] if operation["op"] == "phone_commit" and operation["expect"] == "possession_required")["expect"] = "enrolled"
+    mutants.append(("phone without possession accepted", false_phone))
+    late_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in late_phone["scenarios"]
+        if scenario["name"] == "phone_candidate_late_reply_refused"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("late phone reply accepted", late_phone))
+    revoked_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in revoked_phone["scenarios"]
+        if scenario["name"] == "phone_authorizer_revoked_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("revoked authorizer accepted at phone commit", revoked_phone))
+    recovered_phone = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in recovered_phone["scenarios"]
+        if scenario["name"] == "phone_recovery_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("old epoch phone commit accepted", recovered_phone))
+    duplicate_pending = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in duplicate_pending["scenarios"]
+        if scenario["name"] == "one_pending_phone_per_candidate_value"
+    )["steps"] if operation["op"] == "phone_authorize" and operation["expect"] == "phone_pending_for_value")["expect"] = "phone_pending"
+    mutants.append(("second pending phone for value accepted", duplicate_pending))
+    changed_registry = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in changed_registry["scenarios"]
+        if scenario["name"] == "phone_registry_change_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("changed registry accepted at phone commit", changed_registry))
+    changed_site = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in changed_site["scenarios"]
+        if scenario["name"] == "phone_site_change_before_commit"
+    )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
+    mutants.append(("changed site accepted at phone commit", changed_site))
+    altered_phone_wire = copy.deepcopy(corpus)
+    altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
+    mutants.append(("phone wire wrong sender", altered_phone_wire))
+    for name, mutant in mutants:
+        try:
+            check(mutant, announce=False)
+        except AssertionError:
+            continue
+        raise AssertionError(f"{name} mutation was accepted")
+    print(f"tier-c-approvers/v1: {len(mutants)} mutations refused")
+
+
+if __name__ == "__main__":
+    try:
+        source = json.loads(CORPUS.read_text())
+        check(source)
+        if "--mutations" in sys.argv[1:]:
+            mutations(source)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        print(f"tier-c-approvers vectors failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc

@@ -476,6 +476,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |
 | tier-c-approval | v1 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit pending |
+| tier-c-approvers | v1 | `draft` | `amendable` | — |
 
 ## Deprecation
 
