@@ -2,6 +2,25 @@
 
 New implementation gaps should be added here, naming the owning repository.
 
+## lan-app-api/v1 adoption
+
+- **First locally seeded key has no authenticated gateway pin handoff**
+  ([lan-app-api/v1.md](../lan-app-api/v1.md)): `ori-gateway` and the customer
+  application must agree on a locally authenticated way to deliver the
+  gateway's TLS SPKI pin to an application whose key was seeded directly at
+  the runtime and which has no product pairing grant. Until that path is
+  specified and implemented, the application must refuse the unpinned local
+  proposal session; offline renewal is possible only after an authenticated
+  pin has been retained. Runtime credential enrolment by itself does not
+  authenticate the gateway to the application.
+- **HTTP response and write shapes remain incomplete**
+  ([lan-app-api/v1.md](../lan-app-api/v1.md)): `ori-gateway` and the customer
+  application still need exact bounded payload schemas for site health,
+  posture, readings, events, alerts, proposals and preferences, including
+  refusal and pagination behavior. The named endpoint table alone is not a
+  complete interoperable HTTP contract. Adoption and conformance claims must
+  wait for these schemas and independent consumer tests.
+
 ## tier-c-approvers/v1 ratification and adoption
 
 - **V1 procedural presence and rollback limits**
