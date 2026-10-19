@@ -71,6 +71,17 @@ New implementation gaps should be added here, naming the owning repository.
   lives in the still-open `lan-app-api/v1` PR #344. A locally seeded or
   recovered registry cannot approve Tier C until that contract and its runtime
   consumer exist; the safe default remains non-actuating.
+- **Webhook bridge signing has no contract**
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md#limits-and-later-versions)):
+  no contract fixes the exact input the `ori-gateway` webhook bridge signs and
+  `ori-runtime` verifies, which covers the raw body, timestamp and nonce, and the
+  channel field a second channel on one ingress requires. The path and
+  `Content-Type` are unbound inputs too, and that contract must decide them.
+  Until it exists, `ori-runtime` may treat a phone channel as authenticated
+  only on an ingress its configuration binds to that one channel, and WhatsApp
+  enrolment refuses. The authenticated
+  WhatsApp ingress belongs at the runtime's provider seam
+  ([runtime #887](https://github.com/ori-platform/ori-runtime/issues/887)).
 
 ## skills-package/v2 adoption targets
 
