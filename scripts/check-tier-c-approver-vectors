@@ -33,6 +33,12 @@ COMMERCIAL_KEY = "CzJf9IyhyTJ8DQpovGI8heykR+smA0porxw3cqIXgMY="
 ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 SITE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 PHONE = re.compile(r"\+[1-9][0-9]{1,14}\Z")
+PHONE_CHANNELS = {"sms", "whatsapp"}
+# "Authenticated channel" and "Limits and later versions": in v1 no WhatsApp
+# ingress is authenticated, so only SMS is a phone channel with an
+# authenticated ingress. Any other phone channel is unauthenticated under
+# every rule, whatever a fixture's own `authenticated` flag says.
+AUTHENTICATED_PHONE_CHANNELS = {"sms"}
 NAMES = {
     "recovery_once",
     "first_setup_requires_authenticated_local_request",
@@ -54,6 +60,7 @@ NAMES = {
     "phone_authorizer_revoked_before_commit",
     "phone_recovery_before_commit",
     "one_pending_phone_per_candidate_value",
+    "whatsapp_candidate_refused_at_issue",
     "phone_registry_change_before_commit",
     "phone_site_change_before_commit",
     "phone_pending_expiry_releases_value",
@@ -332,10 +339,34 @@ def candidate_of(operation: dict[str, Any]) -> Any:
     }
 
 
+# Model checks that --mutations switches off one at a time to prove the corpus
+# (or a stated corpus variant) depends on each.
+MODEL_CHECKS = {
+    "issue_channel",
+    "issue_locked_first",
+    "reply_auth_channel",
+    "reply_channel_mismatch",
+    "admit_phone_channel",
+    "admit_auth_flag",
+    "admit_credential_channel",
+    "guard",
+}
+
+
+def credential_channel_of_reply(channel: Any) -> Any:
+    """A reply without a channel is a signed LAN reply; the local console is a
+    transport for a LAN key ("Proposal cutoff and admission")."""
+    if channel is None or channel == "local_console":
+        return "lan_ed25519"
+    return channel
+
+
 class Registry:
-    def __init__(self, initial_mode: str) -> None:
+    def __init__(self, initial_mode: str, disabled: frozenset[str] = frozenset()) -> None:
         if initial_mode != "locked":
             raise ValueError("invalid initial mode")
+        self.disabled = disabled
+        self.channels: dict[str, str] = {}
         self.initialized = False
         self.epoch = EPOCH_1
         self.config_site = SITE_ID
@@ -379,7 +410,21 @@ class Registry:
                         return "malformed"
                 except (TypeError, ValueError):
                     return "malformed"
-            if operation["kind"] == "enrol" and isinstance(operation["candidate"], dict) and operation["candidate"].get("channel") in {"sms", "whatsapp"}:
+            candidate = operation["candidate"]
+            if (
+                isinstance(candidate, dict)
+                and candidate.get("channel") in PHONE_CHANNELS
+                and candidate.get("channel") not in AUTHENTICATED_PHONE_CHANNELS
+            ):
+                # The text has a site binding mismatch (checked above for every
+                # operation) and a locked registry refuse such a candidate first.
+                if not self.initialized and "issue_locked_first" not in self.disabled:
+                    return "registry_unavailable"
+                # Refused at issue for every operation kind: no challenge or
+                # used marker is recorded, no code exists, nothing pends.
+                if "issue_channel" not in self.disabled:
+                    return "channel_unauthenticated"
+            if operation["kind"] == "enrol" and isinstance(candidate, dict) and candidate.get("channel") in PHONE_CHANNELS:
                 digest = operation.get("phone_code_sha256")
                 if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
                     return "malformed"
@@ -432,6 +477,7 @@ class Registry:
             self.initialized = False
             self.active.clear()
             self.values.clear()
+            self.channels.clear()
             self.approvers.clear()
             self.tombstones.clear()
             self.approver_tombstones.clear()
@@ -501,8 +547,11 @@ class Registry:
             except (ValueError, TypeError):
                 return "possession_invalid"
             if (reply["authenticated"] is not True or
+                (reply["channel"] not in AUTHENTICATED_PHONE_CHANNELS
+                 and "reply_auth_channel" not in self.disabled) or
                 reply["sender"] != candidate["value"] or
-                reply["channel"] != candidate["channel"] or
+                (reply["channel"] != candidate["channel"]
+                 and "reply_channel_mismatch" not in self.disabled) or
                 not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), pending["phone_code_sha256"])):
                 return "possession_invalid"
             identifier = candidate["credential"]
@@ -519,6 +568,7 @@ class Registry:
             self.sequence += 1
             self.active[identifier] = self.sequence
             self.values[identifier] = value
+            self.channels[identifier] = candidate["channel"]
             self.approvers[identifier] = approver_id
             self.revision += 1
             return "enrolled"
@@ -547,6 +597,7 @@ class Registry:
             self.sequence += 1
             self.active[identifier] = self.sequence
             self.values[identifier] = value
+            self.channels[identifier] = "lan_ed25519"
             self.approvers[identifier] = approver_id
             self.revision += 1
             return "seeded"
@@ -559,8 +610,12 @@ class Registry:
                 return "local_auth_required"
             channel = operation.get("channel", "lan_ed25519")
             if kind == "phone_authorize":
-                if channel not in {"sms", "whatsapp"} or challenge["phone_code_sha256"] is None:
+                if channel not in PHONE_CHANNELS or challenge["phone_code_sha256"] is None:
                     return "malformed"
+                if channel not in AUTHENTICATED_PHONE_CHANNELS:
+                    # Unreachable while issue refuses the candidate; kept so a
+                    # pending operation can never exist on such a channel.
+                    return "channel_unauthenticated"
                 candidate = candidate_of(operation)
                 if any(pending["candidate"]["value"] == candidate["value"] for pending in self.pending_phone.values()):
                     return "phone_pending_for_value"
@@ -591,6 +646,7 @@ class Registry:
             self.sequence += 1
             self.active[identifier] = self.sequence
             self.values[identifier] = value
+            self.channels[identifier] = "lan_ed25519"
             self.approvers[identifier] = approver_id
             self.revision += 1
             return "enrolled"
@@ -674,10 +730,25 @@ class Registry:
                 return "already_decided"
             if operation.get("channel") == "local_console" and operation.get("authenticated") is not True:
                 return "ingress_unauthenticated"
+            reply_channel = operation.get("channel")
+            if reply_channel in PHONE_CHANNELS:
+                # "A Tier C reply on such a channel is refused as
+                # ingress_unauthenticated." An absent flag is not authenticated.
+                if (reply_channel not in AUTHENTICATED_PHONE_CHANNELS
+                        and "admit_phone_channel" not in self.disabled):
+                    return "ingress_unauthenticated"
+                if (operation.get("authenticated") is not True
+                        and "admit_auth_flag" not in self.disabled):
+                    return "ingress_unauthenticated"
             if proposal["epoch"] != self.epoch:
                 return "epoch_changed"
             sequence = self.active.get(operation["credential"])
             if sequence is None:
+                return "credential_unavailable"
+            # "No active credential for a channel admits no reply on that
+            # channel": the reply's channel must be the credential's channel.
+            if (self.channels.get(operation["credential"]) != credential_channel_of_reply(reply_channel)
+                    and "admit_credential_channel" not in self.disabled):
                 return "credential_unavailable"
             if sequence > proposal["cutoff"]:
                 return "enrolled_after_proposal"
@@ -688,7 +759,187 @@ class Registry:
         raise ValueError(f"unknown operation: {kind}")
 
 
-def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
+def require_channel_flags(scenarios: list[dict[str, Any]]) -> None:
+    """Fixture messages must not claim what v1 says cannot be true.
+
+    A possession reply or Tier C reply on a phone channel outside
+    AUTHENTICATED_PHONE_CHANNELS that says `authenticated: true` is malformed
+    corpus, and a phone-channel Tier C reply must state its flag at all.
+    """
+    for scenario in scenarios:
+        for index, step in enumerate(scenario["steps"]):
+            where = f"{scenario['name']} step {index}"
+            reply = step.get("phone_reply")
+            if isinstance(reply, dict) and reply.get("channel") not in AUTHENTICATED_PHONE_CHANNELS and reply.get("authenticated") is True:
+                raise AssertionError(f"{where}: unauthenticated channel reply flagged authenticated")
+            if step["op"] == "admit" and step.get("channel") in PHONE_CHANNELS:
+                if "authenticated" not in step:
+                    raise AssertionError(f"{where}: phone-channel reply without authenticated flag")
+                if step["channel"] not in AUTHENTICATED_PHONE_CHANNELS and step["authenticated"] is True:
+                    raise AssertionError(f"{where}: unauthenticated channel reply flagged authenticated")
+
+
+def require_whatsapp_refusal(scenarios: list[dict[str, Any]]) -> None:
+    """The scenario named for the WhatsApp refusal must actually exercise it.
+
+    Required, in order: an `issue` of a `whatsapp` candidate expecting
+    `channel_unauthenticated`; a later presentation of that challenge ID
+    expecting `challenge_unavailable` (no challenge or used marker recorded);
+    an SMS credential enrolled by `phone_commit`; then, on one open proposal
+    and that SMS credential, a `whatsapp` reply refused as
+    `ingress_unauthenticated`, an unauthenticated `sms` reply refused as
+    `ingress_unauthenticated`, and only afterwards an authenticated `sms`
+    reply `approved` (so the refusals are not due to the proposal or the
+    credential).
+    """
+    scenario = next(x for x in scenarios if x["name"] == "whatsapp_candidate_refused_at_issue")
+    steps = scenario["steps"]
+    refused = [
+        index for index, step in enumerate(steps)
+        if step["op"] == "issue"
+        and isinstance(step.get("candidate"), dict)
+        and step["candidate"].get("channel") == "whatsapp"
+        and step["expect"] == "channel_unauthenticated"
+    ]
+    if not refused:
+        raise AssertionError("whatsapp refusal at issue not exercised")
+    index = refused[0]
+    if not any(
+        x["op"] in {"phone_authorize", "enrol"}
+        and x.get("challenge_id") == steps[index]["challenge_id"]
+        and x["expect"] == "challenge_unavailable"
+        for x in steps[index + 1:]
+    ):
+        raise AssertionError("refused whatsapp challenge not shown unrecorded")
+    issued_sms = {
+        x["challenge_id"]: x["candidate"]["credential"] for x in steps
+        if x["op"] == "issue" and isinstance(x.get("candidate"), dict) and x["candidate"].get("channel") == "sms"
+    }
+    enrolled = {
+        issued_sms[x["challenge_id"]] for x in steps[index + 1:]
+        if x["op"] == "phone_commit" and x["expect"] == "enrolled" and x["challenge_id"] in issued_sms
+    }
+
+    def admits(channel: str, flag: bool | None, expect: str) -> dict[tuple[str, str], int]:
+        return {
+            (x["credential"], x["proposal"]): i for i, x in enumerate(steps)
+            if x["op"] == "admit" and x.get("channel") == channel
+            and (flag is None or x.get("authenticated") is flag) and x["expect"] == expect
+            and x["credential"] in enrolled
+        }
+    # The WhatsApp reply is refused whatever its flag claims; the structural
+    # guard separately requires that flag to be false.
+    whatsapp = admits("whatsapp", None, "ingress_unauthenticated")
+    sms_false = admits("sms", False, "ingress_unauthenticated")
+    for key, i in admits("sms", True, "approved").items():
+        if whatsapp.get(key, i) < i and sms_false.get(key, i) < i:
+            return
+    raise AssertionError("whatsapp and unauthenticated sms Tier C replies not shown refused for an admissible credential")
+
+
+STATE_FIELDS = (
+    "initialized", "epoch", "config_site", "revision", "external_revision",
+    "last_external_document", "sequence", "active", "values", "channels",
+    "tombstones", "approvers", "approver_tombstones", "proposals",
+    "challenges", "used_challenges", "pending_phone", "invalidated_phone",
+)
+CREDENTIAL_ADD = {"active", "values", "channels", "approvers", "sequence", "revision"}
+PRESENTED = {"recover", "enrol", "local_seed", "phone_authorize"}
+# Refusals that happen before a challenge is found, so nothing is consumed.
+UNCONSUMED = {"challenge_unavailable", "challenge_reused", "site_binding_mismatch"}
+# Fields each successful verdict may change. Every other verdict is a refusal
+# and may change only what the text says a refusal consumes.
+SUCCESS_FIELDS: dict[tuple[str, str], set[str]] = {
+    ("issue", "issued"): {"challenges"},
+    ("expire", "expired"): {"challenges"},
+    ("expire_phone", "expired"): {"pending_phone"},
+    ("phone_authorize", "phone_pending"): {"challenges", "used_challenges", "pending_phone"},
+    ("enrol", "enrolled"): {"challenges", "used_challenges"} | CREDENTIAL_ADD,
+    ("local_seed", "seeded"): {"challenges", "used_challenges"} | CREDENTIAL_ADD,
+    ("phone_commit", "enrolled"): {"pending_phone", "invalidated_phone"} | CREDENTIAL_ADD,
+    ("recover", "recovered"): {
+        "challenges", "used_challenges", "epoch", "initialized", "revision",
+        "external_revision", "last_external_document", "sequence", "proposals",
+        "pending_phone", "invalidated_phone",
+    },
+    ("revoke", "revoked"): {
+        "active", "tombstones", "approver_tombstones", "revision",
+        "external_revision", "last_external_document",
+    },
+    ("open", "opened"): {"proposals"},
+    ("admit", "approved"): {"proposals"},
+    ("lose", "locked"): {
+        "initialized", "active", "values", "channels", "approvers",
+        "tombstones", "approver_tombstones", "challenges",
+    },
+    ("restart", "restarted"): {"challenges", "pending_phone", "invalidated_phone", "proposals"},
+    ("config_site_change", "site_locked"): {"config_site", "proposals", "pending_phone", "invalidated_phone"},
+    ("config_site_restore", "site_restored"): {"config_site"},
+}
+
+
+def snapshot(model: Registry) -> dict[str, Any]:
+    return copy.deepcopy({field: getattr(model, field) for field in STATE_FIELDS})
+
+
+def verify_state_change(where: str, operation: dict[str, Any], verdict: str, before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Every refusal changes nothing beyond what the text says it consumes.
+
+    - Issue refusals (including `channel_unauthenticated`): nothing; no
+      challenge, code, pending operation or revision ("Site enrolment").
+    - A presented challenge is "marked used even when that operation is
+      refused; refusal changes no credential, proposal or registry revision":
+      exactly that challenge leaves `challenges` and enters the used markers.
+      Refusals before the challenge is found consume nothing.
+    - A phone commit refusal "removes the pending operation without adding a
+      credential or changing the revision": exactly that pending entry goes.
+    - Revocation refusals, including `replayed`, "refuse without changes";
+      admission, proposal-open and expiry refusals change nothing.
+    Successful verdicts may change only their own fields, with exact deltas
+    on the challenge, used-marker and pending maps.
+    """
+    op = operation["op"]
+    challenge_id = operation.get("challenge_id")
+    allowed = SUCCESS_FIELDS.get((op, verdict))
+    expected = copy.deepcopy(before)
+    if allowed is None:
+        if op in PRESENTED and verdict not in UNCONSUMED:
+            expected["challenges"].pop(challenge_id, None)
+            expected["used_challenges"].add(challenge_id)
+        elif op == "phone_commit":
+            expected["pending_phone"].pop(challenge_id, None)
+            expected["invalidated_phone"].pop(challenge_id, None)
+        if after != expected:
+            changed = sorted(field for field in STATE_FIELDS if after[field] != expected[field])
+            raise AssertionError(f"{where} {op}: refusal {verdict} changed {changed}")
+        return
+    changed = {field for field in STATE_FIELDS if after[field] != before[field]}
+    if not changed <= allowed:
+        raise AssertionError(f"{where} {op}: {verdict} changed {sorted(changed - allowed)}")
+    if op == "issue":
+        if set(after["challenges"]) != set(before["challenges"]) | {challenge_id}:
+            raise AssertionError(f"{where} issue: challenge set")
+    if op in PRESENTED:
+        if (set(after["challenges"]) - {challenge_id} != set(before["challenges"]) - {challenge_id}
+                or challenge_id in after["challenges"]
+                or after["used_challenges"] != before["used_challenges"] | {challenge_id}):
+            raise AssertionError(f"{where} {op}: challenge consumption")
+    if op == "phone_authorize" and set(after["pending_phone"]) != set(before["pending_phone"]) | {challenge_id}:
+        raise AssertionError(f"{where} phone_authorize: pending set")
+    if op == "phone_commit" and (
+        set(after["pending_phone"]) != set(before["pending_phone"]) - {challenge_id}
+        or set(after["invalidated_phone"]) != set(before["invalidated_phone"]) - {challenge_id}
+    ):
+        raise AssertionError(f"{where} phone_commit: pending set")
+
+
+def check(
+    corpus: dict[str, Any],
+    *,
+    announce: bool = True,
+    disabled: frozenset[str] = frozenset(),
+    factory: Any = None,
+) -> None:
     if corpus["contract"] != "tier-c-approvers/v1":
         raise AssertionError("wrong contract")
     if corpus["provisioning_test_public_key_b64"] != PUBLIC_KEY:
@@ -699,15 +950,20 @@ def check(corpus: dict[str, Any], *, announce: bool = True) -> None:
     scenarios = corpus["scenarios"]
     if len(scenarios) != len(NAMES) or {x["name"] for x in scenarios} != NAMES:
         raise AssertionError("required transition coverage changed")
+    if "guard" not in disabled:
+        require_channel_flags(scenarios)
+    require_whatsapp_refusal(scenarios)
     total = 0
     for scenario in scenarios:
-        model = Registry(scenario["initial_mode"])
+        model = (factory or Registry)(scenario["initial_mode"], disabled)
         for operation in scenario["steps"]:
             if operation["op"] == "revoke" and "preimage_hex" in operation:
                 unsigned = {key: value for key, value in operation["document"].items() if key != "signature"}
                 if (b"ori.tier_c_approver.revoke.v1\0" + canonical_profile2(unsigned)).hex() != operation["preimage_hex"]:
                     raise AssertionError(f"{scenario['name']}: revocation preimage")
+            before = snapshot(model)
             actual = model.apply(operation)
+            verify_state_change(scenario["name"], operation, actual, before, snapshot(model))
             total += 1
             if actual != operation["expect"]:
                 raise AssertionError(
@@ -803,13 +1059,204 @@ def mutations(corpus: dict[str, Any]) -> None:
     altered_phone_wire = copy.deepcopy(corpus)
     altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
     mutants.append(("phone wire wrong sender", altered_phone_wire))
+    def whatsapp_issue(mutant: dict[str, Any]) -> dict[str, Any]:
+        return next(operation for operation in next(
+            scenario for scenario in mutant["scenarios"]
+            if scenario["name"] == "whatsapp_candidate_refused_at_issue"
+        )["steps"] if operation["op"] == "issue" and operation["expect"] == "channel_unauthenticated")
+    whatsapp_issued = copy.deepcopy(corpus)
+    whatsapp_issue(whatsapp_issued)["expect"] = "issued"
+    mutants.append(("whatsapp candidate issued", whatsapp_issued))
+    whatsapp_dropped = copy.deepcopy(corpus)
+    whatsapp_dropped["scenarios"] = [
+        scenario for scenario in whatsapp_dropped["scenarios"]
+        if scenario["name"] != "whatsapp_candidate_refused_at_issue"
+    ]
+    mutants.append(("whatsapp refusal scenario removed", whatsapp_dropped))
+    whatsapp_to_sms = copy.deepcopy(corpus)
+    whatsapp_issue(whatsapp_to_sms)["candidate"]["channel"] = "sms"
+    mutants.append(("sms candidate refused as unauthenticated", whatsapp_to_sms))
+    whatsapp_step_dropped = copy.deepcopy(corpus)
+    steps = next(
+        scenario for scenario in whatsapp_step_dropped["scenarios"]
+        if scenario["name"] == "whatsapp_candidate_refused_at_issue"
+    )["steps"]
+    steps.remove(whatsapp_issue(whatsapp_step_dropped))
+    mutants.append(("whatsapp issue step removed", whatsapp_step_dropped))
+    whatsapp_recorded = copy.deepcopy(corpus)
+    next(operation for operation in next(
+        scenario for scenario in whatsapp_recorded["scenarios"]
+        if scenario["name"] == "whatsapp_candidate_refused_at_issue"
+    )["steps"] if operation["op"] == "phone_authorize" and operation["expect"] == "challenge_unavailable")["expect"] = "phone_pending"
+    mutants.append(("refused whatsapp challenge authorized", whatsapp_recorded))
+    # Fixture claims v1 rules out: refused by the structural guard.
+    def scenario_steps(mutant: dict[str, Any], name: str) -> list[dict[str, Any]]:
+        return next(x for x in mutant["scenarios"] if x["name"] == name)["steps"]
+
+    def wrong_channel_reply(mutant: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            x for x in scenario_steps(mutant, "phone_candidate_rejects_wrong_code_and_sender")
+            if isinstance(x.get("phone_reply"), dict) and x["phone_reply"]["channel"] == "whatsapp"
+        )["phone_reply"]
+
+    def whatsapp_admit(mutant: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            x for x in scenario_steps(mutant, "whatsapp_candidate_refused_at_issue")
+            if x["op"] == "admit" and x.get("channel") == "whatsapp"
+        )
+
+    def sms_unauthenticated_admit(mutant: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            x for x in scenario_steps(mutant, "whatsapp_candidate_refused_at_issue")
+            if x["op"] == "admit" and x.get("channel") == "sms" and x.get("authenticated") is False
+        )
+    flagged_reply = copy.deepcopy(corpus)
+    wrong_channel_reply(flagged_reply)["authenticated"] = True
+    mutants.append(("whatsapp possession reply flagged authenticated", flagged_reply))
+    flagged_admit = copy.deepcopy(corpus)
+    whatsapp_admit(flagged_admit)["authenticated"] = True
+    mutants.append(("whatsapp Tier C reply flagged authenticated", flagged_admit))
+    flagless_admit = copy.deepcopy(corpus)
+    del sms_unauthenticated_admit(flagless_admit)["authenticated"]
+    mutants.append(("phone Tier C reply without flag", flagless_admit))
+    for name, step in (
+        ("whatsapp Tier C reply admitted", whatsapp_admit),
+        ("unauthenticated sms Tier C reply admitted", sms_unauthenticated_admit),
+    ):
+        mutant = copy.deepcopy(corpus)
+        step(mutant)["expect"] = "approved"
+        mutants.append((name, mutant))
+    dropped_admit = copy.deepcopy(corpus)
+    scenario_steps(dropped_admit, "whatsapp_candidate_refused_at_issue").remove(whatsapp_admit(dropped_admit))
+    mutants.append(("whatsapp Tier C refusal removed", dropped_admit))
+
+    # Issue order probes ("A locked registry and a site binding mismatch refuse
+    # such a candidate first").
+    def whatsapp_probe(challenge_id: str, expect: str) -> dict[str, Any]:
+        return {
+            "op": "issue", "kind": "enrol", "challenge_id": challenge_id,
+            "candidate": {"approver_id": "probe", "channel": "whatsapp", "credential": "probe", "value": "+2348012345678"},
+            "phone_code_sha256": "0" * 64, "expect": expect,
+        }
+
+    def with_probe(after_op: str, scenario: str, expect: str) -> dict[str, Any]:
+        mutant = copy.deepcopy(corpus)
+        steps = scenario_steps(mutant, scenario)
+        at = next(i for i, x in enumerate(steps) if x["op"] == after_op) + 1
+        steps.insert(at, whatsapp_probe("probe-" + after_op, expect))
+        return mutant
+    locked_probe = with_probe("lose", "recovery_can_seed_but_closes_old_proposals", "registry_unavailable")
+    site_probe = with_probe("config_site_change", "phone_site_change_before_commit", "site_binding_mismatch")
+    for label, probe in (("locked", locked_probe), ("site mismatch", site_probe)):
+        check(probe, announce=False)
+        flipped = copy.deepcopy(probe)
+        for scenario in flipped["scenarios"]:
+            for x in scenario["steps"]:
+                if x["challenge_id" if "challenge_id" in x else "op"] in {"probe-lose", "probe-config_site_change"}:
+                    x["expect"] = "channel_unauthenticated"
+        mutants.append((f"channel_unauthenticated before {label} refusal", flipped))
+
+    # Model-check removal: each check must decide a verdict in the corpus or in
+    # the stated variant with the stated other checks off.
+    lan_sms_admit = copy.deepcopy(corpus)
+    steps = scenario_steps(lan_sms_admit, "whatsapp_candidate_refused_at_issue")
+    approved_at = next(i for i, x in enumerate(steps) if x["op"] == "admit" and x["expect"] == "approved")
+    steps.insert(approved_at, {
+        "op": "admit", "proposal": steps[approved_at]["proposal"], "credential": "owner-key",
+        "channel": "sms", "authenticated": True, "expect": "credential_unavailable",
+    })
+    removals: list[tuple[str, dict[str, Any], frozenset[str]]] = [
+        ("issue_channel", corpus, frozenset()),
+        ("issue_locked_first", locked_probe, frozenset()),
+        ("admit_auth_flag", corpus, frozenset()),
+        ("admit_phone_channel", flagged_admit, frozenset({"guard"})),
+        ("reply_auth_channel", flagged_reply, frozenset({"guard", "reply_channel_mismatch"})),
+        ("reply_channel_mismatch", flagged_reply, frozenset({"guard", "reply_auth_channel"})),
+        ("admit_credential_channel", lan_sms_admit, frozenset()),
+    ]
+    if {name for name, _, _ in removals} | {"guard"} != MODEL_CHECKS:
+        raise AssertionError("model check without a removal mutation")
+    for name, variant, others in removals:
+        check(variant, announce=False, disabled=others)
+        try:
+            check(variant, announce=False, disabled=others | {name})
+        except AssertionError:
+            continue
+        raise AssertionError(f"removing model check {name} was accepted")
+    # The guard alone decides the flagged fixtures: the model passes them.
+    for variant in (flagged_reply, flagged_admit):
+        try:
+            check(variant, announce=False)
+        except AssertionError as exc:
+            if "flagged authenticated" not in str(exc):
+                raise AssertionError("flagged fixture refused for another reason") from exc
+        else:
+            raise AssertionError("removing the guard was accepted")
+        check(variant, announce=False, disabled=frozenset({"guard"}))
+    # Forbidden writes injected after each refusal class. Each must be caught.
+    def forbidden_writes() -> dict[str, Any]:
+        def pending(model: Registry) -> None:
+            model.pending_phone["injected"] = {"candidate": {}, "authorizer": "", "revision": 0, "epoch": "", "site": "", "phone_code_sha256": ""}
+        def credential(model: Registry) -> None:
+            model.active["injected"] = 0
+        def approval(model: Registry) -> bool:
+            for proposal in model.proposals.values():
+                proposal["approved"] = not proposal["approved"]
+                return True
+            return False
+        return {
+            "revision": lambda m: setattr(m, "revision", m.revision + 1),
+            "credential_sequence": lambda m: setattr(m, "sequence", m.sequence + 1),
+            "last_external_revision": lambda m: setattr(m, "external_revision", m.external_revision + 1),
+            "epoch": lambda m: setattr(m, "epoch", EPOCH_2 if m.epoch != EPOCH_2 else EPOCH_1),
+            "recorded challenge": lambda m: m.challenges.__setitem__("injected", {"kind": "enrol", "candidate": {}, "revision": 0, "epoch": "", "proposed_epoch": None, "sequence": 0, "expired": False, "phone_code_sha256": None}),
+            "used marker": lambda m: m.used_challenges.add("injected"),
+            "pending phone operation": pending,
+            "active credential": credential,
+            "tombstone": lambda m: m.tombstones.add("injected"),
+            "new proposal": lambda m: m.proposals.__setitem__("injected", {"cutoff": 0, "epoch": m.epoch, "approved": False}),
+            "proposal approval": approval,
+        }
+    refusal_classes = {
+        "issue refusal": lambda op, verdict: op == "issue" and verdict != "issued",
+        "presented challenge refusal (consumed)": lambda op, verdict: op in PRESENTED and (op, verdict) not in SUCCESS_FIELDS and verdict not in UNCONSUMED,
+        "presented challenge refusal (unconsumed)": lambda op, verdict: op in PRESENTED and verdict in UNCONSUMED,
+        "phone commit refusal": lambda op, verdict: op == "phone_commit" and verdict != "enrolled",
+        "revocation refusal": lambda op, verdict: op == "revoke" and verdict != "revoked",
+        "admission refusal": lambda op, verdict: op == "admit" and verdict != "approved",
+        "open refusal": lambda op, verdict: op == "open" and verdict != "opened",
+        "phone expiry refusal": lambda op, verdict: op == "expire_phone" and verdict != "expired",
+    }
+    injections = 0
+    for class_name, matches in refusal_classes.items():
+        for write_name, write in forbidden_writes().items():
+            applied = [0]
+
+            class Injected(Registry):
+                def apply(self, operation: dict[str, Any]) -> str:
+                    verdict = super().apply(operation)
+                    if matches(operation["op"], verdict) and write(self) is not False:
+                        applied[0] += 1
+                    return verdict
+            try:
+                check(corpus, announce=False, factory=Injected)
+            except AssertionError:
+                injections += 1
+                continue
+            if applied[0] == 0 and write_name == "proposal approval":
+                continue  # no proposal existed at any refusal of this class
+            raise AssertionError(f"forbidden {write_name} write at {class_name} was accepted")
     for name, mutant in mutants:
         try:
             check(mutant, announce=False)
         except AssertionError:
             continue
         raise AssertionError(f"{name} mutation was accepted")
-    print(f"tier-c-approvers/v1: {len(mutants)} mutations refused")
+    print(
+        f"tier-c-approvers/v1: {len(mutants)} mutations refused, "
+        f"{len(removals) + 1} model-check removals refused, "
+        f"{injections} forbidden state writes refused"
+    )
 
 
 if __name__ == "__main__":
