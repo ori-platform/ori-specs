@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-config/v2 `gateway.state_directory` load-rule corpus.
+
+Nothing here is shared with scripts/check-gateway-config-state-directory-vectors,
+which reads the load rules from the contract and decides every case itself.
+
+    python3 scripts/generate-gateway-config-state-directory-vectors          # write
+    python3 scripts/generate-gateway-config-state-directory-vectors --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-config" / "vectors" / "state-directory-v2.json"
+
+OUTBOUND = "/var/lib/ori-gateway/evidence-outbound"
+RETURN = "/var/lib/ori-gateway/evidence-return"
+STATE = "/var/lib/ori-gateway/state"
+
+NOTE = (
+    "Each case is the value of `gateway.auth.enabled`, the `gateway.state_directory` "
+    "value as written (absent when the key is `null`), and the courier's `enabled` flag "
+    "and two queue directories, every other courier key holding a valid value. A valid "
+    "case names `effective`, the state directory after surrounding whitespace is removed, "
+    "empty when absent; a refused case names the first load rule it breaks: "
+    "`required_under_auth`, `absolute`, or `separate_from_evidence_queues`. Start rules "
+    "are not load rules and are not represented."
+)
+
+
+# Unicode White_Space, as Unicode's PropList.txt lists it.
+WHITE_SPACE = (
+    "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def trim(value: str) -> str:
+    return value.strip(WHITE_SPACE)
+
+
+def clean(path: str) -> str:
+    parts: list[str] = []
+    for part in path.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(part)
+    return "/" + "/".join(parts)
+
+
+def related(a: str, b: str) -> bool:
+    if a == b:
+        return True
+    if a == "/" or b == "/":
+        return True
+    return b.startswith(a + "/") or a.startswith(b + "/")
+
+
+def decide(case: dict) -> tuple[bool, str]:
+    raw = case["state_directory"]
+    value = trim(raw) if raw is not None else ""
+    if case["auth_enabled"] and value == "":
+        return False, "required_under_auth"
+    if value and not value.startswith("/"):
+        return False, "absolute"
+    evidence = case["evidence"]
+    if value and evidence["enabled"]:
+        for queue in (evidence["queue_directory"], evidence["return_queue_directory"]):
+            if related(clean(value), clean(trim(queue))):
+                return False, "separate_from_evidence_queues"
+    return True, value
+
+
+def evidence(enabled: bool, outbound: str = OUTBOUND, ret: str = RETURN) -> dict:
+    return {"enabled": enabled, "queue_directory": outbound, "return_queue_directory": ret}
+
+
+CASES = [
+    ("auth enabled, a private state directory, courier disabled", True, STATE, evidence(False)),
+    ("auth enabled, a state directory beside both queue directories", True, STATE, evidence(True)),
+    ("auth disabled and the key absent", False, None, evidence(False)),
+    ("auth disabled and the key empty", False, "", evidence(True)),
+    ("auth disabled, an absolute state directory is accepted and unused", False, STATE, evidence(False)),
+    ("surrounding whitespace is removed", True, "  " + STATE + "\t", evidence(True)),
+    ("a trailing slash is still absolute and beside the queues", True, STATE + "/", evidence(True)),
+    (
+        "a name that extends a queue directory's name is not inside it",
+        True,
+        OUTBOUND + "-state",
+        evidence(True),
+    ),
+    (
+        "the separation rule does not apply while the courier is disabled",
+        True,
+        OUTBOUND,
+        evidence(False),
+    ),
+    ("auth enabled and the key absent", True, None, evidence(False)),
+    ("auth enabled and the key empty", True, "", evidence(True)),
+    ("auth enabled and the key only whitespace", True, " \t ", evidence(False)),
+    ("a relative path, auth disabled", False, "var/lib/ori-gateway/state", evidence(False)),
+    ("a dot-relative path, auth enabled", True, "./state", evidence(False)),
+    ("a parent-relative path, auth enabled", True, "../state", evidence(True)),
+    ("equal to the outbound queue directory", True, OUTBOUND, evidence(True)),
+    ("equal to the return queue directory", True, RETURN, evidence(True)),
+    ("inside the outbound queue directory", True, OUTBOUND + "/state", evidence(True)),
+    ("inside the return queue directory", True, RETURN + "/gateway/state", evidence(True)),
+    ("containing both queue directories", True, "/var/lib/ori-gateway", evidence(True)),
+    ("the filesystem root contains every queue directory", True, "/", evidence(True)),
+    (
+        "a queue directory at the root contains every state directory",
+        True,
+        STATE,
+        evidence(True, outbound="/", ret="/var/lib/ori-gateway/r"),
+    ),
+    (
+        "equal to a queue directory once repeated slashes and dot components are removed",
+        True,
+        "/var/lib//ori-gateway/./evidence-return/.",
+        evidence(True),
+    ),
+    (
+        "inside a queue directory once a parent component is resolved",
+        True,
+        STATE + "/../evidence-outbound/state",
+        evidence(True),
+    ),
+    ("auth disabled and the key only whitespace", False, " \t ", evidence(False)),
+    ("auth disabled, surrounding whitespace is removed", False, "  " + STATE + " ", evidence(False)),
+    (
+        "non-breaking and ideographic spaces are surrounding whitespace",
+        True,
+        "\u00a0" + STATE + "\u3000",
+        evidence(True),
+    ),
+    (
+        "a queue directory whose name extends the state directory's name is not inside it",
+        True,
+        "/var/lib/ori-gateway/evidence",
+        evidence(True),
+    ),
+    (
+        "a value written inside a queue directory that resolves outside it",
+        True,
+        OUTBOUND + "/../state",
+        evidence(True),
+    ),
+    (
+        "a relative value naming a queue directory is refused as not absolute first",
+        True,
+        OUTBOUND.lstrip("/"),
+        evidence(True),
+    ),
+    ("equal to a queue directory but for a trailing slash", True, OUTBOUND + "/", evidence(True)),
+    ("containing both queue directories, written with a trailing slash", True, "/var/lib/ori-gateway/", evidence(True)),
+    (
+        "equal to an outbound queue directory that is written uncleaned",
+        True,
+        STATE,
+        evidence(True, outbound="/var/lib/./ori-gateway/state"),
+    ),
+    (
+        "equal to a return queue directory that is written uncleaned",
+        True,
+        STATE,
+        evidence(True, ret="/var/lib/ori-gateway/x/../state"),
+    ),
+    (
+        "equal to a queue directory once surrounding whitespace is removed",
+        True,
+        " " + OUTBOUND + "\t",
+        evidence(True),
+    ),
+    ("the separation rule applies with auth disabled", False, RETURN, evidence(True)),
+    ("a parent component at the root stays at the root", True, "/.." + OUTBOUND, evidence(True)),
+    (
+        "whitespace inside the value is kept and left to the start requirements",
+        True,
+        "/var/lib/ori-gateway/state dir\tx",
+        evidence(True),
+    ),
+    (
+        "an outbound queue directory with leading whitespace is trimmed and stays beside the state directory",
+        True,
+        STATE,
+        evidence(True, outbound="  " + OUTBOUND),
+    ),
+    (
+        "a return queue directory with leading whitespace is trimmed and stays beside the state directory",
+        True,
+        STATE,
+        evidence(True, ret="\t" + RETURN),
+    ),
+    (
+        "equal to a return queue directory once its leading whitespace is removed",
+        True,
+        RETURN,
+        evidence(True, ret=" " + RETURN),
+    ),
+    (
+        "letter case distinguishes a path from a queue directory",
+        True,
+        "/var/lib/ori-gateway/Evidence-Outbound",
+        evidence(True),
+    ),
+    (
+        "a leading unit separator is not whitespace, so the value is not absolute",
+        True,
+        "\u001f" + STATE,
+        evidence(False),
+    ),
+    (
+        "equal to a queue directory once the queue's surrounding whitespace is removed",
+        True,
+        STATE,
+        evidence(True, outbound=STATE + " "),
+    ),
+    (
+        "a queue directory written uncleaned still lies inside the state directory",
+        True,
+        STATE,
+        evidence(True, outbound=STATE + "//outbound/"),
+    ),
+]
+
+
+def build() -> dict:
+    cases = []
+    for name, auth, state, ev in CASES:
+        case = {"name": name, "auth_enabled": auth, "state_directory": state, "evidence": ev}
+        valid, detail = decide(case)
+        case["valid"] = valid
+        if valid:
+            case["effective"] = detail
+        else:
+            case["rule"] = detail
+        cases.append(case)
+    return {"contract": "gateway-config/v2 gateway.state_directory", "note": NOTE, "cases": cases}
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
