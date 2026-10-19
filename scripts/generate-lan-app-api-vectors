@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate deterministic signed lan-app-api/v1 contract vectors.
+
+The keys are public test fixtures, never deployment keys. The independent
+checker shares no code with this generator.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "lan-app-api" / "vectors" / "admission.json"
+NOW = 1_787_000_000_000
+CODE = "ABCDEFGHJKMN"
+
+
+def key(label: str) -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(("lan-app-api/v1 " + label).encode()).digest()
+    )
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def canonical(value: dict[str, object]) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def sign(
+    value: dict[str, object],
+    *,
+    purpose: str,
+    signer: Ed25519PrivateKey,
+    signature_field: str = "signature",
+) -> dict[str, object]:
+    unsigned = copy.deepcopy(value)
+    signed = purpose.encode("utf-8") + b"\x00" + canonical(unsigned)
+    return {**unsigned, signature_field: b64(signer.sign(signed))}
+
+
+def public_key(signer: Ed25519PrivateKey) -> str:
+    return b64(signer.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw))
+
+
+def spki(signer: Ed25519PrivateKey) -> bytes:
+    return signer.public_key().public_bytes(
+        Encoding.DER, PublicFormat.SubjectPublicKeyInfo
+    )
+
+
+def sha256(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def make() -> dict[str, object]:
+    grant_key = key("grant")
+    time_key = key("time")
+    app_key = key("application")
+    gateway_key = key("gateway")
+    authority_snapshot = {
+        "v": 1,
+        "action": "trip_relay",
+        "action_capability": "sha256:" + "1" * 64,
+        "binding_digest": "sha256:" + "2" * 64,
+        "outcome": "open_protected_circuit",
+        "policy_digest": "sha256:" + "3" * 64,
+        "resource": "relay-gpio-26",
+        "safety_profile": "",
+        "zone_digest": "sha256:" + "4" * 64,
+        "zone_id": "zone-feeder-a",
+    }
+    snapshot_digest = sha256(canonical(authority_snapshot))
+    grant = sign(
+        {
+            "v": 1,
+            "grant_id": "grant-001",
+            "tenant_id": "tenant-a",
+            "site_id": "site-a",
+            "gateway_id": "gateway-a",
+            "device_id": "edge-01",
+            "customer_id": "customer-a",
+            "role": "owner",
+            "app_spki_sha256": sha256(spki(app_key)),
+            "gateway_spki_sha256": sha256(spki(gateway_key)),
+            "code_sha256": sha256(
+                ("ori.lan.code.v1\x00" + "grant-001\x00" + CODE).encode()
+            ),
+            "issued_at_ms": NOW,
+            "not_before_ms": NOW,
+            "expires_at_ms": NOW + 600_000,
+            "signing_key_id": "test-grant-key",
+        },
+        purpose="ori.lan.pairing-grant.v1",
+        signer=grant_key,
+    )
+    time_assertion = sign(
+        {
+            "v": 1,
+            "site_id": "site-a",
+            "gateway_id": "gateway-a",
+            "nonce": "00112233445566778899aabbccddeeff",
+            "utc_ms": NOW + 1000,
+            "signing_key_id": "test-time-key",
+        },
+        purpose="ori.lan.time-assertion.v1",
+        signer=time_key,
+    )
+    reply = sign(
+        {
+            "v": 1,
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "identity_epoch": b64(bytes(range(16))),
+            "proposal_id": "AB12CD34",
+            "authority_snapshot_digest": snapshot_digest,
+            "reply": "yes",
+            "client_nonce": b64(bytes(range(16, 32))),
+        },
+        purpose="ori.lan.reply.v1",
+        signer=app_key,
+        signature_field="app_signature",
+    )
+    session_proof = sign(
+        {
+            "v": 1,
+            "site_id": "site-a",
+            "device_id": "edge-01",
+            "challenge": b64(bytes(range(48, 64))),
+            "app_spki_sha256": sha256(spki(app_key)),
+        },
+        purpose="ori.lan.proposal-session.v1",
+        signer=app_key,
+    )
+    context: dict[str, object] = {
+        "site_id": "site-a",
+        "gateway_id": "gateway-a",
+        "device_id": "edge-01",
+        "app_spki_sha256": sha256(spki(app_key)),
+        "gateway_spki_sha256": sha256(spki(gateway_key)),
+        "now_ms": NOW + 1000,
+        "trusted_time": True,
+        "code": CODE,
+        "wrong_attempts": 0,
+        "redeemed": False,
+        "revoked": False,
+        "storage_ok": True,
+    }
+    pairing_cases: list[dict[str, object]] = [{"name": "accept", "expect": "accept"}]
+    session_cases: list[dict[str, object]] = [
+        {"name": "offline_key_session", "expect": "session"},
+        {"name": "expired_challenge", "context": {"age_ms": 30001}, "expect": "session_expired"},
+        {"name": "binding_mismatch_and_expired", "context": {"challenge": b64(bytes(range(64, 80))), "age_ms": 30001}, "expect": "binding_mismatch"},
+        {"name": "expired_and_replayed_challenge", "context": {"age_ms": 30001, "used": True}, "expect": "session_expired"},
+        {"name": "replayed_challenge", "context": {"used": True}, "expect": "nonce_reused"},
+        {"name": "restart_loses_challenge", "context": {"restarted": True}, "expect": "session_expired"},
+        {"name": "different_client_key", "context": {"app_spki_sha256": sha256(spki(key("other application")))}, "expect": "unauthenticated"},
+        {"name": "storage_failure", "context": {"storage_ok": False}, "expect": "storage_unavailable"},
+        {"name": "malformed_proof", "proof": {**session_proof, "extra": True}, "expect": "malformed"},
+    ]
+    tampered_session = {**session_proof, "site_id": "site-b"}
+    session_cases.append({"name": "tampered_session_proof", "proof": tampered_session, "expect": "unauthenticated"})
+
+    def pair_case(name: str, expect: str, **changes: object) -> None:
+        pairing_cases.append({"name": name, "context": changes, "expect": expect})
+
+    pair_case("different_gateway", "binding_mismatch", gateway_id="gateway-b")
+    pair_case(
+        "different_application_key",
+        "wrong_application_key",
+        app_spki_sha256=sha256(spki(key("other application"))),
+    )
+    pair_case("untrusted_clock", "no_trusted_time", trusted_time=False)
+    pair_case("not_yet_valid", "not_yet_valid", now_ms=NOW - 30_001)
+    pair_case("expired", "expired", now_ms=NOW + 630_001)
+    pair_case("five_wrong_codes", "code_attempts_exhausted", wrong_attempts=5)
+    pair_case("wrong_code", "code_mismatch", code="ABCDEFGHJKMP")
+    pair_case("redeemed", "already_redeemed", redeemed=True)
+    pair_case("revoked", "revoked", revoked=True)
+    pair_case("storage_failure", "storage_unavailable", storage_ok=False)
+    bad_grant = copy.deepcopy(grant)
+    signature = bytearray(base64.b64decode(str(bad_grant["signature"])))
+    signature[0] ^= 1
+    bad_grant["signature"] = b64(bytes(signature))
+    pairing_cases.append(
+        {
+            "name": "tampered_grant_signature",
+            "grant": bad_grant,
+            "expect": "signature_invalid",
+        }
+    )
+    pairing_cases.append(
+        {
+            "name": "malformed_grant_member",
+            "grant": {**grant, "unexpected": True},
+            "expect": "malformed",
+        }
+    )
+    wrong_purpose_grant = sign(
+        {k: v for k, v in grant.items() if k != "signature"},
+        purpose="ori.lan.time-assertion.v1",
+        signer=grant_key,
+    )
+    pairing_cases.append(
+        {
+            "name": "wrong_signing_purpose",
+            "grant": wrong_purpose_grant,
+            "expect": "signature_invalid",
+        }
+    )
+    unknown_key_id_grant = sign(
+        {
+            **{k: v for k, v in grant.items() if k != "signature"},
+            "signing_key_id": "unknown-key",
+        },
+        purpose="ori.lan.pairing-grant.v1",
+        signer=grant_key,
+    )
+    pairing_cases.append(
+        {
+            "name": "unknown_signing_key_id",
+            "grant": unknown_key_id_grant,
+            "expect": "signature_invalid",
+        }
+    )
+    bad_time = copy.deepcopy(time_assertion)
+    altered_time_signature = bytearray(base64.b64decode(str(bad_time["signature"])))
+    altered_time_signature[0] ^= 1
+    bad_time["signature"] = b64(bytes(altered_time_signature))
+    pairing_cases.append(
+        {
+            "name": "tampered_time_assertion",
+            "time_assertion": bad_time,
+            "expect": "no_trusted_time",
+        }
+    )
+    pairing_cases.append(
+        {
+            "name": "malformed_time_assertion",
+            "time_assertion": {**time_assertion, "unexpected": True},
+            "expect": "malformed",
+        }
+    )
+
+    runtime_reply_cases: list[dict[str, object]] = [
+        {"name": "valid_enrolled_reply", "expect": "eligible"},
+        {"name": "registry_unavailable", "context": {"registry_available": False}, "expect": "credential_unavailable"},
+        {"name": "key_not_enrolled", "context": {"credential_active": False}, "expect": "credential_unavailable"},
+        {"name": "revoked_key", "context": {"credential_active": False}, "expect": "credential_unavailable"},
+        {"name": "enrolled_after_proposal", "context": {"credential_sequence": 9, "proposal_cutoff": 8}, "expect": "credential_unavailable"},
+        {"name": "old_epoch", "context": {"identity_epoch": b64(bytes(range(1, 17)))}, "expect": "credential_unavailable"},
+        {"name": "old_epoch_and_different_proposal", "context": {"identity_epoch": b64(bytes(range(1, 17))), "proposal_id": "AB12CD35"}, "expect": "credential_unavailable"},
+        {"name": "different_proposal", "context": {"proposal_id": "AB12CD35"}, "expect": "proposal_mismatch"},
+        {"name": "altered_reply", "reply": {**reply, "reply": "no"}, "expect": "unauthenticated"},
+        {"name": "tampered_snapshot_digest", "reply": {**reply, "authority_snapshot_digest": "sha256:" + "f" * 64}, "expect": "unauthenticated"},
+        {"name": "revoked_key_wrong_site", "context": {"credential_active": False, "site_id": "site-b"}, "expect": "credential_unavailable"},
+    ]
+    negative_reply = sign(
+        {
+            **{k: v for k, v in reply.items() if k != "app_signature"},
+            "reply": "no",
+            "client_nonce": b64(bytes(range(32, 48))),
+        },
+        purpose="ori.lan.reply.v1",
+        signer=app_key,
+        signature_field="app_signature",
+    )
+    runtime_reply_cases.extend([
+        {"name": "signed_no_records_refusal", "reply": negative_reply, "expect": "refusal"},
+        {"name": "no_product_grant_needed", "grant": None, "expect": "eligible"},
+        {"name": "malformed_reply_member", "reply": {**reply, "unexpected": True}, "expect": "malformed"},
+    ])
+    alternate_snapshot = {**authority_snapshot, "resource": "relay-gpio-27"}
+    stale_snapshot_reply = sign(
+        {**{k: v for k, v in reply.items() if k != "app_signature"},
+         "authority_snapshot_digest": sha256(canonical(alternate_snapshot))},
+        purpose="ori.lan.reply.v1",
+        signer=app_key,
+        signature_field="app_signature",
+    )
+    runtime_reply_cases.append({"name": "signed_other_snapshot", "reply": stale_snapshot_reply, "expect": "proposal_mismatch"})
+    runtime_reply_cases.append({"name": "other_snapshot_and_late_enrolment", "reply": stale_snapshot_reply, "context": {"credential_sequence": 9, "proposal_cutoff": 8}, "expect": "proposal_mismatch"})
+    gateway_reply_cases: list[dict[str, object]] = [
+        {"name": "new_reply_queued", "expect": "queued"},
+        {"name": "signed_no_queued", "reply": negative_reply, "expect": "queued"},
+        {"name": "session_expired", "context": {"session_live": False}, "expect": "session_expired"},
+        {"name": "expired_session_and_wrong_key", "context": {"session_live": False, "app_spki_sha256": "sha256:" + "0" * 64}, "expect": "session_expired"},
+        {"name": "session_lost_on_restart", "context": {"session_live": False}, "expect": "session_expired"},
+        {"name": "nonce_reused_with_changed_bytes", "context": {"nonce_conflict": True}, "expect": "nonce_reused"},
+        {"name": "nonce_retry_same_bytes", "context": {"stored_reply": reply}, "expect": "stored_relay"},
+        {"name": "nonce_retry_after_registry_revocation", "context": {"stored_reply": reply, "credential_active": False}, "expect": "stored_relay"},
+        {"name": "nonce_retry_different_key", "context": {"stored_reply": reply, "app_spki_sha256": "sha256:" + "0" * 64}, "expect": "unauthenticated"},
+        {"name": "nonce_retry_different_path", "context": {"stored_reply": reply, "path_proposal_id": "AB12CD35"}, "expect": "proposal_mismatch"},
+        {"name": "bad_application_signature", "reply": {**reply, "reply": "no"}, "expect": "unauthenticated"},
+        {"name": "different_path_proposal", "context": {"path_proposal_id": "AB12CD35"}, "expect": "proposal_mismatch"},
+        {"name": "outbox_unavailable", "context": {"outbox_ok": False}, "expect": "relay_unavailable"},
+    ]
+    disclosure_cases = [
+        {"name": "active_key_open_proposal", "context": {}, "expect": "allow"},
+        {"name": "runtime_timeout", "context": {"response_events": [{"at_ms": 2001, "verified": True, "matches": True}]}, "expect": "deny"},
+        {"name": "runtime_no_reply", "context": {"response_events": []}, "expect": "deny"},
+        {"name": "registry_unavailable", "context": {"registry_available": False}, "expect": "deny"},
+        {"name": "revoked_key", "context": {"credential_active": False}, "expect": "deny"},
+        {"name": "new_key_old_proposal", "context": {"credential_sequence": 9, "proposal_cutoff": 8}, "expect": "deny"},
+        {"name": "closed_proposal", "context": {"proposal_open": False}, "expect": "deny"},
+        {"name": "mismatched_response", "context": {"response_events": [{"at_ms": 100, "verified": True, "matches": False}]}, "expect": "deny"},
+        {"name": "forged_then_valid", "context": {"response_events": [{"at_ms": 100, "verified": False, "matches": True}, {"at_ms": 200, "verified": True, "matches": True}]}, "expect": "allow"},
+        {"name": "forged_then_timeout", "context": {"response_events": [{"at_ms": 100, "verified": False, "matches": True}, {"at_ms": 2001, "verified": True, "matches": True}]}, "expect": "deny"},
+        {"name": "mismatch_then_valid", "context": {"response_events": [{"at_ms": 100, "verified": True, "matches": False}, {"at_ms": 200, "verified": True, "matches": True}]}, "expect": "allow"},
+    ]
+    runtime_request_cases = [
+        {"name": "verified_request", "expect": "answer"},
+        {"name": "topic_mismatch_valid_signature", "context": {"topic_matches": False}, "expect": "drop_no_answer"},
+        {"name": "valid_topic_bad_signature", "context": {"signature_valid": False}, "expect": "drop_no_answer"},
+        {"name": "verification_fault", "context": {"verification_ok": False}, "expect": "drop_no_answer"},
+        {"name": "stale_request", "context": {"fresh": False}, "expect": "drop_no_answer"},
+        {"name": "replayed_request", "context": {"replay_valid": False}, "expect": "drop_no_answer"},
+        {"name": "oversized_request", "context": {"size_ok": False}, "expect": "drop_no_answer"},
+        {"name": "malformed_request", "context": {"members_ok": False}, "expect": "drop_no_answer"},
+    ]
+    proposal_response = {
+        "v": 1,
+        "site_id": "site-a",
+        "device_id": "edge-01",
+        "proposals": [{
+            "proposal_id": "AB12CD34",
+            "created_at_ms": NOW,
+            "expires_at_ms": NOW + 30_000,
+            "summary": "Open protected circuit",
+            "authority_snapshot_digest": snapshot_digest,
+            "identity_epoch": b64(bytes(range(16))),
+        }],
+    }
+    proposal_response_cases = [
+        {"name": "allowed_proposal", "expect": "valid"},
+        {"name": "missing_snapshot_digest", "response": {**proposal_response, "proposals": [{k: v for k, v in proposal_response["proposals"][0].items() if k != "authority_snapshot_digest"}]}, "expect": "malformed"},
+        {"name": "gateway_inferred_epoch", "response": {**proposal_response, "proposals": [{**proposal_response["proposals"][0], "identity_epoch": b64(bytes(range(1, 17)))}]}, "expect": "unauthorized_metadata"},
+        {"name": "gateway_changed_snapshot", "response": {**proposal_response, "proposals": [{**proposal_response["proposals"][0], "authority_snapshot_digest": "sha256:" + "f" * 64}]}, "expect": "unauthorized_metadata"},
+        {"name": "unallowed_id", "context": {"allowed_ids": []}, "expect": "unauthorized_metadata"},
+        {"name": "more_than_100_candidates", "context": {"projected_count": 101}, "expect": "refuse_no_metadata"},
+        {"name": "empty_candidates", "response": {**proposal_response, "proposals": []}, "context": {"projected_count": 0, "allowed_ids": []}, "expect": "valid"},
+        {"name": "unexpected_outer_member", "response": {**proposal_response, "count": 1}, "expect": "malformed"},
+        {"name": "oversized_summary", "response": {**proposal_response, "proposals": [{**proposal_response["proposals"][0], "summary": "x" * 257}]}, "expect": "malformed"},
+    ]
+    relay_status_cases = [
+        {"name": "queued_only", "response": {"status": "queued", "proposal_id": "AB12CD34", "client_nonce": reply["client_nonce"]}, "expect": "valid"},
+        {"name": "gateway_claims_approved", "response": {"status": "approved", "proposal_id": "AB12CD34", "client_nonce": reply["client_nonce"]}, "expect": "malformed"},
+    ]
+    return {
+        "contract": "lan-app-api/v1",
+        "note": "Representability vectors only; no gateway or runtime conformance claim.",
+        "public_keys": {
+            "grant": public_key(grant_key),
+            "time": public_key(time_key),
+            "app": public_key(app_key),
+        },
+        "fixtures": {
+            "grant": grant,
+            "time_assertion": time_assertion,
+            "reply": reply,
+            "authority_snapshot": authority_snapshot,
+            "proposal_response": proposal_response,
+            "session_proof": session_proof,
+            "app_spki_b64": b64(spki(app_key)),
+            "gateway_spki_b64": b64(spki(gateway_key)),
+        },
+        "pairing_context": context,
+        "pairing_cases": pairing_cases,
+        "session_cases": session_cases,
+        "gateway_reply_cases": gateway_reply_cases,
+        "runtime_reply_cases": runtime_reply_cases,
+        "disclosure_cases": disclosure_cases,
+        "runtime_request_cases": runtime_request_cases,
+        "proposal_response_cases": proposal_response_cases,
+        "relay_status_cases": relay_status_cases,
+    }
+
+
+def main() -> int:
+    rendered = json.dumps(make(), indent=2, sort_keys=True) + "\n"
+    if "--check" in sys.argv[1:]:
+        if not OUT.exists() or OUT.read_text() != rendered:
+            print(f"{OUT}: does not reproduce", file=sys.stderr)
+            return 1
+        print("lan-app-api/v1 corpus reproduces")
+        return 0
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(rendered)
+    print(f"wrote {OUT}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

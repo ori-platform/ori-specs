@@ -445,6 +445,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | gateway-config | v2 | `draft` | `amendable` | — |
 | gateway-evidence-carriage | v1 | `draft` | `amendable` | — |
 | gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
+| lan-app-api | v1 | `draft` | `amendable` | — |
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | offline-tokens | v2 | `draft` | `frozen` | claiming-merge, runtime `31ef157`, 2026-09-26; audit complete |
 | operator-socket | v1 | `draft` | `frozen` | claiming-merge, runtime `4078762`, 2026-09-29; audit complete |
