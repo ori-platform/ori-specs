@@ -1,0 +1,2522 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the operator-socket/v3 Approver Registry Operations corpus.
+
+Nothing here is shared with the corpus checker, which reads the order of
+refusal, the members and the codes from the contract and replays every case
+itself.
+
+    python3 scripts/generate-operator-socket-approver-registry-vectors-v3          # write
+    python3 scripts/generate-operator-socket-approver-registry-vectors-v3 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+from cryptography.exceptions import InvalidSignature
+
+# A revision of thousands of digits is a JSON integer the contract judges (malformed, over 2^53 - 1); Python's
+# default cap on integer string conversion must not turn it into a parse failure.
+if hasattr(sys, "set_int_max_str_digits"):
+    sys.set_int_max_str_digits(0)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "operator-socket" / "vectors" / "approver-registry-v3.json"
+
+BOUND = 16_384
+DEVICE_ID = "edge-1"
+SITE_ID = "site-1"
+OPERATOR_UID = 1001
+
+
+def b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def seeded_key(label: str) -> Ed25519PrivateKey:
+    return Ed25519PrivateKey.from_private_bytes(
+        hashlib.sha256(f"ori operator-socket/v3 {label} test key".encode()).digest()
+    )
+
+
+def raw_public(key: Ed25519PrivateKey) -> bytes:
+    return key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
+def lan_value(key: Ed25519PrivateKey) -> str:
+    return "ed25519:" + b64(raw_public(key))
+
+
+PROVISIONING = seeded_key("current provisioning anchor")
+PREVIOUS = seeded_key("previous provisioning anchor")
+OTHER_CLASS = seeded_key("other class anchor")
+STRANGER = seeded_key("unconfigured signer")
+OWNER = seeded_key("owner LAN credential")
+SECOND = seeded_key("second LAN credential")
+CANDIDATE = seeded_key("candidate LAN credential")
+
+EPOCH = b64(bytes(range(16, 32)))
+OLD_EPOCH = b64(bytes(range(32, 48)))
+NEW_EPOCH = b64(bytes(range(48, 64)))
+
+
+def cid(n: int) -> str:
+    return b64(bytes([n]) * 16)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def sign(key: Ed25519PrivateKey, domain: bytes, unsigned: dict) -> dict:
+    signature = key.sign(domain + b"\0" + canonical(unsigned))
+    return {**unsigned, "signature": b64(signature)}
+
+
+def flip(signature: str) -> str:
+    raw = bytearray(base64.b64decode(signature))
+    raw[0] ^= 1
+    return b64(bytes(raw))
+
+
+# --- Ed25519 identity, admission and fixture keys ----------------------------
+# Edwards25519 arithmetic for what the cryptography package does not expose:
+# whether a key passes ed25519-key-admission/v1, and keys that do not.
+
+FIELD = 2 ** 255 - 19
+ORDER = 2 ** 252 + 27742317777372353535851937790883648493
+EDWARDS_D = -121665 * pow(121666, FIELD - 2, FIELD) % FIELD
+ZERO = (0, 1, 1, 0)
+
+
+def point_add(a: tuple, b: tuple) -> tuple:
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    k1 = (y1 - x1) * (y2 - x2) % FIELD
+    k2 = (y1 + x1) * (y2 + x2) % FIELD
+    k3 = 2 * EDWARDS_D * t1 * t2 % FIELD
+    k4 = 2 * z1 * z2 % FIELD
+    e, f, g, h = k2 - k1, k4 - k3, k4 + k3, k2 + k1
+    return (e * f % FIELD, g * h % FIELD, f * g % FIELD, e * h % FIELD)
+
+
+def point_mul(n: int, point: tuple) -> tuple:
+    acc = ZERO
+    while n:
+        if n & 1:
+            acc = point_add(acc, point)
+        point = point_add(point, point)
+        n >>= 1
+    return acc
+
+
+def is_zero(point: tuple) -> bool:
+    return point[0] % FIELD == 0 and (point[1] - point[2]) % FIELD == 0
+
+
+def point_decode(raw: bytes) -> tuple | None:
+    value = int.from_bytes(raw, "little")
+    sign, y = value >> 255, value & ((1 << 255) - 1)
+    if y >= FIELD:
+        return None
+    xx = (y * y - 1) * pow(EDWARDS_D * y * y + 1, FIELD - 2, FIELD) % FIELD
+    x = pow(xx, (FIELD + 3) // 8, FIELD)
+    if (x * x - xx) % FIELD:
+        x = x * pow(2, (FIELD - 1) // 4, FIELD) % FIELD
+    if (x * x - xx) % FIELD or (x == 0 and sign):
+        return None
+    if x & 1 != sign:
+        x = FIELD - x
+    return (x, y, 1, x * y % FIELD)
+
+
+def point_encode(point: tuple) -> bytes:
+    x, y, z, _ = point
+    inv = pow(z, FIELD - 2, FIELD)
+    x, y = x * inv % FIELD, y * inv % FIELD
+    return (y | (x & 1) << 255).to_bytes(32, "little")
+
+
+def admitted(raw: bytes) -> bool:
+    """ed25519-key-admission/v1: canonical, on the curve, not of small order, of prime order."""
+    point = point_decode(raw) if len(raw) == 32 else None
+    return point is not None and not is_zero(point_mul(8, point)) and is_zero(point_mul(ORDER, point))
+
+
+def identity(raw: bytes) -> bytes:
+    """ed25519-key-admission/v1, Recognising a key: the 32 bytes with bit 255 cleared."""
+    return raw[:31] + bytes([raw[31] & 0x7F])
+
+
+def negated(raw: bytes) -> bytes:
+    return raw[:31] + bytes([raw[31] ^ 0x80])
+
+
+def sign_negated(label: str, domain: bytes, unsigned: dict) -> dict:
+    """Sign under the negation of a seeded key: the holder of a signs with -a under -A."""
+    h = hashlib.sha512(hashlib.sha256(f"ori operator-socket/v3 {label} test key".encode()).digest()).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    public = negated(raw_public(seeded_key(label)))
+    message = domain + b"\0" + canonical(unsigned)
+    r = int.from_bytes(hashlib.sha512(h[32:] + message).digest(), "little") % ORDER
+    big_r = point_encode(point_mul(r, BASE_POINT))
+    k = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little") % ORDER
+    s = (r + k * (ORDER - a % ORDER)) % ORDER
+    signature = big_r + s.to_bytes(32, "little")
+    Ed25519PublicKey.from_public_bytes(public).verify(signature, message)
+    return {**unsigned, "signature": b64(signature)}
+
+
+BASE_POINT = point_decode((4 * pow(5, FIELD - 2, FIELD) % FIELD).to_bytes(32, "little"))
+EIGHT_TORSION = point_decode(bytes.fromhex("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"))
+assert EIGHT_TORSION is not None and is_zero(point_mul(8, EIGHT_TORSION))
+assert not is_zero(point_mul(4, EIGHT_TORSION))
+SMALL_ORDER_KEY = (1).to_bytes(32, "little")
+EIGHT_TORSION_KEY = point_encode(EIGHT_TORSION)
+NONCANONICAL_KEY = (FIELD + 1).to_bytes(32, "little")
+
+
+def seed_scalar(label: str) -> int:
+    h = hashlib.sha512(hashlib.sha256(f"ori operator-socket/v3 {label} test key".encode()).digest()).digest()
+    a = int.from_bytes(h[:32], "little")
+    return (a & ((1 << 254) - 8)) | (1 << 254)
+
+
+def sign_ground(scalar: int, public: bytes, domain: bytes, unsigned: dict) -> dict:
+    """Sign so the cofactorless equation [S]B = R + [k]A holds under a key that fails admission.
+
+    A is [scalar]B plus a point of order dividing 8. The nonce is ground until k, taken both as the
+    full 512-bit hash and reduced mod L, is a multiple of 8, so [k] removes the torsion component and
+    admission alone refuses the key, as ed25519-key-admission/v1 describes.
+    """
+    message = domain + b"\0" + canonical(unsigned)
+    point = point_decode(public)
+    for counter in range(10_000):
+        r = int.from_bytes(hashlib.sha512(counter.to_bytes(4, "little") + public + message).digest(),
+                           "little") % ORDER
+        big_r = point_encode(point_mul(r, BASE_POINT))
+        k_full = int.from_bytes(hashlib.sha512(big_r + public + message).digest(), "little")
+        if k_full % 8 or (k_full % ORDER) % 8:
+            continue
+        s = (r + k_full * scalar) % ORDER
+        left = point_encode(point_mul(s, BASE_POINT))
+        for k in (k_full, k_full % ORDER):
+            assert left == point_encode(point_add(point_decode(big_r), point_mul(k, point))), "equation"
+        return {**unsigned, "signature": b64(big_r + s.to_bytes(32, "little"))}
+    raise AssertionError("no nonce found")
+
+
+def mixed_order(raw: bytes) -> bytes:
+    return point_encode(point_add(point_decode(raw), EIGHT_TORSION))
+
+
+# --- the runtime as the contract describes it --------------------------------
+
+OPERATIONS = (
+    "reconcile_tier_c",
+    "evidence_commission",
+    "approver_registry_challenge",
+    "approver_registry_recover",
+    "approver_registry_local_seed",
+    "approver_registry_enrol",
+    "approver_registry_revoke",
+    "approver_registry_binding",
+)
+MEMBERS = {
+    "approver_registry_challenge": {"operation", "challenge_operation", "candidate"},
+    "approver_registry_recover": {"operation", "challenge_id"},
+    "approver_registry_local_seed": {"operation", "challenge_id", "candidate", "possession"},
+    "approver_registry_enrol": {"operation", "challenge_id", "candidate", "authorization", "possession"},
+    "approver_registry_revoke": {"operation", "document"},
+    "approver_registry_binding": {"operation"},
+}
+REVOKE_MEMBERS = {"v", "device_id", "site_id", "identity_epoch", "revision", "targets", "signing_key", "signature"}
+ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+E164 = re.compile(r"\+[1-9][0-9]{1,14}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+TARGET = re.compile(r"(?:credential|approver):[A-Za-z0-9._-]{1,64}")
+
+
+class Refused(Exception):
+    def __init__(self, code: str, consumes: bool = False) -> None:
+        super().__init__(code)
+        self.code = code
+        self.consumes = consumes
+
+
+def canonical_b64(value: object, length: int) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except ValueError:
+        return False
+    return len(raw) == length and b64(raw) == value
+
+
+def is_int(value: object) -> bool:
+    return type(value) is int
+
+
+def channel_value_ok(channel: object, value: object) -> bool:
+    if channel in ("sms", "whatsapp"):
+        return isinstance(value, str) and E164.fullmatch(value) is not None
+    if channel == "lan_ed25519":
+        return isinstance(value, str) and value.startswith("ed25519:") and canonical_b64(value[8:], 32)
+    return False
+
+
+def candidate_ok(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"approver_id", "credential_id", "channel", "value"}
+        and all(isinstance(value[k], str) and ID.fullmatch(value[k]) for k in ("approver_id", "credential_id"))
+        and channel_value_ok(value["channel"], value["value"])
+    )
+
+
+def proof_ok(value: object, id_member: str) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"v", "challenge_id", "challenge_sha256", id_member, "signature"}
+        and is_int(value["v"]) and value["v"] == 1
+        and canonical_b64(value["challenge_id"], 16)
+        and isinstance(value["challenge_sha256"], str) and HEX64.fullmatch(value["challenge_sha256"]) is not None
+        and isinstance(value[id_member], str) and ID.fullmatch(value[id_member]) is not None
+        and canonical_b64(value["signature"], 64)
+    )
+
+
+class Obj(dict):
+    """A parsed JSON object that remembers whether a member was named twice in it, and whether any member,
+    shadowed ones included, held a string with no UTF-8 form."""
+    repeated = False
+    no_utf8 = False
+
+
+def no_utf8(value: object) -> bool:
+    """A string, key or nested string with no UTF-8 form, such as an escaped lone surrogate."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        return False
+    if isinstance(value, dict):
+        return getattr(value, "no_utf8", False) or any(no_utf8(k) or no_utf8(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(no_utf8(v) for v in value)
+    return False
+
+
+def unique(pairs: list) -> dict:
+    """Keep every member's verdict: a value a later duplicate shadows is still judged at parse."""
+    out = Obj()
+    for key, value in pairs:
+        if no_utf8(key) or no_utf8(value):
+            out.no_utf8 = True
+        if key in out:
+            out.repeated = True
+        out[key] = value
+    return out
+
+
+def no_constant(name: str) -> object:
+    raise ValueError(f"{name} is not JSON")
+
+
+MAX_DEPTH = 32
+MAX_REVISION = 2 ** 53 - 1
+
+
+def parse_faults(value: object, depth: int = 1) -> bool:
+    """A string with no UTF-8 form, or nesting deeper than MAX_DEPTH, anywhere."""
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return True
+        return False
+    if isinstance(value, (dict, list)):
+        if depth > MAX_DEPTH:
+            return True
+        items = list(value.items()) if isinstance(value, dict) else [(None, v) for v in value]
+        return any((k is not None and parse_faults(k, depth)) or parse_faults(v, depth + 1) for k, v in items)
+    return False
+
+
+def repeats(value: object) -> bool:
+    if isinstance(value, dict):
+        return bool(getattr(value, "repeated", False)) or any(repeats(v) for v in value.values())
+    if isinstance(value, list):
+        return any(repeats(v) for v in value)
+    return False
+
+
+def form(request: dict) -> str:
+    op = request.get("operation")
+    if not isinstance(op, str) or op not in OPERATIONS:
+        raise Refused("invalid_arguments")
+    if op not in MEMBERS:
+        raise AssertionError("v2 operations appear only in cases decided before their members")
+    if set(request) != MEMBERS[op]:
+        raise Refused("invalid_arguments")
+    if op == "approver_registry_challenge":
+        kind, cand = request["challenge_operation"], request["candidate"]
+        if kind not in ("recover", "local_seed", "enrol"):
+            raise Refused("invalid_arguments")
+        if kind == "recover":
+            if cand is not None:
+                raise Refused("invalid_arguments")
+        else:
+            members = {"channel", "value"} | ({"approver_id"} if kind == "enrol" else set())
+            if not (isinstance(cand, dict) and set(cand) == members
+                    and channel_value_ok(cand["channel"], cand["value"])):
+                raise Refused("invalid_arguments")
+            approver = cand.get("approver_id")
+            if approver is not None and not (isinstance(approver, str) and ID.fullmatch(approver)):
+                raise Refused("invalid_arguments")
+    if op in ("approver_registry_recover", "approver_registry_local_seed", "approver_registry_enrol"):
+        if not canonical_b64(request["challenge_id"], 16):
+            raise Refused("invalid_arguments")
+    if op in ("approver_registry_local_seed", "approver_registry_enrol"):
+        if not candidate_ok(request["candidate"]):
+            raise Refused("invalid_arguments")
+    if op == "approver_registry_local_seed" and not proof_ok(request["possession"], "candidate_credential_id"):
+        raise Refused("invalid_arguments")
+    if op == "approver_registry_enrol":
+        auth, poss = request["authorization"], request["possession"]
+        if auth is not None and not proof_ok(auth, "authorizer_credential_id"):
+            raise Refused("invalid_arguments")
+        lan = request["candidate"]["channel"] == "lan_ed25519"
+        if lan and not proof_ok(poss, "candidate_credential_id"):
+            raise Refused("invalid_arguments")
+        if not lan and poss is not None:
+            raise Refused("invalid_arguments")
+    return op
+
+
+def verifies(public_raw: bytes, domain: bytes, signed: dict) -> bool:
+    if not admitted(public_raw):
+        return False
+    unsigned = {k: v for k, v in signed.items() if k != "signature"}
+    try:
+        Ed25519PublicKey.from_public_bytes(public_raw).verify(
+            base64.b64decode(signed["signature"]), domain + b"\0" + canonical(unsigned)
+        )
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def site_mismatch(ctx: dict) -> bool:
+    reg = ctx["registry"]
+    return reg is not None and reg["site_id"] != ctx["verified_site_id"]
+
+
+def tombstoned_ids(reg: dict) -> set:
+    return {entry["credential_id"] for entry in reg["tombstoned_credentials"]}
+
+
+def value_key(value: str) -> tuple:
+    """A LAN value is recognised by its key's identity; a phone value by its number alone."""
+    if value.startswith("ed25519:"):
+        return ("lan", identity(base64.b64decode(value[8:])))
+    return ("phone", value)
+
+
+def value_checks(ctx: dict, reg: dict, value: str, consumes: bool) -> None:
+    key = value_key(value)
+    if key in {value_key(v) for v in reg["tombstoned_values"]}:
+        raise Refused("value_tombstoned", consumes)
+    if key in {value_key(c["value"]) for c in reg["credentials"]}:
+        raise Refused("duplicate_value", consumes)
+    if key[0] == "phone" and value in ctx["pending_phone_values"]:
+        raise Refused("phone_pending_for_value", consumes)
+
+
+def candidate_checks(ctx: dict, reg: dict, cand: dict) -> None:
+    if cand["approver_id"] in reg["tombstoned_approvers"]:
+        raise Refused("approver_revoked", True)
+    active_ids = {c["credential_id"] for c in reg["credentials"]}
+    if cand["credential_id"] in active_ids or cand["credential_id"] in tombstoned_ids(reg):
+        raise Refused("credential_reused", True)
+    value_checks(ctx, reg, cand["value"], True)
+
+
+def possession_checks(challenge: dict, digest: str, cand: dict, poss: dict) -> None:
+    if (poss["challenge_id"] != challenge["challenge_id"] or poss["challenge_sha256"] != digest
+            or poss["candidate_credential_id"] != cand["credential_id"]):
+        raise Refused("possession_invalid", True)
+    if not verifies(base64.b64decode(cand["value"][8:]), b"ori.tier_c_approver.possession.v1", poss):
+        raise Refused("signature_invalid", True)
+
+
+def challenge_op(ctx: dict, request: dict) -> dict:
+    kind, cand = request["challenge_operation"], request["candidate"]
+    if kind == "local_seed" and cand["channel"] != "lan_ed25519":
+        raise Refused("lan_key_required")
+    if site_mismatch(ctx):
+        raise Refused("site_binding_mismatch")
+    reg, minted = ctx["registry"], ctx["minted"]
+    if kind == "recover" and reg is not None:
+        raise Refused("recovery_not_available")
+    if kind != "recover" and reg is None:
+        raise Refused("registry_unavailable")
+    if kind == "recover":
+        epoch, revision, candidates = minted["identity_epoch"], 0, []
+    else:
+        if kind == "enrol" and cand["channel"] not in ("lan_ed25519", *ctx["authenticated_phone_channels"]):
+            raise Refused("channel_unauthenticated")
+        if kind == "local_seed" and reg["credentials"]:
+            raise Refused("active_authorizer_exists")
+        approver = cand.get("approver_id")
+        if approver is not None:
+            if approver in reg["tombstoned_approvers"]:
+                raise Refused("approver_revoked")
+            if approver not in {c["approver_id"] for c in reg["credentials"]}:
+                raise Refused("approver_unknown")
+        value_checks(ctx, reg, cand["value"], False)
+        epoch, revision = reg["identity_epoch"], reg["registry_revision"]
+        candidates = [{"approver_id": approver or minted["approver_id"],
+                       "credential_id": minted["credential_id"],
+                       "channel": cand["channel"], "value": cand["value"]}]
+    CHANGES.append(f"challenge_added:{minted['challenge_id']}")
+    if kind == "enrol" and cand["channel"] in ("sms", "whatsapp"):
+        CHANGES.append(f"code_sent:{minted['challenge_id']}")
+    return {"challenge": {
+        "v": 1, "challenge_id": minted["challenge_id"], "device_id": ctx["device_id"],
+        "site_id": ctx["verified_site_id"], "identity_epoch": epoch, "operation": kind,
+        "registry_revision": revision, "candidates": candidates,
+    }}
+
+
+def presented(ctx: dict, request: dict, kind: str) -> tuple[dict, dict]:
+    if site_mismatch(ctx):
+        raise Refused("site_binding_mismatch")
+    held = next((h for h in ctx["challenges"] if h["challenge"]["challenge_id"] == request["challenge_id"]), None)
+    if held is not None and held["state"] == "used":
+        raise Refused("challenge_reused")
+    if held is None:
+        raise Refused("challenge_unavailable")
+    if held["state"] == "expired" or held["elapsed_ms"] > CHALLENGE_WINDOW_MS:
+        raise Refused("challenge_expired", True)
+    challenge = held["challenge"]
+    if challenge["operation"] != kind:
+        raise Refused("candidate_changed", True)
+    if kind != "recover" and request["candidate"] != challenge["candidates"][0]:
+        raise Refused("candidate_changed", True)
+    reg = ctx["registry"]
+    if kind == "recover":
+        if reg is not None:
+            raise Refused("recovery_not_available", True)
+        if (challenge["device_id"], challenge["site_id"]) != (ctx["device_id"], ctx["verified_site_id"]):
+            raise Refused("challenge_stale", True)
+        return held, {}
+    if reg is None:
+        raise Refused("registry_unavailable", True)
+    if (reg["registry_revision"], reg["identity_epoch"]) != (challenge["registry_revision"],
+                                                             challenge["identity_epoch"]):
+        raise Refused("challenge_stale", True)
+    return held, reg
+
+
+def recover_op(ctx: dict, request: dict) -> dict:
+    held, _ = presented(ctx, request, "recover")
+    CHANGES.extend([f"used:{request['challenge_id']}",
+                    f"registry_created:{held['challenge']['identity_epoch']}",
+                    "challenges_cleared", "phone_authorizations_cleared", "pending_phone_cleared"])
+    return {"status": "recovered", "registry_revision": 1}
+
+
+def local_seed_op(ctx: dict, request: dict) -> dict:
+    held, reg = presented(ctx, request, "local_seed")
+    if reg["credentials"]:
+        raise Refused("active_authorizer_exists", True)
+    challenge = held["challenge"]
+    possession_checks(challenge, hashlib.sha256(canonical(challenge)).hexdigest(),
+                      request["candidate"], request["possession"])
+    candidate_checks(ctx, reg, request["candidate"])
+    credential_added(reg, request)
+    return {"status": "seeded", "registry_revision": reg["registry_revision"] + 1}
+
+
+def enrol_op(ctx: dict, request: dict) -> dict:
+    held, reg = presented(ctx, request, "enrol")
+    challenge = held["challenge"]
+    digest = hashlib.sha256(canonical(challenge)).hexdigest()
+    active = {c["credential_id"]: c for c in reg["credentials"]}
+    auth = request["authorization"]
+    if auth is not None:
+        authorizer = active.get(auth["authorizer_credential_id"])
+        if authorizer is None or authorizer["channel"] != "lan_ed25519":
+            raise Refused("authorizer_unavailable", True)
+    else:
+        # The first text recorded for the challenge is its authorization; later ones change nothing.
+        record = next((p for p in ctx["phone_authorizations"] if p["challenge_id"] == challenge["challenge_id"]), None)
+        if record is not None and record["challenge_sha256"] != digest:
+            record = None
+        authorizer = None if record is None else active.get(record["authorizer_credential_id"])
+        if authorizer is None or authorizer["channel"] not in ("sms", "whatsapp"):
+            raise Refused("authorizer_unavailable", True)
+    if authorizer["sequence"] > held["credential_sequence_at_issue"]:
+        raise Refused("authorizer_not_preexisting", True)
+    if auth is not None and (
+        auth["challenge_id"] != challenge["challenge_id"] or auth["challenge_sha256"] != digest
+        or not verifies(base64.b64decode(authorizer["value"][8:]), b"ori.tier_c_approver.enrol.v1", auth)
+    ):
+        raise Refused("signature_invalid", True)
+    named = challenge["candidates"][0]["approver_id"]
+    if named in {c["approver_id"] for c in reg["credentials"]} and authorizer["approver_id"] != named:
+        raise Refused("authorizer_not_approver", True)
+    cand = request["candidate"]
+    if cand["channel"] == "lan_ed25519":
+        possession_checks(challenge, digest, cand, request["possession"])
+        candidate_checks(ctx, reg, cand)
+        credential_added(reg, request)
+        return {"status": "enrolled", "registry_revision": reg["registry_revision"] + 1}
+    candidate_checks(ctx, reg, cand)
+    CHANGES.extend([f"used:{request['challenge_id']}", f"pending_phone_added:{cand['value']}"])
+    return {"status": "phone_pending", "registry_revision": reg["registry_revision"]}
+
+
+def credential_added(reg: dict, request: dict) -> None:
+    CHANGES.extend([f"used:{request['challenge_id']}",
+                    f"credential_added:{request['candidate']['credential_id']}",
+                    f"sequence:{reg['credential_sequence'] + 1}",
+                    f"revision:{reg['registry_revision'] + 1}"])
+
+
+def document_malformed(doc: object) -> bool:
+    if not isinstance(doc, dict) or repeats(doc) or set(doc) != REVOKE_MEMBERS:
+        return True
+    targets = doc["targets"]
+    return not (
+        is_int(doc["v"]) and doc["v"] == 1
+        and is_int(doc["revision"]) and 1 <= doc["revision"] <= MAX_REVISION
+        and isinstance(doc["device_id"], str) and ID.fullmatch(doc["device_id"])
+        and isinstance(doc["site_id"], str) and ID.fullmatch(doc["site_id"])
+        and canonical_b64(doc["identity_epoch"], 16)
+        and isinstance(targets, list) and 0 < len(targets) <= 32
+        and all(isinstance(t, str) and TARGET.fullmatch(t) for t in targets)
+        and targets == sorted(set(targets))
+        and isinstance(doc["signing_key"], str) and doc["signing_key"].startswith("ed25519:")
+        and canonical_b64(doc["signing_key"][8:], 32)
+        and canonical_b64(doc["signature"], 64)
+    )
+
+
+def revoke_op(ctx: dict, request: dict) -> dict:
+    doc = request["document"]
+    anchors = {role: base64.b64decode(key) for role, key in ctx["anchors"].items()}
+    current = anchors["current"]
+    if (not ctx["anchor_available"] or not admitted(current)
+            or len({identity(key) for key in anchors.values()}) < 3):
+        raise Refused("anchor_unavailable")
+    if document_malformed(doc):
+        raise Refused("malformed")
+    key = base64.b64decode(doc["signing_key"][8:])
+    role = next((r for r in ("current", "previous", "other_class")
+                 if identity(anchors[r]) == identity(key)), None)
+    if role is None:
+        raise Refused("unknown_signer")
+    if not verifies(key, b"ori.tier_c_approver.revoke.v1", doc):
+        raise Refused("signature_invalid")
+    if role == "previous":
+        raise Refused("superseded_signer")
+    if role == "other_class":
+        raise Refused("wrong_authority")
+    reg = ctx["registry"]
+    if reg is None:
+        raise Refused("registry_unavailable")
+    if site_mismatch(ctx):
+        raise Refused("site_binding_mismatch")
+    bound_to = (ctx["device_id"], reg["site_id"], reg["identity_epoch"])
+    if (doc["device_id"], doc["site_id"], doc["identity_epoch"]) != bound_to:
+        raise Refused("binding_mismatch")
+    last = reg["last_external_revision"]
+    if doc["revision"] < last:
+        raise Refused("revision_regressed")
+    if doc["revision"] == last:
+        if hashlib.sha256(canonical(doc)).hexdigest() != reg["last_external_document_sha256"]:
+            raise Refused("revision_conflict")
+        return {"status": "replayed", "registry_revision": reg["registry_revision"],
+                "last_external_revision": last}
+    known_credentials = {c["credential_id"] for c in reg["credentials"]} | tombstoned_ids(reg)
+    known_approvers = ({c["approver_id"] for c in reg["credentials"]} | set(reg["tombstoned_approvers"])
+                       | {e["approver_id"] for e in reg["tombstoned_credentials"]})
+    for target in doc["targets"]:
+        kind, ident = target.split(":", 1)
+        if ident not in (known_credentials if kind == "credential" else known_approvers):
+            raise Refused("unknown_target")
+    removed = []
+    for target in doc["targets"]:
+        kind, ident = target.split(":", 1)
+        if kind == "credential":
+            removed += [c for c in reg["credentials"] if c["credential_id"] == ident]
+        else:
+            removed += [c for c in reg["credentials"] if c["approver_id"] == ident]
+            if ident not in reg["tombstoned_approvers"]:
+                CHANGES.append(f"approver_tombstoned:{ident}")
+    for cred in {c["credential_id"]: c for c in removed}.values():
+        CHANGES.extend([f"credential_tombstoned:{cred['credential_id']}", f"value_tombstoned:{cred['value']}"])
+    CHANGES.extend([f"revision:{reg['registry_revision'] + 1}", f"last_external_revision:{doc['revision']}"])
+    return {"status": "revoked", "registry_revision": reg["registry_revision"] + 1,
+            "last_external_revision": doc["revision"]}
+
+
+def binding_op(ctx: dict, request: dict) -> dict:
+    reg = ctx["registry"]
+    if reg is None:
+        raise Refused("registry_unavailable")
+    if site_mismatch(ctx):
+        raise Refused("site_binding_mismatch")
+    return {"device_id": ctx["device_id"], "site_id": reg["site_id"],
+            "identity_epoch": reg["identity_epoch"], "registry_revision": reg["registry_revision"]}
+
+
+HANDLERS = {
+    "approver_registry_challenge": challenge_op,
+    "approver_registry_recover": recover_op,
+    "approver_registry_local_seed": local_seed_op,
+    "approver_registry_enrol": enrol_op,
+    "approver_registry_revoke": revoke_op,
+    "approver_registry_binding": binding_op,
+}
+TABLE = [False]
+CHANGES: list = []
+PRESENTING = {"approver_registry_recover", "approver_registry_local_seed", "approver_registry_enrol"}
+
+
+def frame(request: str) -> bytes:
+    """The request is the bytes before the first LF; the replay appends one LF."""
+    return (request.encode("utf-8") + b"\n").split(b"\n", 1)[0]
+
+
+def answer(ctx: dict, request: str, terminated: bool = True) -> dict:
+    raw = frame(request)
+    op = None
+    parsed: dict = {}
+    CHANGES.clear()
+    try:
+        if len(raw) > BOUND:
+            raise Refused("payload_too_large")
+        if not terminated and b"\n" not in request.encode("utf-8"):
+            raise Refused("invalid_arguments")
+        try:
+            parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=unique, parse_constant=no_constant)
+        except ValueError:
+            raise Refused("invalid_arguments") from None
+        if not isinstance(parsed, dict) or parse_faults(parsed) or no_utf8(parsed):
+            raise Refused("invalid_arguments")
+        if parsed.repeated or any(repeats(v) for k, v in parsed.items() if k != "document"):
+            raise Refused("invalid_arguments")
+        op = form(parsed)
+        peer, operator = ctx["peer_uid"], ctx["operator_uid"]
+        if peer is None or not (peer == 0 or (operator is not None and peer == operator)):
+            raise Refused("unauthenticated")
+        if ctx["registry_operation_in_flight"]:
+            raise Refused("registry_busy")
+        if not ctx["verified_site_id"]:
+            raise Refused("registry_unavailable")
+        TABLE[0] = True
+        result = HANDLERS[op](ctx, parsed)
+    except Refused as refusal:
+        expected = {"ok": False, "code": refusal.code}
+        if op in PRESENTING:
+            expected["consumes_challenge"] = refusal.consumes
+        expected["changes"] = [f"used:{parsed['challenge_id']}"] if refusal.consumes else []
+        return expected
+    expected = {"ok": True, "result": result}
+    if op in PRESENTING:
+        expected["consumes_challenge"] = True
+    expected["changes"] = sorted(CHANGES)
+    return expected
+
+
+# --- fixtures ----------------------------------------------------------------
+
+def credential(approver: str, ident: str, channel: str, value: str, sequence: int) -> dict:
+    return {"approver_id": approver, "credential_id": ident, "channel": channel, "value": value, "sequence": sequence}
+
+
+OWNER_CRED = credential("owner", "owner-key", "lan_ed25519", lan_value(OWNER), 1)
+PHONE_CRED = credential("owner", "owner-phone", "sms", "+2348012345678", 2)
+
+
+def tomb(credential_id: str, approver_id: str) -> dict:
+    return {"credential_id": credential_id, "approver_id": approver_id}
+
+
+def registry(**overrides: object) -> dict:
+    base = {
+        "site_id": SITE_ID,
+        "identity_epoch": EPOCH,
+        "registry_revision": 3,
+        "last_external_revision": 0,
+        "last_external_document_sha256": None,
+        "credential_sequence": 2,
+        "credentials": [OWNER_CRED, PHONE_CRED],
+        "tombstoned_credentials": [],
+        "tombstoned_approvers": [],
+        "tombstoned_values": [],
+    }
+    base.update(overrides)
+    return base
+
+
+EMPTY = dict(registry_revision=2, credential_sequence=1, credentials=[],
+             tombstoned_credentials=[tomb("old-key", "old-owner")], tombstoned_approvers=["old-owner"],
+             tombstoned_values=[lan_value(SECOND)])
+
+
+def ctx(**overrides: object) -> dict:
+    base = {
+        "device_id": DEVICE_ID,
+        "verified_site_id": SITE_ID,
+        "peer_uid": OPERATOR_UID,
+        "operator_uid": OPERATOR_UID,
+        "registry_operation_in_flight": False,
+        "anchor_available": True,
+        "anchors": {"current": b64(raw_public(PROVISIONING)), "previous": b64(raw_public(PREVIOUS)),
+                    "other_class": b64(raw_public(OTHER_CLASS))},
+        "registry": registry(),
+        "challenges": [],
+        "phone_authorizations": [],
+        "pending_phone_values": [],
+        "authenticated_phone_channels": ["sms"],
+        "minted": None,
+        "keys_failing_admission": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def request(obj: dict) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def padded_text(text: str, size: int) -> str:
+    assert text.endswith("}")
+    return text[:-1] + " " * (size - len(text.encode("utf-8"))) + "}"
+
+
+def padded(obj: dict, size: int) -> str:
+    text = request(obj)
+    assert text.endswith("}")
+    gap = size - len(text.encode("utf-8"))
+    assert gap >= 0
+    return text[:-1] + " " * gap + "}"
+
+
+def challenge(n: int, kind: str, candidates: list, *, revision: int = 3, epoch: str = EPOCH) -> dict:
+    return {"v": 1, "challenge_id": cid(n), "device_id": DEVICE_ID, "site_id": SITE_ID,
+            "identity_epoch": epoch, "operation": kind, "registry_revision": revision,
+            "candidates": candidates}
+
+
+CHALLENGE_WINDOW_MS = 60_000
+
+
+def held(ch: dict, state: str = "pending", sequence: int = 2, elapsed_ms: int | None = None) -> dict:
+    """A held challenge; elapsed_ms is monotonic time since issue, past 60,000 when it has expired."""
+    if elapsed_ms is None:
+        elapsed_ms = CHALLENGE_WINDOW_MS + 1_000 if state == "expired" else 1_000
+    assert (state == "expired") == (elapsed_ms > CHALLENGE_WINDOW_MS) or state == "used", (state, elapsed_ms)
+    return {"challenge": ch, "state": state, "credential_sequence_at_issue": sequence, "elapsed_ms": elapsed_ms}
+
+
+def digest(ch: dict) -> str:
+    return hashlib.sha256(canonical(ch)).hexdigest()
+
+
+def possession(key: Ed25519PrivateKey, ch: dict, cred: str, *, sha: str | None = None) -> dict:
+    return sign(key, b"ori.tier_c_approver.possession.v1", {
+        "v": 1, "challenge_id": ch["challenge_id"], "challenge_sha256": sha or digest(ch),
+        "candidate_credential_id": cred})
+
+
+def authorization(key: Ed25519PrivateKey, ch: dict, cred: str, *, sha: str | None = None) -> dict:
+    return sign(key, b"ori.tier_c_approver.enrol.v1", {
+        "v": 1, "challenge_id": ch["challenge_id"], "challenge_sha256": sha or digest(ch),
+        "authorizer_credential_id": cred})
+
+
+def revocation(revision: int, targets: list, *, key: Ed25519PrivateKey = PROVISIONING,
+               epoch: str = EPOCH, site: str = SITE_ID) -> dict:
+    return sign(key, b"ori.tier_c_approver.revoke.v1", {
+        "v": 1, "device_id": DEVICE_ID, "site_id": site, "identity_epoch": epoch,
+        "revision": revision, "targets": sorted(targets), "signing_key": "ed25519:" + b64(raw_public(key))})
+
+
+SEED_CAND = {"approver_id": "minted-a", "credential_id": "minted-c", "channel": "lan_ed25519",
+             "value": lan_value(CANDIDATE)}
+SMS_CAND = {"approver_id": "minted-a", "credential_id": "minted-c", "channel": "sms", "value": "+2348098765432"}
+SEED_CH = challenge(1, "local_seed", [SEED_CAND], revision=2)
+ENROL_CH = challenge(2, "enrol", [SEED_CAND])
+SMS_CH = challenge(3, "enrol", [SMS_CAND])
+RECOVER_CH = challenge(4, "recover", [], revision=0, epoch=NEW_EPOCH)
+MINTED = {"challenge_id": cid(9), "approver_id": "minted-a", "credential_id": "minted-c",
+          "identity_epoch": NEW_EPOCH}
+
+BINDING = {"operation": "approver_registry_binding"}
+REVOKE_1 = revocation(1, ["credential:owner-phone"])
+REVOKE_REQ = {"operation": "approver_registry_revoke", "document": REVOKE_1}
+RECONCILE = {"operation": "reconcile_tier_c", "proposal_id": "AB12CD34", "device_id": DEVICE_ID,
+             "zone_id": "zone-1", "outcome": "executed", "reason": "site_inspection", "note": None}
+
+
+def seed_req(ch: dict = SEED_CH, cand: dict = SEED_CAND, poss: dict | None = None) -> dict:
+    return {"operation": "approver_registry_local_seed", "challenge_id": ch["challenge_id"],
+            "candidate": cand, "possession": poss or possession(CANDIDATE, ch, cand["credential_id"])}
+
+
+def enrol_req(ch: dict = ENROL_CH, cand: dict = SEED_CAND, auth: object = "owner",
+              poss: object = "candidate") -> dict:
+    if auth == "owner":
+        auth = authorization(OWNER, ch, "owner-key")
+    if poss == "candidate":
+        poss = possession(CANDIDATE, ch, cand["credential_id"])
+    return {"operation": "approver_registry_enrol", "challenge_id": ch["challenge_id"],
+            "candidate": cand, "authorization": auth, "possession": poss}
+
+
+def challenge_req(kind: str, channel: str | None = None, value: str | None = None,
+                  approver: str | None = None) -> dict:
+    cand = None if channel is None else {"channel": channel, "value": value}
+    if cand is not None and kind == "enrol":
+        cand = {"approver_id": approver, **cand}
+    return {"operation": "approver_registry_challenge", "challenge_operation": kind, "candidate": cand}
+
+
+RECOVER_REQ = {"operation": "approver_registry_recover", "challenge_id": RECOVER_CH["challenge_id"]}
+SEED_CTX = dict(registry=registry(**EMPTY), challenges=[held(SEED_CH, sequence=1)])
+ENROL_CTX = dict(challenges=[held(ENROL_CH)])
+SMS_CTX = dict(challenges=[held(SMS_CH)])
+LOCKED = dict(registry=None)
+
+CASES: list[tuple[str, str, dict, str]] = []
+
+
+def case(name: str, note: str, context: dict, req: str, terminated: bool = True) -> None:
+    CASES.append((name, note, ctx(**context), req, terminated))
+
+
+# The bound, decided before parsing.
+case("binding_at_bound", "a request of exactly 16,384 bytes is parsed and answered",
+     {}, padded(BINDING, BOUND))
+case("binding_one_over_bound", "one byte over the bound is refused before parsing",
+     {}, padded(BINDING, BOUND + 1))
+case("revoke_at_bound", "a revocation of exactly 16,384 bytes is parsed and committed",
+     {}, padded(REVOKE_REQ, BOUND))
+case("revoke_one_over_bound", "a valid revocation one byte over the bound is refused and revokes nothing",
+     {}, padded(REVOKE_REQ, BOUND + 1))
+case("over_bound_from_unadmitted_peer", "the bound is decided before the caller",
+     {"peer_uid": 1002}, padded(BINDING, BOUND + 1))
+case("over_bound_while_in_flight", "the bound is decided before serialisation",
+     {"registry_operation_in_flight": True}, padded(BINDING, BOUND + 1))
+case("over_bound_reconcile", "the bound applies to every operation on the socket, decided before the operation is read",
+     {}, padded(RECONCILE, BOUND + 1))
+case("over_bound_not_json", "bytes that would not parse are refused at the bound without parsing",
+     {}, "x" * (BOUND + 1))
+
+# Form and members.
+case("not_json", "a request that is not JSON", {}, "operation=approver_registry_binding")
+case("not_an_object", "a request that is a JSON array", {}, request([BINDING]))  # type: ignore[arg-type]
+case("operation_absent", "no operation member", {}, "{}")
+case("operation_not_string", "an operation that is not a string", {}, '{"operation":1}')
+case("operation_unknown", "an operation this socket does not serve", {},
+     request({"operation": "approver_registry_add"}))
+case("operation_case_variant", "a member that differs from operation only in case is unaccepted", {},
+     '{"Operation":"approver_registry_binding"}')
+case("operation_named_twice", "the operation member named twice", {},
+     '{"operation":"approver_registry_binding","operation":"approver_registry_binding"}')
+case("binding_extra_member", "a binding request with a member it does not accept", {},
+     request({**BINDING, "device_id": DEVICE_ID}))
+case("revoke_document_absent", "a revocation request without its document", {},
+     request({"operation": "approver_registry_revoke"}))
+case("member_twice_in_document", "a member named twice inside the revocation document is the document's "
+     "fault: malformed", {},
+     request(REVOKE_REQ).replace('"v":1', '"v":1,"v":1', 1))
+case("member_twice_in_candidate", "a member named twice inside a candidate", SEED_CTX,
+     request(seed_req()).replace('"channel":"lan_ed25519"', '"channel":"lan_ed25519","channel":"lan_ed25519"', 1))
+case("member_twice_in_possession", "a member named twice inside a possession object", SEED_CTX,
+     request(seed_req()).replace('"candidate_credential_id":"minted-c"',
+                                 '"candidate_credential_id":"minted-c","candidate_credential_id":"minted-c"', 1))
+case("member_twice_from_unadmitted_peer", "a member named twice is decided before the caller",
+     {"peer_uid": 1002}, '{"operation":"approver_registry_binding","operation":"approver_registry_binding"}')
+case("member_twice_while_in_flight", "a member named twice is decided before serialisation",
+     {"registry_operation_in_flight": True},
+     '{"operation":"approver_registry_binding","operation":"approver_registry_binding"}')
+case("member_twice_reconcile", "a member named twice refuses a v2 operation the same way", {},
+     request(RECONCILE).replace('"note":null', '"note":null,"note":null'))
+case("challenge_recover_with_candidate", "a recover challenge names no candidate", LOCKED,
+     request({**challenge_req("recover"), "candidate": {"channel": "sms", "value": "+2348098765432"}}))
+case("challenge_enrol_without_candidate", "an enrol challenge names a candidate", {},
+     request(challenge_req("enrol")))
+case("challenge_candidate_names_ids", "a challenge request cannot choose the approver or credential ID", {},
+     request({**challenge_req("enrol"), "candidate": {**SMS_CAND}}))
+case("challenge_unknown_operation", "challenge_operation outside its set", {},
+     request(challenge_req("revoke", "sms", "+2348098765432")))
+case("challenge_phone_value_prefixed", "a transport prefix is not part of a value", {},
+     request(challenge_req("enrol", "sms", "whatsapp:+2348098765432")))
+case("challenge_phone_value_not_e164", "a phone value that is not canonical E.164", {},
+     request(challenge_req("enrol", "sms", "+234 809 876 5432")))
+case("challenge_lan_value_noncanonical", "a LAN value whose Base64 is not canonical", {},
+     request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE)[:-1] + "B")))
+case("recover_challenge_id_noncanonical", "a challenge ID that is not canonical Base64 of 16 bytes", LOCKED,
+     request({**RECOVER_REQ, "challenge_id": "AAAA"}))
+case("enrol_lan_candidate_without_possession", "a LAN candidate needs a possession object", ENROL_CTX,
+     request(enrol_req(poss=None)))
+case("enrol_phone_candidate_with_possession", "a phone candidate carries no possession object", SMS_CTX,
+     request(enrol_req(SMS_CH, SMS_CAND, poss=possession(CANDIDATE, SMS_CH, "minted-c"))))
+case("enrol_authorization_wrong_v", "an authorization whose v is not the integer 1", ENROL_CTX,
+     request(enrol_req(auth={**authorization(OWNER, ENROL_CH, "owner-key"), "v": True})))
+
+# The caller.
+case("binding_unadmitted_peer", "a peer that is neither root nor the installed operator", {"peer_uid": 1002},
+     request(BINDING))
+case("binding_no_peer_credentials", "a connection whose peer credentials cannot be established",
+     {"peer_uid": None}, request(BINDING))
+case("binding_no_operator_installed", "without an installed operator identity only root is admitted",
+     {"operator_uid": None}, request(BINDING))
+case("binding_root_admitted", "root is admitted without an installed operator identity",
+     {"peer_uid": 0, "operator_uid": None}, request(BINDING))
+case("revoke_unadmitted_peer_locked_registry", "an unadmitted caller learns nothing of the registry's condition",
+     {"peer_uid": 1002, **LOCKED}, request(REVOKE_REQ))
+case("recover_unadmitted_peer", "an unadmitted caller consumes no challenge",
+     {"peer_uid": 1002, **LOCKED, "challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+case("unadmitted_peer_while_in_flight", "the caller is decided before serialisation",
+     {"peer_uid": 1002, "registry_operation_in_flight": True}, request(BINDING))
+
+# Serialisation.
+case("binding_while_in_flight", "another registry operation is in flight", {"registry_operation_in_flight": True},
+     request(BINDING))
+case("revoke_while_in_flight", "a valid revocation is refused while another registry operation is in flight",
+     {"registry_operation_in_flight": True}, request(REVOKE_REQ))
+case("enrol_while_in_flight", "a refusal for serialisation consumes no challenge",
+     {"registry_operation_in_flight": True, **ENROL_CTX}, request(enrol_req()))
+
+# Binding.
+case("binding", "the readback of the current binding", {}, request(BINDING))
+case("binding_locked", "a locked registry has no binding to read", LOCKED, request(BINDING))
+case("binding_site_changed", "a registry whose site binding differs from the verified site",
+     {"verified_site_id": "site-2"}, request(BINDING))
+
+# Challenge.
+case("challenge_recover", "first setup or recovery from a locked registry",
+     {**LOCKED, "minted": MINTED}, request(challenge_req("recover")))
+case("challenge_recover_initialized", "recovery is not available while the registry is initialized",
+     {"minted": MINTED}, request(challenge_req("recover")))
+case("challenge_local_seed", "a local seed challenge for an initialized registry with no active credential",
+     {"registry": registry(**EMPTY), "minted": MINTED},
+     request(challenge_req("local_seed", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_local_seed_phone", "a local seed candidate must be a LAN key",
+     {"registry": registry(**EMPTY), "minted": MINTED}, request(challenge_req("local_seed", "sms", "+2348098765432")))
+case("challenge_local_seed_active", "no local seed while a credential is active",
+     {"minted": MINTED}, request(challenge_req("local_seed", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_local_seed_locked", "no local seed for a locked registry",
+     {**LOCKED, "minted": MINTED}, request(challenge_req("local_seed", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_enrol_lan", "an enrolment challenge for a LAN candidate",
+     {"minted": MINTED}, request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_enrol_sms", "an enrolment challenge for an SMS candidate; the possession code is never answered",
+     {"minted": MINTED}, request(challenge_req("enrol", "sms", "+2348098765432")))
+case("challenge_enrol_whatsapp", "a WhatsApp candidate has no authenticated ingress and creates no challenge",
+     {"minted": MINTED}, request(challenge_req("enrol", "whatsapp", "+2348098765432")))
+case("challenge_enrol_whatsapp_locked", "a locked registry is refused before the channel is judged",
+     {**LOCKED, "minted": MINTED}, request(challenge_req("enrol", "whatsapp", "+2348098765432")))
+case("challenge_enrol_whatsapp_site_changed", "a site binding mismatch is refused before the channel is judged",
+     {"verified_site_id": "site-2", "minted": MINTED}, request(challenge_req("enrol", "whatsapp", "+2348098765432")))
+case("challenge_enrol_existing_approver", "an enrolment challenge whose new credential joins an existing approver",
+     {"minted": MINTED}, request(challenge_req("enrol", "sms", "+2348098765432", approver="owner")))
+case("challenge_enrol_revoked_approver", "an enrolment challenge naming an approver tombstoned in this epoch",
+     {"registry": registry(tombstoned_approvers=["gone"]), "minted": MINTED},
+     request(challenge_req("enrol", "sms", "+2348098765432", approver="gone")))
+case("challenge_enrol_unknown_approver", "an enrolment challenge naming no approver with an active credential",
+     {"minted": MINTED}, request(challenge_req("enrol", "sms", "+2348098765432", approver="nobody")))
+case("challenge_enrol_approver_id_absent", "an enrol candidate carries approver_id, null or a string", {},
+     request({**challenge_req("enrol"), "candidate": {"channel": "sms", "value": "+2348098765432"}}))
+case("challenge_local_seed_names_approver", "a local seed candidate names no approver", {"registry": registry(**EMPTY)},
+     request({**challenge_req("local_seed"), "candidate": {"approver_id": None, "channel": "lan_ed25519",
+                                                            "value": lan_value(CANDIDATE)}}))
+case("challenge_enrol_approver_id_invalid", "an approver ID outside its form", {},
+     request(challenge_req("enrol", "sms", "+2348098765432", approver="no spaces")))
+case("challenge_enrol_site_changed", "no challenge while the site binding differs",
+     {"verified_site_id": "site-2", "minted": MINTED},
+     request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_enrol_locked", "no enrolment challenge for a locked registry",
+     {**LOCKED, "minted": MINTED}, request(challenge_req("enrol", "sms", "+2348098765432")))
+
+# Recover.
+REC = {**LOCKED, "challenges": [held(RECOVER_CH, sequence=0)]}
+case("recover", "recovery commits an empty registry at revision 1", REC, request(RECOVER_REQ))
+case("recover_reused", "a challenge already presented", {**LOCKED, "challenges": [held(RECOVER_CH, "used", 0)]},
+     request(RECOVER_REQ))
+case("recover_unknown_challenge", "no pending challenge with this ID, as after a restart", LOCKED,
+     request(RECOVER_REQ))
+case("recover_expired", "a challenge past its deadline is consumed and refused",
+     {**LOCKED, "challenges": [held(RECOVER_CH, "expired", 0)]}, request(RECOVER_REQ))
+case("recover_with_enrol_challenge", "a challenge created for another operation",
+     {**LOCKED, "challenges": [held(ENROL_CH)]},
+     request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+case("recover_registry_initialized", "the registry was initialized after the challenge was created",
+     {"challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+case("recover_site_changed", "a site binding mismatch is decided before the challenge is read, and consumes nothing",
+     {"verified_site_id": "site-2", "challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+
+# Local seed.
+case("local_seed", "the first LAN credential of an empty registry", SEED_CTX, request(seed_req()))
+case("local_seed_candidate_changed", "a candidate that differs from the challenge's",
+     SEED_CTX, request(seed_req(cand={**SEED_CAND, "approver_id": "chosen"})))
+case("local_seed_stale", "the registry revision moved since the challenge",
+     {**SEED_CTX, "registry": registry(**{**EMPTY, "registry_revision": 3})}, request(seed_req()))
+case("local_seed_possession_wrong_digest", "a possession object over another challenge digest",
+     SEED_CTX, request(seed_req(poss=possession(CANDIDATE, SEED_CH, "minted-c", sha="0" * 64))))
+case("local_seed_bad_signature", "a possession signature that does not verify",
+     SEED_CTX, request(seed_req(poss={**possession(CANDIDATE, SEED_CH, "minted-c"),
+                                      "signature": flip(possession(CANDIDATE, SEED_CH, "minted-c")["signature"])})))
+case("local_seed_wrong_key", "a possession signed by a key other than the candidate's",
+     SEED_CTX, request(seed_req(poss=possession(SECOND, SEED_CH, "minted-c"))))
+TOMB_CAND = {**SEED_CAND, "value": lan_value(SECOND)}
+TOMB_CH = challenge(5, "local_seed", [TOMB_CAND], revision=2)
+case("local_seed_value_tombstoned", "a key tombstoned in this epoch cannot be seeded again",
+     {"registry": registry(**EMPTY), "challenges": [held(TOMB_CH, sequence=1)]},
+     request(seed_req(TOMB_CH, TOMB_CAND, possession(SECOND, TOMB_CH, "minted-c"))))
+REVOKED_APPROVER = {**SEED_CAND, "approver_id": "old-owner"}
+RA_CH = challenge(7, "local_seed", [REVOKED_APPROVER], revision=2)
+case("local_seed_approver_revoked", "defence in depth, a collision fixture: the challenge holds a minted approver "
+     "ID that is tombstoned in this epoch, which the runtime's CSPRNG does not produce",
+     {"registry": registry(**EMPTY), "challenges": [held(RA_CH, sequence=1)]},
+     request(seed_req(RA_CH, REVOKED_APPROVER)))
+REUSED_CRED = {**SEED_CAND, "credential_id": "old-key"}
+RC_CH = challenge(8, "local_seed", [REUSED_CRED], revision=2)
+case("local_seed_credential_reused", "defence in depth, a collision fixture: the challenge holds a minted "
+     "credential ID that is tombstoned in this epoch, which the runtime's CSPRNG does not produce",
+     {"registry": registry(**EMPTY), "challenges": [held(RC_CH, sequence=1)]},
+     request(seed_req(RC_CH, REUSED_CRED)))
+case("local_seed_locked", "a locked registry refuses after the challenge is consumed",
+     {**LOCKED, "challenges": [held(SEED_CH, sequence=1)]}, request(seed_req()))
+
+# Enrol.
+case("enrol_lan", "a LAN candidate authorised by an existing LAN approver", ENROL_CTX, request(enrol_req()))
+case("enrol_sms_pending", "a phone candidate is recorded pending its possession reply", SMS_CTX,
+     request(enrol_req(SMS_CH, SMS_CAND, poss=None)))
+case("enrol_lan_phone_authorizer", "a LAN candidate authorised by a phone approver's ORI-ENROL-V1 text",
+     {**ENROL_CTX, "phone_authorizations": [{"challenge_id": ENROL_CH["challenge_id"],
+                                             "challenge_sha256": digest(ENROL_CH),
+                                             "authorizer_credential_id": "owner-phone"}]},
+     request(enrol_req(auth=None)))
+case("enrol_phone_authorizer_absent", "no attributed phone authorisation was received", ENROL_CTX,
+     request(enrol_req(auth=None)))
+case("enrol_authorizer_unknown", "an authorization naming no active credential", ENROL_CTX,
+     request(enrol_req(auth=authorization(OWNER, ENROL_CH, "nobody"))))
+case("enrol_authorizer_is_phone", "an authorization object must name a LAN credential", ENROL_CTX,
+     request(enrol_req(auth=authorization(OWNER, ENROL_CH, "owner-phone"))))
+LATE = credential("late", "late-key", "lan_ed25519", lan_value(SECOND), 3)
+case("enrol_authorizer_not_preexisting", "defence in depth, a fixture: the registry holds a credential enrolled "
+     "after the challenge (sequence 3, issued at sequence 2) at the challenge's revision, a state challenge_stale "
+     "otherwise refuses first",
+     {"registry": registry(credentials=[OWNER_CRED, PHONE_CRED, LATE], credential_sequence=3),
+      "challenges": [held(ENROL_CH, sequence=2)]},
+     request(enrol_req(auth=authorization(SECOND, ENROL_CH, "late-key"))))
+case("enrol_authorizer_wrong_digest", "an authorization over another challenge digest", ENROL_CTX,
+     request(enrol_req(auth=authorization(OWNER, ENROL_CH, "owner-key", sha="0" * 64))))
+case("enrol_authorizer_wrong_key", "an authorization signed by a key other than the authorizer's", ENROL_CTX,
+     request(enrol_req(auth=authorization(SECOND, ENROL_CH, "owner-key"))))
+case("enrol_possession_bad_signature", "a candidate possession signature that does not verify", ENROL_CTX,
+     request(enrol_req(poss=possession(SECOND, ENROL_CH, "minted-c"))))
+case("enrol_possession_wrong_credential", "a possession naming another credential ID", ENROL_CTX,
+     request(enrol_req(poss=possession(CANDIDATE, ENROL_CH, "other-c"))))
+DUP_CAND = {**SMS_CAND, "value": PHONE_CRED["value"]}
+DUP_CH = challenge(6, "enrol", [DUP_CAND])
+case("enrol_duplicate_value", "a value already active under another credential", {"challenges": [held(DUP_CH)]},
+     request(enrol_req(DUP_CH, DUP_CAND, poss=None)))
+case("enrol_phone_pending_for_value", "a value with a pending phone operation",
+     {**SMS_CTX, "pending_phone_values": [SMS_CAND["value"]]}, request(enrol_req(SMS_CH, SMS_CAND, poss=None)))
+case("enrol_stale", "the registry revision moved since the challenge",
+     {**ENROL_CTX, "registry": registry(registry_revision=4)}, request(enrol_req()))
+case("enrol_locked", "a locked registry refuses after the challenge is consumed",
+     {**LOCKED, **ENROL_CTX}, request(enrol_req()))
+
+# Revoke.
+REVOKED_REG = registry(registry_revision=4, last_external_revision=1,
+                       last_external_document_sha256=hashlib.sha256(canonical(REVOKE_1)).hexdigest(),
+                       credentials=[OWNER_CRED], tombstoned_credentials=[tomb("owner-phone", "owner")],
+                       tombstoned_values=[PHONE_CRED["value"]])
+case("revoke_credential", "a credential target is removed", {}, request(REVOKE_REQ))
+case("revoke_approver", "an approver target removes every credential of that approver", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["approver:owner"])}))
+case("revoke_replayed", "the recorded document again, in another member order and whitespace",
+     {"registry": REVOKED_REG},
+     '{ "document": ' + json.dumps(dict(reversed(list(REVOKE_1.items()))), separators=(", ", " : "))
+     + ', "operation": "approver_registry_revoke" }')
+case("revoke_tombstoned_target", "a target already tombstoned stays tombstoned under a higher revision",
+     {"registry": REVOKED_REG}, request({**REVOKE_REQ, "document": revocation(2, ["credential:owner-phone"])}))
+case("revoke_revision_conflict", "the recorded revision with different signed members",
+     {"registry": REVOKED_REG}, request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-key"])}))
+case("revoke_revision_regressed", "a revision below the last external revision",
+     {"registry": registry(last_external_revision=5, last_external_document_sha256="0" * 64)},
+     request(REVOKE_REQ))
+case("revoke_unknown_target", "one unknown target refuses the whole document", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:never", "credential:owner-phone"])}))
+case("revoke_old_epoch", "a document for another identity epoch", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], epoch=OLD_EPOCH)}))
+case("revoke_other_site", "a document for another site", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], site="site-2")}))
+case("revoke_document_extra_member", "a document with a member the signed object does not have", {},
+     request({**REVOKE_REQ, "document": {**REVOKE_1, "add": ["credential:x"]}}))
+case("revoke_document_not_object", "a document that is not an object is malformed", {},
+     request({**REVOKE_REQ, "document": "credential:owner-phone"}))
+case("revoke_targets_unsorted", "targets out of order", {},
+     request({**REVOKE_REQ, "document": {**revocation(1, ["credential:owner-phone", "credential:owner-key"]),
+                                          "targets": ["credential:owner-phone", "credential:owner-key"]}}))
+case("revoke_revision_boolean", "a revision that is a boolean", {},
+     request({**REVOKE_REQ, "document": {**REVOKE_1, "revision": True}}))
+case("revoke_unknown_signer", "a signing key that matches no configured anchor", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], key=STRANGER)}))
+case("revoke_bad_signature", "a signature that does not verify", {},
+     request({**REVOKE_REQ, "document": {**REVOKE_1, "signature": flip(REVOKE_1["signature"])}}))
+case("revoke_previous_anchor", "a document signed by the previous provisioning anchor", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], key=PREVIOUS)}))
+case("revoke_other_class_anchor", "a document signed by an anchor of another class", {},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], key=OTHER_CLASS)}))
+case("revoke_anchor_unavailable", "no usable current provisioning anchor", {"anchor_available": False},
+     request(REVOKE_REQ))
+case("revoke_locked", "a locked registry", LOCKED, request(REVOKE_REQ))
+case("revoke_site_changed", "a registry whose site binding differs from the verified site",
+     {"verified_site_id": "site-2"}, request(REVOKE_REQ))
+
+
+# --- framing --------------------------------------------------------------------
+case("lf_inside_json", "an LF inside the JSON text cuts the request there; the bytes before it are not one object",
+     {}, '{"operation":\n"approver_registry_binding"}')
+case("bytes_after_lf_ignored", "the bytes after the first LF are not read", {},
+     request(BINDING) + "\n" + '{"operation":"approver_registry_add"}')
+MULTI = {"operation": "approver_registry_binding", "x": ""}
+MULTI_TEXT = request(MULTI)
+MULTI_REQ = MULTI_TEXT[:-2] + "é" * (BOUND - len(MULTI_TEXT)) + '"}'
+assert len(MULTI_REQ) == BOUND and len(MULTI_REQ.encode("utf-8")) > BOUND
+case("bound_counts_bytes", "16,384 characters of which some are two UTF-8 bytes exceed the bound", {}, MULTI_REQ)
+
+# --- common order ------------------------------------------------------------
+case("no_verified_site_binding", "no verified device.site_id: every registry operation is registry_unavailable",
+     {"verified_site_id": None}, request(BINDING))
+case("no_verified_site_challenge", "no verified device.site_id refuses a challenge before its table",
+     {"verified_site_id": None, **LOCKED}, request(challenge_req("recover")))
+case("no_verified_site_before_site_mismatch", "no verified site is decided before site_binding_mismatch",
+     {"verified_site_id": None, **ENROL_CTX}, request(enrol_req()))
+case("order_payload_first", "over the bound, a member named twice, unadmitted and busy: the bound decides",
+     {"peer_uid": 1002, "registry_operation_in_flight": True, "verified_site_id": None},
+     padded_text('{"operation":"approver_registry_binding","operation":"approver_registry_binding"}', BOUND + 1))
+case("order_members_before_caller", "a member named twice, unadmitted, busy and no site: members decide",
+     {"peer_uid": 1002, "registry_operation_in_flight": True, "verified_site_id": None},
+     '{"operation":"approver_registry_binding","operation":"approver_registry_binding"}')
+case("order_caller_before_busy", "unadmitted, busy and no site: the caller decides",
+     {"peer_uid": 1002, "registry_operation_in_flight": True, "verified_site_id": None}, request(BINDING))
+case("order_busy_before_site", "busy and no site: serialisation decides",
+     {"registry_operation_in_flight": True, "verified_site_id": None}, request(BINDING))
+
+# --- challenge table order ---------------------------------------------------
+PHONE_X = "+2348098765432"
+NEG_SECOND = "ed25519:" + b64(negated(raw_public(SECOND)))
+THIRD = seeded_key("third LAN credential")
+NEG_CRED = credential("other", "neg-key", "lan_ed25519", NEG_SECOND, 2)
+TOMB_LAN = dict(credentials=[OWNER_CRED, NEG_CRED], tombstoned_values=[lan_value(SECOND)],
+                tombstoned_approvers=["gone"], tombstoned_credentials=[tomb("old-key", "gone")])
+case("ch_order_lan_key_required", "lan_key_required decides over a site mismatch, an active credential, a "
+     "tombstoned value and a pending phone value",
+     {"verified_site_id": "site-2", "registry": registry(tombstoned_values=[PHONE_X]),
+      "pending_phone_values": [PHONE_X]}, request(challenge_req("local_seed", "sms", PHONE_X)))
+case("ch_order_site_binding_mismatch", "site_binding_mismatch decides over a whatsapp candidate, a tombstoned "
+     "approver, a tombstoned value and a pending value",
+     {"verified_site_id": "site-2", "registry": registry(tombstoned_values=[PHONE_X], tombstoned_approvers=["gone"]),
+      "pending_phone_values": [PHONE_X]}, request(challenge_req("enrol", "whatsapp", PHONE_X, approver="gone")))
+case("ch_order_registry_unavailable", "a locked registry decides over a whatsapp candidate, an unknown approver "
+     "and a pending value", {**LOCKED, "pending_phone_values": [PHONE_X]},
+     request(challenge_req("enrol", "whatsapp", PHONE_X, approver="nobody")))
+case("ch_order_channel_unauthenticated", "channel_unauthenticated decides over a tombstoned approver, a tombstoned "
+     "value and a pending value",
+     {"registry": registry(tombstoned_values=[PHONE_X], tombstoned_approvers=["gone"]),
+      "pending_phone_values": [PHONE_X]}, request(challenge_req("enrol", "whatsapp", PHONE_X, approver="gone")))
+case("ch_order_active_authorizer_exists", "active_authorizer_exists decides over a key that is tombstoned and "
+     "active, each up to bit 255", {"registry": registry(**TOMB_LAN)},
+     request(challenge_req("local_seed", "lan_ed25519", lan_value(SECOND))))
+case("ch_order_approver_revoked", "approver_revoked decides over a tombstoned and active key",
+     {"registry": registry(**TOMB_LAN)}, request(challenge_req("enrol", "lan_ed25519", lan_value(SECOND),
+                                                                approver="gone")))
+case("ch_order_approver_unknown", "approver_unknown decides over a tombstoned and active key",
+     {"registry": registry(**TOMB_LAN)}, request(challenge_req("enrol", "lan_ed25519", lan_value(SECOND),
+                                                                approver="nobody")))
+case("ch_order_value_tombstoned_lan", "value_tombstoned decides over the same key active as its negation",
+     {"registry": registry(**TOMB_LAN)}, request(challenge_req("enrol", "lan_ed25519", lan_value(SECOND))))
+case("ch_order_value_tombstoned_phone", "value_tombstoned decides over a pending value",
+     {"registry": registry(tombstoned_values=[PHONE_X]), "pending_phone_values": [PHONE_X]},
+     request(challenge_req("enrol", "sms", PHONE_X)))
+case("ch_value_tombstoned_negated_key", "a LAN candidate equal to a tombstoned key up to bit 255 is tombstoned",
+     {"registry": registry(tombstoned_values=[lan_value(SECOND)])},
+     request(challenge_req("enrol", "lan_ed25519", NEG_SECOND)))
+case("ch_order_duplicate_value", "duplicate_value decides over a pending value",
+     {"pending_phone_values": [PHONE_CRED["value"]]}, request(challenge_req("enrol", "sms", PHONE_CRED["value"])))
+case("ch_duplicate_value_other_phone_channel", "a fixture: an sms candidate whose number is active as whatsapp; "
+     "phone values compare by number alone. v1 enrols no whatsapp credential, so the runtime reaches this state "
+     "only through a later authenticated whatsapp ingress",
+     {"registry": registry(credentials=[OWNER_CRED, credential("owner", "owner-wa", "whatsapp", PHONE_X, 2)])},
+     request(challenge_req("enrol", "sms", PHONE_X)))
+case("ch_duplicate_value_negated_key", "a LAN candidate active as its negation is a duplicate",
+     {"registry": registry(credentials=[OWNER_CRED, NEG_CRED])},
+     request(challenge_req("enrol", "lan_ed25519", lan_value(SECOND))))
+case("ch_phone_pending_for_value", "a phone value with a pending phone operation creates no challenge",
+     {"pending_phone_values": [PHONE_X]}, request(challenge_req("enrol", "sms", PHONE_X)))
+
+# --- challenges presented order ------------------------------------------------
+case("cp_order_site_binding_mismatch", "site_binding_mismatch decides over a used challenge for another operation",
+     {"verified_site_id": "site-2", "challenges": [held(ENROL_CH, "used")]},
+     request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+case("cp_order_challenge_reused", "challenge_reused decides over a challenge for another operation",
+     {"challenges": [held(ENROL_CH, "used")]}, request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+case("cp_order_challenge_expired", "challenge_expired decides over a challenge for another operation",
+     {"challenges": [held(ENROL_CH, "expired")]}, request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+case("cp_order_candidate_changed", "candidate_changed decides over an initialized registry and a stale site",
+     {"challenges": [held(ENROL_CH)]}, request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+
+# --- recover order -------------------------------------------------------------
+STALE_RECOVER_CH = {**RECOVER_CH, "site_id": "site-0"}
+case("rc_order_recovery_not_available", "recovery_not_available decides over a challenge for another site",
+     {"challenges": [held(STALE_RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+case("recover_stale_site", "a recover challenge whose site is not the verified site",
+     {**LOCKED, "challenges": [held(STALE_RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+
+# --- local seed order ----------------------------------------------------------
+BAD_CAND = {"approver_id": "gone", "credential_id": "old-key", "channel": "lan_ed25519", "value": lan_value(SECOND)}
+
+
+def seed_fixture(n: int, cand: dict, revision: int = 3) -> dict:
+    return challenge(n, "local_seed", [cand], revision=revision)
+
+
+LS_CH = seed_fixture(20, BAD_CAND)
+LS_WRONG = possession(SECOND, LS_CH, "old-key", sha="0" * 64)
+case("ls_order_registry_unavailable", "a locked registry decides over a possession for another digest",
+     {**LOCKED, "challenges": [held(LS_CH)]}, request(seed_req(LS_CH, BAD_CAND, LS_WRONG)))
+case("ls_order_challenge_stale", "challenge_stale decides over every later row: an active credential, a "
+     "possession for another digest, a tombstoned approver, credential ID and value, and an active value",
+     {"registry": registry(registry_revision=4, **TOMB_LAN), "challenges": [held(LS_CH)]},
+     request(seed_req(LS_CH, BAD_CAND, LS_WRONG)))
+case("ls_order_active_authorizer_exists", "defence in depth, a fixture: an active credential at the challenge's "
+     "revision; it decides over every later row",
+     {"registry": registry(**TOMB_LAN), "challenges": [held(LS_CH)]}, request(seed_req(LS_CH, BAD_CAND, LS_WRONG)))
+TOMB_EMPTY = dict(registry_revision=3, credentials=[], tombstoned_values=[lan_value(SECOND)],
+                  tombstoned_approvers=["gone"], tombstoned_credentials=[tomb("old-key", "gone")])
+case("ls_order_possession_invalid", "possession_invalid decides over a tombstoned approver, credential ID and value",
+     {"registry": registry(**TOMB_EMPTY), "challenges": [held(LS_CH)]},
+     request(seed_req(LS_CH, BAD_CAND, LS_WRONG)))
+case("ls_order_signature_invalid", "signature_invalid decides over a tombstoned approver, credential ID and value",
+     {"registry": registry(**TOMB_EMPTY), "challenges": [held(LS_CH)]},
+     request(seed_req(LS_CH, BAD_CAND, possession(OWNER, LS_CH, "old-key"))))
+case("ls_order_approver_revoked", "defence in depth, a collision fixture: approver_revoked decides over a "
+     "tombstoned credential ID and value",
+     {"registry": registry(**TOMB_EMPTY), "challenges": [held(LS_CH)]},
+     request(seed_req(LS_CH, BAD_CAND, possession(SECOND, LS_CH, "old-key"))))
+LS_CH2 = seed_fixture(21, {**BAD_CAND, "approver_id": "fresh"})
+case("ls_order_credential_reused", "defence in depth, a collision fixture: credential_reused decides over a "
+     "tombstoned value", {"registry": registry(**TOMB_EMPTY), "challenges": [held(LS_CH2)]},
+     request(seed_req(LS_CH2, {**BAD_CAND, "approver_id": "fresh"}, possession(SECOND, LS_CH2, "old-key"))))
+LS_CAND3 = {**BAD_CAND, "approver_id": "fresh", "credential_id": "fresh-c"}
+LS_CH3 = seed_fixture(22, LS_CAND3)
+case("ls_value_tombstoned", "defence in depth, a fixture: a value tombstoned at the challenge's revision",
+     {"registry": registry(**TOMB_EMPTY), "challenges": [held(LS_CH3)]},
+     request(seed_req(LS_CH3, LS_CAND3, possession(SECOND, LS_CH3, "fresh-c"))))
+for label, bad, scalar in (("small_order", EIGHT_TORSION_KEY, 0),
+                           ("mixed_order", mixed_order(raw_public(CANDIDATE)), seed_scalar("candidate LAN credential")),
+                           ("noncanonical", NONCANONICAL_KEY, None)):
+    cand_bad = {**SEED_CAND, "value": "ed25519:" + b64(bad)}
+    ch_bad = challenge(30 + len(label), "local_seed", [cand_bad], revision=2)
+    unsigned = {"v": 1, "challenge_id": ch_bad["challenge_id"], "challenge_sha256": digest(ch_bad),
+                "candidate_credential_id": "minted-c"}
+    poss_bad = (possession(CANDIDATE, ch_bad, "minted-c") if scalar is None else
+                sign_ground(scalar, bad, b"ori.tier_c_approver.possession.v1", unsigned))
+    case(f"ls_candidate_key_{label}",
+         f"a candidate key that fails ed25519-key-admission/v1 ({label.replace('_', ' ')})"
+         + ("" if scalar is None else "; its possession satisfies the cofactorless equation, so admission "
+            "alone refuses it"),
+         {"registry": registry(**EMPTY), "challenges": [held(ch_bad, sequence=1)]},
+         request(seed_req(ch_bad, cand_bad, poss_bad)))
+
+# --- enrol order ---------------------------------------------------------------
+LATE3 = credential("late", "late-key", "lan_ed25519", lan_value(THIRD), 3)
+E_CH = challenge(40, "enrol", [BAD_CAND])
+E_POSS_WRONG = possession(SECOND, E_CH, "old-key", sha="0" * 64)
+E_AUTH_WRONG = authorization(THIRD, E_CH, "late-key", sha="0" * 64)
+E_REG = dict(credentials=[OWNER_CRED, NEG_CRED, LATE3], credential_sequence=3, tombstoned_values=[lan_value(SECOND)],
+             tombstoned_approvers=["gone"], tombstoned_credentials=[tomb("old-key", "gone")])
+case("en_order_registry_unavailable", "a locked registry decides over a missing authorizer and a possession for "
+     "another digest", {**LOCKED, "challenges": [held(E_CH)]},
+     request(enrol_req(E_CH, BAD_CAND, authorization(OWNER, E_CH, "nobody"), E_POSS_WRONG)))
+case("en_order_challenge_stale", "challenge_stale decides over every later row",
+     {"registry": registry(registry_revision=4, **E_REG), "challenges": [held(E_CH)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH_WRONG, E_POSS_WRONG)))
+case("en_order_authorizer_unavailable", "authorizer_unavailable decides over a possession for another digest and "
+     "a tombstoned approver, credential ID and value", {"registry": registry(**E_REG), "challenges": [held(E_CH)]},
+     request(enrol_req(E_CH, BAD_CAND, authorization(OWNER, E_CH, "nobody"), E_POSS_WRONG)))
+case("en_order_authorizer_not_preexisting", "defence in depth, a fixture: a credential enrolled after the "
+     "challenge at its revision decides over every later row",
+     {"registry": registry(**E_REG), "challenges": [held(E_CH, sequence=2)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH_WRONG, E_POSS_WRONG)))
+case("en_order_signature_invalid_authorization", "an authorization for another digest decides over every later row",
+     {"registry": registry(**E_REG), "challenges": [held(E_CH, sequence=3)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH_WRONG, E_POSS_WRONG)))
+E_AUTH = authorization(THIRD, E_CH, "late-key")
+case("en_order_possession_invalid", "possession_invalid decides over a tombstoned approver, credential ID and "
+     "value and an active value", {"registry": registry(**E_REG), "challenges": [held(E_CH, sequence=3)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH, E_POSS_WRONG)))
+case("en_order_signature_invalid_possession", "a possession that does not verify decides over every later row",
+     {"registry": registry(**E_REG), "challenges": [held(E_CH, sequence=3)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH, possession(OWNER, E_CH, "old-key"))))
+case("en_order_approver_revoked", "defence in depth, a fixture: approver_revoked decides over a tombstoned "
+     "credential ID and value and an active value",
+     {"registry": registry(**E_REG), "challenges": [held(E_CH, sequence=3)]},
+     request(enrol_req(E_CH, BAD_CAND, E_AUTH, possession(SECOND, E_CH, "old-key"))))
+E_CAND2 = {**BAD_CAND, "approver_id": "fresh"}
+E_CH2 = challenge(41, "enrol", [E_CAND2])
+case("en_order_credential_reused", "defence in depth, a collision fixture: credential_reused decides over a "
+     "tombstoned and active value", {"registry": registry(**E_REG), "challenges": [held(E_CH2, sequence=3)]},
+     request(enrol_req(E_CH2, E_CAND2, authorization(THIRD, E_CH2, "late-key"), possession(SECOND, E_CH2, "old-key"))))
+E_CAND3 = {**E_CAND2, "credential_id": "fresh-c"}
+E_CH3 = challenge(42, "enrol", [E_CAND3])
+case("en_order_value_tombstoned", "defence in depth, a fixture: value_tombstoned decides over the same key active",
+     {"registry": registry(**E_REG), "challenges": [held(E_CH3, sequence=3)]},
+     request(enrol_req(E_CH3, E_CAND3, authorization(THIRD, E_CH3, "late-key"), possession(SECOND, E_CH3, "fresh-c"))))
+E_CAND4 = {"approver_id": "fresh", "credential_id": "fresh-c", "channel": "sms", "value": PHONE_CRED["value"]}
+E_CH4 = challenge(43, "enrol", [E_CAND4])
+case("en_order_duplicate_value", "defence in depth, a fixture: duplicate_value decides over a pending value",
+     {"challenges": [held(E_CH4)], "pending_phone_values": [PHONE_CRED["value"]]},
+     request(enrol_req(E_CH4, E_CAND4, poss=None)))
+E_CH5 = challenge(44, "enrol", [{**SEED_CAND}], epoch=OLD_EPOCH)
+case("enrol_stale_epoch_only", "only the identity epoch differs from the challenge's",
+     {"challenges": [held(E_CH5)]}, request(enrol_req(E_CH5)))
+case("enrol_phone_authorization_other_challenge", "an ORI-ENROL-V1 text recorded for a different challenge",
+     {**ENROL_CTX, "phone_authorizations": [{"challenge_id": SMS_CH["challenge_id"],
+                                             "challenge_sha256": digest(SMS_CH),
+                                             "authorizer_credential_id": "owner-phone"}]},
+     request(enrol_req(auth=None)))
+
+# --- revoke order ----------------------------------------------------------------
+BELOW_REG = registry(last_external_revision=5, last_external_document_sha256="0" * 64)
+WIDE = dict(verified_site_id="site-2", registry=BELOW_REG)
+TARGET_X = ["credential:never"]
+case("rv_order_anchor_unavailable", "anchor_unavailable decides over a previous signer, a site mismatch, another "
+     "epoch, a lower revision and an unknown target",
+     {**WIDE, "anchor_available": False},
+     request({**REVOKE_REQ, "document": revocation(1, TARGET_X, key=PREVIOUS, epoch=OLD_EPOCH)}))
+case("rv_anchors_collide", "a current anchor recognised as another configured anchor (its negation) is unusable",
+     {"anchors": {"current": b64(raw_public(PROVISIONING)), "previous": b64(raw_public(PREVIOUS)),
+                  "other_class": b64(negated(raw_public(PROVISIONING)))}}, request(REVOKE_REQ))
+case("rv_order_malformed", "malformed decides over a locked registry", LOCKED,
+     request({**REVOKE_REQ, "document": sign(PROVISIONING, b"ori.tier_c_approver.revoke.v1",
+                                             {k: v for k, v in REVOKE_1.items()
+                                              if k not in ("signature", "revision")})}))
+case("rv_order_unknown_signer", "unknown_signer decides over a site mismatch, another epoch, a lower revision "
+     "and an unknown target", WIDE,
+     request({**REVOKE_REQ, "document": revocation(1, TARGET_X, key=STRANGER, epoch=OLD_EPOCH)}))
+PREV_DOC = revocation(1, TARGET_X, key=PREVIOUS, epoch=OLD_EPOCH)
+case("rv_order_signature_invalid", "signature_invalid decides over a previous signer and every later row", WIDE,
+     request({**REVOKE_REQ, "document": {**PREV_DOC, "signature": flip(PREV_DOC["signature"])}}))
+case("rv_order_superseded_signer", "superseded_signer decides over every later row", WIDE,
+     request({**REVOKE_REQ, "document": PREV_DOC}))
+case("rv_order_wrong_authority", "wrong_authority decides over every later row", WIDE,
+     request({**REVOKE_REQ, "document": revocation(1, TARGET_X, key=OTHER_CLASS, epoch=OLD_EPOCH)}))
+case("rv_order_site_binding_mismatch", "site_binding_mismatch decides over another epoch, a lower revision and "
+     "an unknown target", WIDE, request({**REVOKE_REQ, "document": revocation(1, TARGET_X, epoch=OLD_EPOCH)}))
+case("rv_order_binding_mismatch", "binding_mismatch decides over a lower revision and an unknown target",
+     {"registry": BELOW_REG}, request({**REVOKE_REQ, "document": revocation(1, TARGET_X, epoch=OLD_EPOCH)}))
+case("rv_order_revision_regressed", "revision_regressed decides over an unknown target", {"registry": BELOW_REG},
+     request({**REVOKE_REQ, "document": revocation(1, TARGET_X)}))
+PREV_RECORDED = revocation(1, ["credential:owner-phone"], key=PREVIOUS)
+case("rv_replay_by_previous_anchor", "the recorded document, signed by an anchor that is now the previous one, "
+     "is superseded_signer: replay is decided after the signer",
+     {"registry": registry(registry_revision=4, last_external_revision=1,
+                           last_external_document_sha256=hashlib.sha256(canonical(PREV_RECORDED)).hexdigest(),
+                           credentials=[OWNER_CRED], tombstoned_credentials=[tomb("owner-phone", "owner")],
+                           tombstoned_values=[PHONE_CRED["value"]])},
+     request({**REVOKE_REQ, "document": PREV_RECORDED}))
+NEG_PREV_KEY = "ed25519:" + b64(negated(raw_public(PREVIOUS)))
+NEG_CUR_KEY = "ed25519:" + b64(negated(raw_public(PROVISIONING)))
+
+
+def negated_revocation(label: str, signing_key: str, targets: list) -> dict:
+    return sign_negated(label, b"ori.tier_c_approver.revoke.v1", {
+        "v": 1, "device_id": DEVICE_ID, "site_id": SITE_ID, "identity_epoch": EPOCH, "revision": 1,
+        "targets": targets, "signing_key": signing_key})
+
+
+case("rv_negated_previous_anchor", "the previous anchor's negation is the previous anchor", {},
+     request({**REVOKE_REQ, "document": negated_revocation("previous provisioning anchor", NEG_PREV_KEY,
+                                                           ["credential:owner-phone"])}))
+case("rv_negated_current_anchor", "the current anchor's negation is the current anchor; its holder signs under it",
+     {}, request({**REVOKE_REQ, "document": negated_revocation("current provisioning anchor", NEG_CUR_KEY,
+                                                               ["credential:owner-phone"])}))
+for label, bad in (("small_order", SMALL_ORDER_KEY), ("mixed_order", mixed_order(raw_public(PROVISIONING))),
+                   ("noncanonical", NONCANONICAL_KEY)):
+    doc = {**REVOKE_1, "signing_key": "ed25519:" + b64(bad)}
+    case(f"rv_signing_key_{label}", f"a signing key that fails ed25519-key-admission/v1 ({label.replace('_', ' ')}) "
+         "is recognised as no anchor", {}, request({**REVOKE_REQ, "document": doc}))
+
+
+def signed_doc(**changes: object) -> dict:
+    unsigned = {k: v for k, v in REVOKE_1.items() if k != "signature"}
+    unsigned.update(changes)
+    return sign(PROVISIONING, b"ori.tier_c_approver.revoke.v1", unsigned)
+
+
+def noncanonical(value: str) -> str:
+    """The same bytes with nonzero padding bits: Base64 that decodes but is not canonical."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    head, pad = value.rstrip("="), value[len(value.rstrip("=")):]
+    return head[:-1] + alphabet[alphabet.index(head[-1]) + 1] + pad
+
+
+for label, doc in (
+    ("missing_member", sign(PROVISIONING, b"ori.tier_c_approver.revoke.v1",
+                            {k: v for k, v in REVOKE_1.items() if k not in ("signature", "site_id")})),
+    ("v_not_1", signed_doc(v=2)),
+    ("targets_empty", signed_doc(targets=[])),
+    ("targets_repeated", signed_doc(targets=["credential:owner-phone", "credential:owner-phone"])),
+    ("targets_over_32", signed_doc(targets=sorted(f"credential:t{i:02d}" for i in range(33)))),
+    ("target_badly_formed", signed_doc(targets=["phone:owner-phone"])),
+    ("identity_epoch_noncanonical", signed_doc(identity_epoch=noncanonical(EPOCH))),
+    ("signing_key_noncanonical",
+     {**signed_doc(), "signing_key": "ed25519:" + noncanonical(b64(raw_public(PROVISIONING)))}),
+    ("signature_noncanonical", {**REVOKE_1, "signature": noncanonical(REVOKE_1["signature"])}),
+):
+    case(f"rv_malformed_{label}", f"a malformed document: {label.replace('_', ' ')}; signed where its form allows",
+         {}, request({**REVOKE_REQ, "document": doc}))
+
+# --- ruled representability -----------------------------------------------------
+case("eof_before_lf", "the connection ends after a whole JSON object with no LF", {}, request(BINDING),
+     terminated=False)
+GHOST_REG = registry(tombstoned_credentials=[tomb("ghost-key", "ghost")])
+case("rv_approver_known_through_tombstone", "an approver known only through a tombstoned credential's approver ID "
+     "is a known target", {"registry": GHOST_REG},
+     request({**REVOKE_REQ, "document": revocation(1, ["approver:ghost"])}))
+case("rv_approver_unknown_target", "an approver neither active nor tombstoned in any form is unknown",
+     {"registry": GHOST_REG}, request({**REVOKE_REQ, "document": revocation(1, ["approver:never"])}))
+BAD_AUTH_KEY = b64(mixed_order(raw_public(OWNER)))
+BAD_AUTH = credential("owner", "bad-auth", "lan_ed25519", "ed25519:" + BAD_AUTH_KEY, 1)
+case("en_authorizer_key_fails_admission", "a fixture: an active LAN authorizer whose key fails "
+     "ed25519-key-admission/v1 (mixed order); its authorization satisfies the cofactorless equation, so "
+     "admission alone refuses it",
+     {"registry": registry(credentials=[BAD_AUTH, PHONE_CRED]), "challenges": [held(ENROL_CH)],
+      "keys_failing_admission": [BAD_AUTH_KEY]},
+     request(enrol_req(auth=sign_ground(
+         seed_scalar("owner LAN credential"), base64.b64decode(BAD_AUTH_KEY), b"ori.tier_c_approver.enrol.v1",
+         {"v": 1, "challenge_id": ENROL_CH["challenge_id"], "challenge_sha256": digest(ENROL_CH),
+          "authorizer_credential_id": "bad-auth"}))))
+BAD_PREVIOUS = mixed_order(raw_public(PREVIOUS))
+case("rv_previous_anchor_fails_admission", "a fixture: a configured previous anchor that fails "
+     "ed25519-key-admission/v1 (mixed order); the document satisfies the cofactorless equation, so admission "
+     "alone refuses it, at signature_invalid before superseded_signer",
+     {"anchors": {"current": b64(raw_public(PROVISIONING)), "previous": b64(BAD_PREVIOUS),
+                  "other_class": b64(raw_public(OTHER_CLASS))}, "keys_failing_admission": [b64(BAD_PREVIOUS)]},
+     request({**REVOKE_REQ, "document": sign_ground(
+         seed_scalar("previous provisioning anchor"), BAD_PREVIOUS, b"ori.tier_c_approver.revoke.v1",
+         {"v": 1, "device_id": DEVICE_ID, "site_id": SITE_ID, "identity_epoch": EPOCH, "revision": 1,
+          "targets": ["credential:owner-phone"], "signing_key": "ed25519:" + b64(BAD_PREVIOUS)})}))
+BAD_ANCHOR = b64(mixed_order(raw_public(PROVISIONING)))
+case("rv_current_anchor_fails_admission", "a fixture: a configured current anchor that fails "
+     "ed25519-key-admission/v1 (mixed order) is unusable",
+     {"anchors": {"current": BAD_ANCHOR, "previous": b64(raw_public(PREVIOUS)),
+                  "other_class": b64(raw_public(OTHER_CLASS))}, "keys_failing_admission": [BAD_ANCHOR]},
+     request(REVOKE_REQ))
+
+# --- order witnesses -------------------------------------------------------------
+case("w_ch_site_over_recovery_not_available", "site_binding_mismatch decides while recovery_not_available also "
+     "fails", {"verified_site_id": "site-2"}, request(challenge_req("recover")))
+case("w_ch_lan_key_over_registry_unavailable", "lan_key_required decides while the registry is locked", LOCKED,
+     request(challenge_req("local_seed", "sms", PHONE_X)))
+case("w_ch_site_over_active_authorizer", "site_binding_mismatch decides while active_authorizer_exists also fails",
+     {"verified_site_id": "site-2"}, request(challenge_req("local_seed", "lan_ed25519", lan_value(CANDIDATE))))
+case("w_ch_channel_over_approver_unknown", "channel_unauthenticated decides while approver_unknown also fails", {},
+     request(challenge_req("enrol", "whatsapp", PHONE_X, approver="nobody")))
+SEED_BAD_SIG = possession(OWNER, SEED_CH, "minted-c")
+case("w_ls_registry_unavailable_over_signature", "a locked registry decides while the possession signature fails",
+     {**LOCKED, "challenges": [held(SEED_CH, sequence=1)]}, request(seed_req(poss=SEED_BAD_SIG)))
+case("w_ls_stale_over_signature", "challenge_stale decides while the possession signature fails",
+     {**SEED_CTX, "registry": registry(**{**EMPTY, "registry_revision": 3})}, request(seed_req(poss=SEED_BAD_SIG)))
+case("w_ls_active_over_signature", "defence in depth, a fixture: active_authorizer_exists decides while the "
+     "possession signature fails", {"registry": registry(registry_revision=2), "challenges": [held(SEED_CH)]},
+     request(seed_req(poss=SEED_BAD_SIG)))
+case("w_ls_possession_invalid_over_signature", "possession_invalid decides while the possession signature fails",
+     SEED_CTX, request(seed_req(poss=possession(OWNER, SEED_CH, "minted-c", sha="0" * 64))))
+ENROL_BAD_POSS = possession(SECOND, ENROL_CH, "minted-c")
+LATE_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, LATE3], credential_sequence=3)
+case("w_en_registry_unavailable_over_signature", "a locked registry decides while the possession signature fails",
+     {**LOCKED, **ENROL_CTX}, request(enrol_req(poss=ENROL_BAD_POSS)))
+case("w_en_stale_over_signature", "challenge_stale decides while the possession signature fails",
+     {**ENROL_CTX, "registry": registry(registry_revision=4)}, request(enrol_req(poss=ENROL_BAD_POSS)))
+case("w_en_stale_over_authorizer_unavailable", "challenge_stale decides while authorizer_unavailable also fails",
+     {**ENROL_CTX, "registry": registry(registry_revision=4)},
+     request(enrol_req(auth=authorization(OWNER, ENROL_CH, "nobody"))))
+case("w_en_authorizer_unavailable_over_signature", "authorizer_unavailable decides while the possession signature "
+     "fails", ENROL_CTX, request(enrol_req(auth=authorization(OWNER, ENROL_CH, "nobody"), poss=ENROL_BAD_POSS)))
+case("w_en_not_preexisting_over_signature", "defence in depth, a fixture: authorizer_not_preexisting decides while "
+     "the possession signature fails", {"registry": LATE_REG, "challenges": [held(ENROL_CH, sequence=2)]},
+     request(enrol_req(auth=authorization(THIRD, ENROL_CH, "late-key"), poss=ENROL_BAD_POSS)))
+case("w_en_authorization_signature_over_possession_signature", "the authorization's signature_invalid decides "
+     "while the possession signature also fails", ENROL_CTX,
+     request(enrol_req(auth=authorization(SECOND, ENROL_CH, "owner-key"), poss=ENROL_BAD_POSS)))
+case("w_en_possession_invalid_over_signature", "possession_invalid decides while the possession signature fails",
+     ENROL_CTX, request(enrol_req(poss=possession(SECOND, ENROL_CH, "minted-c", sha="0" * 64))))
+
+CONFLICT_REG = registry(last_external_revision=1,
+                        last_external_document_sha256=hashlib.sha256(canonical(REVOKE_1)).hexdigest())
+OTHER_1 = ["credential:owner-key"]
+
+
+def conflict_case(name: str, note: str, context: dict, doc: dict) -> None:
+    case(name, note + " while revision_conflict would also fail", {"registry": CONFLICT_REG, **context},
+         request({**REVOKE_REQ, "document": doc}))
+
+
+conflict_case("w_rv_anchor_over_conflict", "anchor_unavailable decides", {"anchor_available": False},
+              revocation(1, OTHER_1))
+conflict_case("w_rv_malformed_over_conflict", "malformed decides", {},
+              {**revocation(1, OTHER_1), "add": ["credential:x"]})
+conflict_case("w_rv_unknown_signer_over_conflict", "unknown_signer decides", {}, revocation(1, OTHER_1, key=STRANGER))
+OTHER_DOC = revocation(1, OTHER_1)
+conflict_case("w_rv_signature_over_conflict", "signature_invalid decides", {},
+              {**OTHER_DOC, "signature": flip(OTHER_DOC["signature"])})
+conflict_case("w_rv_superseded_over_conflict", "superseded_signer decides", {}, revocation(1, OTHER_1, key=PREVIOUS))
+conflict_case("w_rv_wrong_authority_over_conflict", "wrong_authority decides", {},
+              revocation(1, OTHER_1, key=OTHER_CLASS))
+conflict_case("w_rv_site_over_conflict", "site_binding_mismatch decides", {"verified_site_id": "site-2"},
+              revocation(1, OTHER_1))
+conflict_case("w_rv_binding_over_conflict", "binding_mismatch decides", {}, revocation(1, OTHER_1, epoch=OLD_EPOCH))
+OC_DOC = revocation(1, ["credential:owner-phone"], key=OTHER_CLASS)
+case("w_rv_anchor_over_wrong_authority", "anchor_unavailable decides while wrong_authority would also fail",
+     {"anchor_available": False}, request({**REVOKE_REQ, "document": OC_DOC}))
+case("w_rv_malformed_over_wrong_authority", "malformed decides while wrong_authority would also fail", {},
+     request({**REVOKE_REQ, "document": {**OC_DOC, "add": ["credential:x"]}}))
+case("w_rv_signature_over_wrong_authority", "signature_invalid decides while wrong_authority would also fail", {},
+     request({**REVOKE_REQ, "document": {**OC_DOC, "signature": flip(OC_DOC["signature"])}}))
+for label, doc in (("unknown_signer", revocation(1, ["credential:owner-phone"], key=STRANGER)),
+                   ("signature", {**REVOKE_1, "signature": flip(REVOKE_1["signature"])}),
+                   ("superseded", revocation(1, ["credential:owner-phone"], key=PREVIOUS)),
+                   ("wrong_authority", OC_DOC)):
+    case(f"w_rv_{label}_over_locked", f"the {label.replace('_', ' ')} row decides while the registry is locked",
+         LOCKED, request({**REVOKE_REQ, "document": doc}))
+case("w_rv_anchor_over_malformed", "anchor_unavailable decides while the document is malformed",
+     {"anchor_available": False}, request({**REVOKE_REQ, "document": {**REVOKE_1, "add": ["credential:x"]}}))
+
+# --- no verified site, and a stale device -----------------------------------------
+case("recover_no_verified_site", "no verified device.site_id refuses a recover and consumes nothing",
+     {"verified_site_id": None, **REC}, request(RECOVER_REQ))
+case("local_seed_no_verified_site", "no verified device.site_id refuses a local seed and consumes nothing",
+     {"verified_site_id": None, **SEED_CTX}, request(seed_req()))
+case("revoke_no_verified_site", "no verified device.site_id refuses a revocation", {"verified_site_id": None},
+     request(REVOKE_REQ))
+case("recover_stale_device", "a recover challenge bound to another device",
+     {**LOCKED, "challenges": [held({**RECOVER_CH, "device_id": "edge-0"}, sequence=0)]}, request(RECOVER_REQ))
+
+# --- challenges-presented rows decide before any signature ------------------------
+case("w_cp_expired_over_signature", "challenge_expired decides, and consumes the challenge, while the possession "
+     "signature also fails", {**SEED_CTX, "challenges": [held(SEED_CH, "expired", sequence=1)]},
+     request(seed_req(poss=SEED_BAD_SIG)))
+case("w_cp_candidate_changed_over_signature", "candidate_changed decides, and consumes the challenge, while the "
+     "possession signature also fails", ENROL_CTX,
+     request(enrol_req(cand={**SEED_CAND, "approver_id": "chosen"},
+                       poss=possession(SECOND, ENROL_CH, "minted-c"))))
+
+# --- parse faults, document members and the same approver --------------------------
+case("escaped_member_name", "member names compare after JSON unescaping: \\u006fperation is operation", {},
+     '{"\\u006fperation":"approver_registry_binding"}')
+case("escaped_member_named_twice", "an escaped spelling of a member already present names it twice", {},
+     '{"operation":"approver_registry_binding","\\u006fperation":"approver_registry_binding"}')
+
+
+def nested_targets(depth: int) -> str:
+    """A revocation whose deepest array sits at nesting `depth`; the request object is level 1."""
+    arrays = depth - 2
+    doc = json.dumps({k: v for k, v in REVOKE_1.items() if k != "targets"}, separators=(",", ":"),
+                     ensure_ascii=False)
+    doc = doc[:-1] + ',"targets":' + "[" * arrays + "]" * arrays + "}"
+    return '{"operation":"approver_registry_revoke","document":' + doc + "}"
+
+
+case("nesting_at_32", "nesting of exactly 32 levels is parsed; the document is malformed", {}, nested_targets(32))
+case("nesting_at_33", "nesting of 33 levels, inside the document, is a parse failure", {}, nested_targets(33))
+case("lone_surrogate_in_document", "a JSON string with no UTF-8 form, inside the document, is a parse failure", {},
+     request(REVOKE_REQ).replace('"device_id":"edge-1"', '"device_id":"\\ud800"', 1))
+for label, changes in (("site_id_non_ascii", {"site_id": "sité"}), ("site_id_empty", {"site_id": ""}),
+                       ("device_id_space", {"device_id": "edge 1"})):
+    case(f"rv_malformed_{label}", f"a document whose {label.split('_')[0]}_id is outside ^[A-Za-z0-9._-]{{1,64}}$",
+         {}, request({**REVOKE_REQ, "document": signed_doc(**changes)}))
+OTHER_APPROVER = credential("other", "other-key", "lan_ed25519", lan_value(THIRD), 3)
+SAME_CAND = {"approver_id": "owner", "credential_id": "minted-c", "channel": "lan_ed25519",
+             "value": lan_value(CANDIDATE)}
+SAME_CH = challenge(50, "enrol", [SAME_CAND])
+SAME_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_APPROVER], credential_sequence=3)
+case("enrol_same_approver", "a new key for an existing approver, authorised by that approver's own credential",
+     {"registry": SAME_REG, "challenges": [held(SAME_CH, sequence=3)]},
+     request(enrol_req(SAME_CH, SAME_CAND, authorization(OWNER, SAME_CH, "owner-key"))))
+case("enrol_other_approver_authorizes", "a new key for an existing approver, authorised by another approver",
+     {"registry": SAME_REG, "challenges": [held(SAME_CH, sequence=3)]},
+     request(enrol_req(SAME_CH, SAME_CAND, authorization(THIRD, SAME_CH, "other-key"))))
+case("enrol_phone_authorization_wrong_digest", "an ORI-ENROL-V1 text for this challenge ID carrying another "
+     "challenge SHA-256 authorises nothing",
+     {**ENROL_CTX, "phone_authorizations": [{"challenge_id": ENROL_CH["challenge_id"], "challenge_sha256": "0" * 64,
+                                             "authorizer_credential_id": "owner-phone"}]},
+     request(enrol_req(auth=None)))
+
+# --- authorizer_not_approver order witnesses ---------------------------------------
+OTHER_AUTH = authorization(THIRD, SAME_CH, "other-key")
+case("w_en_not_preexisting_over_not_approver", "defence in depth, a fixture: authorizer_not_preexisting decides "
+     "while authorizer_not_approver also fails", {"registry": SAME_REG, "challenges": [held(SAME_CH, sequence=2)]},
+     request(enrol_req(SAME_CH, SAME_CAND, OTHER_AUTH)))
+case("w_en_authorization_signature_over_not_approver", "the authorization's signature_invalid decides while "
+     "authorizer_not_approver also fails", {"registry": SAME_REG, "challenges": [held(SAME_CH, sequence=3)]},
+     request(enrol_req(SAME_CH, SAME_CAND, authorization(SECOND, SAME_CH, "other-key"))))
+case("w_en_stale_over_not_approver", "challenge_stale decides while authorizer_not_approver also fails",
+     {"registry": {**SAME_REG, "registry_revision": 4}, "challenges": [held(SAME_CH, sequence=3)]},
+     request(enrol_req(SAME_CH, SAME_CAND, OTHER_AUTH)))
+case("w_en_not_approver_over_possession_invalid", "authorizer_not_approver decides while possession_invalid also "
+     "fails", {"registry": SAME_REG, "challenges": [held(SAME_CH, sequence=3)]},
+     request(enrol_req(SAME_CH, SAME_CAND, OTHER_AUTH, possession(CANDIDATE, SAME_CH, "minted-c", sha="0" * 64))))
+
+# --- authorizer_not_approver on the phone paths -----------------------------------
+OTHER_PHONE = credential("other", "other-phone", "sms", "+2348011111111", 4)
+OWNER_PHONE_LATE = credential("owner", "owner-phone-2", "sms", "+2348022222222", 4)
+PHONE_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_APPROVER, OTHER_PHONE], credential_sequence=4)
+SAME_SMS = {"approver_id": "owner", "credential_id": "minted-c", "channel": "sms", "value": PHONE_X}
+SAME_SMS_CH = challenge(51, "enrol", [SAME_SMS])
+
+
+def phone_auth(ch: dict, credential_id: str) -> list:
+    return [{"challenge_id": ch["challenge_id"], "challenge_sha256": digest(ch),
+             "authorizer_credential_id": credential_id}]
+
+
+case("enrol_phone_authorizer_other_approver", "an existing approver named, and an ORI-ENROL-V1 text from another "
+     "approver's phone credential", {"registry": PHONE_REG, "challenges": [held(SAME_CH, sequence=4)],
+                                     "phone_authorizations": phone_auth(SAME_CH, "other-phone")},
+     request(enrol_req(SAME_CH, SAME_CAND, None)))
+case("enrol_phone_candidate_other_approver", "a phone candidate naming an existing approver, authorised by another "
+     "approver", {"registry": PHONE_REG, "challenges": [held(SAME_SMS_CH, sequence=4)]},
+     request(enrol_req(SAME_SMS_CH, SAME_SMS, authorization(THIRD, SAME_SMS_CH, "other-key"), None)))
+case("enrol_phone_candidate_same_approver", "a phone candidate naming an existing approver, authorised by that "
+     "approver, is recorded pending its possession reply",
+     {"registry": PHONE_REG, "challenges": [held(SAME_SMS_CH, sequence=4)]},
+     request(enrol_req(SAME_SMS_CH, SAME_SMS, authorization(OWNER, SAME_SMS_CH, "owner-key"), None)))
+case("enrol_phone_authorizer_not_preexisting", "defence in depth, a fixture: a phone authoriser enrolled after the "
+     "challenge (sequence 4, issued at sequence 3) at the challenge's revision",
+     {"registry": registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_APPROVER, OWNER_PHONE_LATE],
+                           credential_sequence=4),
+      "challenges": [held(SAME_CH, sequence=3)], "phone_authorizations": phone_auth(SAME_CH, "owner-phone-2")},
+     request(enrol_req(SAME_CH, SAME_CAND, None)))
+
+# --- the enrolment matrix -----------------------------------------------------------
+# Every cell of authoriser path x candidate kind x candidate approver, generated rather than chosen, so no
+# combination is covered on one path only.
+MATRIX_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_APPROVER], credential_sequence=3)
+MATRIX_PATHS = (("lan", "owner-key"), ("phone", "owner-phone"))
+MATRIX_CANDIDATES = (("lan", "lan_ed25519", lan_value(CANDIDATE)), ("sms", "sms", PHONE_X))
+MATRIX_APPROVERS = (("minted", "minted-a"), ("own", "owner"), ("other", "other"))
+MATRIX_WORDS = {"minted": "newly minted", "own": "the authoriser's own", "other": "another existing approver"}
+for p_index, (path, authorizer_id) in enumerate(MATRIX_PATHS):
+    for c_index, (kind, channel, value) in enumerate(MATRIX_CANDIDATES):
+        for a_index, (label, approver) in enumerate(MATRIX_APPROVERS):
+            cand = {"approver_id": approver, "credential_id": "minted-c", "channel": channel, "value": value}
+            ch = challenge(60 + p_index * 6 + c_index * 3 + a_index, "enrol", [cand])
+            auth = authorization(OWNER, ch, authorizer_id) if path == "lan" else None
+            poss = possession(CANDIDATE, ch, "minted-c") if kind == "lan" else None
+            context = {"registry": MATRIX_REG, "challenges": [held(ch, sequence=3)]}
+            if path == "phone":
+                context["phone_authorizations"] = phone_auth(ch, authorizer_id)
+            case(f"m_{path}_{kind}_{label}",
+                 f"matrix: a {path} authoriser of approver owner, a {kind} candidate, and a candidate approver that "
+                 f"is {MATRIX_WORDS[label]}", context, request(enrol_req(ch, cand, auth, poss)))
+
+# --- the authoriser eligibility block ------------------------------------------------
+# Every authoriser condition on both paths, generated, so an ineligible authoriser is refused on each path.
+ELIG_LATE_LAN = credential("late", "late-key", "lan_ed25519", lan_value(THIRD), 4)
+ELIG_LATE_PHONE = credential("late", "late-phone", "sms", "+2348033333333", 5)
+ELIG_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, ELIG_LATE_LAN, ELIG_LATE_PHONE], credential_sequence=5,
+                    tombstoned_credentials=[tomb("gone-key", "gone"), tomb("gone-phone", "gone")],
+                    tombstoned_values=[lan_value(SECOND), "+2348044444444"], tombstoned_approvers=["gone"])
+ELIG_CONDITIONS = {
+    # condition: (authorizer credential named on the lan path, the one attributed on the phone path)
+    "absent": ("nobody", None),
+    "not_active": ("gone-key", "gone-phone"),
+    "wrong_kind": ("owner-phone", "owner-key"),
+    "not_preexisting": ("late-key", "late-phone"),
+    "eligible": ("owner-key", "owner-phone"),
+}
+ELIG_SIGNERS = {"late-key": THIRD}
+for p_index, path in enumerate(("lan", "phone")):
+    for c_index, (condition, named) in enumerate(ELIG_CONDITIONS.items()):
+        ch = challenge(80 + p_index * 5 + c_index, "enrol", [SEED_CAND])
+        authorizer_id = named[0] if path == "lan" else named[1]
+        context = {"registry": ELIG_REG, "challenges": [held(ch, sequence=3)]}
+        if path == "lan":
+            auth = authorization(ELIG_SIGNERS.get(authorizer_id, OWNER), ch, authorizer_id)
+        else:
+            auth = None
+            if authorizer_id is not None:
+                context["phone_authorizations"] = phone_auth(ch, authorizer_id)
+        note = f"eligibility: a {path} authoriser that is {condition.replace('_', ' ')}"
+        if condition == "not_preexisting":
+            note = "defence in depth, a fixture: " + note + " (enrolled after the challenge, at its revision)"
+        case(f"e_{path}_{condition}", note, context, request(enrol_req(ch, SEED_CAND, auth)))
+
+case("challenge_enrol_lan_existing_approver", "an enrolment challenge for a LAN key joining an existing approver",
+     {}, request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE), approver="owner")))
+case("challenge_local_seed_whatsapp", "a local seed candidate on whatsapp is refused at the first Challenge row it "
+     "fails: lan_key_required", {"registry": registry(**EMPTY)},
+     request(challenge_req("local_seed", "whatsapp", PHONE_X)))
+case("enrol_phone_pending_for_value_phone_path", "a phone candidate whose value is pending, on the phone "
+     "authoriser path", {**SMS_CTX, "phone_authorizations": phone_auth(SMS_CH, "owner-phone"),
+                         "pending_phone_values": [SMS_CAND["value"]]},
+     request(enrol_req(SMS_CH, SMS_CAND, None, None)))
+
+# --- the refusal sweep -----------------------------------------------------------------
+# One generated case per refusal row and per value of every axis that row can occur on, each decided by that
+# row with every earlier row holding. Axes: the Order-of-refusal steps over every registry operation; the
+# Challenges presented rows over recover, local_seed and enrol; Recover, Local seed, Revoke and Binding rows
+# alone; every Enrol row over authoriser path (lan, phone) x candidate kind (lan, sms), except that the
+# authorization signature row is lan-path only (a phone ORI-ENROL-V1 text carries no signature), the
+# possession rows are lan-candidate only (a phone candidate carries no possession object), and
+# phone_pending_for_value is sms-candidate only (only a phone candidate has a pending phone operation).
+SWEEP_EXPECT: dict[str, str] = {}
+DID = "defence in depth, a fixture: "
+
+
+def sweep(name: str, code: str, note: str, context: dict, req: str) -> None:
+    SWEEP_EXPECT[name] = code
+    case(name, note, context, req)
+
+
+SW_CANDS = {
+    "lan": {"approver_id": "minted-a", "credential_id": "minted-c", "channel": "lan_ed25519",
+            "value": lan_value(CANDIDATE)},
+    "sms": {"approver_id": "minted-a", "credential_id": "minted-c", "channel": "sms", "value": PHONE_X},
+}
+SW_COUNTER = [100]
+
+
+def enrol_cell(path: str, kind: str, *, cand: dict | None = None, reg: dict | None = None, sequence: int = 2,
+               authorizer: str | None = None, signer: Ed25519PrivateKey = OWNER, state: str = "pending",
+               auth_sha: str | None = None, poss: object = "good", ch_override: dict | None = None,
+               extra: dict | None = None) -> tuple[dict, str]:
+    """An enrolment that the runtime accepts, but for the one change the caller makes."""
+    SW_COUNTER[0] += 1
+    cand = cand or SW_CANDS[kind]
+    ch = challenge(SW_COUNTER[0] % 256, "enrol", [cand])
+    context = {"registry": registry() if reg is None else reg, "challenges": [held(ch, state, sequence)]}
+    if path == "lan":
+        auth = authorization(signer, ch, authorizer or "owner-key", sha=auth_sha)
+    else:
+        auth = None
+        if authorizer != "none":
+            context["phone_authorizations"] = phone_auth(ch, authorizer or "owner-phone")
+    if cand["channel"] != "lan_ed25519":
+        possession_obj = None
+    elif poss == "good":
+        possession_obj = possession(CANDIDATE, ch, cand["credential_id"])
+    else:
+        possession_obj = poss(ch)
+    request_cand = (ch_override or {}).get("candidate", cand)
+    context.update(extra or {})
+    return context, request(enrol_req(ch, request_cand, auth, possession_obj))
+
+
+AXES = [(p, k) for p in ("lan", "phone") for k in ("lan", "sms")]
+LOCKED_REG = {"registry": None}
+OTHER_SECOND = credential("other", "other-key", "lan_ed25519", lan_value(SECOND), 2)
+OTHER_SMS = credential("other", "other-phone", "sms", "+2348011111111", 3)
+# Every Enrol row is swept over the candidate approver as the challenge names it: minted (named by no
+# request), own (the authoriser's approver) and other (another existing approver). other is swept up to
+# authorizer_not_approver, which refuses it; past that row only minted and own remain. authorizer_not_approver
+# is other only, and approver_revoked names a tombstoned approver (minted only in the sentence's terms).
+APPROVERS_BEFORE = ("minted", "own", "other")
+APPROVERS_AFTER = ("minted", "own")
+for path, kind in AXES:
+    cell = f"{path}_{kind}"
+    late = (credential("late", "late-key", "lan_ed25519", lan_value(THIRD), 3) if path == "lan"
+            else credential("late", "late-phone", "sms", "+2348033333333", 3))
+    for who in APPROVERS_BEFORE:
+        wcell = f"{cell}_{who}"
+
+        def cand_for(base: dict, own: str = "owner", who: str = who) -> dict:
+            if who == "minted":
+                return base
+            return {**base, "approver_id": own if who == "own" else "other"}
+
+        with_other = registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_SECOND])
+        if who == "minted":
+            # A locked registry holds no credentials, so the approver axis is not observable here.
+            ctx_, req_ = enrol_cell(path, kind)
+            sweep(f"x_en_registry_unavailable_{cell}", "registry_unavailable", "sweep: Enrol, a locked registry",
+                  {**ctx_, "registry": None}, req_)
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                reg=registry(registry_revision=4, credentials=[OWNER_CRED, PHONE_CRED, OTHER_SECOND]))
+        sweep(f"x_en_challenge_stale_{wcell}", "challenge_stale", "sweep: Enrol, the revision moved", ctx_, req_)
+        # minted: no such authoriser. own and other: the would-be authoriser is an active credential of approver
+        # owner, of the wrong kind for the path, so the candidate approver (owner for own, other for other) is
+        # defined from state relative to it.
+        if who == "minted":
+            wrong, wrong_note = ("nobody" if path == "lan" else "none"), "no such authoriser"
+        elif path == "lan":
+            wrong, wrong_note = "owner-phone", "an authorization naming approver owner's sms credential"
+        else:
+            wrong, wrong_note = "owner-key", "a text attributed to approver owner's LAN credential"
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                reg=registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_SECOND, OTHER_SMS],
+                                             credential_sequence=3),
+                                authorizer=wrong)
+        sweep(f"x_en_authorizer_unavailable_{wcell}", "authorizer_unavailable",
+              f"sweep: Enrol, no eligible authoriser: {wrong_note}", ctx_, req_)
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind], "late"),
+                                reg=registry(credentials=[OWNER_CRED, PHONE_CRED, late, OTHER_SECOND],
+                                             credential_sequence=3),
+                                authorizer=late["credential_id"], signer=THIRD)
+        sweep(f"x_en_authorizer_not_preexisting_{wcell}", "authorizer_not_preexisting",
+              DID + "sweep: Enrol, an authoriser enrolled after the challenge at its revision", ctx_, req_)
+        if path == "lan":
+            ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]), auth_sha="0" * 64, reg=with_other)
+            sweep(f"x_en_signature_invalid_authorization_{wcell}", "signature_invalid",
+                  "sweep: Enrol, an authorization over another digest", ctx_, req_)
+        if who == "other":
+            ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]), reg=with_other)
+            sweep(f"x_en_authorizer_not_approver_{cell}", "authorizer_not_approver",
+                  "sweep: Enrol, an existing approver named and another approver authorising", ctx_, req_)
+            continue
+        if kind == "lan":
+            ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                    poss=lambda ch: possession(CANDIDATE, ch, "minted-c", sha="0" * 64))
+            sweep(f"x_en_possession_invalid_{wcell}", "possession_invalid",
+                  "sweep: Enrol, a possession over another digest", ctx_, req_)
+            ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                    poss=lambda ch: possession(SECOND, ch, "minted-c"))
+            sweep(f"x_en_signature_invalid_possession_{wcell}", "signature_invalid",
+                  "sweep: Enrol, a possession signed by another key", ctx_, req_)
+        if who == "minted":
+            ctx_, req_ = enrol_cell(path, kind, cand={**SW_CANDS[kind], "approver_id": "gone"},
+                                    reg=registry(tombstoned_approvers=["gone"]))
+            sweep(f"x_en_approver_revoked_{cell}", "approver_revoked",
+                  DID + "sweep: Enrol, the challenge's approver tombstoned at its revision", ctx_, req_)
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for({**SW_CANDS[kind], "credential_id": "old-key"}),
+                                reg=registry(tombstoned_credentials=[tomb("old-key", "old-owner")]))
+        sweep(f"x_en_credential_reused_{wcell}", "credential_reused",
+              DID + "sweep: Enrol, a collision fixture: the challenge's credential ID is tombstoned", ctx_, req_)
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                reg=registry(tombstoned_values=[SW_CANDS[kind]["value"]]))
+        sweep(f"x_en_value_tombstoned_{wcell}", "value_tombstoned",
+              DID + "sweep: Enrol, the challenge's value tombstoned at its revision", ctx_, req_)
+        dup = credential("dup", "dup-c", SW_CANDS[kind]["channel"], SW_CANDS[kind]["value"], 2)
+        ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                reg=registry(credentials=[OWNER_CRED, PHONE_CRED, dup]))
+        sweep(f"x_en_duplicate_value_{wcell}", "duplicate_value",
+              DID + "sweep: Enrol, the challenge's value active at its revision", ctx_, req_)
+        if kind == "sms":
+            ctx_, req_ = enrol_cell(path, kind, cand=cand_for(SW_CANDS[kind]),
+                                    extra={"pending_phone_values": [PHONE_X]})
+            sweep(f"x_en_phone_pending_for_value_{wcell}", "phone_pending_for_value",
+                  "sweep: Enrol, the value already pending", ctx_, req_)
+
+# Challenges presented, over every operation that presents a challenge. A presented request may carry a
+# candidate of any channel, whatever the challenge's operation allows: local_seed (a lan challenge) and enrol
+# (a lan or an sms challenge) are each swept over the presented candidate kind (lan, sms, whatsapp), a phone
+# candidate presenting no possession on enrol. A kind other than the challenge's is decided at candidate_changed
+# unless an earlier row fires. recover presents no candidate. An expired sms challenge sits past the 60-second
+# challenge window and inside the 10-minute possession window, so expiry follows the challenge window.
+SW_LS_CH = challenge(200, "local_seed", [SEED_CAND], revision=2)
+PRESENTED = {
+    "lan": SEED_CAND,
+    "sms": {**SEED_CAND, "channel": "sms", "value": PHONE_X},
+    "whatsapp": {**SEED_CAND, "channel": "whatsapp", "value": PHONE_X},
+}
+
+
+def recover_present(state: str) -> dict:
+    return {**LOCKED_REG, "challenges": [held(RECOVER_CH, state, 0)]}
+
+
+for row, state, changes in (("site_binding_mismatch", "pending", {"verified_site_id": "site-2",
+                                                                  "registry": registry()}),
+                            ("challenge_reused", "used", {}), ("challenge_expired", "expired", {})):
+    sweep(f"x_cp_{row}_recover", row, f"sweep: Challenges presented, {row.replace('_', ' ')}",
+          {**recover_present(state), **changes}, request(RECOVER_REQ))
+sweep("x_cp_candidate_changed_recover", "candidate_changed", "sweep: Challenges presented, a challenge for another "
+      "operation", {**LOCKED_REG, "challenges": [held(SW_LS_CH, sequence=1)]},
+      request({**RECOVER_REQ, "challenge_id": SW_LS_CH["challenge_id"]}))
+
+CP_CHALLENGES = {
+    "local_seed": (SEED_CH, {"registry": registry(**EMPTY)}, 1),
+    "enrol_lan": (ENROL_CH, {}, 2),
+    "enrol_sms": (SMS_CH, {}, 2),
+}
+for op, (ch_, base_ctx, seq_) in CP_CHALLENGES.items():
+    challenge_kind = "lan" if ch_["candidates"][0]["channel"] == "lan_ed25519" else "sms"
+    for shown, cand_ in PRESENTED.items():
+        if op == "local_seed":
+            req_ = request(seed_req(ch_, cand_, possession(CANDIDATE, ch_, "minted-c")))
+        else:
+            poss_ = possession(CANDIDATE, ch_, "minted-c") if shown == "lan" else None
+            cand_here = cand_ if shown != challenge_kind else ch_["candidates"][0]
+            req_ = request(enrol_req(ch_, cand_here, poss=poss_))
+        pcell = f"{op}_presents_{shown}"
+        expired_ms = 300_000 if challenge_kind == "sms" else None
+
+        def held_as(state: str, ch_: dict = ch_, seq_: int = seq_, expired_ms: int | None = expired_ms) -> list:
+            return [held(ch_, state, seq_, elapsed_ms=expired_ms if state == "expired" else None)]
+
+        site_ctx = {**base_ctx, "registry": base_ctx.get("registry", registry())}
+        sweep(f"x_cp_site_binding_mismatch_{pcell}", "site_binding_mismatch",
+              "sweep: Challenges presented, a site change", {**site_ctx, "challenges": held_as("pending"),
+                                                             "verified_site_id": "site-2"}, req_)
+        sweep(f"x_cp_challenge_reused_{pcell}", "challenge_reused", "sweep: Challenges presented, a used challenge",
+              {**base_ctx, "challenges": held_as("used")}, req_)
+        sweep(f"x_cp_challenge_expired_{pcell}", "challenge_expired", "sweep: Challenges presented, an expired "
+              "challenge" + (", 5 minutes after issue: past the challenge window, inside the possession window"
+                             if challenge_kind == "sms" else ""), {**base_ctx, "challenges": held_as("expired")},
+              req_)
+        if shown == challenge_kind:
+            # The same kind as the challenge: a candidate whose approver the request changed.
+            changed_cand = {**ch_["candidates"][0], "approver_id": "chosen"}
+            if op == "local_seed":
+                creq_ = request(seed_req(ch_, changed_cand, possession(CANDIDATE, ch_, "minted-c")))
+            else:
+                creq_ = request(enrol_req(ch_, changed_cand, poss=possession(CANDIDATE, ch_, "minted-c")
+                                          if shown == "lan" else None))
+        else:
+            creq_ = req_
+        sweep(f"x_cp_candidate_changed_{pcell}", "candidate_changed",
+              "sweep: Challenges presented, a candidate other than the challenge's", {**base_ctx,
+                                                                                     "challenges": held_as("pending")},
+              creq_)
+
+# Rows that hold no challenge have no challenge kind: challenge_unavailable, and site_binding_mismatch on a
+# site-changed registry, which fires before the presented ID is looked up. Each is swept over the operation and
+# the presented candidate kind alone, with a challenge ID the runtime does not hold, and consumes nothing.
+UNHELD = {"recover": [("", request(RECOVER_REQ))]}
+for op in ("local_seed", "enrol"):
+    UNHELD[op] = []
+    for shown, cand_ in PRESENTED.items():
+        ch_ = SEED_CH if op == "local_seed" else ENROL_CH
+        if op == "local_seed":
+            req_ = request(seed_req(ch_, cand_, possession(CANDIDATE, ch_, "minted-c")))
+        else:
+            req_ = request(enrol_req(ch_, cand_, poss=possession(CANDIDATE, ch_, "minted-c") if shown == "lan"
+                                     else None))
+        UNHELD[op].append((f"_presents_{shown}", req_))
+for op, cells in UNHELD.items():
+    base_reg = LOCKED_REG if op == "recover" else ({"registry": registry(**EMPTY)} if op == "local_seed" else {})
+    for suffix, req_ in cells:
+        sweep(f"x_cp_challenge_unavailable_{op}{suffix}", "challenge_unavailable",
+              "sweep: Challenges presented, no challenge held", {**base_reg, "challenges": []}, req_)
+        site_reg = registry(**EMPTY) if op == "local_seed" else registry()
+        sweep(f"x_cp_site_binding_mismatch_unheld_{op}{suffix}", "site_binding_mismatch",
+              "sweep: Challenges presented, a site change, no challenge held",
+              {"registry": site_reg, "verified_site_id": "site-2", "challenges": []}, req_)
+
+# The challenge window's boundary: exactly 60,000 ms after issue the challenge still holds; 60,001 it has expired.
+for kind_, (ch_, cand_, poss_) in (("sms", (SMS_CH, SMS_CAND, None)),
+                                   ("lan", (ENROL_CH, SEED_CAND, "candidate"))):
+    case(f"x_cp_window_at_60000_enrol_{kind_}", "the challenge window's last millisecond: the presentation proceeds",
+         {"challenges": [held(ch_, elapsed_ms=CHALLENGE_WINDOW_MS)]}, request(enrol_req(ch_, cand_, poss=poss_)))
+    sweep(f"x_cp_window_at_60001_enrol_{kind_}", "challenge_expired",
+          "sweep: Challenges presented, one millisecond past the challenge window",
+          {"challenges": [held(ch_, "expired", elapsed_ms=CHALLENGE_WINDOW_MS + 1)]},
+          request(enrol_req(ch_, cand_, poss=poss_)))
+
+# Recover.
+sweep("x_rc_recovery_not_available", "recovery_not_available", "sweep: Recover, an initialized registry",
+      {"challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+sweep("x_rc_challenge_stale", "challenge_stale", "sweep: Recover, a challenge for another site",
+      {**LOCKED_REG, "challenges": [held({**RECOVER_CH, "site_id": "site-0"}, sequence=0)]}, request(RECOVER_REQ))
+
+# Local seed (lan candidates only: local_seed seeds a LAN key).
+SW_LS = {"registry": registry(**EMPTY), "challenges": [held(SEED_CH, sequence=1)]}
+sweep("x_ls_registry_unavailable", "registry_unavailable", "sweep: Local seed, a locked registry",
+      {**SW_LS, "registry": None}, request(seed_req()))
+sweep("x_ls_challenge_stale", "challenge_stale", "sweep: Local seed, the revision moved",
+      {**SW_LS, "registry": registry(**{**EMPTY, "registry_revision": 3})}, request(seed_req()))
+sweep("x_ls_active_authorizer_exists", "active_authorizer_exists", DID + "sweep: Local seed, an active credential at "
+      "the challenge's revision", {**SW_LS, "registry": registry(registry_revision=2)}, request(seed_req()))
+sweep("x_ls_possession_invalid", "possession_invalid", "sweep: Local seed, a possession over another digest", SW_LS,
+      request(seed_req(poss=possession(CANDIDATE, SEED_CH, "minted-c", sha="0" * 64))))
+sweep("x_ls_signature_invalid", "signature_invalid", "sweep: Local seed, a possession signed by another key", SW_LS,
+      request(seed_req(poss=possession(SECOND, SEED_CH, "minted-c"))))
+for row, field, value in (("approver_revoked", "approver_id", "old-owner"), ("credential_reused", "credential_id",
+                                                                             "old-key")):
+    cand_ = {**SEED_CAND, field: value}
+    ch_ = challenge(210 + len(row), "local_seed", [cand_], revision=2)
+    sweep(f"x_ls_{row}", row, DID + f"sweep: Local seed, a collision fixture: the challenge's {field} is tombstoned",
+          {"registry": registry(**EMPTY), "challenges": [held(ch_, sequence=1)]},
+          request(seed_req(ch_, cand_, possession(CANDIDATE, ch_, cand_["credential_id"]))))
+cand_ = {**SEED_CAND, "value": lan_value(SECOND)}
+ch_ = challenge(230, "local_seed", [cand_], revision=2)
+sweep("x_ls_value_tombstoned", "value_tombstoned", DID + "sweep: Local seed, the challenge's value tombstoned at its "
+      "revision", {"registry": registry(**EMPTY), "challenges": [held(ch_, sequence=1)]},
+      request(seed_req(ch_, cand_, possession(SECOND, ch_, "minted-c"))))
+
+# Revoke and Binding.
+REV_DOC = REVOKE_1
+for row, context_, doc_ in (
+    ("anchor_unavailable", {"anchor_available": False}, REV_DOC),
+    ("malformed", {}, {**REV_DOC, "add": ["credential:x"]}),
+    ("unknown_signer", {}, revocation(1, ["credential:owner-phone"], key=STRANGER)),
+    ("signature_invalid", {}, {**REV_DOC, "signature": flip(REV_DOC["signature"])}),
+    ("superseded_signer", {}, revocation(1, ["credential:owner-phone"], key=PREVIOUS)),
+    ("wrong_authority", {}, revocation(1, ["credential:owner-phone"], key=OTHER_CLASS)),
+    ("registry_unavailable", LOCKED_REG, REV_DOC),
+    ("site_binding_mismatch", {"verified_site_id": "site-2"}, REV_DOC),
+    ("binding_mismatch", {}, revocation(1, ["credential:owner-phone"], epoch=OLD_EPOCH)),
+    ("revision_regressed", {"registry": registry(last_external_revision=5, last_external_document_sha256="0" * 64)},
+     REV_DOC),
+    ("revision_conflict", {"registry": CONFLICT_REG}, revocation(1, OTHER_1)),
+    ("unknown_target", {}, revocation(1, ["credential:never"])),
+):
+    sweep(f"x_rv_{row}", row, f"sweep: Revoke, {row.replace('_', ' ')}", context_,
+          request({**REVOKE_REQ, "document": doc_}))
+sweep("x_bd_registry_unavailable", "registry_unavailable", "sweep: Binding, a locked registry", LOCKED_REG,
+      request(BINDING))
+sweep("x_bd_site_binding_mismatch", "site_binding_mismatch", "sweep: Binding, a site change",
+      {"verified_site_id": "site-2"}, request(BINDING))
+
+# The Order-of-refusal steps, over every registry operation.
+SW_OPS = {
+    "challenge": ({}, challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))),
+    "recover": (REC, RECOVER_REQ),
+    "local_seed": (SW_LS, seed_req()),
+    "enrol": (ENROL_CTX, enrol_req()),
+    "revoke": ({}, REVOKE_REQ),
+    "binding": ({}, BINDING),
+}
+for op, (context_, obj_) in SW_OPS.items():
+    sweep(f"x_steps_payload_too_large_{op}", "payload_too_large", "sweep: Order of refusal, over the bound",
+          context_, padded(obj_, BOUND + 1))
+    sweep(f"x_steps_invalid_arguments_{op}", "invalid_arguments", "sweep: Order of refusal, an unaccepted member",
+          context_, request({**obj_, "extra": 1}))
+    sweep(f"x_steps_unauthenticated_{op}", "unauthenticated", "sweep: Order of refusal, an unadmitted peer",
+          {**context_, "peer_uid": 1002}, request(obj_))
+    sweep(f"x_steps_registry_busy_{op}", "registry_busy", "sweep: Order of refusal, another operation in flight",
+          {**context_, "registry_operation_in_flight": True}, request(obj_))
+    sweep(f"x_steps_registry_unavailable_{op}", "registry_unavailable", "sweep: Order of refusal, no verified site",
+          {**context_, "verified_site_id": None}, request(obj_))
+
+# The two steps a v2 operation reaches before its own members are read.
+COMMISSION = {"operation": "evidence_commission", "reference": "sha256:" + "ab" * 32, "force": False}
+sweep("x_steps_payload_too_large_evidence_commission", "payload_too_large",
+      "sweep: Order of refusal, a commissioning request over the bound", {}, padded(COMMISSION, BOUND + 1))
+sweep("x_steps_invalid_arguments_evidence_commission", "invalid_arguments",
+      "sweep: Order of refusal, a commissioning request naming a member twice", {},
+      request(COMMISSION).replace('"force":false', '"force":false,"force":false'))
+
+# The Challenge table for an enrolment challenge, over candidate kind (lan, sms) and the approver the request
+# names (null: minted; named: an existing approver, owner). channel_unauthenticated needs a whatsapp candidate
+# and phone_pending_for_value a phone candidate; approver_revoked and approver_unknown need a named approver.
+CH_KINDS = {"lan": ("lan_ed25519", lan_value(CANDIDATE)), "sms": ("sms", PHONE_X)}
+for kind, (channel, value) in CH_KINDS.items():
+    for who, approver in (("null", None), ("named", "owner")):
+        ccell = f"enrol_{kind}_{who}"
+        req_ = request(challenge_req("enrol", channel, value, approver=approver))
+        sweep(f"x_ch_site_binding_mismatch_{ccell}", "site_binding_mismatch", "sweep: Challenge, a site change",
+              {"verified_site_id": "site-2"}, req_)
+        sweep(f"x_ch_registry_unavailable_{ccell}", "registry_unavailable", "sweep: Challenge, a locked registry",
+              LOCKED_REG, req_)
+        sweep(f"x_ch_value_tombstoned_{ccell}", "value_tombstoned", "sweep: Challenge, a tombstoned value",
+              {"registry": registry(tombstoned_values=[value])}, req_)
+        dup = credential("dup", "dup-c", channel, value, 2)
+        sweep(f"x_ch_duplicate_value_{ccell}", "duplicate_value", "sweep: Challenge, an active value",
+              {"registry": registry(credentials=[OWNER_CRED, PHONE_CRED, dup])}, req_)
+        if kind == "sms":
+            sweep(f"x_ch_phone_pending_for_value_{ccell}", "phone_pending_for_value",
+                  "sweep: Challenge, a pending value", {"pending_phone_values": [value]}, req_)
+for who, approver in (("null", None), ("named", "owner")):
+    sweep(f"x_ch_channel_unauthenticated_enrol_whatsapp_{who}", "channel_unauthenticated",
+          "sweep: Challenge, a whatsapp candidate", {},
+          request(challenge_req("enrol", "whatsapp", PHONE_X, approver=approver)))
+    sweep(f"x_ch_channel_unauthenticated_enrol_sms_no_ingress_{who}", "channel_unauthenticated",
+          "sweep: Challenge, an sms candidate while the runtime has no authenticated SMS ingress",
+          {"authenticated_phone_channels": []}, request(challenge_req("enrol", "sms", PHONE_X, approver=approver)))
+sweep("x_ch_approver_revoked_enrol_lan_named", "approver_revoked", "sweep: Challenge, a tombstoned approver named",
+      {"registry": registry(tombstoned_approvers=["gone"])},
+      request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE), approver="gone")))
+sweep("x_ch_approver_unknown_enrol_lan_named", "approver_unknown", "sweep: Challenge, an unknown approver named",
+      {}, request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE), approver="nobody")))
+
+# Member strictness by where in the request the member sits: an escaped spelling of a member already present,
+# a case variant of an accepted member, and an unknown member, at the top level and inside a candidate,
+# possession, authorization and revocation document. Inside a document each is the document's fault.
+ENROL_TEXT = request(enrol_req())
+LOCATIONS = {
+    "top": ('{"operation":"approver_registry_binding"', ',"\\u006fperation":"approver_registry_binding"',
+            ',"Operation":"approver_registry_binding"', ',"x":1', {}, request(BINDING)),
+    "candidate": ('"candidate":{"approver_id":"minted-a"', ',"\\u0061pprover_id":"minted-a"',
+                  ',"Approver_id":"minted-a"', ',"x":1', ENROL_CTX, ENROL_TEXT),
+    "authorization": ('"authorization":{"v":1', ',"\\u0076":1', ',"V":1', ',"x":1', ENROL_CTX, ENROL_TEXT),
+    "possession": ('"possession":{"v":1', ',"\\u0076":1', ',"V":1', ',"x":1', ENROL_CTX, ENROL_TEXT),
+    "document": ('"document":{"v":1', ',"\\u0076":1', ',"V":1', ',"x":1', {}, request(REVOKE_REQ)),
+}
+for location, (anchor_, escaped, variant, unknown, context_, text_) in LOCATIONS.items():
+    assert text_.count(anchor_) == 1, location
+    code = "malformed" if location == "document" else "invalid_arguments"
+    for label, insert in (("escaped_duplicate", escaped), ("case_variant", variant), ("unknown_member", unknown)):
+        sweep(f"x_ms_{label}_{location}", code, f"sweep: member strictness, {label.replace('_', ' ')} inside "
+              f"the {location}" if location != "top" else f"sweep: member strictness, {label.replace('_', ' ')} "
+              "at the top level", context_, text_.replace(anchor_, anchor_ + insert, 1))
+
+# Lows the sweep does not reach on its own.
+case("challenge_local_seed_value_tombstoned", "a local seed challenge for a key tombstoned in this epoch",
+     {"registry": registry(**EMPTY)}, request(challenge_req("local_seed", "lan_ed25519", lan_value(SECOND))))
+
+# Integer members: JSON integers only, revisions at most 2^53 - 1.
+for label, text_v in (("fraction", "1.0"), ("exponent", "1e0")):
+    case(f"rv_malformed_v_{label}", f"a document whose v is written {text_v}, not as a JSON integer", {},
+         request(REVOKE_REQ).replace('"document":{"v":1', '"document":{"v":' + text_v, 1))
+case("rv_malformed_revision_over_2_53", "a document whose revision is 2^53, past 2^53 - 1", {},
+     request({**REVOKE_REQ, "document": revocation(2 ** 53, ["credential:owner-phone"])}))
+case("rv_revision_at_2_53_minus_1", "a document whose revision is 2^53 - 1 is accepted", {},
+     request({**REVOKE_REQ, "document": revocation(2 ** 53 - 1, ["credential:owner-phone"])}))
+case("possession_v_exponent", "a request member written with an exponent is not an integer", SEED_CTX,
+     request(seed_req()).replace('"possession":{"v":1', '"possession":{"v":1e0', 1))
+
+# Raw decoding: JSON token types and every member value are kept as written.
+for label, raw_value in (("exponent", "1e0"), ("integer", "1")):
+    case(f"challenge_approver_id_{label}", f"an approver_id written {raw_value} is not a string",
+         {}, request(challenge_req("enrol", "sms", PHONE_X, approver="owner")).replace('"approver_id":"owner"',
+                                                                                     '"approver_id":' + raw_value, 1))
+HUGE = "9" * 5000
+case("rv_malformed_revision_5000_digits", "a revision of 5,000 digits, under the request bound, is a JSON integer "
+     "over 2^53 - 1: malformed", {}, request(REVOKE_REQ).replace('"revision":1', '"revision":' + HUGE, 1))
+case("rv_shadowed_no_utf8_in_document", "a member named twice inside the document whose shadowed value has no UTF-8 "
+     "form: the parse failure decides before the document's malformed", {},
+     request(REVOKE_REQ).replace('"document":{"v":1', '"document":{"v":1,"device_id":"\\ud800"', 1))
+case("shadowed_no_utf8_top_level", "a member named twice whose shadowed value has no UTF-8 form", {},
+     '{"operation":"\\ud800","operation":"approver_registry_binding"}')
+
+# SMS ingress availability.
+case("challenge_enrol_sms_no_sms_ingress", "an sms candidate while the runtime has no authenticated SMS ingress: "
+     "nothing recorded, no code sent", {"authenticated_phone_channels": []},
+     request(challenge_req("enrol", "sms", PHONE_X)))
+
+# The first ORI-ENROL-V1 text for a challenge is its authorization.
+TEXT_REG = registry(credentials=[OWNER_CRED, PHONE_CRED, OTHER_APPROVER, OTHER_PHONE], credential_sequence=4)
+for label, order in (("own_first", ("owner-phone", "other-phone")), ("other_first", ("other-phone", "owner-phone")),
+                     ("wrong_digest_first", ("wrong-digest", "owner-phone")),
+                     ("later_unknown", ("owner-phone", "nobody")), ("unknown_first", ("nobody", "owner-phone"))):
+    texts = [{"challenge_id": SAME_CH["challenge_id"],
+              "challenge_sha256": "0" * 64 if who == "wrong-digest" else digest(SAME_CH),
+              "authorizer_credential_id": "owner-phone" if who == "wrong-digest" else who} for who in order]
+    case(f"enrol_phone_texts_{label}", f"two ORI-ENROL-V1 texts for one challenge, {order[0]} first: the first is "
+         "its authorization and the later one changes nothing",
+         {"registry": TEXT_REG, "challenges": [held(SAME_CH, sequence=4)], "phone_authorizations": texts},
+         request(enrol_req(SAME_CH, SAME_CAND, None)))
+
+CODES = (
+    "payload_too_large", "invalid_arguments", "unauthenticated", "registry_busy", "lan_key_required",
+    "channel_unauthenticated", "site_binding_mismatch", "recovery_not_available", "registry_unavailable",
+    "active_authorizer_exists", "approver_unknown", "challenge_reused", "challenge_unavailable",
+    "challenge_expired", "candidate_changed", "challenge_stale",
+    "possession_invalid", "signature_invalid", "approver_revoked", "credential_reused", "value_tombstoned",
+    "duplicate_value", "authorizer_unavailable", "authorizer_not_preexisting", "authorizer_not_approver",
+    "phone_pending_for_value",
+    "anchor_unavailable", "malformed", "unknown_signer", "superseded_signer", "wrong_authority",
+    "binding_mismatch", "revision_regressed", "revision_conflict", "unknown_target",
+)
+
+NOTE = {
+    "corpus": (
+        "The cases named m_<path>_<candidate>_<approver> are the enrolment matrix: every combination of "
+        "authoriser path (lan, an authorization object; phone, an ORI-ENROL-V1 text), candidate kind (lan, sms) "
+        "and candidate approver (minted, own, other). The cases named e_<path>_<condition> are the authoriser "
+        "eligibility block: every combination of authoriser path (lan, phone) and authoriser condition (absent, "
+        "not_active, wrong_kind, not_preexisting, eligible). The cases named x_<table>_<row>_<axes> are the "
+        "refusal sweep, each decided by its row: steps (the Order-of-refusal steps) over every registry "
+        "operation, and over evidence_commission for payload_too_large and invalid_arguments; cp (Challenges "
+        "presented) over recover, and over local_seed (a lan challenge) and enrol (a lan or sms challenge) each "
+        "x presented candidate kind (lan, sms, whatsapp), a presented kind other than the challenge's being "
+        "decided at candidate_changed unless an earlier row fires; challenge_unavailable over the presented "
+        "candidate kind alone, no challenge being held, and site_binding_mismatch also with no challenge held, "
+        "over recover and the presented kind for local_seed and enrol; an "
+        "expired sms challenge sitting between "
+        "the 60-second challenge window and the 10-minute possession window; ch "
+        "(Challenge) for an enrolment over candidate kind (lan, sms) x request approver (null, named), except "
+        "phone_pending_for_value (sms only), channel_unauthenticated (whatsapp, and sms while the runtime has "
+        "no authenticated SMS ingress) and approver_revoked and "
+        "approver_unknown (named only); rc, ls, rv and bd (Recover, Local seed, Revoke, Binding) alone; en "
+        "(Enrol) over authoriser path (lan, phone) x candidate kind (lan, sms), and from challenge_stale on, "
+        "where the registry is held, also x candidate approver (minted, own, and other up to "
+        "authorizer_not_approver; registry_unavailable has no approver axis), except that "
+        "signature_invalid_authorization is lan-path only, possession_invalid and signature_invalid_possession "
+        "are lan-candidate only, "
+        "phone_pending_for_value is sms-candidate only, authorizer_not_approver is other only and "
+        "approver_revoked minted only; ms (member strictness) over member form (escaped_duplicate, "
+        "case_variant, unknown_member) x location (top, candidate, authorization, possession, document), "
+        "malformed inside a document and invalid_arguments elsewhere. "
+        "Each case is one request on the operator socket and the runtime's answer to it under the context "
+        "given. Every case is independent; contexts do not carry over. A replay sends `request` as its UTF-8 "
+        "bytes followed by one LF, from a peer with the context's credentials, and compares the answer with "
+        "`expected`."
+    ),
+    "request": (
+        "The exact bytes the client sends, as UTF-8 text; `request_bytes` is their length in UTF-8 bytes. The "
+        "runtime reads the bytes before the first LF, so a request that holds an LF is judged on the bytes "
+        "before it and the bound is compared with their length."
+    ),
+    "terminated": (
+        "true: the client sends one LF after `request`. false: the connection ends after `request` with no "
+        "further byte, so a request that holds no LF ends before any LF."
+    ),
+    "signatures": (
+        "A signed object is a possession (verified under the candidate's value at Local seed's or Enrol's "
+        "possession signature_invalid row), an authorization (under the named active credential's value, at "
+        "Enrol's first signature_invalid row) or a revocation document (under its signing_key, at Revoke's "
+        "signature_invalid row). A case may carry a signed object whose signature does not verify only when "
+        "its answer is decided by a step of Order of refusal, by a row of Challenges presented, or by a row "
+        "of the operation's table that comes before that object's signature row or is that row. In every "
+        "other case each signed object the request carries verifies under its key."
+    ),
+    "expected.changes": (
+        "Every state change the answer commits, sorted, from this closed vocabulary: "
+        "challenge_added:<challenge_id> (a pending challenge with its deadline); code_sent:<challenge_id> (a "
+        "possession code sent to the challenge's phone candidate); used:<challenge_id> (the challenge marked "
+        "used); registry_created:<identity_epoch> (an empty initialized registry under that epoch and the "
+        "verified site: revision 1, last external revision 0, credential sequence 0, no credentials or "
+        "tombstones); challenges_cleared, phone_authorizations_cleared and pending_phone_cleared (every held "
+        "challenge, received phone authorization and pending phone operation removed); "
+        "credential_added:<credential_id> (the candidate made active); sequence:<n> and revision:<n> (the new "
+        "credential sequence and registry revision); pending_phone_added:<value> (a pending phone operation "
+        "for the candidate); credential_tombstoned:<credential_id> and value_tombstoned:<value> (an active "
+        "credential removed, its ID and value tombstoned); approver_tombstoned:<approver_id>; and "
+        "last_external_revision:<n>. A refusal lists [] or, when it consumes its challenge, only "
+        "used:<challenge_id>. Every successful recover lists challenges_cleared, phone_authorizations_cleared "
+        "and pending_phone_cleared, whether or not anything was held, and still lists used:<challenge_id> for "
+        "the challenge it consumes and clears in the same transaction. registry_created implies revision 1, "
+        "last external revision 0 and credential sequence 0, which are not listed separately. The recorded "
+        "fingerprint of the last applied revocation document changes with last_external_revision and has no "
+        "token of its own."
+    ),
+    "context.keys_failing_admission": (
+        "The configured anchors' keys and active lan_ed25519 credential keys (canonical Base64 of the raw "
+        "32 bytes) that this fixture deliberately holds although they fail ed25519-key-admission/v1. Every "
+        "other key in the context passes it."
+    ),
+    "context.device_id": "The running runtime's device identity.",
+    "context.verified_site_id": "The device.site_id of the runtime's verified provisioning configuration.",
+    "context.peer_uid": (
+        "The peer's effective user ID from kernel peer credentials; null when they cannot be established."
+    ),
+    "context.operator_uid": "The installed operator identity; null when none is installed.",
+    "context.registry_operation_in_flight": "Whether another admitted registry operation is in flight.",
+    "context.anchor_available": "Whether the current provisioning anchor is present and usable.",
+    "context.anchors": (
+        "The configured anchors' raw Ed25519 public keys, canonical Base64: the current provisioning "
+        "anchor, the previous provisioning anchor, and one anchor of another class."
+    ),
+    "context.registry": (
+        "null when the registry is locked. Otherwise its site binding, identity epoch, registry revision, "
+        "last external revision, the SHA-256 (lowercase hex) of the Profile 2 canonical JSON of the last "
+        "applied revocation document or null, credential sequence, active credentials (each with its "
+        "approver ID, credential ID, channel, value as in a challenge candidate, and enrolment sequence), "
+        "the credentials tombstoned in this epoch (each with its credential ID and the approver ID it belonged "
+        "to), the approver IDs tombstoned in this epoch, and the values tombstoned in this epoch: revoking a "
+        "credential tombstones its value as well as its ID."
+    ),
+    "context.challenges": (
+        "Challenges the runtime holds, each with its challenge object, its state (pending; used, already "
+        "presented; or expired, its deadline passed and not yet presented), the registry's credential "
+        "sequence when it was created, and elapsed_ms, the monotonic milliseconds since it was created. A "
+        "challenge not used is expired exactly when elapsed_ms exceeds 60,000, the challenge window, whatever "
+        "its candidate's channel; the separate 10-minute phone possession window never extends it. A "
+        "challenge absent from the list is one the runtime does not hold."
+    ),
+    "context.phone_authorizations": (
+        "ORI-ENROL-V1 texts the runtime has received and attributed through a phone channel's authenticated "
+        "ingress, in the order they arrived: the challenge ID and challenge SHA-256 the text carries, and the "
+        "credential ID of the sender. The first entry for a challenge ID is that challenge's authorization, "
+        "whoever its sender; a later entry for the same challenge ID is ignored. A sender the runtime could not "
+        "attribute to a credential is represented by a credential ID that is neither active nor tombstoned."
+    ),
+    "context.pending_phone_values": "Phone values with a pending phone operation, on either phone channel.",
+    "context.authenticated_phone_channels": (
+        "The phone channels that have an authenticated ingress at the runtime. In v1 only sms can; an empty list "
+        "means the runtime has no authenticated SMS ingress, so an sms candidate is channel_unauthenticated. The "
+        "set is fixed for a run, so a held challenge whose candidate is on a phone channel the list leaves out "
+        "is not a valid context."
+    ),
+    "context.minted": (
+        "The values the runtime's CSPRNG yields for the next challenge: challenge ID, approver ID, "
+        "credential ID, and the prospective identity epoch for a recover challenge. null unless the request "
+        "is a well-formed challenge request that reaches the Challenge table."
+    ),
+    "expected": (
+        "ok true with the exact `result` object, or ok false with the `error.code`. `consumes_challenge` "
+        "appears for the operations that present a challenge: whether the named challenge is used "
+        "afterwards because of this request. A refusal changes nothing else."
+    ),
+    "keys": (
+        "Ed25519 private keys are SHA-256 of 'ori operator-socket/v3 <label> test key'; challenge_sha256 is "
+        "SHA-256 of the challenge's Profile 2 canonical JSON. Test keys only."
+    ),
+}
+
+
+STEP_CODES = ("payload_too_large", "invalid_arguments", "unauthenticated", "registry_busy", "registry_unavailable",
+              "site_binding_mismatch", "challenge_reused", "challenge_unavailable", "challenge_expired",
+              "candidate_changed")
+UP_TO_SIGNATURE_ROW = {
+    ("approver_registry_revoke", "document"): ("anchor_unavailable", "malformed", "unknown_signer",
+                                               "signature_invalid"),
+    ("approver_registry_local_seed", "possession"): ("challenge_stale", "active_authorizer_exists",
+                                                     "possession_invalid", "signature_invalid"),
+    ("approver_registry_enrol", "authorization"): ("challenge_stale", "authorizer_unavailable",
+                                                   "authorizer_not_preexisting", "signature_invalid"),
+    ("approver_registry_enrol", "possession"): ("challenge_stale", "authorizer_unavailable",
+                                                "authorizer_not_preexisting", "signature_invalid",
+                                                "possession_invalid"),
+}
+
+
+def signature_may_fail(req: str, label: str, expected: dict) -> bool:
+    """The signatures note: a deciding row at or before the object's signature row."""
+    code = expected.get("code")
+    if code is None:
+        return False
+    if code in STEP_CODES and code != "registry_unavailable":
+        return True
+    op = json.loads(frame(req).decode("utf-8"))["operation"]
+    return code == "registry_unavailable" or code in UP_TO_SIGNATURE_ROW[(op, label)]
+
+
+def context_keys(context: dict) -> list:
+    keys = list(context["anchors"].values())
+    for cred in (context["registry"] or {}).get("credentials", []):
+        if cred["channel"] == "lan_ed25519":
+            keys.append(cred["value"][8:])
+    return keys
+
+
+def check_fixture_keys(name: str, context: dict) -> None:
+    """A context key fails admission exactly when the fixture lists it as doing so."""
+    listed = set(context["keys_failing_admission"])
+    for key in context_keys(context):
+        assert admitted(base64.b64decode(key)) == (key not in listed), (name, key)
+    assert listed <= set(context_keys(context)), name
+
+
+def signed_objects_verify(context: dict, req: str) -> list:
+    try:
+        parsed = json.loads(frame(req).decode("utf-8"))
+    except ValueError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    creds = {c["credential_id"]: c for c in (context["registry"] or {}).get("credentials", [])}
+    out = []
+    cand, poss, auth, doc = (parsed.get(k) for k in ("candidate", "possession", "authorization", "document"))
+
+    def check(label: str, value: object, domain: bytes, signed: dict) -> None:
+        try:
+            out.append((label, verifies(base64.b64decode(str(value)[8:]), domain, signed)))
+        except (ValueError, KeyError, TypeError):
+            out.append((label, False))
+
+    if isinstance(cand, dict) and isinstance(poss, dict) and str(cand.get("value", "")).startswith("ed25519:"):
+        check("possession", cand["value"], b"ori.tier_c_approver.possession.v1", poss)
+    if isinstance(auth, dict) and auth.get("authorizer_credential_id") in creds:
+        key = creds[auth["authorizer_credential_id"]]["value"]
+        if key.startswith("ed25519:"):
+            check("authorization", key, b"ori.tier_c_approver.enrol.v1", auth)
+    if isinstance(doc, dict) and str(doc.get("signing_key", "")).startswith("ed25519:"):
+        check("document", doc["signing_key"], b"ori.tier_c_approver.revoke.v1", doc)
+    return out
+
+
+def is_challenge_request(req: str) -> bool:
+    try:
+        parsed = json.loads(frame(req).decode("utf-8"))
+    except ValueError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("operation") == "approver_registry_challenge"
+
+
+def build() -> dict:
+    cases = []
+    seen = set()
+    for name, note, context, req, terminated in CASES:
+        assert name not in seen, name
+        seen.add(name)
+        context = copy.deepcopy(context)
+        if is_challenge_request(req):
+            # context.minted is set exactly when the Challenge table judges the request.
+            context["minted"] = MINTED
+            TABLE[0] = False
+            expected = answer(context, req, terminated)
+            if not (expected["ok"] or TABLE[0]):
+                context["minted"] = None
+        expected = answer(context, req, terminated)
+        if not expected["ok"]:
+            assert expected["code"] in CODES, expected
+        if name in SWEEP_EXPECT:
+            assert expected.get("code") == SWEEP_EXPECT[name], (name, expected)
+        check_fixture_keys(name, context)
+        for label, verified in signed_objects_verify(context, req):
+            assert verified or signature_may_fail(req, label, expected), f"{name}: its {label} does not verify"
+        cases.append({
+            "name": name,
+            "note": note,
+            "context": context,
+            "request": req,
+            "request_bytes": len(req.encode("utf-8")),
+            "terminated": terminated,
+            "expected": expected,
+        })
+    missing = set(CODES) - {c["expected"].get("code") for c in cases}
+    assert not missing, sorted(missing)
+    return {
+        "contract": "operator-socket/v3",
+        "section": "Approver Registry Operations",
+        "bound_bytes": BOUND,
+        "codes": list(CODES),
+        "note": NOTE,
+        "cases": cases,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -46,7 +46,12 @@ New implementation gaps should be added here, naming the owning repository.
 - **Runtime and gateway consumers**
   ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `ori-runtime` has no
   registry, local first-approver path, signed enrolment consumer, revocation
-  consumer or serialized Tier C admission check. Its current phone sender
+  consumer or serialized Tier C admission check;
+  [operator-socket/v3](../operator-socket/v3.md) is the contract its
+  `recover`, `local_seed` and `enrol` delivery follows. Before it claims v3, it
+  must move `reconcile_tier_c` and `evidence_commission` from its shipped
+  8,192-byte bound, refused `invalid_arguments`, to v3's 16,384 bytes, refused
+  `payload_too_large`. Its current phone sender
   normalization is more permissive than this draft. `ori-gateway` does not
   perform the per-request runtime disclosure query; its bounded MQTT pair
   belongs in `gateway-api/v2` before the LAN surface in #344 can be adopted.
@@ -60,10 +65,10 @@ New implementation gaps should be added here, naming the owning repository.
   The draft `runtime-config/v2` field `device.site_id` has no consumer yet.
   A signed site-ID change locks Tier C; v1 has no site-transfer operation.
 - **Local revocation delivery and recovery disclosure**
-  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)): `operator-socket/v2`
-  rejects an approver-revocation operation. A successor socket contract and
-  runtime consumer must specify the bounded local request and authenticated
-  binding readback. No authenticated automatic disclosure to the product or
+  ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)):
+  [operator-socket/v3](../operator-socket/v3.md) specifies the bounded local
+  revocation request and the authenticated binding readback, and no runtime
+  consumer serves them yet. No authenticated automatic disclosure to the product or
   remote revocation route exists, including after recovery. A compromised
   credential stays active until someone can reach the site for local delivery.
 - **LAN approval reply dependency**
