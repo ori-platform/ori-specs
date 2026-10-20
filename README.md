@@ -46,7 +46,7 @@ below are checked against those records.
 | Gateway API | [gateway-api/v1.md](gateway-api/v1.md) | `draft` | runtime `shipped` in v1.0.0, `unassessed`, gateway `implemented-unreleased`, claimed, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed` | `frozen` (2026-06-04), audit `complete` |
 | Gateway API | [gateway-api/v2.md](gateway-api/v2.md) | `draft` | producer (runtime) `implemented-unreleased`, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `amendable` |
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed current snapshot `4c28c93` (1 divergence) | `frozen` (2026-06-09), audit `complete` |
-| Gateway config surface | [gateway-config/v2.md](gateway-config/v2.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed implementation snapshot `a0dd23c` (3 divergences) | `amendable` |
+| Gateway config surface | [gateway-config/v2.md](gateway-config/v2.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed implementation snapshot `a0dd23c` (7 divergences) | `amendable` |
 | Gateway Evidence Carriage | [gateway-evidence-carriage/v1.md](gateway-evidence-carriage/v1.md) | `draft` | none recorded | `amendable` |
 | Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `pending` |
 | LAN application API | [lan-app-api/v1.md](lan-app-api/v1.md) | `draft` | none recorded | `amendable` |
