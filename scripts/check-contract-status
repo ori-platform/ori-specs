@@ -59,6 +59,7 @@ import urllib.parse
 import sys
 import tempfile
 import textwrap
+import unicodedata
 from collections.abc import Callable
 from typing import Any
 
@@ -593,15 +594,18 @@ def amends_document(rev: str, path: str) -> bool:
 
 
 def normative_words(text: str) -> str:
-    """A document's text outside its Status block with whitespace collapsed, so a re-wrap changes nothing."""
-    return " ".join(" ".join(normative_lines(text)).split())
+    """A document's text outside its Status block, in NFKC with format characters removed and whitespace
+    collapsed, so a re-wrap or an invisible character changes nothing."""
+    t = unicodedata.normalize("NFKC", "\n".join(normative_lines(text)))
+    return " ".join("".join(c for c in t if unicodedata.category(c) != "Cf").split())
 
 
-def carries(rec: object, item: tuple[str, str]) -> bool:
-    """Whether a parsed status record's assessments, active or superseded, record the item."""
+def carries(rec: object, item: tuple[str, str], who: tuple[object, object]) -> bool:
+    """Whether a parsed status record's entry for who, (role, repository), records the item in an assessment,
+    active or superseded."""
     field = dict(RECORDED_KINDS)[item[0]]
     for e in rec.get("adoption") or [] if isinstance(rec, dict) else []:
-        if not isinstance(e, dict):
+        if not isinstance(e, dict) or (e.get("role"), e.get("repository")) != who:
             continue
         prior = e.get("prior_assessments") if isinstance(e.get("prior_assessments"), list) else []
         for a in [e.get("assessment"), *prior]:
@@ -610,7 +614,7 @@ def carries(rec: object, item: tuple[str, str]) -> bool:
     return False
 
 
-def first_recorded(item: tuple[str, str], status_rel: str) -> str | None:
+def first_recorded(item: tuple[str, str], status_rel: str, who: tuple[object, object]) -> str | None:
     """The ori-specs commit at which a status record's assessments first recorded the item, found by parsing each
     version of the record in its log, oldest first, so an escaped or repeated string cannot mislead it."""
     if item[1] in RECORDED_AT:
@@ -618,7 +622,7 @@ def first_recorded(item: tuple[str, str], status_rel: str) -> str | None:
     for rev in (_git_out(ROOT, "log", "--reverse", "--format=%H", "HEAD", "--", status_rel) or "").split():
         blob = _git_out(ROOT, "show", f"{rev}:{status_rel}")
         try:
-            if blob is not None and carries(json.loads(blob), item):
+            if blob is not None and carries(json.loads(blob), item, who):
                 return rev
         except (json.JSONDecodeError, RecursionError):
             continue
@@ -720,7 +724,8 @@ def check_assessment_history(rec: dict, w: str, e: dict, asm: dict, bad: Callabl
                                           f"recorded this {item[0]}, so no fix can resolve it there")
         else:
             rev = str(r.get("contract_revision", ""))
-            first = first_recorded(item, status_rel) if HEX.match(rev) else None
+            who = (e.get("role"), e.get("repository"))
+            first = first_recorded(item, status_rel, who) if HEX.match(rev) else None
             if not HEX.match(rev) or "commit" in r:
                 bad("resolution-invalid", f"{rw} is an amended rule, so it names contract_revision, the ori-specs "
                                           "commit the active assessment was judged under, and no commit")
@@ -4314,11 +4319,18 @@ def mutations() -> int:
             ("a re-wrap leaves the normative words unchanged",
              normative_words(doc) == normative_words(doc.replace("a\nstale", "a stale"))),
             ("a changed word changes them", normative_words(doc) != normative_words(doc.replace("stale", "old"))),
+            ("an invisible character leaves them unchanged",
+             normative_words(doc) == normative_words(doc.replace("stale", "st\u200bale"))),
+            ("a normal-form swap leaves them unchanged",
+             normative_words(doc + "caf\u00e9\n") == normative_words(doc + "cafe\u0301\n")),
             ("an item quoting \" and \\ is found in a parsed record", carries(json.loads(json.dumps({
-                "adoption": [{"prior_assessments": [{"divergences": ['takes "x" \\ y']}]}]})),
-                ("divergence", 'takes "x" \\ y'))),
+                "adoption": [{"role": "r", "repository": "g", "prior_assessments": [
+                    {"divergences": ['takes "x" \\ y']}]}]})), ("divergence", 'takes "x" \\ y'), ("r", "g"))),
             ("an item in notes alone is not found", not carries({"notes": "d", "adoption": [{}]},
-                                                                  ("divergence", "d")))):
+                                                                  ("divergence", "d"), (None, None))),
+            ("an item another entry recorded is not found", not carries(
+                {"adoption": [{"role": "r", "repository": "other", "assessment": {"divergences": ["d"]}}]},
+                ("divergence", "d"), ("r", "g")))):
         print(f"{'ok  ' if good else 'FAIL'} {name}")
         total += 1
         failed += not good
