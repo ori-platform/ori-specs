@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 health transition corpus.
+
+Each case is the first item of a `health` export response, already verified,
+the device the export was requested from, and whether the gateway has read a
+marked item from that device before. Legacy items are mutations of exports two
+runtime releases produced, held in health-transition-baselines-v2.json. Nothing
+here is shared with scripts/check-gateway-health-transition-vectors-v2, which
+reads the readings, the member table and the latch from the contract rather
+than from this file.
+
+    python3 scripts/generate-gateway-health-transition-vectors-v2          # write
+    python3 scripts/generate-gateway-health-transition-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "health-transition-v2.json"
+BASELINES = ROOT / "gateway-api" / "vectors" / "health-transition-baselines-v2.json"
+
+MARK = "runtime-health/v4/remote"
+DEVICE = "dev-01"
+ABSENT = object()
+
+# The top-level members each encoding always sends. A member's own type is read from the
+# baseline, and WRONG gives a value of another JSON type for it.
+COMMON = ("device_id", "uptime_s", "health_socket_path", "sensors", "degradation_reasons", "safety",
+          "alert_outbox", "capability_posture", "commissioning", "community_skills",
+          "config_authority", "device_policy", "evidence", "firmware_liveness",
+          "firmware_mqtt_operator", "gateway_broker_posture", "last_alert_timestamps",
+          "remote_command_lockout", "state_store_encryption", "telemetry_export")
+LATER = ("critical", "firmware_reading_age", "firmware_controller_profiles")
+WRONG = {str: 7, float: "812.5", int: "812", list: {}, dict: [], bool: "false"}
+
+
+def started(item: dict) -> dict:
+    """The baseline as a started runtime serves it: safety built, socket bound, time passed."""
+    out = copy.deepcopy(item)
+    out.update(safety={}, health_socket_path="/run/ori/health.sock", uptime_s=812.5)
+    return out
+
+
+def edit(item: dict, **changes: object) -> dict:
+    out = copy.deepcopy(item)
+    for key, value in changes.items():
+        if value is ABSENT:
+            out.pop(key, None)
+        else:
+            out[key] = value
+    return out
+
+
+def wrong(value: object) -> object:
+    return "null" if value is None else WRONG[type(value)]
+
+
+REASONS = {"ok": [], "degraded": ["commissioning_problem"],
+           "critical": ["firmware_liveness_device_expired"]}
+
+
+def projection(status: object = "ok", mark: object = MARK) -> dict:
+    """A projection whose critical and degradation_reasons agree with its status."""
+    item: dict = {"projection": mark, "device_id": DEVICE, "uptime_s": 812.5,
+                  "critical": status == "critical",
+                  "degradation_reasons": REASONS.get(status, []) if isinstance(status, str) else [],
+                  "unknown_critical_blocks": []}
+    if status is not ABSENT:
+        item["status"] = status
+    return item
+
+
+def cases(v250: dict, later: dict) -> list[tuple]:
+    """(name, note, latched before, item, severity, latched after)."""
+    a, b = started(later), started(v250)
+    out: list[tuple] = [
+        ("producer_later_exact", "an e4ba3e92 export exactly as produced", False, later, "ok",
+         False),
+        ("producer_v250_exact", "a v2.5.0 export exactly as produced", False, v250, "ok", False),
+        ("later_started", "", False, a, "ok", False),
+        ("v250_started", "", False, b, "ok", False),
+    ]
+    for name, base, required in (("later", a, COMMON + LATER), ("v250", b, COMMON)):
+        for member in required:
+            out.append((f"{name}_{member}_absent", "a required member missing is never health",
+                        False, edit(base, **{member: ABSENT}), "unknown", False))
+            out.append((f"{name}_{member}_mistyped", "a required member of another JSON type",
+                        False, edit(base, **{member: wrong(base[member])}), "unknown", False))
+        out += [
+            (f"{name}_other_device", "an item naming another device is never health", False,
+             edit(base, device_id="dev-02"), "unknown", False),
+            (f"{name}_degraded", "", False,
+             edit(base, status="degraded", degradation_reasons=["commissioning_problem"]),
+             "degraded", False),
+            (f"{name}_degraded_empty_reasons", "", False, edit(base, status="degraded"),
+             "degraded", False),
+            (f"{name}_reasons_without_status", "reasons without a degraded status are "
+             "inconsistent", False, edit(base, degradation_reasons=["commissioning_problem"]),
+             "unknown", False),
+            (f"{name}_reasons_null", "", False, edit(base, degradation_reasons=None), "unknown",
+             False),
+            (f"{name}_reasons_string", "", False, edit(base, degradation_reasons="none"),
+             "unknown", False),
+            (f"{name}_reasons_object", "", False, edit(base, degradation_reasons={}), "unknown",
+             False),
+            (f"{name}_critical_overrides_malformed", "critical is never read as less, a "
+             "malformed item included", False,
+             edit(base, status="critical", degradation_reasons=None, sensors=ABSENT),
+             "critical", False),
+            (f"{name}_status_other", "", False, edit(base, status="warning"), "unknown", False),
+            (f"{name}_status_not_string", "", False, edit(base, status=1), "unknown", False),
+            (f"{name}_status_null", "a present null is not absent", False,
+             edit(base, status=None), "unknown", False),
+            (f"{name}_device_near_match", "device_id is compared exactly", False,
+             edit(base, device_id=DEVICE + " "), "unknown", False),
+            (f"{name}_safety_zones_mistyped", "a listed member that is present has its type",
+             False, edit(base, safety_zones={}), "unknown", False),
+            (f"{name}_critical_beside_mistyped_member", "critical is never read as less, a "
+             "mistyped listed member included", False,
+             edit(base, status="critical", safety_zones={}), "critical", False),
+            (f"{name}_status_critical_trailing_space", "the critical status is compared whole",
+             False, edit(base, status="critical "), "unknown", False),
+            (f"{name}_latched", "once a device has served the projection, an unmarked item is "
+             "refused", True, base, "unknown", True),
+            (f"{name}_latched_critical", "critical is never read as less, the latch included",
+             True, edit(base, status="critical"), "critical", True),
+        ]
+    out += [
+        ("later_status_ok", "a later release's explicit ok", False, edit(a, status="ok"), "ok",
+         False),
+        ("later_reasons_with_status_ok", "reasons beside an ok status are inconsistent", False,
+         edit(a, status="ok", degradation_reasons=["commissioning_problem"]), "unknown", False),
+        ("later_extra_member", "a later release may send further members", False,
+         edit(a, telemetry_rollup={}), "ok", False),
+        ("later_critical_true", "", False, edit(a, critical=True), "critical", False),
+        ("later_critical_null", "", False, edit(a, critical=None), "unknown", False),
+        ("later_critical_string_true", "a string is not the JSON boolean true: neither critical "
+         "nor well formed", False, edit(a, critical="true"), "unknown", False),
+        ("v250_status_ok", "v2.5.0 never writes ok", False, edit(b, status="ok"), "unknown",
+         False),
+        ("v250_status_critical", "v2.5.0's path that sets status critical without critical",
+         False, edit(b, status="critical",
+                     degradation_reasons=["firmware_liveness_device_expired"]),
+         "critical", False),
+        ("v250_critical_true_status_degraded", "v2.5.0's liveness path beside a degraded status",
+         False, edit(b, critical=True, status="degraded",
+                     degradation_reasons=["commissioning_problem"]), "critical", False),
+        ("v250_with_later_member", "a member v2.5.0 never sends rules out 3b", False,
+         edit(b, firmware_reading_age={}), "unknown", False),
+        ("v250_extra_member", "3b's member set is closed", False, edit(b, telemetry_rollup={}),
+         "unknown", False),
+        ("v250_with_safety_zones", "safety_zones is in v2.5.0's set", False,
+         edit(b, safety_zones=[]), "ok", False),
+        ("marked_ok", "a projection's status is its severity", False, projection("ok"), "ok",
+         True),
+        ("marked_degraded", "", False, projection("degraded"), "degraded", True),
+        ("marked_critical", "", False, projection("critical"), "critical", True),
+        ("marked_status_absent", "a projection without status is unknown", False,
+         projection(ABSENT), "unknown", True),
+        ("marked_status_other", "", False, projection("healthy"), "unknown", True),
+        ("marked_status_not_string", "", False, projection(0), "unknown", True),
+        ("marked_while_latched", "the latch changes nothing for a marked item", True,
+         projection("degraded"), "degraded", True),
+        ("marked_critical_true_status_absent", "critical is never read as less", False,
+         dict(projection(ABSENT), critical=True), "critical", True),
+        ("marked_status_critical_without_critical", "either signal reads critical", False,
+         dict(projection("critical"), critical=False), "critical", True),
+        ("projection_alone_other_value", "projection with another value is projection-only on "
+         "its own", False, edit(a, projection="runtime-health/v3"), "unknown", False),
+        ("projection_alone_extended", "the marker is compared whole, never by prefix", False,
+         edit(a, projection=MARK + "/2"), "unknown", False),
+        ("projection_alone_trailing_space", "never after trimming", False,
+         edit(a, projection=MARK + " "), "unknown", False),
+        ("projection_alone_not_string", "", False, edit(a, projection=4), "unknown", False),
+    ]
+    for member in ("unknown_critical_blocks", "action_log_records", "safety_registry",
+                   "skill_hooks"):
+        out.append((f"unmarked_{member}", "a projection-only member", False,
+                    edit(a, **{member: {}}), "unknown", False))
+    out += [
+        ("unmarked_member_with_critical", "critical is never read as less", False,
+         edit(a, critical=True, unknown_critical_blocks=[]), "critical", False),
+        ("unmarked_member_latched", "", True, edit(a, skill_hooks={}), "unknown", True),
+        ("item_names_another_device_latched", "the latch is the requested device's", True,
+         edit(a, device_id="dev-02"), "unknown", True),
+    ]
+    return out
+
+
+def build() -> bytes:
+    baselines = json.loads(BASELINES.read_text(encoding="utf-8"))
+    built = [{"name": name, "note": note, "requested_device_id": DEVICE, "latched": latched,
+              "item": item, "expect": {"severity": severity, "latched_after": after}}
+             for name, note, latched, item, severity, after
+             in cases(baselines["v2.5.0"], baselines["e4ba3e92"])]
+    corpus = {
+        "contract": ("ori-specs/gateway-api/v2.md"
+                     "#reading-status-while-runtimes-adopt-runtime-healthv4"),
+        "version": 2,
+        "comment": (
+            "Golden vectors for reading the health export's status while runtimes adopt "
+            "runtime-health/v4. Each case is items[0] of a verified health export response, "
+            "requested_device_id, the device the export was requested from, and whether the "
+            "gateway has read a marked item from it before. Legacy items are mutations of the "
+            "producer exports in health-transition-baselines-v2.json. A gateway must read each "
+            "case as the severity given, and hold or not hold the device's latch afterwards as "
+            "given."
+        ),
+        "baselines": "health-transition-baselines-v2.json",
+        "severities": ["ok", "degraded", "critical", "unknown"],
+        "cases": built,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
