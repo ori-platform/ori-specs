@@ -42,7 +42,10 @@ Held to:
   records, and one digest under two ids, each alone; and
   each misuse of the alarm tokens; and for each bound pair the grammar reads
   (fleet identifier length, record length, digest hex length), each end
-  accepted and one past each end refused;
+  accepted and one past each end refused; `runtime_key_domains` and
+  `command_results` each declared and accepted, `command_results` with
+  `runtime_key_domains` and without it, and each refused for another string, a
+  letter-case variant, null, another JSON type and each mistaken comparison;
 - the digests firmware-telemetry/v2.md pins are the two corpora's.
 
     python3 scripts/check-firmware-manifest-vectors-v2
@@ -91,7 +94,8 @@ MODE_RULES = ("mode_undefined", "mode_disagrees", "channels_empty")
 PROFILE_RULES = ("profile_missing", "profile_unexpected", "profile_invalid",
                  "alarm_channel")
 DOMAIN_RULES = ("domains_invalid",)
-RULES = MODE_RULES + PROFILE_RULES + DOMAIN_RULES
+RESULTS_RULES = ("results_invalid",)
+RULES = MODE_RULES + PROFILE_RULES + DOMAIN_RULES + RESULTS_RULES
 # What each rule refuses, as v2.md words it. The checker evaluates each rule by
 # its own predicate below, so the clause it is held to must say exactly that: a
 # clause whose meaning changes, its polarity included, fails here rather than
@@ -150,10 +154,20 @@ PROFILE_CLAUSES = (
 # pairing rule, so a second qualification brings a second record with it.
 IMPLIED = {"one_id_two_qualification": "one_id_two_record"}
 OPTIONAL_MANIFEST_FIELD = "deployment_maintenance_limit_ms"
-# Runtime Key Domains: the member's example, and its Manifest Validation bullet.
+# Runtime Key Domains and Command Results: each member's example, and its
+# Manifest Validation bullet. The bullet pattern matches both members' bullets.
 DOMAINS_FENCE = r'```json\n"([a-z_]+)": "([^"]+)"\n```'
 DOMAINS_BULLET = (r"- `([a-z_]+)` is present and is not the string `([^`]+)`, including a value "
                   r"of another JSON type \(`([a-z_]+)`\)\.")
+# Each closed-string member: the model key it is read into, the subsection that
+# defines it, and the rule that refuses another value.
+CLOSED_MEMBERS = (("domains", "### Runtime Key Domains", "domains_invalid"),
+                  ("results", "### Command Results", "results_invalid"))
+# Golden Vectors' Command Results paragraph names the reason its refusals carry.
+RESULTS_GOLDEN = (r"It covers \[Command Results\]\(#command-results\) the same way: manifests "
+                  r"that declare `([a-z_]+)`, with `([a-z_]+)` and without it, accepted, and "
+                  r"refusals whose signatures verify for another string and for each of those "
+                  r"forms, refused as `([a-z_]+)`\.")
 
 
 class Failure(Exception):
@@ -458,18 +472,38 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
                                                    profile["alarm_unit"]):
         raise Failure("v2 does not say what a manifest channel reading an alarm word declares")
     profile["alarm_kind"] = reading.group(1)
-    domains_text = _section(t2, "### Runtime Key Domains")
-    fence = re.search(DOMAINS_FENCE, domains_text)
-    bullet = re.search(DOMAINS_BULLET, " ".join(_section(t2, "### Manifest Validation").split()))
-    if fence is None or bullet is None:
-        raise Failure("v2 Runtime Key Domains or its Manifest Validation bullet changed shape")
-    if fence.groups() != bullet.groups()[:2]:
-        raise Failure("the Runtime Key Domains example and its refusal name different values")
-    if f"The field's only value is the string `{fence.group(2)}`." not in " ".join(
-            domains_text.split()):
-        raise Failure("Runtime Key Domains does not state the field's only value")
-    reasons["domains_invalid"] = bullet.group(3)
+    bullets = {b[0]: b for b in re.findall(
+        DOMAINS_BULLET, " ".join(_section(t2, "### Manifest Validation").split()))}
+    members = {}
+    for key, heading, rule in CLOSED_MEMBERS:
+        where = heading.lstrip("# ")
+        member_text = _section(t2, heading)
+        fence = re.search(DOMAINS_FENCE, member_text)
+        bullet = None if fence is None else bullets.get(fence.group(1))
+        if fence is None or bullet is None:
+            raise Failure(f"v2 {where} or its Manifest Validation bullet changed shape")
+        if fence.groups() != bullet[:2]:
+            raise Failure(f"the {where} example and its refusal name different values")
+        if f"The field's only value is the string `{fence.group(2)}`." not in " ".join(
+                member_text.split()):
+            raise Failure(f"{where} does not state the field's only value")
+        reasons[rule] = bullet[2]
+        members[key] = {"field": fence.group(1), "value": fence.group(2)}
+    # Capability Manifest lists the optional members, each with the value its
+    # own subsection gives.
+    listed = re.findall(r'```json\n"([a-z_]+)": ([^\n]+)\n```',
+                        _section(t2, "## Capability Manifest"))
+    if sorted(f for f, _ in listed) != sorted(
+            [OPTIONAL_MANIFEST_FIELD] + [m["field"] for m in members.values()]) or any(
+            (m["field"], json.dumps(m["value"])) not in listed for m in members.values()):
+        raise Failure("v2 Capability Manifest does not list the optional members "
+                      "their subsections define")
     golden = _section(t2, "## Golden Vectors")
+    covered = re.search(RESULTS_GOLDEN, " ".join(golden.split()))
+    if covered is None or covered.groups() != (
+            members["results"]["field"], members["domains"]["field"],
+            reasons["results_invalid"]):
+        raise Failure("v2 Golden Vectors does not say how the corpus covers Command Results")
     pins = {}
     for name in ("manifest", "controller-profile"):
         pin = re.search(rf"\[{name}-vectors-v2\.json\]\({name}-vectors-v2\.json\)"
@@ -482,7 +516,8 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
         "bridged_source": bridged.group(1),
         "modes": modes,
         "reasons": reasons,
-        "domains": {"field": fence.group(1), "value": fence.group(2)},
+        "domains": members["domains"],
+        "results": members["results"],
         "profile": profile,
         "pin": pins["manifest"],
         "profile_pin": pins["controller-profile"],
@@ -616,7 +651,7 @@ def v1_fault(message: dict, context: dict, public: bytes, model: dict,
     if type(message) is not dict or set(message) != {"manifest", "manifest_hash", "signature"}:
         return "message fields"
     m = message["manifest"]
-    optional = {OPTIONAL_MANIFEST_FIELD, model["domains"]["field"]}
+    optional = {OPTIONAL_MANIFEST_FIELD, model["domains"]["field"], model["results"]["field"]}
     if type(m) is not dict or not v1["fields"] <= set(m) <= v1["fields"] | optional:
         return "manifest fields"
     if OPTIONAL_MANIFEST_FIELD in m:
@@ -775,9 +810,10 @@ def broken_rules(manifest: dict, model: dict, off: frozenset[str]) -> set[str]:
             broken.add("alarm_channel")
     if consistency_faults(manifest, model) and "profile_consistency" not in off:
         broken.add("profile_invalid")
-    d = model["domains"]
-    if d["field"] in manifest and not exact(manifest[d["field"]], d["value"], model, "domains"):
-        broken.add("domains_invalid")
+    for key, _, rule in CLOSED_MEMBERS:
+        d = model[key]
+        if d["field"] in manifest and not exact(manifest[d["field"]], d["value"], model, key):
+            broken.add(rule)
     return broken - off
 
 
@@ -970,17 +1006,24 @@ def check(corpus: dict, model: dict, profiles: dict,
                and derive_mode(m, model) == m["device_mode"] for r, m in refused):
         raise Failure("coverage: no refusal for empty channels alone")
     _profile_coverage(accepted, refused, model, off)
-    _domains_coverage(accepted, refused, model)
+    _member_coverage(accepted, refused, model, "domains", "domains_invalid")
+    _member_coverage(accepted, refused, model, "results", "results_invalid")
+    # Golden Vectors: command_results accepted with runtime_key_domains and without it.
+    r, d = model["results"]["field"], model["domains"]["field"]
+    for label, with_domains in (("with", True), ("without", False)):
+        if not any(m.get(r) == model["results"]["value"] and (d in m) == with_domains
+                   for m in accepted):
+            raise Failure(f"coverage: no accepted {r} {label} {d}")
 
 
-def _domains_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
-                      model: dict) -> None:
-    """Golden Vectors' Runtime Key Domains list: declared, another string, a case
-    variant, and values of other JSON types."""
-    d, invalid = model["domains"], model["reasons"]["domains_invalid"]
+def _member_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
+                     model: dict, key: str, rule: str) -> None:
+    """Golden Vectors' list for a closed-string member: declared, another string,
+    a case variant, and values of other JSON types."""
+    d, invalid = model[key], model["reasons"][rule]
     values = [m[d["field"]] for r, m in refused if r == invalid and d["field"] in m]
     wanted = {
-        "a manifest declaring the domains accepted": any(
+        f"a manifest declaring {d['value']} accepted": any(
             m.get(d["field"]) == d["value"] for m in accepted),
         "another string refused": any(
             type(v) is str and v.lower() != d["value"].lower() for v in values),
@@ -994,7 +1037,7 @@ def _domains_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
     }
     missing = sorted(k for k, ok in wanted.items() if not ok)
     if missing:
-        raise Failure(f"coverage: runtime_key_domains {missing}")
+        raise Failure(f"coverage: {d['field']} {missing}")
 
 
 def _bound_coverage(accepted: list[dict], refused: list[tuple[str, dict]],
@@ -1258,7 +1301,7 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
     exact_mutants = [
         (f"{rule} compared {label}", model_mutant(
             lambda m, r=rule, h=how: m.update(compare={r: h})))
-        for rule in ("mode", "qualification", "domains")
+        for rule in ("mode", "qualification", "domains", "results")
         for how, label in (("prefix", "by prefix"), ("strip", "after trimming"),
                            ("lstrip", "after trimming the start"),
                            ("rstrip", "after trimming the end"),
@@ -1286,7 +1329,13 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                      "reject_runtime_key_domains_zero_width", "reject_runtime_key_domains_bom",
                      "reject_runtime_key_domains_truncated", "reject_runtime_key_domains_nul",
                      "reject_runtime_key_domains_letter_case",
-                     "reject_runtime_key_domains_fullwidth")
+                     "reject_runtime_key_domains_fullwidth",
+                     "reject_command_results_extended", "reject_command_results_padded",
+                     "reject_command_results_leading_space",
+                     "reject_command_results_zero_width", "reject_command_results_bom",
+                     "reject_command_results_truncated", "reject_command_results_nul",
+                     "reject_command_results_letter_case",
+                     "reject_command_results_fullwidth")
     ]
     cases: list[tuple[str, Callable[[], None]]] = exact_mutants + [
         ("signature bit flipped", corpus_mutant(flip_signature)),
@@ -1337,6 +1386,70 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             '"runtime_key_domains": "firmware-commands/v3"\n```\n\nThe field')),
         ("runtime_key_domains reason renamed in v2.md", text_mutant(
             "t2", "(`invalid_runtime_key_domains`)", "(`invalid_key_domains`)")),
+        ("rule off: command_results value", lambda: run(
+            corpus_bytes, model, frozenset({"results_invalid"}))),
+        ("command_results value admits another version", model_mutant(
+            lambda m: m["results"].update(value="firmware-command-result/v2"))),
+        ("command_results judged as runtime_key_domains", model_mutant(
+            lambda m: m["results"].update(value=m["domains"]["value"]))),
+        ("command_results refused where accepted", corpus_mutant(
+            edited(find("cases", "mixed_declares_command_results"),
+                   command_results="firmware-command-result/v2"))),
+        ("command_results accepted without runtime_key_domains refused", corpus_mutant(
+            edited(find("cases", "mixed_declares_command_results_without_domains"),
+                   command_results=None))),
+        ("command_results accepted cases dropped", corpus_mutant(lambda c: c.update(cases=[
+            x for x in c["cases"] if "command_results" not in x["message"]["manifest"]]))),
+        ("command_results accepted case without runtime_key_domains dropped", corpus_mutant(
+            lambda c: c["cases"].remove(
+                find("cases", "mixed_declares_command_results_without_domains")(c)))),
+        ("command_results accepted case with runtime_key_domains dropped", corpus_mutant(
+            lambda c: c["cases"].remove(find("cases", "mixed_declares_command_results")(c)))),
+        ("command_results null refusal dropped", corpus_mutant(lambda c: c.update(
+            reject_cases=[x for x in c["reject_cases"]
+                          if x["name"] != "reject_command_results_null"]))),
+        ("command_results other-type refusals dropped", corpus_mutant(lambda c: c.update(
+            reject_cases=[x for x in c["reject_cases"] if x["name"] not in (
+                "reject_command_results_null", "reject_command_results_integer",
+                "reject_command_results_list")]))),
+        ("command_results other-string refusals dropped", corpus_mutant(lambda c: c.update(
+            reject_cases=[x for x in c["reject_cases"] if x["name"] not in (
+                "reject_command_results_other_version", "reject_command_results_empty",
+                "reject_command_results_extended")]))),
+        ("command_results refusal relabelled runtime_key_domains", corpus_mutant(
+            lambda c: find("reject_cases", "reject_command_results_null")(c).update(
+                reason="invalid_runtime_key_domains"))),
+        ("command_results refusal also breaks runtime_key_domains and re-signed", corpus_mutant(
+            edited(find("reject_cases", "reject_command_results_null"),
+                   runtime_key_domains="firmware-commands/v3"))),
+        ("command_results refusal fixed and re-signed", corpus_mutant(
+            edited(find("reject_cases", "reject_command_results_padded"),
+                   command_results="firmware-command-result/v1"))),
+        ("command_results value changed in v2.md's example", text_mutant(
+            "t2", '"command_results": "firmware-command-result/v1"\n```\n\nThe field',
+            '"command_results": "firmware-command-result/v2"\n```\n\nThe field')),
+        ("command_results only-value sentence changed in v2.md", text_mutant(
+            "t2", "The field's only value is the string `firmware-command-result/v1`.",
+            "The field's value is the string `firmware-command-result/v1`.")),
+        ("command_results reason renamed in v2.md", text_mutant(
+            "t2", "(`invalid_command_results`)", "(`invalid_command_result`)")),
+        ("command_results bullet dropped from v2.md", text_mutant(
+            "t2", "- `command_results` is present and is not the string\n"
+            "  `firmware-command-result/v1`, including a value of another JSON type\n"
+            "  (`invalid_command_results`).\n", "")),
+        ("command_results bullet's other-type clause dropped in v2.md", text_mutant(
+            "t2", "`firmware-command-result/v1`, including a value of another JSON type\n"
+            "  (`invalid_command_results`)", "`firmware-command-result/v1`\n"
+            "  (`invalid_command_results`)")),
+        ("command_results dropped from v2.md's Capability Manifest", text_mutant(
+            "t2", '```json\n"command_results": "firmware-command-result/v1"\n```\n\nThey are',
+            "They are")),
+        ("Golden Vectors names another reason for Command Results in v2.md", text_mutant(
+            "t2", "of those forms, refused as `invalid_command_results`.",
+            "of those forms, refused as `invalid_runtime_key_domains`.")),
+        ("Golden Vectors drops command_results without runtime_key_domains in v2.md",
+         text_mutant("t2", "declare `command_results`, with `runtime_key_domains` and without it,",
+                     "declare `command_results` with `runtime_key_domains`,")),
         ("rule off: undefined mode", lambda: run(
             corpus_bytes, model, frozenset({"mode_undefined"}))),
         ("rule off: disagreeing mode", lambda: run(
