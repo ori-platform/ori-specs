@@ -329,16 +329,27 @@ def flat(text: str) -> str:
 
 # ---------------------------------------------------------------- the text
 
+def headings(lines: list[str]) -> list[int]:
+    """Heading lines outside fenced code: one reading for every splitter here."""
+    fence, out = False, []
+    for i, line in enumerate(lines):
+        if line.startswith("```"):
+            fence = not fence
+        elif not fence and re.match(r"#{1,6} ", line):
+            out.append(i)
+    return out
+
+
 def sections(text: str) -> dict[str, list[str]]:
     lines = text.split("\n")
-    try:
-        start = lines.index(f"## {SECTION}")
-    except ValueError:
-        raise Failure(f"no '## {SECTION}' heading") from None
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")),
-               len(lines))
+    heads = headings(lines)
+    at = [i for i in heads if lines[i] == f"## {SECTION}"]
+    if len(at) != 1:
+        raise Failure(f"'## {SECTION}' is a heading {len(at)} times, not once")
+    start = at[0]
+    end = next((i for i in heads if i > start and lines[i].startswith("## ")), len(lines))
     body = lines[start + 1:end]
-    heads = [i for i, line in enumerate(body) if line.startswith("### ")]
+    heads = [i - start - 1 for i in heads if start < i < end and lines[i].startswith("### ")]
     names = tuple(body[i][4:].strip() for i in heads)
     if names != SUBSECTIONS:
         raise Failure(f"subsections changed: {list(names)}")
@@ -348,24 +359,40 @@ def sections(text: str) -> dict[str, list[str]]:
     return out
 
 
-def bullets(lines: list[str], after: Callable[[str], bool]) -> list[str]:
-    """The bullet list that follows the first line matching `after`."""
+def events_lead(line: str) -> bool:
+    return line.rstrip().endswith("The events are:")
+
+
+def cover_lead(line: str) -> bool:
+    return line.strip() == "The cases cover:"
+
+
+def list_span(lines: list[str], after: Callable[[str], bool]) -> tuple[int, int]:
+    """The lines of the list that follows the first line matching `after`: what
+    `bullets` parses and `closed_sections` leaves out, the same span for both."""
     at = next((i for i, line in enumerate(lines) if after(line)), None)
     if at is None:
         raise Failure("a list's lead-in line is gone")
     i = at + 1
     while i < len(lines) and not lines[i].strip():
         i += 1
+    j = i
+    while j < len(lines) and lines[j].strip():
+        j += 1
+    return i, j
+
+
+def bullets(lines: list[str], after: Callable[[str], bool]) -> list[str]:
+    """The bullet list that follows the first line matching `after`."""
+    i, j = list_span(lines, after)
     items: list[str] = []
-    while i < len(lines) and lines[i].strip():
-        line = lines[i]
+    for line in lines[i:j]:
         if line.startswith("- "):
             items.append(line[2:])
         elif line.startswith("  ") and items:
             items[-1] += " " + line.strip()
         else:
             raise Failure(f"unrecognised line in a list: {line!r}")
-        i += 1
     return [flat(item) for item in items]
 
 
@@ -438,14 +465,14 @@ def contract_model(text: str, guard: bool = True) -> dict:
     # Replay vectors: the event list, the cover list, the scripts.
     rv = sec["Replay vectors"]
     events = []
-    for item in bullets(rv, lambda line: line.rstrip().endswith("The events are:")):
+    for item in bullets(rv, events_lead):
         m = re.fullmatch(r"((?:`[a-z_]+`(?: and |, )?)+): (.+)", item)
         if not m:
             raise Failure(f"event bullet unrecognised: {item!r}")
         events.append((tuple(re.findall(r"`([a-z_]+)`", m.group(1))), m.group(2)))
     if tuple(events) != EVENTS:
         raise Failure(f"event list changed: {events}")
-    cover = [b.rstrip(";.") for b in bullets(rv, lambda line: line.strip() == "The cases cover:")]
+    cover = [b.rstrip(";.") for b in bullets(rv, cover_lead)]
     if len(cover) != len(set(cover)) or set(cover) != set(COVERAGE):
         unknown = [b for b in cover if b not in COVERAGE]
         gone = [b for b in COVERAGE if b not in cover]
@@ -505,12 +532,8 @@ def digest(sentence: str) -> str:
 def guarded_sections(text: str) -> dict[str, list[str]]:
     """Each section's own body (to the next heading of any level), by heading,
     for every section outside this one whose body touches the stems."""
-    lines, fence, heads = text.split("\n"), False, []
-    for i, line in enumerate(lines):
-        if line.startswith("```"):
-            fence = not fence
-        elif not fence and re.match(r"#{1,6} ", line):
-            heads.append(i)
+    lines = text.split("\n")
+    heads = headings(lines)
     out: dict[str, list[str]] = {}
     inside = False
     for n, i in enumerate(heads):
@@ -528,24 +551,46 @@ def guarded_sections(text: str) -> dict[str, list[str]]:
     return out
 
 
+def structure(lines: list[str]) -> str:
+    """The lines with what renders as structure kept: each block's start and
+    each list item's marker, with their indentation, as a token, so nesting,
+    a code block, a setext heading or a merged block changes a digest. A reflow
+    inside a block changes none."""
+    out, start = [], True
+    for raw in lines:
+        line = raw.expandtabs(4)
+        if not line.strip():
+            out.append("")
+            start = True
+            continue
+        body = line.lstrip()
+        ind = len(line) - len(body)
+        m = re.match(r"([-*+]|\d+[.)])\s", body)
+        if m:
+            out.append(f"<{ind}{m.group(1)}> {body[m.end():]}")
+        elif start:
+            out.append(f"<{ind}> {body}")
+        else:
+            out.append(body)
+        start = False
+    return "\n".join(out)
+
+
 def closed_sections(text: str) -> dict[str, list[str]]:
-    """Every prose sentence of this section, by subsection. The table, the
-    event list and the cover list are parsed instead, and left out here."""
+    """Every sentence of this section, by subsection, but for exactly what a
+    parser validates: the order-of-checks table, every `|` line of that
+    subsection (`contract_model` takes them all as its six rows), and the event
+    and cover lists of Replay vectors, by the same spans `bullets` parses."""
     out = {}
     for name, lines in sections(text).items():
-        keep = [line for line in lines if not line.startswith("|")]
-        for lead in ("The events are:", "The cases cover:"):
-            at = next((i for i, line in enumerate(keep) if line.rstrip().endswith(lead)), None)
-            if at is None:
-                continue
-            i = at + 1
-            while i < len(keep) and not keep[i].strip():
-                i += 1
-            j = i
-            while j < len(keep) and keep[j].strip():
-                j += 1
-            keep = keep[:i] + keep[j:]
-        out[f"### {name}" if name else f"## {SECTION}"] = sentences("\n".join(keep))
+        keep = list(lines)
+        if name == "Order of checks":
+            keep = [line for line in keep if not line.startswith("|")]
+        if name == "Replay vectors":
+            spans = [list_span(keep, events_lead), list_span(keep, cover_lead)]
+            keep = [line for n, line in enumerate(keep)
+                    if not any(i <= n < j for i, j in spans)]
+        out[f"### {name}" if name else f"## {SECTION}"] = sentences(structure(keep))
     return out
 
 
@@ -574,9 +619,10 @@ def compare(where: str, held: tuple[str, ...], now: list[str]) -> None:
 def check_inventory(text: str, runtime_config: str, status: dict,
                     guard: bool = True) -> None:
     if guard:
-        for head, now_closed in closed_sections(text).items():
-            if head not in CLOSED:
-                raise Failure(f"closed passages changed: {head!r}")
+        closed = closed_sections(text)
+        if set(closed) != set(CLOSED):
+            raise Failure(f"closed passages changed: {sorted(set(closed) ^ set(CLOSED))}")
+        for head, now_closed in closed.items():
             compare(f"gateway-api/v2.md {SECTION}, {head}", CLOSED[head], now_closed)
     now = guarded_sections(text)
     if set(now) != set(INVENTORY):
@@ -620,58 +666,58 @@ def print_inventory(text: str, status: dict) -> None:
 # BEGIN INVENTORY
 CLOSED = {
     '## Envelope Freshness and Replay': (
-        "907e544e10739af2", "321f315320f9448c", "c16175e806c9447f", "32f3e956cfd84ac0",
-        "31e6e280eca03f63", "4aeef3a3c1380201", "5f5ad92f01e8f8d1", "8e0ed0e8d7dae52c",
-        "8306effa78b6ff0e", "813e62fbc106c665", "b5c12b4da302b21b",
+        "f1f0d413232a681f", "321f315320f9448c", "9554dcc56e6b5754", "32f3e956cfd84ac0",
+        "c91ddced6368bf5b", "32abb61a50bbbf3c", "f6b36fc520af3d88", "8e0ed0e8d7dae52c",
+        "8306effa78b6ff0e", "3655f322cde86457", "b5c12b4da302b21b",
     ),
     '### Order of checks': (
-        "9f3f06e67863375e", "add504bd0f1203ea", "34059d674e611468", "a5fae435cd1bbed6",
-        "9aff481ebc0cf273", "d7fc7a0156e4638a", "b7360a1ee590b7d6", "3b4bdd7e3b60ab16",
+        "143e0547c3c87b93", "26a0cba5d197d57d", "34059d674e611468", "a5fae435cd1bbed6",
+        "9aff481ebc0cf273", "d7fc7a0156e4638a", "b7360a1ee590b7d6", "878502c4ee0dbd9a",
         "260be94fb3cc5e6a",
     ),
     '### Retention': (
-        "fe182cdb3d442027", "066fa807f8b14451", "3ccec9f6d7bfa6fd", "91b46e886c2fbd00",
+        "45abcf86939ccfdf", "cf9e9e11ebec49c5", "3ccec9f6d7bfa6fd", "91b46e886c2fbd00",
     ),
     '### The floor': (
-        "b9f272acbe19f575", "038dea2290b9cd50", "d668e909dbd66b63", "c0d96f62f41b5186",
-        "ac96316c6646f468", "c597d20e4a7fcce3", "5585e88cfefbba8f", "cb7eabc6712a4e90",
-        "ca5739c7d2ec6144", "472aab5f7b05ca1e", "f3e9dc6933c115d1", "66ecc8bc1fa05f10",
+        "4914c4b98fcb688f", "038dea2290b9cd50", "d668e909dbd66b63", "c0d96f62f41b5186",
+        "466eb24ff77ca8df", "7a29866f7fc108e7", "5585e88cfefbba8f", "cb7eabc6712a4e90",
+        "ca5739c7d2ec6144", "472aab5f7b05ca1e", "f3e9dc6933c115d1", "c058b805ee19d68e",
         "af55b6db8163a086", "617e6e3200eb4026", "1748c5d824e07965", "900d1ba318d9e9cc",
-        "f4364e6023d0bc58", "961b603f30df4688", "247b895faaa0063b", "d0d71819b6c3d1ae",
-        "eca19c7572e6abd9", "314fc8c3c28b922f", "4870f5d1de4005ea", "b4d569b60fdf9451",
+        "f4364e6023d0bc58", "60ae32301014a09f", "247b895faaa0063b", "1c1343f46a20cb38",
+        "eca19c7572e6abd9", "314fc8c3c28b922f", "b206f33cb0fbf7de", "b4d569b60fdf9451",
         "a642249b4c564d14",
     ),
     '### What the floor costs': (
-        "8b17e745a4b28523", "e0e95077b6909475", "b6574e4725cf4065", "386ad7d7fbe27753",
-        "c2d93a2d40003e83", "104544d83908e364", "d38d58d08941640e", "78fa57f9fbf6c55f",
-        "06a590b269e84791", "761475668313fcfe", "3e80eb8b09cca3b1", "6068f356e9db47f8",
+        "9fa659ce6e073bdf", "e0e95077b6909475", "a5d64e6ea3c54506", "386ad7d7fbe27753",
+        "c2d93a2d40003e83", "104544d83908e364", "178b4f57db01fa5c", "7105054a798bcf08",
+        "06a590b269e84791", "761475668313fcfe", "46cca7d500036e64", "6068f356e9db47f8",
         "d45a6161b4bb5dfa",
     ),
     '### Recovery': (
-        "619adcc4fef6807f", "28ab1da1b2977d23", "112be67200ee38fe", "44065851a3b34a42",
-        "0c7cb451e2d18fd4", "2cbfcad11f4904c1", "c18de4075f81a083", "a7ce7cfc6a37f69b",
-        "afe7c16d2e6768b1", "bb4a3123fdcf46dd", "06c4482c9449b898", "71c51150b0446fea",
-        "86cb2f389fc56c00", "795dc32be6628cde", "303f6640a5ed18c7", "ebac958e0b90cb82",
-        "6c6ea35897bf9ec1", "8036d8f95ad06c88", "0f9c19189b3e1b70", "93e9f90fd5162e15",
-        "53a3f113ae0230fd", "2c86b45ae3a52ed2", "d4de0360ad8e32c9", "e5114e161d8c6927",
+        "549e423e778caa0b", "28ab1da1b2977d23", "112be67200ee38fe", "44065851a3b34a42",
+        "0c7cb451e2d18fd4", "2cbfcad11f4904c1", "c18de4075f81a083", "8af04e933beab2e1",
+        "afe7c16d2e6768b1", "bb4a3123fdcf46dd", "643143545c5f346e", "71c51150b0446fea",
+        "86cb2f389fc56c00", "14c8ec6b2ef2a912", "4dfc84372626ae67", "ebac958e0b90cb82",
+        "a98f81bcfcde694a", "8036d8f95ad06c88", "0f9c19189b3e1b70", "93e9f90fd5162e15",
+        "821de8f3ac700e8d", "2c86b45ae3a52ed2", "d4de0360ad8e32c9", "e5114e161d8c6927",
     ),
     '### Senders': (
-        "c2a0a98badf09500", "2337998959e3ff1d", "97c8db8cec0c83c6", "f62fc2bd79035287",
+        "b457cfad511e804a", "2337998959e3ff1d", "97c8db8cec0c83c6", "f62fc2bd79035287",
         "de8d54d759e41924", "ea6149fe9685480a", "0d3516cf3275fee5",
     ),
     '### Limits and later versions': (
-        "c6613b2bc1350392", "1a093ac822fa3cf4", "40ac7b42eaf349c4", "163eb1ef4d4a50df",
-        "cb6c9be2c2d2d7b4", "52c15b2c4de7eafa", "6dc9b551a2da5870", "a44ef3a2ee4f2eff",
-        "773d5734c68d999b", "2bf7f7c73fd88de2", "8979123931d8c1cb", "8defdbd9fd4a1b72",
+        "54c295858907dd1c", "1a093ac822fa3cf4", "40ac7b42eaf349c4", "163eb1ef4d4a50df",
+        "7a01b8ebb3bfa55d", "52c15b2c4de7eafa", "6dc9b551a2da5870", "a44ef3a2ee4f2eff",
+        "773d5734c68d999b", "87acbca78f338062", "8979123931d8c1cb", "8defdbd9fd4a1b72",
         "8a123c15216d339d", "9332dd29553fa096", "9d12a72b5e1b1153", "a10aedd24b562822",
-        "c2677d6400ba580b", "579fe76e14eac208", "49cc247d72a5157a", "95550767a4965289",
-        "03b95979b43889ef", "e3997041950dcac3", "1839ada207d41dcb", "7c46b959f9387301",
-        "67e1ec39aa9638a1", "02e6a2bef7b8daf4", "791ee0edd657384f", "cfcee60d876303e1",
+        "e40851f68a9aacab", "579fe76e14eac208", "49cc247d72a5157a", "95550767a4965289",
+        "03b95979b43889ef", "e3997041950dcac3", "d34a791ceb6f4d43", "7c46b959f9387301",
+        "67e1ec39aa9638a1", "6d40096cf4886e13", "791ee0edd657384f", "83af0fd092f686da",
     ),
     '### Replay vectors': (
-        "dbd83f21b3c4c282", "a2963ebd6e47a247", "361d7c705465f134", "c1be6321390f1053",
-        "e335b4e3e393e9ce", "dc287454edbdbc1a", "2175da235ea6a288", "26549a5509500421",
-        "6f390a9ff1540603", "cb3f91d54eee30e5",
+        "708cc8a9b84aae80", "a2963ebd6e47a247", "361d7c705465f134", "c1be6321390f1053",
+        "db796340401b5afe", "dc4ba9700a9e9ba0", "2175da235ea6a288", "88199a1811f1e4cf",
+        "6f390a9ff1540603", "6cd315b68bdd5ea9",
     ),
 }
 INVENTORY = {
@@ -2004,6 +2050,48 @@ def mutations(text: str, corpus: dict) -> int:
             ":", ": also", 1) if blk.startswith("- `") else blk + " too"
         tm(f"text: bullet reworded: {label}…", blk, reworded)
 
+    # What the closure leaves out must be what a parser validates, and nothing
+    # beside it: tables, lists, fences, comments, headings and structure.
+    tbl = "| Rotation | Effect |\n| --- | --- |\n| keeps none | drops the floor and keys |\n\n"
+    tm("codex: a Recovery table drops the floor on rotation", "### Recovery\n\n",
+       "### Recovery\n\n" + tbl)
+    tm("codex: a Retention table drops without raising", "### Retention\n\n",
+       "### Retention\n\n| Drop | Floor |\n| --- | --- |\n| any key | not raised |\n\n")
+    for head in [f"## {SECTION}"] + [f"### {n}" for n in SUBSECTIONS]:
+        tm(f"closed: a table under {head}", f"{head}\n\n", f"{head}\n\n{tbl}")
+    tm("closed: a fifth row in the order-of-checks table",
+       "| 4 | its key is not held | `replay_detected` |\n",
+       "| 4 | its key is not held | `replay_detected` |\n| 5 | it is fresh | `none` |\n")
+    tm("closed: a table row after the order-of-checks table", "Every bound is inclusive.",
+       "| rotation | drops the floor |\n\nEvery bound is inclusive.")
+    rule = "A rotation that keeps no earlier secret drops the floor and every held key."
+    ev = "- `rotate`: a rotation that keeps the previous secret, or one that keeps none.\n"
+    tm("closed: prose in the event block", ev, ev + rule + "\n")
+    tm("closed: a continuation in the event block", ev, ev + "  " + rule + "\n")
+    cv = "- a rotation that keeps the previous secret and one that keeps none;\n"
+    tm("closed: prose in the cover block", cv, cv + rule + "\n")
+    tm("closed: a continuation in the cover block", cv, cv + "  " + rule + "\n")
+    end = "\n---\n"
+    for label, blk in (("a fenced block", f"```\n{rule}\n```"),
+                       ("an HTML comment", f"<!-- {rule} -->"),
+                       ("a fenced fake heading", f"```\n## Notes\n```\n\n{rule}"),
+                       ("a block quote", f"> {rule}"),
+                       ("a footnote", f"[^r]: {rule}"),
+                       ("an indented code block", f"    {rule}"),
+                       ("a deeper heading", f"#### Note\n\n{rule}")):
+        om(f"closed: {label} at the section's end", lambda x, blk=blk: x[:x.index(
+            end, sec_at)] + "\n\n" + blk + "\n" + x[x.index(end, sec_at):])
+    om("closed: the section heading a second time", lambda x: x.replace(
+        "## Producer Time\n", f"## {SECTION}\n\n{rule}\n\n## Producer Time\n", 1))
+    tm("structure: a reset step dedented to a fourth way", "  - the receiver is stopped,",
+       "- the receiver is stopped,")
+    tm("structure: the restart nested under wait", "- **Restart a receiver that stores "
+       "nothing", "  - **Restart a receiver that stores nothing")
+    tm("structure: a paragraph indented into code", "\nReplacing a receiver's whole state "
+       "store", "\n    Replacing a receiver's whole state store")
+    tm("structure: a setext heading", "the ones declared.\n\n---", "the ones declared.\n---")
+    tm("structure: two paragraphs merged", "wait is too long.\n\nReplacing", "wait is too "
+       "long.\nReplacing")
     for head in [f"## {SECTION}"] + [f"### {n}" for n in SUBSECTIONS]:
         tm(f"closed: a sentence added under {head}", f"{head}\n\n",
            f"{head}\n\nA receiver may lower its floor.\n\n")
