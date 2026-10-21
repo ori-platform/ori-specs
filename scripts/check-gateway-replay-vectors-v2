@@ -24,11 +24,18 @@ Held to:
 - closed: every prose sentence of the section, in order, outside the table,
   the event list and the cover list, which are parsed; an added, removed or
   changed sentence anywhere in the section fails;
-- one place for replay claims: every other section of gateway-api/v2.md whose
-  own body touches replay, freshness, staleness, skew, signing time, capture or
-  retransmission, the replay-settings obligation in runtime-config/v2.md and
-  the notes in status/gateway-api/v2.json are held sentence by sentence;
-  `--inventory` prints the held digests from the files as they stand.
+- one place for replay claims: every other section of gateway-api/v2.md, with
+  no filter, is held sentence by sentence with its structure, so any edit
+  anywhere in the document needs a deliberate `--inventory` re-pin; the
+  replay-settings obligation in runtime-config/v2.md is held exactly, and the
+  notes in status/gateway-api/v2.json sentence by sentence. `--inventory`
+  prints the held digests from the files as they stand.
+
+Limit: other contract files that cite this section, such as gateway-config/v2.md
+and runtime-config/v2.md, are not held whole; this checker holds only
+runtime-config/v2.md's replay-settings bullet and refuses another replay
+obligation beside it, so a replay claim added elsewhere in those files is not
+seen here.
 
     python3 scripts/check-gateway-replay-vectors-v2
     python3 scripts/check-gateway-replay-vectors-v2 --mutations
@@ -329,33 +336,56 @@ def flat(text: str) -> str:
 
 # ---------------------------------------------------------------- the text
 
-def headings(lines: list[str]) -> list[int]:
-    """Heading lines outside fenced code: one reading for every splitter here."""
+FENCE = re.compile(r" {0,3}(```|~~~)")
+ATX = re.compile(r" {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*")
+SETEXT = re.compile(r" {0,3}(=+|-+)[ \t]*")
+
+
+def headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """Every ATX heading outside fenced code, as (line, level, title), the title
+    without closing hashes or surrounding whitespace: one reading for every
+    splitter here."""
     fence, out = False, []
     for i, line in enumerate(lines):
-        if line.startswith("```"):
+        if FENCE.match(line):
             fence = not fence
-        elif not fence and re.match(r"#{1,6} ", line):
-            out.append(i)
+        elif not fence and (m := ATX.fullmatch(line)):
+            out.append((i, len(m.group(1)), (m.group(2) or "").strip()))
     return out
+
+
+def section_span(lines: list[str]) -> tuple[int, int, list[tuple[int, int, str]]]:
+    """This section's heading line and the line its body ends before. Its title
+    may be a heading once, at level 2, however it is written."""
+    heads = headings(lines)
+    at = [h for h in heads if h[2] == SECTION]
+    fence, setext = False, 0
+    for i, line in enumerate(lines):
+        if FENCE.match(line):
+            fence = not fence
+        elif not fence and i and SETEXT.fullmatch(line) and lines[i - 1].strip() == SECTION:
+            setext += 1
+    if len(at) + setext != 1:
+        raise Failure(f"'{SECTION}' is a heading {len(at) + setext} times, not once")
+    start, level, _ = at[0]
+    if level != 2:
+        raise Failure(f"'{SECTION}' is a level {level} heading, not level 2")
+    end = next((i for i, lv, _ in heads if i > start and lv <= 2), len(lines))
+    return start, end, heads
 
 
 def sections(text: str) -> dict[str, list[str]]:
     lines = text.split("\n")
-    heads = headings(lines)
-    at = [i for i in heads if lines[i] == f"## {SECTION}"]
-    if len(at) != 1:
-        raise Failure(f"'## {SECTION}' is a heading {len(at)} times, not once")
-    start = at[0]
-    end = next((i for i in heads if i > start and lines[i].startswith("## ")), len(lines))
+    start, end, heads = section_span(lines)
     body = lines[start + 1:end]
-    heads = [i - start - 1 for i in heads if start < i < end and lines[i].startswith("### ")]
-    names = tuple(body[i][4:].strip() for i in heads)
+    subs = [(i - start - 1, title) for i, lv, title in heads if start < i < end and lv == 3]
+    names = tuple(title for _, title in subs)
     if names != SUBSECTIONS:
         raise Failure(f"subsections changed: {list(names)}")
-    out = {"": body[:heads[0]]}
-    for n, i in enumerate(heads):
-        out[names[n]] = body[i + 1:heads[n + 1] if n + 1 < len(heads) else len(body)]
+    at = [i for i, _ in subs]
+    out = {"": body[:at[0]]}
+    for n, i in enumerate(at):
+        out[names[n]] = body[i + 1:at[n + 1] if n + 1 < len(at) else len(body)]
     return out
 
 
@@ -500,11 +530,10 @@ def contract_model(text: str, guard: bool = True) -> dict:
 
 # ---------------------------------------------------------------- the inventory
 # Whatever this contract says replay protection stops is stated in this section
-# alone. Every other section whose own body touches replay, freshness,
-# staleness, skew, signing time, capture or retransmission is held sentence by
-# sentence, in order, as the SHA-256 of each sentence (whitespace collapsed),
-# so an added, removed or changed sentence fails and is printed. A section that
-# starts touching those stems fails until it is added here.
+# alone. Every other section of the document is held sentence by sentence, in
+# order, as the SHA-256 of each sentence with its structure, so an added,
+# removed or changed sentence anywhere fails and is printed. STEMS now only
+# finds a second replay obligation in runtime-config/v2.md.
 # `--inventory` prints the block below from the files as they stand.
 
 STEMS = re.compile(r"replay|fresh|stale|skew|signed_at|captur|resubmi|redeliver|retransmi",
@@ -530,24 +559,25 @@ def digest(sentence: str) -> str:
 
 
 def guarded_sections(text: str) -> dict[str, list[str]]:
-    """Each section's own body (to the next heading of any level), by heading,
-    for every section outside this one whose body touches the stems."""
+    """Every section outside this one, by heading in document order, each its
+    own body to the next heading of any level, with its structure. A repeated
+    heading is keyed by its occurrence."""
     lines = text.split("\n")
-    heads = headings(lines)
+    start, end, heads = section_span(lines)
     out: dict[str, list[str]] = {}
-    inside = False
-    for n, i in enumerate(heads):
-        head = lines[i]
-        if head.startswith("## "):
-            inside = head == f"## {SECTION}"
-        if inside:
+    first = heads[0][0] if heads else len(lines)
+    if "".join(lines[:first]).strip():
+        out["(before the first heading)"] = sentences(structure(lines[:first]))
+    seen: dict[str, int] = {}
+    for n, (i, level, title) in enumerate(heads):
+        if start <= i < end:
             continue
-        end = heads[n + 1] if n + 1 < len(heads) else len(lines)
-        body = "\n".join(lines[i + 1:end])
-        if STEMS.search(body):
-            if head in out:
-                raise Failure(f"two guarded sections share the heading {head!r}")
-            out[head] = sentences(body)
+        nxt = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        key = f"{'#' * level} {title}"
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            key += f" ({seen[key]})"
+        out[key] = sentences(structure(lines[i + 1:nxt]))
     return out
 
 
@@ -625,11 +655,17 @@ def check_inventory(text: str, runtime_config: str, status: dict,
         for head, now_closed in closed.items():
             compare(f"gateway-api/v2.md {SECTION}, {head}", CLOSED[head], now_closed)
     now = guarded_sections(text)
-    if set(now) != set(INVENTORY):
-        raise Failure(f"guarded sections changed: new {sorted(set(now) - set(INVENTORY))}, "
-                      f"gone {sorted(set(INVENTORY) - set(now))}")
-    for head, held in INVENTORY.items():
-        compare(f"gateway-api/v2.md {head}", held, now[head])
+    try:
+        if set(now) != set(INVENTORY):
+            raise Failure(f"gateway-api/v2.md sections changed: new "
+                          f"{sorted(set(now) - set(INVENTORY))}, gone "
+                          f"{sorted(set(INVENTORY) - set(now))}")
+        for head, held in INVENTORY.items():
+            compare(f"gateway-api/v2.md {head}", held, now[head])
+    except Failure as failure:
+        raise Failure(f"{failure}. Every section of gateway-api/v2.md is held; re-pin with "
+                      f"--inventory only once the change is read and states nothing about "
+                      f"replay that contradicts {SECTION}") from None
     notes = status_notes(status)
     if set(notes) != set(STATUS_NOTES):
         raise Failure(f"status/gateway-api/v2.json notes changed: {sorted(notes)}")
@@ -721,73 +757,114 @@ CLOSED = {
     ),
 }
 INVENTORY = {
+    '# Gateway API v2': (
+        "c973d27756a950a2", "43b2cfa650cc89f9", "5adc9554ec1fc858", "a724b3c28cb92017",
+        "8b928d4ba50325e8", "7bc1a475ba9f43fe", "ba9060593092828d", "44e81725c71c187a",
+        "126fe538838b7afe", "45d48be713b49a18", "6590d070b8a05906",
+    ),
+    '## Transport': (
+        "ba4ca10a71e58b04", "c457913d87aac816",
+    ),
+    '## Topics': (
+        "4ff7a419b3c7f48f", "635ea3fd8a69c43d", "1fb003e325604585", "ffbdfc3bac093b7a",
+        "85bd980c254efd44", "958aa769041721ca",
+    ),
     '## LAN Tier C Reply Relay': (
-        "d0e7ab50508c3525", "83f940aa289acc27", "0e2fc95ac65bdc28", "87d07873c56f60cc",
-        "ce03335c6cf79bc7", "12bc07372e372fbc", "2a75891c326e8e79", "047449bb65dcf545",
+        "c97714ef8b11e452", "83f940aa289acc27", "0e2fc95ac65bdc28", "87d07873c56f60cc",
+        "ce03335c6cf79bc7", "12bc07372e372fbc", "2a75891c326e8e79", "d84a1f50fd722a55",
         "309deda50889a229", "b4a4c97ac28ea6ac", "c04dd663a76e28b4", "a9cdd1d4ca6fa4fa",
-        "0c944f8315258797", "c253a9c4b6265ced", "3231fff03abe87ed", "6072a808a270da66",
+        "8d15469620bff0aa", "c253a9c4b6265ced", "3231fff03abe87ed", "6072a808a270da66",
         "99ea24fdf6538e2b", "f29ad7c3448c20b0", "ed93869f418c2cca", "1922c1d780dd3fb8",
-        "5e0e1580a89db51f", "4ead02ccdef8b50c", "5cc2ab8c9deb0540", "113c452e877f2113",
+        "5e0e1580a89db51f", "4ead02ccdef8b50c", "5cc2ab8c9deb0540", "40156cc6cdf1d8f6",
         "0ce3d20d8850b5cd", "347846d4a261e73c", "dff573b4758cc1c5", "09df66fc251d40cf",
-        "1c87c1458f2b40ba", "8cea729d79e9a42f", "f1662fdc88d3d1cb", "c66ee53cba85e4fa",
-        "4235a1bce1d619c8", "6166eb41f765d0da", "44c3763e1149fbbc", "2515755451c90dd8",
-        "bb7d8930336f0379", "4ae39e8dae03778d", "54c6d31325ae7c07", "4ffc68440b1df6d8",
+        "6b86dce035fadce8", "8cea729d79e9a42f", "f1662fdc88d3d1cb", "c66ee53cba85e4fa",
+        "4235a1bce1d619c8", "6166eb41f765d0da", "44c3763e1149fbbc", "8d8a996a77479d1c",
+        "bb7d8930336f0379", "4ae39e8dae03778d", "2f2e1b5b4d7be811", "4ffc68440b1df6d8",
         "b7c77109d3761dc3", "e3ece7b3e25d0492", "9e14221a283ea738", "637befe6e9eb3445",
-        "1679f5a8989a37c7", "112ebd6b36f40ef8", "eb4bd430c7ee3988", "7dc2ee3b0e7e8739",
+        "1679f5a8989a37c7", "112ebd6b36f40ef8", "fe9c3d0ae8c1de5a", "7dc2ee3b0e7e8739",
         "101e3eeed136756b", "048fa7adba30f1a9", "201e9d43dd3255bb", "51da3cd795d18e76",
         "51eaabc2ee0708db", "d912614f1db581ca", "93e7936cbbdf0500", "5a26163998e3c091",
         "c296200bcefae70b", "54a018b6226c13f0", "e0843fbe576a8453", "ed34fec60ba547bc",
         "34f416e6ddeee5de", "ca9535bdfb42ba99", "a0cf7ad5c6cc55bd", "feba3f59a15f2f8c",
-        "174aa9b16779b368", "252d79cf3f148365", "06335c0bd1269635",
+        "174aa9b16779b368", "252d79cf3f148365", "5ec278247fed2e0c",
     ),
     '## Payload Size': (
-        "8fb413e789d21543", "07d81a4822fb0416", "0ff7c50b42a790a6", "2fd9a0ae867e87fb",
+        "c062273801500324", "07d81a4822fb0416", "0ff7c50b42a790a6", "8fff18dbbb751ec4",
         "a39f7876e124336b", "f11583a194bd7b91", "1977b77ac579a07d", "0f23f9b407d7f56f",
         "ffc07f1152fcc054", "e453c7369da5e193", "dbb15ba0119873c0", "c632975699939a98",
         "ebc342459fb50cd9", "050bc72f85ddc82e", "8c9f3047c8a254de", "f5ba1df5368bcc50",
         "4f7ba2fbd9c6ab16", "e678a9ca48626bc5", "6578ac999fcb5696", "b11a9e4f162c16e7",
-        "2e491a92a6db808e", "a2cf4073812e4c2d", "c82801db42728f4b", "96f407cae70c003d",
-        "8b14fc0f558bc653", "4975a4447d902d53", "6a98f91bf0808431", "bfd24c4012bc1f86",
+        "e62157671877a0ac", "a2cf4073812e4c2d", "c82801db42728f4b", "96f407cae70c003d",
+        "8b14fc0f558bc653", "4975a4447d902d53", "305b99f3b3fa66a3", "bfd24c4012bc1f86",
         "4e1bd735e50e2ff9", "f036d9316ce9e707", "c4097b7c5d75fb53", "7f30c0782257fc84",
-        "dd349a5a98be8123", "3d01d7e175cc3cb6", "e2bca7df02d1ec21", "aa0635659d28934e",
-        "3510f343af56f945", "331e21e452c9ae91", "458403c67812828f", "16b41e481f31c27a",
-        "db2c8f6ffcf52c83", "8a3a33c49bb441da", "4926e10d6f4b24a9", "a25fa9a31a6560c2",
-        "65793a48e8ab710f", "1aebbd801d0ac14e", "c797bde00b84b748", "7616514fc27d35ee",
-        "7863728b3427584c", "a31c5446ef76656e", "3440a82f2956cc94", "16000f76acbd4d96",
-        "b5f9a24207a7b863", "f4a81c86ddde154d", "6eb02ca72e59dcb2",
+        "461f1c9caf42e59d", "3d01d7e175cc3cb6", "e2bca7df02d1ec21", "aa0635659d28934e",
+        "140959d8417d5688", "1fdff05a952c3540", "458403c67812828f", "19e202560b7fede4",
+        "3dc6897b14d356cf", "8a3a33c49bb441da", "8d770e75bcd6bc4b", "a25fa9a31a6560c2",
+        "65793a48e8ab710f", "c4639a13e37f0240", "c797bde00b84b748", "837c1dc06504d416",
+        "2166723273e40646", "a31c5446ef76656e", "419c2221ee120b9d", "16000f76acbd4d96",
+        "b5f9a24207a7b863", "f4a81c86ddde154d", "e1aac42f08c26889",
     ),
     '### Size vectors': (
-        "b48c74258c767c81", "496ca59aa03e5071", "9aca1c1de61fe25b", "8e3355fb5cc115df",
-        "749c3052cb3741fe", "9e02de36c9f41262", "09b93701aaeeebf9", "2b7e79d161198c70",
-        "f0a632bfa64ad2e0", "4bd38dfcf5276c7e", "9ce6a120a881f836", "459603942af535ac",
-        "a64880117a72c1b6", "1ba995927ab6ce51", "ecdc263a460eaab1", "74a0ba665e5da392",
+        "8143910a2797baad", "496ca59aa03e5071", "b01b4b8729b87bd9", "469065ddbb02560b",
+        "4c0dfd375b9868a1", "9e02de36c9f41262", "c66cbbebe2fb0691", "bc2ace61654f154b",
+        "f0a632bfa64ad2e0", "4bd38dfcf5276c7e", "9ce6a120a881f836", "ed67ea3bb76f8906",
+        "a64880117a72c1b6", "1ba995927ab6ce51", "71555b62d8406f8d", "74a0ba665e5da392",
+    ),
+    '## Payload Volume': (
+        "f241ba9412136375", "abaa26b78609730b", "33789f645854870d", "186b6b82055aed2f",
+        "341eab714eab8d9b", "46fa5375dbc58f4e", "61c8ef68bb2aaf3b", "6bc8e16b97fbf0e4",
+        "8623241a67184bc6",
+    ),
+    '## Payload Member Rule': (
+        "b33f6be8f93bab06", "b4f4c58ad5016283", "f52e6f6619f3e7d4", "333a06f79c7dd742",
+        "84d504cf56bbd1dc", "f0ce13948412c09c", "d544448058941ad8", "93baa5737af0376a",
+        "e61c85e314227e40", "19d74c2bcc22eb05", "e7d7cab5befb1c76", "f5718e8118053ebd",
+        "4f6a674b118833df", "2945369d83f69fb3", "2f8f07c58faded69", "f20abce4eff9aaa8",
+        "05999632ddeb3b06", "1ec12354e270610a", "f381585090273def", "22e41b3ad9082a04",
+        "86f39b47474a03b0", "e915672db38c51d9", "b234f96c8ff3b0c5", "4c9b71628131c272",
+        "555b5cb5b22bc47e", "e52ecb196f84e2af", "ef915bfb231ddb0e", "788ded84099da62f",
+        "c01f59b742f7a459", "0a1fd2fb80d2a135", "cd304cf3a6a994e7", "9a4c95fded53f412",
+        "cbc06c5c5bfccc76", "b6a0bbb6e6b5d168", "5f56991bd19a766c", "49776651e94b4dfa",
+        "d1bd7390bef59170", "407f52c6aa1378e5", "b6747dc418e81c9f", "1eb9bafc4bf5d40a",
+        "291008b5e0f671fb", "782279874c44053d", "64c36068216ed84d", "8dd91358069e56a0",
+        "4b4171128e9fed29", "35813cc50c6c99d9", "8965e0ce8d132fce", "806643fd3e91af38",
+        "3eee710721b4e036", "aebaf76e70171fd7", "89e914601c08bf4d", "8d7ed36949758e3d",
+        "72997e0132cabb40", "3fdffca6e41bd937", "16795981a89b243d", "738c85e1427535eb",
+        "c18fd5535df73a23", "1d049ceb25a3aa38", "a18f8c53bb9ea515", "442cd231f83ebe7a",
     ),
     '### Envelope Members': (
-        "766e99bf601bc523", "f5bf7826e399548a", "d8753affe89f7911",
+        "875717873f3b24d5", "f5bf7826e399548a", "73b1f3905c828ed9",
+    ),
+    '## Tier 3 Reasoning Request Payload': (
+        "d111674665b82b7e", "79edbae5779735fa", "24499ac897e4b812",
+    ),
+    '## Tier 3 Reasoning Response Payload': (
+        "e44c8c992e052048", "af765020574d93cc", "800c20e6f258d79f", "ca83b3d6b999d5a2",
+        "188f0fca659b7c3b", "80a8606052790ae8",
     ),
     '### Reasoning Auth Envelope': (
-        "bbfd15169431f723", "2448979c275b4177", "26e234527a9c3fc3", "b6b94ccbd7a789e6",
-        "3cc5ad86ae6ad3de", "270167b8bdd1a2e8", "18975aeb2546e58c", "d4a91d5a26239d4c",
+        "646679386c5a212b", "0f7d5b32a54cb633", "26e234527a9c3fc3", "b6b94ccbd7a789e6",
+        "d8d25ad7a65dad0b", "f34ef0093365e398", "18975aeb2546e58c", "d4a91d5a26239d4c",
     ),
     '## Heartbeat Payload': (
-        "1b15716c8252a154", "5efe608e5ff1e149", "8cdaa85afc12a5e9", "1a68288f3ab71ec6",
-        "e603466d8f24ba8d", "df7c511321770e75", "52f5ca00774dcd04",
+        "b277de9defa5d3b3", "5b9f1bb78427735f", "db2b49044d01045d", "1a68288f3ab71ec6",
+        "fcce1ff077b184e3", "df7c511321770e75", "52f5ca00774dcd04",
     ),
     '### Heartbeat Auth Envelope': (
-        "8e80143578569b8e", "3c55b3ebaa240b54", "ad40dbce6598a9ad", "e7dbc69232f0cff7",
-        "66352e223a26e91e", "bdb571f6a803526c", "56e40bee14711b7f", "07f633e7878ddf4c",
-        "12f64d0bf998add3", "89e96f6eb6d925b0", "dd6293ca8bfd7bd8",
+        "17b57ca34e54e7f7", "3c55b3ebaa240b54", "ad40dbce6598a9ad", "e7dbc69232f0cff7",
+        "66352e223a26e91e", "ab385ad66ce21571", "56e40bee14711b7f", "07f633e7878ddf4c",
+        "ebdf604c78be21f0", "89e96f6eb6d925b0", "720e925500ae1b39",
     ),
     '## Runtime Node Heartbeat Payload': (
-        "69ba6e138a03611c", "d6e8de7cd4159d3c", "d0258a92bf98e2d8", "9996006f8c4176f6",
-        "bb04b590a19bf699", "ddb7f8e04e7f2813", "d5df07a1f834c0f3", "06f7d5f57cf81fc3",
-        "fdecb576b4dbea08", "7e602dd3b11d850d", "797a903e502f0f25", "21fad9f81d0b8408",
-        "e2507e6f0d9b50a7", "4b379f2fd3a7b4bc", "d91f2c6be1c4aaee",
+        "396a7c9a9dfac11b", "d6e8de7cd4159d3c", "158591ae191e0340", "9996006f8c4176f6",
+        "1c506aceedd8201d", "ddb7f8e04e7f2813", "d5df07a1f834c0f3", "06f7d5f57cf81fc3",
+        "fdecb576b4dbea08", "ba6382d062a1f60e", "797a903e502f0f25", "21fad9f81d0b8408",
+        "e2507e6f0d9b50a7", "d1f31c97d5289b28", "d91f2c6be1c4aaee",
     ),
     '### `degradation_reasons`': (
-        "61b31248245be8d8", "8a315aa0344d7c5c", "371830a16dd41ff0", "69709183ac1e8a9f",
-        "b64ba0563ebdcfb9", "7f7dfe89953c68d6", "a7940dbb436fdf4e", "8d26a59f2bd5d665",
-        "477dc6d95a769660", "d82941a7e70d5bc6", "516277fd3bf1a1d4", "8291f409763ae4ae",
+        "7e0be17a1d87501d", "8a315aa0344d7c5c", "151367bf88dcd52b", "69709183ac1e8a9f",
+        "b64ba0563ebdcfb9", "7f7dfe89953c68d6", "260f2457fc55b560", "8d26a59f2bd5d665",
+        "477dc6d95a769660", "73f4a7744e060835", "516277fd3bf1a1d4", "8291f409763ae4ae",
         "342614159f2b01b0", "db438e13074dffa0", "c2118bfeecb828c8", "5bde63dba668d43f",
         "c89343fb69411b85", "458893bf867faccd", "4ac24c83da585862", "5f009fa20a2c1671",
         "0b405e9bc773128a", "1bc1c0c25c743376", "08580a9d55286b8e", "8c58d25a9a5fa485",
@@ -796,90 +873,225 @@ INVENTORY = {
         "b30fa9a4e8988125", "82f4aca20266070f", "8d62f04611899a2d", "00f910704604e18c",
         "7ac61116b21b8b93", "39856e7ff7d78f96", "b62d0e9e922ca3c3", "bf0dafa2e51d65f4",
         "a55140bc29a453c4", "1828d2161950ac23", "a2ff374d31fdf3df", "51881f252b019edb",
-        "39067f9091e3bcb3", "81713b7b8d20cfc5", "03285484d1024106", "7b2b6633fdf8eb35",
-        "db90459c7ebb441e", "f79efacd884a01c8", "831f2ee186f245dc", "d4ffdca1087cd665",
+        "c0aaa93ede0e0a3e", "81713b7b8d20cfc5", "03285484d1024106", "3cea7f7ff9bb3db2",
+        "db90459c7ebb441e", "36a0182b69a670d5", "8bfe7e41abdcc1e1", "d4ffdca1087cd665",
         "379342a3f2428138", "77eb993e7e5b9580", "e372694680c4cc68", "42dfa32fe7a90114",
-        "b524a58f20ff2019", "7a19d1c69219d95a", "6b2f6c38139f923b", "7abc7df81ad5bb8a",
-        "ce4de1c20e7424d5", "13e49951d6843f55", "f0a45942724b445c", "452103f555f86171",
-        "708661ec3a1383b6", "3a92a6f15c8ff68d", "29b0a125cc671f41", "4cac674ffc8cc8db",
-        "c7713e2b5b05bb22", "b222f3c45f24e05d", "311fc70a54c458e9", "b5a1853421960974",
-        "dbd724b24655938f", "5e5797663a7c00d8", "56de9f63114ec9a1", "d2ca949ba96ed1a9",
-        "d0cf61ae03570bbb", "33806a5777752b63", "e0c7c7ef9fb703e1", "13d259d5b98f7bf4",
-        "24f296420b19a7e7", "34d062f93872db4e", "d84db359b2037743", "e03412375ff5c465",
+        "b524a58f20ff2019", "7a19d1c69219d95a", "8cde5ea144541d15", "3e054386ad42885a",
+        "d2b586d632d48015", "13e49951d6843f55", "b1f2878b4566b376", "a5014661197dd13a",
+        "708661ec3a1383b6", "0bd5330f6b0c0dfc", "29b0a125cc671f41", "0c98236e5f37d497",
+        "c7713e2b5b05bb22", "42019c3d1d75db50", "311fc70a54c458e9", "efcfe2e1a44650ee",
+        "dbd724b24655938f", "5e5797663a7c00d8", "a8cf940c8b72ad8d", "d2ca949ba96ed1a9",
+        "e3c6234d23e2d1b5", "3b98dfd112a11aac", "af0beee725a6536a", "13d259d5b98f7bf4",
+        "24f296420b19a7e7", "34d062f93872db4e", "596cc295f471e4cc", "e03412375ff5c465",
         "0a681b6b28db0ce4", "6fdd24ec425c6085", "33d6d2b80125a2a0", "e5c35981a79fca6f",
-        "968011f7747582f9", "f1d967d4a3a7f9f4", "8fc20cd8e28ced77", "12c03f565484b7cf",
-        "7d3ad25feea43c90", "68dd6526f498d957", "a595bacde995ab73", "22a7737271b9383a",
-        "db739814c7ed8c7b", "66f7e47e582d2fa1", "c04c6c5a24344e6a", "5dae5b4fb14ab03e",
-        "770540cc7cae0d09", "0d71bb5a86ceda62", "7cfbeda7f222f7f0", "6bd01f51816d6d19",
-        "89054a0489547a70", "b73d7234232fb6eb", "19e216aaff693458", "d37634c18ed0b01b",
+        "968011f7747582f9", "bd4358c6fc09cc2f", "8fc20cd8e28ced77", "12c03f565484b7cf",
+        "7d3ad25feea43c90", "5ebba70cbb10bc3a", "a595bacde995ab73", "22a7737271b9383a",
+        "db739814c7ed8c7b", "66f7e47e582d2fa1", "c04c6c5a24344e6a", "6cd72e8148dbee6c",
+        "770540cc7cae0d09", "99c64602e8333bd7", "7cfbeda7f222f7f0", "6bd01f51816d6d19",
+        "7b5b8b1cf00208e5", "e00f82b16fff9e2e", "c0d7c67783527c84", "d37634c18ed0b01b",
+    ),
+    '## Tier 3 Timeout and Retry Target Behavior': (
+        "cc99df09be7c0a58", "cbe5cfdf7c2118a9",
+    ),
+    '## Gateway Availability Check': (
+        "251f044d8a6e6025", "831b62a48cbf436b", "453d06721fd44f2d", "2f4d245be3ff8940",
+        "898c5eeb2c25e840", "cf88aaea347af51b", "d35c97cfe895d6be", "85077e7a533bd521",
+        "ab179e9933c02e14", "ac6fda81526c3b0f", "4f608484685bf434", "6cd315b68bdd5ea9",
+    ),
+    '## Producer Time': (
+        "c4ad8bf89566ba93", "efef65bb93f9a72c", "d6a7767b30ca13f8", "761675d4c1bcc2df",
+        "b4aeb31f6385fe98", "8084f0ec649ea776", "5b97b22e29bf1742", "faaced6abd6ed74a",
+        "e0e09b0d018c236d", "fbf0401091684c74", "1f11f5afa83d5b62", "1ad7febe741a9a13",
+        "0efcd7030a006de1", "cee0e1a21f3eed17", "bbd7aef2f1b8b5d4", "924dd4fb084b7675",
+        "ce0871222e00902d", "af944bed5500fc3f", "bb1e687bd54c5af4", "f345199fc28b58c0",
+        "462bef409f28fb09", "e4e9632d37f4b4a7", "4ab8368d200d30b1", "2a6780c77f8c80a6",
+        "261860eed4b48181", "35bcea7a1b10b7d7", "46286ee56d5c9a98", "bc8fdd6d26c561f8",
+        "6420005928e8135c", "288df49fdba0e161", "eff0547dc128d7d8", "37c0147d7dc9b5e3",
+        "02b14ebe5372d9e5", "bb1ee1e0e41dd131", "74ea4e8c04e10e84", "45efd3d3fc443a7a",
+        "6cd315b68bdd5ea9",
+    ),
+    '## Runtime Export Request Payload': (
+        "9e8e8e629d4221f8", "e3fa3329cd414e86",
+    ),
+    '### Request Fields': (
+        "bbcdb602ffdb2846", "6e2ca54b7a4ed0bb", "222d557afd666ae5", "c2fd846ec684b4b1",
+        "6d1dcd1d6068dc58", "ef2cab337c1c3d99", "e09fd84463a99092", "ef2cab337c1c3d99",
+        "17415baa86cd7216", "209a37a9299e0c4b", "35034278033a451e", "dba0191cb079113a",
+        "8629875c7f0925f5", "007a09a952f9508c", "bb864ef41131c56f", "6933a61c93be8765",
+        "a130f01c4920454a", "27f4077618f6ed28", "1c678051f60687fd",
+    ),
+    '## Runtime Export Response Payload': (
+        "801e4402e9ed65c9", "87f18b85d11bb76a", "c3ecb16bbb1cce42", "d88e10b3bfb988d0",
+        "4bc5b62d87ca8a53", "5f60b3c155cfd07d", "ebdb3b3b4caa32f9",
     ),
     '### Export Auth Envelope': (
-        "8a464792bbfae995", "75c79e7ac8cf3e79", "d9c0bd1269c12728", "e1f94c5084858923",
-        "445bf0ea1e89640c", "5d9b699583fa8f50", "807a8e3e735a1528", "fff01644bef92774",
-        "21cdb4e13ef72524", "8833609e1a8bc8df", "ca9535bdfb42ba99", "6f945f446697a2c3",
-        "a61a27ab319580c1", "e06fe44841d4c386", "0776f88e222935e9", "69b0c5b72ddab0cc",
-        "2f24fa0b1eec2b57", "ec3c1f834c94338c", "727e16955389fe28", "093bcff6ce25f830",
+        "2956f09c610da271", "882a668f7297a1dd", "d9c0bd1269c12728", "e1f94c5084858923",
+        "4b7752a123f475c7", "5d9b699583fa8f50", "01319920e51c9459", "fff01644bef92774",
+        "46586c76182983ea", "869a770f0abc2503", "ca9535bdfb42ba99", "6f945f446697a2c3",
+        "a61a27ab319580c1", "654e1f5eb027aa73", "450a3902accaefdd", "560814f882de8889",
+        "2f24fa0b1eec2b57", "e85549fcdeb1f6fb", "727e16955389fe28", "093bcff6ce25f830",
         "dfca74d290eb307e", "9dc10a7de324536c", "8f61817ca0856b3d", "15e0216947c56dd1",
-        "c5771c09e1654ebc", "4e9d7bed0063a667", "00ce6a45ba90298f", "fc180126796a3b8f",
+        "3b1481044bbd9636", "7ac78ebf1f7cd6a2", "4d5e7c50b3be11b0", "c556c4f20324f7f1",
         "38f84aeec2c102e4",
     ),
+    '## Supported Export Types': (
+    ),
+    '### `health`': (
+        "992cac5252815925", "a1470c787656785a", "170d8a08a16f1335", "4c394fe01596f1f8",
+        "41de0e4e24f4e310", "9c1e4ca58be15528", "343a340303bf08c9",
+    ),
+    '#### Reading `status` while runtimes adopt runtime-health/v4': (
+        "42aefc01c59c9c78", "c875c1ec39b3cae4", "4cf918d84abe953a", "cd69fae527682d27",
+        "7b3a25ba388f9190", "6fa312ad0a942001", "2ccd8b0fba265a22", "89e8aaeb11a29983",
+        "b6c56edbf29cbb95", "c9202dacf7fc7ed2", "31e3a926c3290ef4", "53b78d111449dbbd",
+        "7ba7391afe2de95f", "08b7575748c5460f", "3facc4ca04720a38", "3592e8154fa1e724",
+        "cd985fd6ce6ae594", "723cc1f1ec6793c1", "fe7dd66b6015cd8a", "37c6d6c70ad5a908",
+        "068a5fe557f48f01", "cea2ffb67f568757", "b1362f7c778e9507", "209b7c83c0e5eeea",
+        "4c69d552c310c8fb", "8c737b2b7225942f", "54bacad5c22e377d", "014ca85f69e34e49",
+        "ec6445290a3cab61", "7b38cbe986c5a57b", "3d8e9e3ab0c20719", "5e0e4216aa31c673",
+        "aec78c0bf737c53b", "abe2d632ea4d5982", "1de4b569da7456ba", "b40aa6d6d3bac163",
+        "22a36da78dfe7c20", "8861f85f3de09dd5", "62182cdb0acb993c", "6cd0d81d5f3d4523",
+        "1d6c4557aaa40733", "c4b2624794506f97", "9a60e76b77b9060e",
+    ),
+    '### `sensor_history`': (
+        "eaa7da138a8988bd", "12859fa2afebb38b", "bf1c7c3b66da3366", "38e78833e42d53ea",
+        "080dbf52eff3ecaf", "bdf5d067bc39831e", "c22ee2316c12529c", "85c0787ef9a13913",
+        "1462613fbf6999f4", "21099cc89faa5694", "43eddc3d62f4f190", "bd19bb87b31c94c3",
+        "5294f9492fb1daf3", "f36f31dc3bc61b33", "b7198d5be5754cf5", "7dd420dc5642e922",
+        "f2805599cfe4ce97", "0c11965e39e98185", "9ebace000413d44e", "e3f5e496a6808de2",
+        "8c38acbd046217fa", "378b6059085dc620", "a8807c7acb7d0e32", "bca07b6aa387b2f9",
+        "dfc1283bee8ff676", "4875e9daa3b196ad",
+    ),
+    '### `action_log`': (
+        "a52a3b636ff9e57a", "caa91126c7cca689", "970df4a58dd6ec66", "6431c4991551caf2",
+        "229edc89cc061b87", "d97a9d7ac6def5fc", "c061a133a8b742e5", "86565e1e32cf5e03",
+        "dc364d8ecb2fd3d6", "ae293a9d8626ff11", "e6795e1800f4a7b4", "c7b4e2302d4e49c8",
+        "39f89744f5d771b5", "49788fb3778bd488", "2a11a4c79b0a9fc1", "0b3cc469e10f61e4",
+        "d81a6628cc0713e3", "9368016e9e406534", "a7f3312ef1023218", "45af6bb30bda7b2d",
+        "5390bcb10537d98b", "e8966aad02901b61", "2d16066db03c0311", "0c7e6fe350889523",
+        "a6fb2e9382166506", "75a433aa4c2827bb", "b0441b95e14c2b2b", "fa29c912bd086c13",
+        "af2eca5fa1afbf5c", "a64e37696e7f645f", "91de3370cf600c4e", "6f630e6b8ba47eb4",
+        "5c7e421af2852221", "8e396f51c5248206", "6e83cfff1e04b0f2", "62d7f3fa0f05758a",
+        "71397753b9cab4e0", "116789d125f0f5e2", "d4f5dd630648a9c3", "793da39dc5102352",
+    ),
+    '### `reasoning_log`': (
+        "246a2ec3487a1cca", "c5347ddb6cf3061c", "c52dd43ae9de9fee", "c5e05a96ee5b6ad4",
+        "46d706d466c39b3f", "919953ef2ed09790", "267eaaa73e9afe2a", "ee98e3fe64837ee9",
+    ),
+    '### `tier_c_decision_log`': (
+        "443b303bdb2b721b", "c861b906fe61c5f4",
+    ),
+    '## Runtime Export Invariants': (
+        "d8650c24566a1740", "2a713b8b622bfe40", "05f2cb877789f096", "17b7847614e1a27c",
+        "df1a8d09f5c9b32d", "21d2d8da19caf011", "36b1e0c9ba55d625", "e10f63aafa86a063",
+        "2a01af84abe1ff62", "2a460788c03e7e55", "7f99f43e05ec14d0", "6cd315b68bdd5ea9",
+    ),
+    '## Tier C Enrichment': (
+        "9274c84b82ae4f84", "96f7437caa4fd159", "da194d35b43b69f2", "47b6fa3f70a87b97",
+        "6ae0d86b54ce17a4",
+    ),
+    '### Topics': (
+        "70857f0152d3b80a",
+    ),
+    '### Tier C Enrichment Request Payload': (
+        "d00e52dc00d9a5bc",
+    ),
+    '### Tier C Enrichment Response Payload': (
+        "7a21a0cdd8f87642", "88ac77ae4ce19647", "02173beebae20a31", "711af270af75ec8f",
+    ),
     '### Enrichment Auth Envelope': (
-        "78cd707f6bf74877", "5438d96b05e68e08", "31ca26107a2763f3", "e55a30b15c4ebaf4",
-        "3cc5ad86ae6ad3de", "17f48b53760fcdb3", "bb759623255183f8", "8833609e1a8bc8df",
-        "b05ab93993e7fdcf", "ac41f0786c896b6b", "bdb41543f790214e", "837d780cdc49542b",
-        "202df59528110ebd", "dc08909071552d30", "33c287415dbd902c", "597a58f2db11d617",
-        "cb3f91d54eee30e5",
+        "15aa025bfcce7065", "5438d96b05e68e08", "6d589326821157c4", "e55a30b15c4ebaf4",
+        "d8d25ad7a65dad0b", "830fb8ae259098c1", "bb759623255183f8", "869a770f0abc2503",
+        "b05ab93993e7fdcf", "e5b873d6ec8c4fd2", "ca62f2466920c9e0", "8d73e90cecfa47a8",
+        "202df59528110ebd", "dc08909071552d30", "e7b232c518ae4462", "597a58f2db11d617",
+        "6cd315b68bdd5ea9",
+    ),
+    '## Gateway Weekly Reporting': (
+        "aa108a679d1ce080", "7408b553c84e01ed", "44093d9875b814fa", "0325339f4723cea4",
+        "284a323200f79b31", "2cd42be33d265cc1", "f9b6581857a60f44", "0e69cf718c847778",
+        "1d7544900045e96a", "73d7618a2776016d",
+    ),
+    '### Invariants': (
+        "51c251305306b306", "4a4d4c1ef1cab794", "a63d507890fc6623", "a3cccb784867bd6a",
+        "969ec771f58b9c20", "d61acbfdad6a9940", "53754f89254bcf46",
     ),
     '## Site Health HTTP Projection': (
-        "e550fac5ceb31644", "7ca86a7ae4040333", "ad9cd62b7d55233e", "549684e5fec20990",
-        "32c5fff7decbd1d8", "db20ad09019ebecb", "f8595d7ddb489bb6", "7842c43ae90efecb",
-        "3c4d70cce4e44463", "d5d7d83918e1839c", "dac1e2dbda1a49f3", "b25f609d4146d937",
-        "ea969d27f1433ba8", "40acc21c8ae733a0", "1f9b138a2ea51620", "7c00063d250e2f13",
-        "ec58d097c6928528", "ba8198c7919b3fee", "a22ffc1fbc93d8d3",
+        "8102d02f768a8b99", "5966b81e51a98d26", "ad9cd62b7d55233e", "549684e5fec20990",
+        "5ea6006db7185fa3", "db20ad09019ebecb", "f8595d7ddb489bb6", "d2ad65ee76d168db",
+        "3c4d70cce4e44463", "d5d7d83918e1839c", "dac1e2dbda1a49f3", "0db9f01eb5aff3ca",
+        "ea969d27f1433ba8", "40acc21c8ae733a0", "1f9b138a2ea51620", "763771eec0be222b",
+        "ec58d097c6928528", "ba8198c7919b3fee", "810b40dfe13d7bc5",
+    ),
+    '## Outbound Evidence Carriage': (
+        "afcac0f7bd25a79f", "0c25cb0c6bab1125", "0c8d2079e72e4a87", "b9460ef6be30fd5b",
+        "1bd5cf9802dcba37", "c9f19970d041f35a", "3d7778cc4529575d", "2dd87d2bd80fc388",
+        "0fa0810d5e60db43", "10bffe69e7d276f7", "057bc8663e5da71d", "c47511b6007c65f8",
+        "b5131d62a4ac2e4b", "490c777698494036", "05686078570797aa", "99b530c114f60cfa",
+        "c311a54a5f6d3803",
     ),
     '### Outbound acknowledgement': (
-        "a60a4d06386f3979", "87bf7c3fbce540e2", "d7990f9d5c80cf14", "d457f53f98b57d61",
-        "7ffc13d55bb50637", "92f0b1fd29c52d80", "f92198622f97c6ff", "df17979b57036aba",
-        "0f4535a4e9cc2d27", "b5d823c2a5293c81", "b4d998c04dc60fdc", "ab900fde568a3e50",
-        "951def4ea058d5c4", "4ee3596debf1d01b", "7843fc55b94c9e1a", "5f1f08d8d78bf15b",
-        "ac0a7b0febbafd0c", "71c92fdbaa200e9b", "6fa367cb99f1b792", "fdaafbfbd20eab19",
-        "cb3f91d54eee30e5",
+        "708d342040b47a1b", "351a9c1636cf33fa", "d7990f9d5c80cf14", "d457f53f98b57d61",
+        "7ffc13d55bb50637", "eb39038eacd2967a", "f92198622f97c6ff", "050a31ff47103c49",
+        "1ef21b8404625f67", "b5d823c2a5293c81", "b4d998c04dc60fdc", "425ae5f9e7805b19",
+        "951def4ea058d5c4", "4ee3596debf1d01b", "340df55f06d889f8", "5f1f08d8d78bf15b",
+        "ac0a7b0febbafd0c", "d551184f7ee9ff4c", "6fa367cb99f1b792", "faa9c36977c7627f",
+        "6cd315b68bdd5ea9",
+    ),
+    '## Inbound Evidence Delivery': (
+        "afcac0f7bd25a79f", "ea1867e3984ec3b8", "60b0e629666be7b3", "1a19c091a66d3317",
+        "b2365567128215e4", "a5d2084561077e0e", "b03b19f2b5d0f915", "f1b56d2494b760d0",
+        "08e4988c606451ea",
     ),
     '### Topic and Delivery': (
-        "e1e9e197da80ee43", "2be36fbeefeb4ed7", "597dce9ad491a394", "c87af99f696ee5e3",
+        "92fb75a15a292047", "2be36fbeefeb4ed7", "597dce9ad491a394", "8226884d09ac0538",
         "7233f10b245b5877", "958aa769041721ca",
     ),
     '### Durability and Retirement': (
-        "26f0501949613e47", "3e25791daf82704d", "bde527086720520b", "c4dbdaaf220d0f61",
-        "dfa83ab898c138c5", "b608a039a20b9005", "d6cc9487f71db3a4", "f45656305c1f9f1f",
-        "f501fc7c85e79b9d", "8618c3d7a8213107", "39294a2d301207c8", "792029172e21a44f",
-        "43471b6ac754def1", "96edab94562c1c14", "ce3a416dfb645e8c", "419c5d98dd3f4cf7",
-        "df17979b57036aba", "caff772a1187b672", "76c36933c8c19dac", "4f35844ca11788f1",
+        "a6e7b10fc52939cf", "f797533efcbe5ac5", "bde527086720520b", "c4dbdaaf220d0f61",
+        "54d3e7af212804e5", "b608a039a20b9005", "d6cc9487f71db3a4", "14cf4656f94629a5",
+        "f51582195676822a", "8618c3d7a8213107", "39294a2d301207c8", "792029172e21a44f",
+        "43471b6ac754def1", "ee35447d96d56b5f", "ce3a416dfb645e8c", "182cec72c1178565",
+        "050a31ff47103c49", "e32cd7f7362cd661", "e2afede5ebdfbb9f", "4f35844ca11788f1",
         "91a19818de1b8242", "30f0c0892de3a420", "54f8444d6b1f27c1", "be2c3bfde9b927c2",
-        "ec522f2a261ee367", "a234a676697996dc", "bf16128e523574bb", "926bbd5c6047511f",
+        "cb925b1fead5e818", "a234a676697996dc", "bf16128e523574bb", "926bbd5c6047511f",
         "e507c45b40e3ab56", "8cf57071acda0dd6", "0aef517e4926d758", "b518faf41e45631c",
         "67848ccebb0d832e", "6733abce8a2a7a11", "38320bbcbca19438", "b80b8ce9a8db7113",
         "3a07d29f3c7e536a", "76a91cb95ece93e1", "bec107885b186605", "f00dfc58790a69ee",
-        "2782d4e34046ff23", "5178e5d39570d67a", "d17291c4efa4102f", "365c61f2965e622d",
-        "3789932b6529cfc1", "8363f78a690dd75c", "d8ed03adf47f8654", "8f1ae5b5496a77a8",
+        "2782d4e34046ff23", "5178e5d39570d67a", "d17291c4efa4102f", "cd2c4a751aabc92d",
+        "3789932b6529cfc1", "682c864cc76fdce3", "d8ed03adf47f8654", "a462b0df2c632117",
         "24c19fb5188fd56a", "a1294246b1c2293b", "23118ea1165f189f", "41af89e346b0ea8c",
-        "a3f7daa7025f8d4b", "db826eb9ad9cc2dc", "e4c8a071ed2909b0", "3dd9e4f0478a4488",
-        "48179f3f0e56f0aa", "e3f8aec1d53c5246", "41e1ca4308cf0215", "050a248504b5a930",
-        "83e91b6620f1144c", "9682e1de2bf6f5e2", "2301016aefcd50c7", "6b68bcc36d112546",
-        "d925c087445d8281", "f1bd1c7ed6044ed6", "40c184dc6a3b9bc7",
+        "a3f7daa7025f8d4b", "db826eb9ad9cc2dc", "78b60b5f905281f6", "3dd9e4f0478a4488",
+        "2212d51d2370bb54", "4fa69a1031cee520", "41e1ca4308cf0215", "050a248504b5a930",
+        "83e91b6620f1144c", "688daf5d0ce277cf", "57a34ab568ed2b8f", "6b68bcc36d112546",
+        "bf1fbbd11f4b8c82", "f1bd1c7ed6044ed6", "40c184dc6a3b9bc7",
     ),
     '### Envelope': (
-        "e5d5f8dcefcd40d9", "5f5c2be6140020ce", "50acd7cafe0f4e0e", "16c834b2e01b5dde",
-        "79531446b8543728", "fa6050a1ea44fc6c", "7ee570afd68d4fa1", "994cb30c8d3dc3ae",
+        "db52ecccfc00131a", "5f5c2be6140020ce", "50acd7cafe0f4e0e", "16c834b2e01b5dde",
+        "79531446b8543728", "fa6050a1ea44fc6c", "7ee570afd68d4fa1", "61f8ae83749a48e7",
         "5c6f166654f66175",
     ),
-    '### Envelope Auth Envelope': (
-        "da4b7efe2c88622f", "672c7aaaade87fbe", "89e96f6eb6d925b0", "176acbe13d494241",
+    '### Artifact Type Vocabulary': (
+        "f3f1294b0e48810a", "340b8ef8e53954cd", "05d4a270e902985f", "2682df50b24cb478",
+        "b8b3e64960903a9c",
     ),
-    '### Invariants': (
-        "f1f1bdb8b5f6fc93", "8dfae1923865362f", "39a0e3e6cbd2aaf5", "3085940f06cc99b5",
-        "463040d2f80e7dcc", "b9fcdb79efd00eca", "d24701496123e5b3", "db06a705570adbf3",
-        "7c84b62f8ac3ec76", "882c734c1989e7ec", "0b98d93f2a749fe2",
+    '### Artifact Bytes': (
+        "d966e63c5091785a", "da4bf8406f6b2111", "82e32704fbb5893b", "551ca6423de8d6a1",
+        "a0f3879fb8f005a5", "c3783fe22217e409", "fc4401f6fd75f79f", "38bdb7606f86c0f8",
+        "3d64c8929416402a", "f759023394591c1f",
+    ),
+    '### Envelope Auth Envelope': (
+        "b454634fd3d79cc4", "672c7aaaade87fbe", "d6595da9b2155989", "92686a9a5ffefdd6",
+    ),
+    '### Invariants (2)': (
+        "a612088bc1aed74b", "8dfae1923865362f", "5f3cc1052ebb57ea", "3085940f06cc99b5",
+        "463040d2f80e7dcc", "969ea4f63d594f3c", "d24701496123e5b3", "e866e21af55e2bcc",
+        "d41fa5b1c659b9e1", "882c734c1989e7ec", "cf049db1568872fc",
+    ),
+    '### Fixtures': (
+        "2516f4cc5fdbd0bf", "d05e59fee9bc966f", "bb6c84f844899e75",
+    ),
+    '## Contract Fixtures': (
+        "c8e3ced5bda02670", "bf8402ec43cc36e4", "675a07aa5a6b2e8c", "c7ab451d11d37ff2",
     ),
 }
 STATUS_NOTES = {
@@ -1998,6 +2210,38 @@ def mutations(text: str, corpus: dict) -> int:
         "defence.\n", 1))
     om("outside: a guarded sentence removed", lambda x: x.replace(
         "from a hostile one.", "from a hostile one", 1))
+    # The whole document is held, with no stem filter and with its structure.
+    rot = "A rotation that keeps no earlier secret drops the receiver's floor and every held key."
+    for head in ("## Transport", "## Payload Volume", "## Gateway Availability Check",
+                 "## Contract Fixtures"):
+        if f"\n{head}\n" not in text:
+            raise SystemExit(f"outside mutant: {head!r} not found")
+        om(f"outside: a stem-free rule under {head}", lambda x, head=head: x.replace(
+            f"\n{head}\n", f"\n{head}\n\n{rot}\n", 1))
+    om("outside: a stem-free rule under a new heading", lambda x: x.replace(
+        "\n## Producer Time\n", f"\n### Rotation\n\n{rot}\n\n## Producer Time\n", 1))
+    for label, dup in (("closing hashes", f"## {SECTION} ##"),
+                       ("trailing whitespace", f"## {SECTION}   "),
+                       ("level 1", f"# {SECTION}"),
+                       ("level 4", f"#### {SECTION}"),
+                       ("indented", f"   ## {SECTION}"),
+                       ("setext", f"{SECTION}\n" + "-" * len(SECTION))):
+        om(f"outside: the section heading again, {label}", lambda x, dup=dup: x.replace(
+            "\n## Producer Time\n", f"\n{dup}\n\n{rot}\n\n## Producer Time\n", 1))
+    inv = "- Report generation must not block reasoning request handling.\n"
+    if inv not in text:
+        raise SystemExit("outside mutant: the Invariants bullet is gone")
+    om("outside: an Invariants bullet nested under its neighbour",
+       lambda x: x.replace(inv, "  " + inv, 1))
+    om("outside: an Invariants bullet turned into indented code",
+       lambda x: x.replace(inv, "\n    " + inv, 1))
+    flow = ("Cloud reasoning, when used, is a gateway backend. The runtime never sends\n"
+            "provider-specific cloud requests")
+    if flow not in text:
+        raise SystemExit("benign reflow: its paragraph is gone")
+    benign = [("outside: a reflowed paragraph", flow.replace(" sends\nprovider-specific",
+                                                             "\nsends provider-specific"))]
+
     rc_text = RUNTIME_CONFIG.read_text(encoding="utf-8")
     st_obj = json.loads(STATUS.read_text(encoding="utf-8"))
     cases.append(("runtime-config: ttl opens a window", lambda: (text, corpus, rc_text.replace(
@@ -2109,6 +2353,11 @@ def mutations(text: str, corpus: dict) -> int:
             survived += 1
         elif parsed.match(label) and outcome(*make(), guard=False) == base_model:
             print(f"SURVIVED by the held text only {label}")
+            survived += 1
+    for label, new in benign:
+        got = outcome(text.replace(flow, new, 1), corpus)
+        if got != base:
+            print(f"REFUSED A BENIGN EDIT {label}: {got}")
             survived += 1
     print(f"{len(cases)} mutants, {len(cases) - survived} refused, {survived} survived")
     for e in equivalent:
