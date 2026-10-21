@@ -86,7 +86,7 @@ PROOF_STATES = ("none", "partial", "established")
 TOP_KEYS = {"contract", "version", "maturity", "ratified_by", "adoption", "compatibility", "frozen_by",
             "proof", "baseline_audit", "companion_files", "notes", "corrections"}
 ENTRY_KEYS = {"role", "repository", "lifecycle", "conformance", "claim", "implementation", "current", "assessment",
-              "notes"}
+              "prior_assessments", "notes"}
 CLAIM_KEYS = {"status", "commit", "claim_citation"}
 PATH_KEYS = {"path_base", "component", "path"}
 LINE_CITATION_KEYS = {"line", "text"}
@@ -95,7 +95,14 @@ IMPLEMENTATION_KEYS = {"commit", "release", "paths", "path_base", "component", "
 PATH_BASES = ("repository-root", "component-root")
 COMPONENT = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 CURRENT_KEYS = {"commit", "vendored_revision"}
-ASSESSMENT_KEYS = {"snapshot", "commit", "assessed_at", "method", "divergences", "missing_requirements"}
+ASSESSMENT_KEYS = {"snapshot", "commit", "assessed_at", "method", "divergences", "missing_requirements", "resolved"}
+# A superseded assessment is kept whole, with the conformance it carried.
+PRIOR_KEYS = ASSESSMENT_KEYS | {"conformance"}
+RESOLVED_KEYS = {"divergence", "by", "commit", "contract_revision", "evidence"}
+RESOLUTIONS = ("fix", "amended-rule")
+# Repositories CI can fetch to check a fix resolution's ancestry. The private ones are never named here.
+PUBLIC_REMOTES = {"runtime": "ori-runtime", "gateway": "ori-gateway", "cli": "ori-cli", "sdk-python": "ori-sdk-python",
+                  "skills-hub": "ori-skills-hub"}
 SNAPSHOTS = ("implementation", "current")
 FROZEN_KEYS = {"event", "repository", "commit", "date", "release", "contract_revision", "pinned_revision",
                "branch_protection", "conservative", "reason"}
@@ -343,6 +350,12 @@ def who(entry: dict) -> str:
     return role if role == repo else f"{role} ({repo})"
 
 
+def fix_resolutions(entry: dict) -> list[dict]:
+    asm = entry.get("assessment") if isinstance(entry.get("assessment"), dict) else {}
+    res = asm.get("resolved") if isinstance(asm.get("resolved"), list) else []
+    return [r for r in res if isinstance(r, dict) and r.get("by") == "fix"]
+
+
 def render_adoption(rec: dict) -> str:
     parts = []
     for e in rec["adoption"]:
@@ -362,6 +375,9 @@ def render_adoption(rec: dict) -> str:
             details.append(f"{n} missing requirement{'s' if n > 1 else ''}")
         if cur.get("snapshot") in SNAPSHOTS and cur.get("commit"):
             text += f" at assessed {cur['snapshot']} snapshot `{short(str(cur['commit']))}`"
+        unverified = len(fix_resolutions(e)) if e["repository"] not in PUBLIC_REMOTES else 0
+        if unverified:
+            details.append(f"{unverified} resolution{'s' if unverified > 1 else ''} unverified by CI")
         if details:
             text += f" ({', '.join(details)})"
         current = e.get("current") or {}
@@ -542,6 +558,86 @@ def text_list(value: object) -> bool:
     return isinstance(value, list) and bool(value) and all(isinstance(d, str) and d.strip() for d in value)
 
 
+def changes_document(rev: str, path: str) -> bool | None:
+    """Whether ori-specs commit rev changed path against its first parent: True, False, or None when git cannot say."""
+    if is_ancestor(rev) is not True:
+        return False
+    out = _git_out(ROOT, "diff", "--name-only", f"{rev}^1", rev, "--", path)
+    return bool(out and out.strip())
+
+
+def check_assessment_history(rec: dict, w: str, e: dict, asm: dict, bad: Callable[[str, str], None]) -> None:
+    """prior_assessments and assessment.resolved: what a single record shows. The merge-base comparison in
+    check_history refuses an edit to history, and --verify-siblings checks a fix's ancestry."""
+    prior = e.get("prior_assessments")
+    if prior is None:
+        if asm.get("resolved") is not None:
+            bad("resolution-invalid", f"{w}.assessment.resolved needs a superseded assessment in prior_assessments")
+        return
+    if not (isinstance(prior, list) and prior and all(isinstance(x, dict) for x in prior)):
+        bad("bad-value", f"{w}.prior_assessments is a non-empty list of superseded assessments when present")
+        return
+    if not asm:
+        bad("bad-value", f"{w} keeps prior_assessments but no active assessment; a superseded assessment is "
+                         "replaced by another, never by none")
+    dates = []
+    for n, x in enumerate(prior):
+        pw = f"{w}.prior_assessments[{n}]"
+        if set(x) - PRIOR_KEYS or x.get("conformance") not in CONFORMANCE[1:] or x.get("snapshot") not in SNAPSHOTS \
+                or not HEX.match(str(x.get("commit", ""))) or not DATE.match(str(x.get("assessed_at", ""))) \
+                or not str(x.get("method", "")).strip():
+            bad("bad-value", f"{pw} is a whole assessment, {sorted(PRIOR_KEYS)}, with the snapshot, commit, "
+                             "assessed_at, method and the assessed conformance it carried")
+            return
+        for name in ("divergences", "missing_requirements"):
+            if x.get(name) is not None and not text_list(x[name]):
+                bad("bad-value", f"{pw}.{name} is a non-empty list of text when present")
+        if x["conformance"] == "non-conforming" and not x.get("divergences"):
+            bad("bad-value", f"{pw} is non-conforming, so it names its divergences")
+        dates.append(x["assessed_at"])
+    if DATE.match(str(asm.get("assessed_at", ""))):
+        dates.append(asm["assessed_at"])
+    if dates != sorted(dates):
+        bad("bad-value", f"{w}: each assessment in prior_assessments, then the active one, is dated no earlier than "
+                         "the one before it")
+    last = prior[-1]
+    active = asm.get("divergences") or []
+    dropped = [d for d in last.get("divergences") or [] if d not in active]
+    res = asm.get("resolved")
+    if res is not None and not (isinstance(res, list) and res and all(isinstance(r, dict) for r in res)):
+        bad("resolution-invalid", f"{w}.assessment.resolved is a non-empty list of resolutions when present")
+        return
+    named = []
+    for n, r in enumerate(res or []):
+        rw = f"{w}.assessment.resolved[{n}]"
+        d, by = r.get("divergence"), r.get("by")
+        if set(r) - RESOLVED_KEYS or by not in RESOLUTIONS or not str(r.get("evidence", "")).strip():
+            bad("resolution-invalid", f"{rw} is {{divergence, by, commit | contract_revision, evidence}} with by "
+                                      f"one of {RESOLUTIONS}")
+            continue
+        if d not in dropped:
+            bad("resolution-invalid", f"{rw} resolves {d!r}, which is not a divergence of the superseded "
+                                      "assessment that the active one drops")
+        named.append(d)
+        if by == "fix":
+            if not HEX.match(str(r.get("commit", ""))) or "contract_revision" in r:
+                bad("resolution-invalid", f"{rw} is a fix, so it names the fixing commit and no contract_revision")
+            elif str(r["commit"]).startswith(str(last["commit"])) or str(last["commit"]).startswith(str(r["commit"])):
+                bad("resolution-invalid", f"{rw}'s fix is the superseded snapshot's own commit; a fix descends from it")
+        else:
+            rev = str(r.get("contract_revision", ""))
+            if not HEX.match(rev) or "commit" in r:
+                bad("resolution-invalid", f"{rw} is an amended rule, so it names contract_revision, the ori-specs "
+                                          "commit the active assessment was judged under, and no commit")
+            elif changes_document(rev, f"{rec.get('contract')}/{rec.get('version')}.md") is False:
+                bad("resolution-invalid", f"{rw}'s contract_revision {rev} is not a commit in this repository's "
+                                          f"history that changed {rec.get('contract')}/{rec.get('version')}.md")
+    for d in dropped:
+        if named.count(d) != 1:
+            bad("resolution-missing", f"{w} drops the superseded divergence {d!r}, so assessment.resolved names it "
+                                      "exactly once, with its fix or amended rule")
+
+
 def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: dict, findings: list[Finding]) -> bool:
     where = f"status/{key[0]}/{key[1]}.json"
     ok = True
@@ -689,6 +785,7 @@ def check_record(root: pathlib.Path, key: tuple[str, str], rec: dict, records: d
                     "the claim commit")
         if conf == "unassessed" and e.get("assessment") is not None:
             bad("bad-value", f"{w} records an assessment but leaves conformance unassessed")
+        check_assessment_history(rec, w, e, asm, bad)
         if claim == "claimed":
             if not HEX.match(str(cl.get("commit", ""))) or not isinstance(cl.get("claim_citation"), dict):
                 bad("claim-without-citation",
@@ -2099,8 +2196,29 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                     findings.append(Finding("adoption-regressed", where,
                                             f"{who}'s assessed conformance was downgraded to unassessed. "
                                             f"{HISTORY_LIMIT}"))
+                old_prior = e.get("prior_assessments") if isinstance(e.get("prior_assessments"), list) else []
+                new_prior = ne.get("prior_assessments") if isinstance(ne.get("prior_assessments"), list) else []
+                superseded = bool(old_asm) and new_asm != old_asm
+                if new_prior[:len(old_prior)] != old_prior:
+                    findings.append(Finding("history-rewritten", where,
+                                            f"{who}'s prior_assessments were edited, reordered or removed; they may "
+                                            f"only be appended. {HISTORY_LIMIT}"))
+                elif superseded and new_prior != old_prior + [{**old_asm, "conformance": e.get("conformance")}]:
+                    findings.append(Finding("history-rewritten", where,
+                                            f"{who}'s assessment changed, so the one it replaces is appended whole to "
+                                            "prior_assessments, with the conformance it carried, and nothing else is. "
+                                            f"{HISTORY_LIMIT}"))
+                elif not superseded and new_prior != old_prior:
+                    findings.append(Finding("history-rewritten", where,
+                                            f"{who} appends to prior_assessments without superseding its assessment. "
+                                            f"{HISTORY_LIMIT}"))
+                if new_prior != old_prior and new.get("proof") != old.get("proof"):
+                    findings.append(Finding("history-rewritten", where,
+                                            f"{who}'s assessment is superseded in a change that also changes proof; a "
+                                            f"reassessment changes no proof level. {HISTORY_LIMIT}"))
                 lost = [d for d in old_asm.get("divergences") or [] if d not in (new_asm.get("divergences") or [])]
-                if lost:
+                if lost and not (superseded and new_prior == old_prior + [{**old_asm,
+                                                                           "conformance": e.get("conformance")}]):
                     findings.append(Finding("adoption-regressed", where,
                                             f"{who}'s recorded divergences were erased ({len(lost)}). {HISTORY_LIMIT}"))
                 old_rel = (e.get("implementation") or {}).get("release") if e.get("lifecycle") == "shipped" else None
@@ -2110,6 +2228,10 @@ def check_history(root: pathlib.Path, records: dict, findings: list[Finding]) ->
                     findings.append(Finding("adoption-regressed", where,
                                             f"{who}'s shipped release was rewritten from {old_rel} to {new_rel}. "
                                             f"{HISTORY_LIMIT}"))
+            if ne is None and (e.get("assessment") or e.get("prior_assessments")):
+                findings.append(Finding("history-rewritten", where,
+                                        f"{who}, assessed, was removed; its assessments stay recorded. "
+                                        f"{HISTORY_LIMIT}"))
             if e.get("lifecycle") != "shipped" and not claimed:
                 continue
             if ne is None:
@@ -2334,6 +2456,55 @@ def check_transcriptions(rec: dict, where: str, repos: dict, findings: list[Find
                                     f"{new.get('commit')} ({resolved[:12] or 'no such tag'})"))
 
 
+def check_resolutions(repo: pathlib.Path, where: str, e: dict, findings: list[Finding]) -> None:
+    """A fix resolution's ancestry in its repository: the fix descends from the superseded snapshot's commit, and
+    the active assessment's commit contains it. A cherry-picked hotfix that does not descend cannot resolve this way."""
+    prior = e.get("prior_assessments") if isinstance(e.get("prior_assessments"), list) else []
+    asm = e.get("assessment") if isinstance(e.get("assessment"), dict) else {}
+    if not prior or not isinstance(prior[-1], dict):
+        return
+    base, head = str(prior[-1].get("commit")), str(asm.get("commit"))
+    for r in fix_resolutions(e):
+        fix = str(r.get("commit"))
+        w = f"{where} resolution of {str(r.get('divergence'))[:60]!r}"
+        missing = [c for c in (base, fix, head) if _git(repo, "cat-file", "-e", f"{c}^{{commit}}").returncode != 0]
+        if missing:
+            findings.append(Finding("sibling-resolution", w, f"{', '.join(missing)} does not exist"))
+            continue
+        if _git(repo, "merge-base", "--is-ancestor", base, fix).returncode != 0:
+            findings.append(Finding("sibling-resolution", w, f"the fix {fix} does not descend from the superseded "
+                                                             f"snapshot {base}"))
+        if _git(repo, "merge-base", "--is-ancestor", fix, head).returncode != 0:
+            findings.append(Finding("sibling-resolution", w, f"the assessed snapshot {head} does not contain the "
+                                                             f"fix {fix}"))
+
+
+def verify_resolutions(root: pathlib.Path, fetch_into: pathlib.Path) -> tuple[list[Finding], int]:
+    """Fetch each public repository a fix resolution names and check its ancestry; count those in private ones."""
+    findings: list[Finding] = []
+    repos: dict[str, pathlib.Path] = {}
+    private = 0
+    for (c, v), rec in sorted(load_records(root, findings).items()):
+        for i, e in enumerate(rec.get("adoption") or []):
+            if not isinstance(e, dict) or not fix_resolutions(e):
+                continue
+            name = PUBLIC_REMOTES.get(str(e.get("repository")))
+            if name is None:
+                private += len(fix_resolutions(e))
+                continue
+            if name not in repos:
+                repos[name] = fetch_into / name
+                r = subprocess.run(["git", "clone", "--quiet", "--bare", "--filter=blob:none",
+                                    f"https://github.com/ori-platform/{name}.git", str(repos[name])],
+                                   capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    findings.append(Finding("sibling-unavailable", name, f"could not fetch: {r.stderr.strip()[:200]}"))
+            if (repos[name] / "HEAD").exists():
+                check_resolutions(repos[name], f"status/{c}/{v}.json adoption[{i}] {e.get('role')} "
+                                               f"({e.get('repository')})", e, findings)
+    return findings, private
+
+
 def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str, str],
                     components: dict[tuple[str, str], str]) -> list[Finding]:
     """Check each recorded snapshot against the sibling repositories: every value must exist at its own commit."""
@@ -2403,6 +2574,7 @@ def verify_siblings(root: pathlib.Path, directory: pathlib.Path, extra: dict[str
                                                  impl["release"]).returncode != 0:
                     findings.append(Finding("sibling-missing", where,
                                             f"release {impl['release']} does not contain {impl['commit']}"))
+            check_resolutions(repo, where, e, findings)
             cur = e.get("current") or {}
             if cur.get("commit") and on_default(cur["commit"], "current.commit"):
                 pins = manifest_pins(repo, cur["commit"], c, v, versions, earlier)
@@ -2737,6 +2909,45 @@ def mutations() -> int:
         rel, i = entry_where(pred)
         return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(r["adoption"][i]))
 
+    # Assessment history: an entry whose assessment names several divergences is superseded by one dropping the
+    # first, as a reassessment would; the "recorded" cases first put that supersession on the merge base.
+    hist_rel, hist_i = entry_where(lambda e: len((e.get("assessment") or {}).get("divergences") or []) > 1)
+    hist_doc = f"{hist_rel}.md"
+    others = (_git_out(ROOT, "rev-list", "--first-parent", "-50", "HEAD") or "").split()
+    unrelated = next((c[:12] for c in others if not changes_document(c, hist_doc)), "0" * 12)
+    amended = (_git_out(ROOT, "rev-list", "-1", "HEAD", "--", hist_doc) or "").strip()[:12] or "0" * 12
+
+    def supersede(edit: Callable[[dict, dict], object] = lambda e, r: None,
+                  recorded: bool = False) -> Callable[[pathlib.Path], None]:
+        def step(r: dict) -> None:
+            e = r["adoption"][hist_i]
+            old = copy.deepcopy(e["assessment"])
+            e["prior_assessments"] = (e.get("prior_assessments") or []) + [{**old, "conformance": e["conformance"]}]
+            e["assessment"] = {**old, "assessed_at": "2099-01-01", "method": "reassessed",
+                               "divergences": old["divergences"][1:],
+                               "resolved": [{"divergence": old["divergences"][0], "by": "fix", "commit": "f" * 12,
+                                             "evidence": "a host test"}]}
+
+        def mutate(root: pathlib.Path) -> None:
+            if recorded:
+                _edit_json(root, f"status/{hist_rel}.json", step)
+                assert BASE_OVERRIDE is not None
+                BASE_OVERRIDE[tuple(hist_rel.split("/"))] = json.loads(  # type: ignore[index]
+                    (root / f"status/{hist_rel}.json").read_text(encoding="utf-8"))
+                _edit_json(root, f"status/{hist_rel}.json", lambda r: edit(r["adoption"][hist_i], r))
+            else:
+                _edit_json(root, f"status/{hist_rel}.json", lambda r: (step(r), edit(r["adoption"][hist_i], r)))
+            write_status_lines(root)
+            write_rows(root)
+        return mutate
+
+    def amend(rev: str) -> Callable[[dict, dict], None]:
+        def fn(e: dict, r: dict) -> None:
+            res = e["assessment"]["resolved"][0]
+            res.pop("commit")
+            res.update(by="amended-rule", contract_revision=rev)
+        return fn
+
     companion_rel = _first(records, lambda r: r["compatibility"] == "frozen" and r.get("companion_files"))
     companion_docs = records[tuple(companion_rel.split("/"))]["companion_files"]  # type: ignore[index]
     companion_doc = companion_docs[0]
@@ -2825,6 +3036,66 @@ def mutations() -> int:
 
     def e0(rel: str, fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
         return lambda root: _edit_json(root, f"status/{rel}.json", lambda r: fn(r["adoption"][0]))
+
+    history_cases = [
+        ("a superseded assessment, each dropped divergence resolved by a fix, passes", None, supersede()),
+        ("a divergence resolved by the amended rule the reassessment was judged under passes", None,
+         supersede(amend(amended))),
+        ("a second supersession over recorded history passes", None,
+         supersede(lambda e, r: supersede_again(e), recorded=True)),
+        ("a dropped divergence with no resolution", "resolution-missing",
+         supersede(lambda e, r: e["assessment"].pop("resolved"))),
+        ("a dropped divergence resolved twice", "resolution-missing",
+         supersede(lambda e, r: e["assessment"]["resolved"].append(dict(e["assessment"]["resolved"][0])))),
+        ("a resolution of a divergence the assessment keeps", "resolution-invalid:which is not a divergence",
+         supersede(lambda e, r: e["assessment"]["resolved"].append(
+             {"divergence": e["assessment"]["divergences"][0], "by": "fix", "commit": "f" * 12, "evidence": "x"}))),
+        ("a fix that is the superseded snapshot's own commit", "resolution-invalid:own commit",
+         supersede(lambda e, r: e["assessment"]["resolved"][0].update(commit=e["prior_assessments"][-1]["commit"]))),
+        ("a fix naming no commit", "resolution-invalid:names the fixing commit",
+         supersede(lambda e, r: e["assessment"]["resolved"][0].pop("commit"))),
+        ("a resolution with no evidence", "resolution-invalid:with by",
+         supersede(lambda e, r: e["assessment"]["resolved"][0].update(evidence=" "))),
+        ("an amended rule naming a commit that did not change the contract", "resolution-invalid:that changed",
+         supersede(amend(unrelated))),
+        ("an amended rule naming a commit outside this repository's history", "resolution-invalid:that changed",
+         supersede(amend("0" * 12))),
+        ("a resolution with no superseded assessment", "resolution-invalid:needs a superseded",
+         entry_edit(lambda e: len((e.get("assessment") or {}).get("divergences") or []) > 1,
+                    lambda e: e["assessment"].update(resolved=[{"divergence": "x", "by": "fix", "commit": "f" * 12,
+                                                                "evidence": "x"}]))),
+        ("a superseded assessment kept without its method", "bad-value:is a whole assessment",
+         supersede(lambda e, r: e["prior_assessments"][-1].pop("method"))),
+        ("a superseded assessment kept without the conformance it carried", "bad-value:is a whole assessment",
+         supersede(lambda e, r: e["prior_assessments"][-1].pop("conformance"))),
+        ("a reassessment dated before the assessment it supersedes", "bad-value:dated no earlier",
+         supersede(lambda e, r: e["assessment"].update(assessed_at="2000-01-01"))),
+        ("an assessment edited in place", "history-rewritten:appended whole",
+         entry_edit(lambda e: len((e.get("assessment") or {}).get("divergences") or []) > 1,
+                    lambda e: e["assessment"].update(method="rewritten"))),
+        ("a supersession that keeps an altered copy of the assessment it replaces", "history-rewritten:appended whole",
+         supersede(lambda e, r: e["prior_assessments"][-1].update(divergences=["softened"]))),
+        ("a supersession that also changes proof", "history-rewritten:changes no proof",
+         supersede(lambda e, r: r["proof"].update(hil={"state": "partial", "evidence": "a bench record"}))),
+        ("a recorded prior assessment edited", "history-rewritten:only be appended",
+         supersede(lambda e, r: e["prior_assessments"][0].update(method="edited"), recorded=True)),
+        ("a recorded prior assessment removed", "history-rewritten:only be appended",
+         supersede(lambda e, r: (e.pop("prior_assessments"), e["assessment"].pop("resolved")), recorded=True)),
+        ("a prior assessment appended without a supersession", "history-rewritten:without superseding",
+         supersede(lambda e, r: e["prior_assessments"].append(dict(e["prior_assessments"][0])), recorded=True)),
+        ("an assessed entry removed", "history-rewritten:was removed",
+         rec_edit(hist_rel, lambda r: r["adoption"].pop(hist_i))),
+    ]
+
+    def supersede_again(e: dict) -> None:
+        old = copy.deepcopy(e["assessment"])
+        e["prior_assessments"].append({**old, "conformance": e["conformance"]})
+        e["assessment"] = {**old, "divergences": old["divergences"][1:], "method": "reassessed again",
+                           "resolved": [{"divergence": old["divergences"][0], "by": "fix", "commit": "e" * 12,
+                                         "evidence": "another host test"}]}
+        if not e["assessment"]["divergences"]:
+            e["assessment"].pop("divergences")
+            e["conformance"] = "conforming"
 
     def decision(root: pathlib.Path) -> None:
         (root / "decisions").mkdir(exist_ok=True)
@@ -3116,6 +3387,7 @@ def mutations() -> int:
         ("a recorded divergence erased", "adoption-regressed:divergences were erased",
          entry_edit(lambda e: e["conformance"] == "non-conforming",
                     lambda e: e["assessment"].update(divergences=["a different divergence"]))),
+        *history_cases,
         ("a shipped release rewritten", "adoption-regressed:release was rewritten",
          entry_edit(lambda e: e["lifecycle"] == "shipped", lambda e: e["implementation"].update(release="v9.9.9"))),
         ("a vector file added to a frozen version", "frozen-audit-pending", add_vector),
@@ -3826,6 +4098,17 @@ def mutations() -> int:
     # invented an anchor (keeping emphasis marks, a link's destination) would let a missing section look present.
     # The quoted-title heading a CommonMark comparison found the earlier parsing anchored as #rule-title: both the
     # anchor the earlier parsing invented and the one GitHub renders are refused, the latter for its form.
+    # A fix in a private repository is rendered as unverified by CI; one in a public repository is not.
+    for repo, want in (("edge-firmware", "(1 resolution unverified by CI)"), ("gateway", None)):
+        line = render_adoption({"adoption": [{
+            "role": "firmware", "repository": repo, "lifecycle": "implemented-unreleased", "conformance": "conforming",
+            "claim": {"status": "none"}, "assessment": {"snapshot": "implementation", "commit": "a" * 7,
+                                                        "resolved": [{"by": "fix"}]}}]})
+        good = (want in line) if want else "unverified" not in line
+        print(f"{'ok  ' if good else 'FAIL'} a fix resolution in {repo} renders "
+              f"{want or 'no unverified note'}" + ("" if good else f" (got {line!r})"))
+        total += 1
+        failed += not good
     for anchor, want in (("rule-title", "not supported"), ("rule", "not supported")):
         got = anchor_problem('# Doc\n\n## [Rule](x "a ) title")\n', anchor)
         good = got is not None and want in got
@@ -4009,8 +4292,27 @@ def sibling_mutations(rel: str) -> tuple[int, int]:
                 "implementation": {"commit": a, "release": None, "paths": ["impl.go"], "vendored_revision": "aaaaaaa"},
                 "current": {"commit": a, "vendored_revision": "aaaaaaa"}}
 
+    def resolved(base: str, fix: str, head: str) -> Callable[[dict, str, str], None]:
+        # The superseded snapshot, the fix and the reassessed snapshot, as revisions of the synthetic repository.
+        def apply(e: dict, a: str, b: str) -> None:
+            at = {"a": a, "b": b, "a~1": f"{a}~1", "none": "0" * 12}
+            e.update(conformance="conforming", prior_assessments=[{
+                "snapshot": "implementation", "commit": at[base], "assessed_at": "2026-01-01", "method": "m",
+                "divergences": ["d"], "conformance": "non-conforming"}],
+                assessment={"snapshot": "implementation", "commit": at[head], "assessed_at": "2026-01-02",
+                            "method": "m", "resolved": [{"divergence": "d", "by": "fix", "commit": at[fix],
+                                                         "evidence": "e"}]})
+        return apply
+
     cases: list[tuple[str, str | None, Callable[[dict, str, str], None]]] = [
         ("sibling: a snapshot that matches its repository passes", None, lambda e, a, b: None),
+        ("sibling: a fix that descends from the superseded snapshot and is in the assessed one passes", None,
+         resolved("a~1", "a", "a")),
+        ("sibling: a fix that does not descend from the superseded snapshot", "sibling-resolution:does not descend",
+         resolved("b", "a", "a")),
+        ("sibling: a fix the assessed snapshot does not contain", "sibling-resolution:does not contain",
+         resolved("a~1", "b", "a")),
+        ("sibling: a fix commit that does not exist", "sibling-resolution:does not exist", resolved("a~1", "none", "a")),
         ("sibling: a repository with no checkout", "sibling-unavailable:no checkout",
          lambda e, a, b: e.update(repository="skills-hub")),
         ("sibling: an implementation commit that does not exist", "sibling-missing:does not exist",
@@ -4114,6 +4416,8 @@ def main() -> int:
     ap.add_argument("--write-rows", action="store_true", help="rewrite the README and VERSIONING rows from the records")
     ap.add_argument("--verify-siblings", metavar="DIR",
                     help="check every snapshot against sibling checkouts under DIR; CI cannot run this")
+    ap.add_argument("--verify-resolutions", action="store_true",
+                    help="fetch each public repository a fix resolution names and check the fix's ancestry")
     ap.add_argument("--sibling", action="append", default=[], metavar="ROLE=PATH",
                     help="a checkout for a repository role that has no default directory name")
     ap.add_argument("--component", action="append", default=[], metavar="ROLE:COMPONENT=SUBDIR",
@@ -4142,6 +4446,14 @@ def main() -> int:
         print(json.dumps({"pinned_sha256": normative_digest((ROOT / f"{args.digest}.md").read_text(encoding="utf-8")),
                           "pinned_files": version_files(ROOT, c, v, versions_in(ROOT, c))}, indent=2))
         return 0
+    if args.verify_resolutions:
+        with tempfile.TemporaryDirectory() as tmp:
+            found, private = verify_resolutions(ROOT, pathlib.Path(tmp))
+        for f in found:
+            print(f, file=sys.stderr)
+        print(f"resolution ancestry: {len(found)} finding(s); {private} resolution(s) in private repositories, "
+              "unverified by CI and rendered as such")
+        return 1 if found else 0
     if args.verify_siblings:
         extra = dict(x.split("=", 1) for x in args.sibling)
         comps = {}

@@ -22,7 +22,7 @@ A record carries:
 | `contract`, `version` | The version it describes; they match the record's path. |
 | `maturity` | `draft` or `ratified`. |
 | `ratified_by` | Only when `ratified`: the path, under `decisions/`, and optional `#anchor`, of the decision record in this repository that ratified the version. |
-| `adoption` | One entry per implementation, by role. Each names `role`, `repository`, `lifecycle`, `conformance`, and the `claim`, `implementation` and optional `current` snapshots described below. |
+| `adoption` | One entry per implementation, by role. Each names `role`, `repository`, `lifecycle`, `conformance`, and the `claim`, `implementation` and optional `current` snapshots described below, with an optional `assessment` and `prior_assessments`; see [Assessment History](#assessment-history). |
 | `compatibility` | `amendable` or `frozen`. |
 | `frozen_by` | Only when `frozen`: the `event` that froze the version, its `repository`, `commit`, `date` and `release`; `contract_revision`, the last ori-specs commit that changed the contract before the event; `pinned_revision`, the ori-specs commit the freezing artifact pins where it pins one; `branch_protection`, `conservative`, and a `reason` for a conservative baseline. |
 | `baseline_audit` | Only when `frozen`, and always then: the audit of the version's text against its freeze revision. See [Baseline Audit](#baseline-audit). |
@@ -72,6 +72,53 @@ which it did not exist:
 
 A conformance assessment is its own record and never attaches to the claim
 commit.
+
+### Assessment History
+
+An entry may keep the assessments its `assessment` replaced. It is opt-in: an
+entry without `prior_assessments` needs no migration.
+
+- `prior_assessments[]` is append-only. Each item is a superseded
+  `assessment` kept whole, with the `conformance` it carried. When the active
+  `assessment` changes, the change appends the one it replaces, unaltered,
+  and nothing else. No item is ever edited, reordered or removed, and an
+  entry that has been assessed is never removed. Assessments are dated in
+  order, oldest first, then the active one.
+- Every divergence of the last superseded assessment that the active one
+  drops appears exactly once in `assessment.resolved[]`, as `{divergence,
+  by, commit | contract_revision, evidence}`, with `divergence` quoted
+  exactly and `evidence` saying what shows it resolved:
+  - `by: "fix"` names the fixing `commit` in the implementation's
+    repository. It descends from the superseded snapshot's commit and is in
+    the history of the commit the active assessment assessed.
+  - `by: "amended-rule"` names `contract_revision`: the commit of this
+    repository the active assessment was judged under, which changed the
+    version's document.
+- Any snapshot may be reassessed, an earlier one or the same one, with a
+  `method` that says why. Such a reassessment can only add divergences: a fix
+  cannot descend from a snapshot and also be in an earlier one, so a
+  rollback keeps every divergence until a later fix resolves it.
+- Superseding an assessment changes no proof level: a change that appends to
+  `prior_assessments` leaves `proof` exactly as it was on the default branch,
+  neither raised nor lowered. A proof change, a downgrade included, is a
+  change of its own.
+
+`scripts/check-contract-status` checks the shape and the amended rule's
+commit on every run, and checks the history against the merge base with the
+default branch. `--verify-resolutions` checks each fix's ancestry, in CI, by
+fetching the public repositories a fix names. A fix in a private repository
+is not fetched, and the status line shows it as "(N resolutions unverified by
+CI)"; `--verify-siblings` checks it against a local checkout.
+
+Stated limits:
+- A cherry-picked hotfix that does not descend from the superseded snapshot
+  cannot resolve a divergence by descent. It is recorded as a new
+  assessment of a snapshot that contains it, and the divergence stays until
+  a fix that descends is in an assessed snapshot.
+- The checker cannot tell whether an amended rule really resolves the
+  divergence it names, or whether a fix fixes it; review does.
+- Missing requirements are kept whole in `prior_assessments`, but dropping
+  one needs no resolution.
 
 `vendored_revision` is input-document provenance only. It is not a conformance
 claim and not a conformance result, and a vendored revision that differs from
