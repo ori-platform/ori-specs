@@ -27,15 +27,16 @@ class Receiver:
         self.skew = ctx["skew_ms"]
         self.ttl = ctx["replay_ttl_ms"]
         self.stores = ctx["stores"]
-        self.stored_floor = ctx["stored_floor_ms"]
+        # A receiver that stores nothing reads a floor an earlier run stored and never raises it; its own
+        # raises live for the run.
+        self.stored_floor = ctx["stored_floor_ms"] if self.stores else None
+        self.read_floor = None if self.stores else ctx["stored_floor_ms"]
         self.start = ctx["start_clock_ms"]
         self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
         self.pending: dict[str, tuple[int, int]] = {}
 
     def floor(self) -> int:
-        if self.stored_floor is None:
-            return self.start
-        return max(self.stored_floor, self.start)
+        return max(x for x in (self.stored_floor, self.read_floor, self.start) if x is not None)
 
     def _raise(self, signed: int) -> None:
         value = signed + 1
@@ -96,11 +97,10 @@ class Receiver:
                 self.skew = ev["skew_ms"]
             return None
         if kind == "rotate":
+            # A rotation keeps the floor and keys (Recovery); one that keeps no earlier secret discards
+            # every authentication not yet recorded.
             if not ev["keeps_previous"]:
-                self.stored_floor = None
-                self.held = {}
                 self.pending = {}
-                self.start = ev["t"]
             return None
         raise ValueError(kind)
 
@@ -260,13 +260,18 @@ CASES = (
      ctx(stores=True, start=0),
      [rx("a", 10250, 10000), rx("b", 10260, 10000), evict(10000), rx("c", 10100, 10100),
       restart(10120), rx("d", 10200, 10200), rx("e", 10251, 10251)]),
+    ("restart_with_storage_off_keeps_earlier_floor",
+     "a receiver that no longer stores its floor reads one an earlier run stored at every start, never "
+     "raises it, and loses its own run's raise at a restart",
+     ctx(stores=False, stored=50000, start=0),
+     [restart(20000), rx("p", 20000, 20000), rx("q", 60000, 60000), prune(60301), restart(55000)]),
     ("rotate_keeping_previous",
      "a rotation that keeps the previous secret keeps the floor and every held key",
      ctx(stored=50000, start=0, held=(("a", 49900, 49900),)),
      [rotate(20000, keeps_previous=True), rx("b", 20000, 20000)]),
     ("rotate_keeping_none",
-     "a rotation that keeps no earlier secret drops the stored floor and every held key, leaving the "
-     "floor at the clock",
+     "a rotation that keeps no earlier secret also keeps the stored floor and every held key; only an "
+     "operator's offline reset lowers a stored floor",
      ctx(stored=50000, start=0, held=(("a", 49900, 49900),)),
      [rotate(20000, keeps_previous=False), rx("b", 20000, 20000), rx("c", 19999, 20001)]),
     ("precedence_stale_before_floor",
