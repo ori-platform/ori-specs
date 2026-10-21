@@ -1,0 +1,604 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the firmware-command-result/v1 corpus.
+
+Signatures come from OpenSSL through `cryptography`. Nothing here is shared
+with scripts/check-firmware-command-result-vectors-v1, which verifies them with
+its own curve arithmetic and reads the kinds, outcomes, reasons and the
+duplicate table from the contract rather than from this file.
+
+    python3 scripts/generate-firmware-command-result-vectors-v1          # write
+    python3 scripts/generate-firmware-command-result-vectors-v1 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import sys
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "firmware-command-result" / "command-result-vectors-v1.json"
+
+# The device seed of the firmware-telemetry/v2 fault corpus and the runtime seed
+# of the firmware-commands/v2 command corpus, both disclosed and test-only.
+DEVICE_SEED_HEX = "42" * 32
+RUNTIME_SEED_HEX = "11" * 32
+COMMAND_DOMAIN = "ori.firmware_command.v2"
+DEVICE_ID = "ori-fw-7c9f2b3a"
+CAPABILITY_HASH = (
+    "sha256:13751b5335ccedcd4ffcc82bbda28ebfb7558859f36a74e710f1a0b0ab23da8d"
+)
+# A second manifest hash, for a judgment stored under an earlier approval.
+EARLIER_HASH = "sha256:" + "ab" * 32
+# A hash no approval of this device names, carried by a command refused as capability_mismatch.
+THIRD_HASH = "sha256:" + "cd" * 32
+POSTURE = "sealed_flash"
+BOOT_ID = 41
+
+REFUSAL_VERDICTS = (
+    "capability_mismatch",
+    "unknown_action",
+    "rate_limited",
+    "storage_failure",
+)
+DISPOSITIONS = (
+    "pending",
+    "capability_mismatch",
+    "unknown_action",
+    "rate_limited",
+    "driver_ok",
+    "driver_error",
+)
+
+# (name, action, channel, cmd_seq, note) for each command the digest group signs.
+COMMANDS = (
+    ("relay_open_1047", "relay_open", "relay0", 1047, "a protective open"),
+    ("relay_close_1048", "relay_close", "relay0", 1048, "the next command, a close"),
+    ("relay_open_1049_second_channel", "relay_open", "relay1", 1049, "another channel"),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def command_bytes(action: str, channel: str, cmd_seq: int) -> bytes:
+    return canonical({"action": action, "capability_hash": CAPABILITY_HASH, "channel": channel,
+                      "cmd_seq": cmd_seq, "device_id": DEVICE_ID, "v": 1})
+
+
+def digest(body: bytes) -> str:
+    preimage = COMMAND_DOMAIN.encode("ascii") + b"\x00" + body
+    return "sha256:" + hashlib.sha256(preimage).hexdigest()
+
+
+def build() -> bytes:
+    device = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(DEVICE_SEED_HEX))
+    runtime = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(RUNTIME_SEED_HEX))
+    device_public = device.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    runtime_public = runtime.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    b64 = lambda raw: base64.b64encode(raw).decode("ascii")  # noqa: E731
+
+    digests = []
+    for name, action, channel, cmd_seq, note in COMMANDS:
+        body = command_bytes(action, channel, cmd_seq)
+        signature = "ed25519:" + b64(runtime.sign(COMMAND_DOMAIN.encode("ascii") + b"\x00" + body))
+        message = b'{"command":' + body + b',"signature":"' + signature.encode() + b'"}'
+        digests.append({"name": name, "note": note, "command": json.loads(body),
+                        "command_hex": body.hex(), "signature": signature,
+                        "message_hex": message.hex(), "command_digest": digest(body)})
+    first = digests[0]["command_digest"]
+    other = digests[1]["command_digest"]
+
+    seq = 150000
+
+    def result(kind: object, outcome: object, override: dict | None = None) -> dict:
+        nonlocal seq
+        seq += 1
+        obj = {"v": 1, "alg": "ed25519", "device_id": DEVICE_ID, "boot_id": BOOT_ID, "seq": seq,
+               "capability_hash": CAPABILITY_HASH, "posture": POSTURE,
+               "device_uptime_ms": 925000 + seq - 150000, "cmd_seq": 1047,
+               "command_digest": first, "kind": kind, "outcome": outcome}
+        for key, value in (override or {}).items():
+            if value is None:
+                del obj[key]
+            else:
+                obj[key] = value
+        return obj
+
+    def signed(obj: dict, extra_family: bool = False) -> dict:
+        body = canonical(obj)
+        signature = "ed25519:" + b64(device.sign(body))
+        payload: dict = {"command_result": obj, "signature": signature}
+        if extra_family:
+            payload["fault"] = {"code": "command_rejected"}
+        return {"object": obj, "canonical_hex": body.hex(), "signature": signature,
+                "payload_hex": canonical(payload).hex()}
+
+    results = []
+
+    def accept(name: str, note: str, obj: dict) -> None:
+        results.append({"name": name, "note": note, **signed(obj), "expect": "accept",
+                        "reason": None})
+
+    def refuse(name: str, reason: str, note: str, obj: dict, extra_family: bool = False) -> None:
+        results.append({"name": name, "note": note, **signed(obj, extra_family),
+                        "expect": "refuse", "reason": reason})
+
+    accept("accepted", "the device verified the command and will act on it", result("accepted", ""))
+    for verdict in REFUSAL_VERDICTS:
+        accept(f"refused_{verdict}", "a refusal after the signature verified",
+               result("refused", verdict))
+    for disposition in DISPOSITIONS:
+        accept(f"duplicate_{disposition}", "a repeat of the last fresh command, answered with "
+               "the disposition the device made durable", result("duplicate", disposition))
+    accept("conflict", "the last fresh cmd_seq reused with other bytes", result("conflict", ""))
+    accept("attempted", "the driver write began", result("attempted", ""))
+    accept("driver_reported_ok", "the driver write returned success",
+           result("driver_reported", "ok"))
+    accept("driver_reported_error", "the driver write failed",
+           result("driver_reported", "error"))
+    accept("conflict_other_digest", "a result may name any digest the device verified",
+           result("conflict", "", {"command_digest": other, "cmd_seq": 1048}))
+
+    refuse("reject_extra_member", "member_set", "a member the contract does not define",
+           result("accepted", "", {"note": "x"}))
+    refuse("reject_missing_digest", "member_set", "command_digest is required",
+           result("accepted", "", {"command_digest": None}))
+    refuse("reject_missing_outcome", "member_set", "outcome is required even when empty",
+           result("accepted", "", {"outcome": None}))
+    refuse("reject_v_2", "unsupported_version", "this version is v 1",
+           result("accepted", "", {"v": 2}))
+    refuse("reject_v_string", "unsupported_version", "v is a JSON integer",
+           result("accepted", "", {"v": "1"}))
+    refuse("reject_feedback_observed", "unknown_kind",
+           "feedback_observed is reserved and no device signs it", result("feedback_observed", ""))
+    refuse("reject_kind_executed", "unknown_kind", "no kind means executed",
+           result("executed", ""))
+    refuse("reject_refused_bad_signature", "outcome_not_allowed",
+           "an unauthenticated refusal gets no result", result("refused", "bad_signature"))
+    refuse("reject_refused_malformed", "outcome_not_allowed",
+           "an unauthenticated refusal gets no result", result("refused", "malformed"))
+    refuse("reject_accepted_with_outcome", "outcome_not_allowed", "accepted takes no outcome",
+           result("accepted", "ok"))
+    refuse("reject_driver_pending", "outcome_not_allowed", "driver_reported is ok or error",
+           result("driver_reported", "pending"))
+    refuse("reject_driver_empty", "outcome_not_allowed", "driver_reported is ok or error",
+           result("driver_reported", ""))
+    refuse("reject_duplicate_accepted", "outcome_not_allowed",
+           "a device never records accepted", result("duplicate", "accepted"))
+    refuse("reject_duplicate_executed", "outcome_not_allowed", "no disposition means executed",
+           result("duplicate", "executed"))
+    refuse("reject_refused_replayed", "outcome_not_allowed",
+           "a replay gets no result, only its fault", result("refused", "replayed"))
+    refuse("reject_duplicate_storage_failure", "outcome_not_allowed",
+           "a failed freshness write stores nothing a duplicate could answer with",
+           result("duplicate", "storage_failure"))
+    refuse("reject_duplicate_replayed", "outcome_not_allowed",
+           "a replay is never the last fresh command's disposition",
+           result("duplicate", "replayed"))
+    refuse("reject_conflict_with_outcome", "outcome_not_allowed", "conflict takes no outcome",
+           result("conflict", "pending"))
+    refuse("reject_digest_uppercase", "digest_form", "the hex digits are lowercase",
+           result("accepted", "", {"command_digest": first.upper().replace("SHA256:", "sha256:")}))
+    refuse("reject_digest_no_prefix", "digest_form", "the sha256: prefix is required",
+           result("accepted", "", {"command_digest": first[len("sha256:"):]}))
+    refuse("reject_digest_short", "digest_form", "64 hex digits",
+           result("accepted", "", {"command_digest": first[:-1]}))
+    refuse("reject_two_family_keys", "family_keys",
+           "a payload carries exactly one family key beside signature",
+           result("accepted", ""), extra_family=True)
+
+    def record(disposition: str, capability_hash: str = CAPABILITY_HASH,
+               command_digest: str = first) -> dict:
+        return {"cmd_seq": 1047, "command_digest": command_digest,
+                "capability_hash": capability_hash, "disposition": disposition}
+
+    def judgment(name: str, note: str, mark: int, rec: dict, cmd_seq: int, cmd_digest: str,
+                 kind: str, outcome: str, cmd_hash: str = CAPABILITY_HASH) -> dict:
+        return {"name": name, "note": note,
+                "device": {"mark": mark, "capability_hash": CAPABILITY_HASH, "record": rec},
+                "command": {"cmd_seq": cmd_seq, "command_digest": cmd_digest,
+                            "capability_hash": cmd_hash},
+                "expect": {"kind": kind, "outcome": outcome}}
+
+    judgments = [
+        judgment("below_mark", "anything below the mark is a replay, whatever its bytes, and "
+                 "gets no result", 1047, record("driver_ok"), 1046, other, "none", ""),
+        judgment("at_mark_other_epoch", "a judgment never crosses an approval epoch: the same "
+                 "bytes, accepted under an earlier approval", 1047,
+                 record("driver_ok", EARLIER_HASH), 1047, first, "none", "", EARLIER_HASH),
+        judgment("at_mark_other_epoch_other_digest", "the epoch rule comes before the digest",
+                 1047, record("pending", EARLIER_HASH), 1047, other, "none", ""),
+        judgment("at_mark_conflict", "the last fresh cmd_seq with other bytes", 1047,
+                 record("driver_ok"), 1047, other, "conflict", ""),
+        judgment("at_mark_conflict_command_other_epoch", "a command at the mark naming another "
+                 "capability_hash is a conflict, never capability_mismatch", 1047,
+                 record("driver_ok"), 1047, other, "conflict", "", EARLIER_HASH),
+        judgment("above_mark", "freshness passes", 1047, record("driver_ok"), 1048, other,
+                 "new", ""),
+        judgment("resend_after_storage_failure", "a failed freshness write stored nothing, so "
+                 "a resend is above the mark and new", 1046,
+                 {"cmd_seq": 1046, "command_digest": other, "capability_hash": CAPABILITY_HASH,
+                  "disposition": "driver_ok"}, 1047, first, "new", ""),
+    ] + [
+        judgment(f"at_mark_duplicate_{d}", "an exact repeat answers with the stored disposition",
+                 1047, record(d), 1047, first, "duplicate", d,
+                 # A command refused as capability_mismatch named a hash other than the
+                 # device's, and its repeat is the same bytes.
+                 THIRD_HASH if d == "capability_mismatch" else CAPABILITY_HASH)
+        for d in DISPOSITIONS
+    ]
+
+    def life(name: str, note: str, events: list[str], timed_out: str | None, ended: bool,
+             uncertain: bool, contradiction: bool = False, critical: bool = False) -> dict:
+        return {"name": name, "note": note, "events": events,
+                "expect": {"timed_out": timed_out, "attempts_ended": ended,
+                           "outcome_uncertain": uncertain, "contradiction": contradiction,
+                           "critical": critical, "executed": False}}
+
+    sent = ["signed", "issued"]
+    ok = "driver_reported_ok"
+    lifecycle = [
+        life("signed_only", "signed and not yet published", ["signed"], None, False, True),
+        life("issued_only", "published is not executed", sent, None, False, True),
+        life("accepted_only", "accepted is not executed, and ends no attempt",
+             sent + ["device_accepted"], None, False, True),
+        life("attempted_only", "a write begun ends no attempt",
+             sent + ["device_accepted", "actuation_attempted"], None, False, True),
+        life("driver_ok", "driver acceptance ends attempts, not uncertainty",
+             sent + ["device_accepted", "actuation_attempted", ok], None, True, True),
+        life("driver_ok_alone", "accepted and attempted are optional before driver_reported",
+             sent + [ok], None, True, True),
+        life("driver_error", "a failed write leaves attempts going",
+             sent + ["device_accepted", "actuation_attempted", "driver_reported_error"],
+             None, False, True),
+        life("driver_ok_then_deadline", "a driver result is final, so no timed_out follows",
+             sent + ["device_accepted", "actuation_attempted", ok, "deadline_passed"],
+             None, True, True),
+        life("driver_error_then_deadline", "driver_reported(error) is final for the deadline "
+             "and ends no attempt",
+             sent + ["device_accepted", "actuation_attempted", "driver_reported_error",
+                     "deadline_passed"], None, False, True),
+        life("driver_error_without_attempted", "a channel with no driver mapping: an error and "
+             "no write begun", sent + ["device_accepted", "driver_reported_error"],
+             None, False, True),
+        life("attempted_then_deadline", "attempted is not final",
+             sent + ["device_accepted", "actuation_attempted", "deadline_passed"],
+             "deadline", False, True),
+        life("deadline_with_nothing", "absence is in doubt", sent + ["deadline_passed"],
+             "deadline", False, True),
+        life("deadline_after_accepted", "accepted is not final",
+             sent + ["device_accepted", "deadline_passed"], "deadline", False, True),
+        life("late_driver_ok", "a late result appends and ends attempts from then on",
+             sent + ["device_accepted", "deadline_passed", ok], "deadline", True, True),
+        life("restart_before_result", "elapsed time across a restart cannot be established",
+             sent + ["device_accepted", "restart"], "restart", False, True),
+        life("restart_then_late_driver_ok", "a result after a restart still appends",
+             sent + ["restart", ok], "restart", True, True),
+        life("restart_after_final", "a restart after a final result records no timed_out",
+             sent + [ok, "restart"], None, True, True),
+        life("refused_then_deadline", "a refusal is final, so no timed_out follows",
+             sent + ["device_refused_capability_mismatch", "deadline_passed"], None, False, True),
+        life("conflict_then_deadline", "a conflict is final",
+             sent + ["device_conflict", "deadline_passed"], None, False, True),
+        life("duplicate_driver_ok", "a duplicate re-signing driver_ok is driver acceptance",
+             sent + ["device_duplicate_driver_ok"], None, True, True),
+        life("duplicate_pending_then_deadline", "a duplicate answering pending is not final",
+             sent + ["device_duplicate_pending", "deadline_passed"], "deadline", False, True),
+        life("duplicate_refusal", "a duplicate of a refused command is final and ends nothing",
+             sent + ["device_duplicate_rate_limited", "deadline_passed"], None, False, True),
+        life("driver_ok_then_duplicate_pending", "an honest device that failed to record its "
+             "driver result answers pending: no contradiction",
+             sent + [ok, "device_duplicate_pending"], None, True, True),
+        life("driver_ok_then_duplicate_refusal", "two final dispositions disagree: attempts "
+             "resume", sent + [ok, "device_duplicate_rate_limited"], None, False, True,
+             True, True),
+        life("duplicate_refusal_then_driver_ok", "the same contradiction in the other order",
+             sent + ["device_duplicate_rate_limited", ok], None, False, True, True, True),
+        life("driver_ok_then_duplicate_driver_error", "driver_ok against driver_error",
+             sent + [ok, "device_duplicate_driver_error"], None, False, True, True, True),
+        life("refused_then_driver_ok", "a live refusal against a driver result",
+             sent + ["device_refused_unknown_action", ok], None, False, True, True, True),
+        life("deadline_then_restart", "a command has one timed_out, the first",
+             sent + ["deadline_passed", "restart"], "deadline", False, True),
+        life("restart_then_deadline", "a deadline is never re-armed after a restart",
+             sent + ["restart", "deadline_passed"], "restart", False, True),
+        life("refused_capability_mismatch_then_driver_ok", "a live capability refusal against a "
+             "driver result", sent + ["device_refused_capability_mismatch", ok], None, False,
+             True, True, True),
+        life("duplicate_capability_mismatch_then_driver_ok", "a stored capability refusal against "
+             "a driver result", sent + ["device_duplicate_capability_mismatch", ok], None, False,
+             True, True, True),
+        life("driver_ok_then_driver_error", "opposite driver results for one command",
+             sent + [ok, "driver_reported_error"], None, False, True, True, True),
+        life("storage_failure_then_driver_ok", "storage_failure never contradicts: a redelivery "
+             "was judged new and driven", sent + ["device_refused_storage_failure", ok], None, True,
+             True),
+        life("driver_ok_then_storage_failure", "a later delivery met a mark it could not read",
+             sent + [ok, "device_refused_storage_failure"], None, True, True),
+        life("conflict_then_driver_ok", "a conflict is its own security event, outside the "
+             "contradiction rule", sent + ["device_conflict", ok], None, True, True),
+        life("accepted_then_refused", "accepted is never signed before every check has passed",
+             sent + ["device_accepted", "device_refused_rate_limited"], None, False, True, True,
+             True),
+        life("attempted_then_refused_then_driver_ok", "a contradiction blocks the acceptance that "
+             "follows", sent + ["actuation_attempted", "device_refused_unknown_action", ok], None,
+             False, True, True, True),
+        life("unconfirmed_then_driver_ok", "results attach to an unconfirmed publication",
+             ["signed", "publish_unconfirmed", ok], None, True, True),
+        life("unconfirmed_then_nothing", "an unconfirmed publication reaches timed_out",
+             ["signed", "publish_unconfirmed", "deadline_passed"], "deadline", False, True),
+        life("observed_matches", "an observation ends uncertainty and attributes nothing",
+             sent + [ok, "terminal_outcome_observed_matches"], None, True, False),
+        life("observed_then_driver_ok", "arrival order changes nothing",
+             sent + ["terminal_outcome_observed_matches", ok], None, True, False),
+        life("observed_differs", "an observed failure is critical",
+             sent + [ok, "terminal_outcome_observed_differs"], None, True, False,
+             False, True),
+        life("observed_without_driver_ok", "an observation is not driver acceptance",
+             sent + ["deadline_passed", "terminal_outcome_observed_matches"],
+             "deadline", False, False),
+        life("refused_then_observed", "the commanded state observed after a signed refusal",
+             sent + ["device_refused_rate_limited", "terminal_outcome_observed_matches"],
+             None, False, False),
+    ]
+
+    # The bound group: a device receiving verified commands, in the command path's order. A
+    # device here signs only driver_reported for a command it drives.
+    def device(start: dict, steps: list[dict]) -> list[dict]:
+        state = {"mark": start["mark"], "record": dict(start["record"]), "boot": None}
+        out = []
+        for step in steps:
+            if step["boot"] != state["boot"]:
+                state.update(boot=step["boot"], duplicate=False, conflict=False, held=[],
+                             spent=0, last=None)
+
+            def storage_failure() -> list[str]:
+                k = (step["cmd_seq"], step["digest"])
+                if k in state["held"]:
+                    return []
+                if state["spent"] >= 4 and step["t_ms"] - state["last"] < 60000:
+                    return []
+                state["held"] = (state["held"] + [k])[-8:]
+                state["spent"] += 1
+                state["last"] = step["t_ms"]
+                return ["refused:storage_failure"]
+
+            record = state["record"]
+            if step["read"] == "fails":
+                signed = storage_failure()
+            elif step["cmd_seq"] < state["mark"]:
+                signed = []
+            elif step["cmd_seq"] == state["mark"]:
+                if record["epoch"] != "current":
+                    signed = []
+                elif step["digest"] == record["digest"]:
+                    signed = [] if state["duplicate"] else [f"duplicate:{record['disposition']}"]
+                    state["duplicate"] = True
+                else:
+                    signed = [] if state["conflict"] else ["conflict:"]
+                    state["conflict"] = True
+            elif step["write"] == "fails":
+                signed = storage_failure()
+            else:
+                state.update(mark=step["cmd_seq"], duplicate=False, conflict=False)
+                record.update(cmd_seq=step["cmd_seq"], digest=step["digest"], epoch="current")
+                verdict = "capability_mismatch" if step["epoch"] != "current" else step["checks"]
+                if verdict != "pass":
+                    record["disposition"] = verdict if step["commit2"] == "ok" else "pending"
+                    signed = [f"refused:{verdict}"]
+                else:
+                    # A failed final-disposition write leaves the record pending.
+                    record["disposition"] = (f"driver_{step['driver']}"
+                                             if step["commit2"] == "ok" else "pending")
+                    signed = [f"driver_reported:{step['driver']}"]
+            out.append({**step, "signed": signed})
+        return out
+
+    def cmd(boot: int, t_ms: int, seq: int, digest: str, *, epoch: str = "current",
+            read: str = "ok", write: str = "ok", checks: str = "pass",
+            driver: str = "ok", commit2: str = "ok") -> dict:
+        return {"boot": boot, "t_ms": t_ms, "cmd_seq": seq, "digest": digest, "epoch": epoch,
+                "read": read, "write": write, "checks": checks, "driver": driver,
+                "commit2": commit2}
+
+    def seq_case(name: str, note: str, steps: list[dict], mark: int = 100,
+                 disposition: str = "driver_ok", epoch: str = "current") -> dict:
+        start = {"mark": mark, "record": {"cmd_seq": mark, "digest": "a", "epoch": epoch,
+                                          "disposition": disposition}}
+        return {"name": name, "note": note, "start": start, "steps": device(start, steps)}
+
+    nine = "bcdefghij"
+    bound = [
+        seq_case("conflict_cycle", "nine conflicting commands for the mark, cycled three "
+                 "times: one conflict result", [cmd(1, i, 100, nine[i % 9]) for i in range(27)]),
+        seq_case("conflict_flag_clears_when_mark_advances", "a fresh command clears the flag",
+                 [cmd(1, 0, 100, "b"), cmd(1, 1, 100, "c"), cmd(1, 2, 101, "a"),
+                  cmd(1, 3, 101, "b")]),
+        seq_case("conflict_flag_clears_at_boot", "", [cmd(1, 0, 100, "b"), cmd(2, 0, 100, "c")]),
+        seq_case("duplicate_once_per_mark", "", [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "a")]),
+        seq_case("separate_flags", "duplicate and conflict each have their own flag",
+                 [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "b"), cmd(1, 2, 100, "a"),
+                  cmd(1, 3, 100, "c")]),
+        seq_case("duplicate_flag_clears_at_boot", "", [cmd(1, 0, 100, "a"), cmd(2, 0, 100, "a")]),
+        seq_case("duplicate_survives_storage_churn", "storage failures never let a duplicate "
+                 "be signed twice", [cmd(1, 0, 100, "a")]
+                 + [cmd(1, 1 + i, 200 + i, "x", write="fails") for i in range(10)]
+                 + [cmd(1, 20, 100, "a")]),
+        seq_case("duplicate_answers_stored_refusal", "a duplicate of a refused command",
+                 [cmd(1, 0, 100, "a")], disposition="rate_limited"),
+        seq_case("below_mark_no_result", "", [cmd(1, 0, 99, "z"), cmd(1, 1, 50, "a")]),
+        seq_case("earlier_epoch_at_mark_no_result", "a record from an earlier approval answers "
+                 "nothing", [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "b")], epoch="earlier"),
+        seq_case("fresh_command_driven", "a fresh command is signed once by its transition, "
+                 "and its redelivery is a duplicate", [cmd(1, 0, 101, "b"), cmd(1, 1, 101, "b"),
+                                                      cmd(1, 2, 101, "b")]),
+        seq_case("fresh_command_refused", "", [cmd(1, 0, 101, "b", checks="unknown_action"),
+                                               cmd(1, 1, 101, "b")]),
+        seq_case("fresh_command_other_epoch", "a command naming another approval is refused "
+                 "as capability_mismatch", [cmd(1, 0, 101, "b", epoch="earlier")]),
+        seq_case("storage_failure_budget", "four in a boot, then one per 60,000 ms after the "
+                 "previous signed", [cmd(1, i, 300 + i, "s", write="fails") for i in range(6)]
+                 + [cmd(1, 60003, 306, "s", write="fails"),
+                    cmd(1, 60004, 307, "s", write="fails"),
+                    cmd(1, 120002, 308, "s", write="fails"),
+                    cmd(1, 120003, 309, "s", write="fails")]),
+        seq_case("storage_failure_held_spends_nothing", "",
+                 [cmd(1, 0, 300, "s", write="fails"), cmd(1, 1, 300, "s", write="fails"),
+                  cmd(1, 2, 301, "s", write="fails"), cmd(1, 3, 302, "s", write="fails"),
+                  cmd(1, 4, 303, "s", write="fails"), cmd(1, 5, 304, "s", write="fails")]),
+        seq_case("storage_failure_unsigned_not_held", "a refusal left unsigned past the budget "
+                 "is signed once the budget allows",
+                 [cmd(1, i, 300 + i, "s", write="fails") for i in range(4)]
+                 + [cmd(1, 4, 304, "s", write="fails"),
+                    cmd(1, 60004, 304, "s", write="fails")]),
+        seq_case("storage_failure_table_holds_eight", "the eighth signed key leaves the first held",
+                 [cmd(1, 60000 * i, 300 + i, "s", write="fails") for i in range(8)]
+                 + [cmd(1, 480000, 300, "s", write="fails")]),
+        seq_case("storage_failure_table_evicts_oldest", "the ninth signed key evicts the first",
+                 [cmd(1, 60000 * i, 300 + i, "s", write="fails") for i in range(9)]
+                 + [cmd(1, 540000, 300, "s", write="fails")]),
+        seq_case("storage_failure_read_fails_at_mark", "a failed read cannot judge a duplicate",
+                 [cmd(1, 0, 100, "a", read="fails"), cmd(1, 1, 100, "a")]),
+        seq_case("read_fails_below_mark", "a failed read cannot tell a replay: it is a budgeted "
+                 "storage_failure, held", [cmd(1, 0, 50, "a", read="fails"),
+                                          cmd(1, 1, 50, "a", read="fails")]),
+        seq_case("read_fails_keeps_flags", "a failed read neither reads nor changes the flags",
+                 [cmd(1, 0, 100, "b"), cmd(1, 1, 100, "c", read="fails"), cmd(1, 2, 100, "d")]),
+        seq_case("write_failure_keeps_conflict_flag", "only a committed freshness write clears "
+                 "the flags", [cmd(1, 0, 100, "b"), cmd(1, 1, 101, "z", write="fails"),
+                               cmd(1, 2, 100, "c")]),
+        seq_case("commit2_fails_duplicate_pending", "a driven command whose final disposition "
+                 "was not recorded answers pending", [cmd(1, 0, 101, "b", commit2="fails"),
+                                                      cmd(1, 1, 101, "b")]),
+        seq_case("storage_failure_then_recovered", "one command refused under two verdicts gets "
+                 "both results", [cmd(1, 0, 101, "b", write="fails"),
+                                  cmd(1, 1, 101, "b", epoch="earlier")]),
+        seq_case("storage_failure_budget_per_boot", "",
+                 [cmd(1, i, 300 + i, "s", write="fails") for i in range(5)]
+                 + [cmd(2, 0, 305, "s", write="fails")]),
+    ]
+
+    # The registry group: a Tier D trip's events, with whether its attempts are active after
+    # each. A contradiction invalidates the acceptance it names; acceptance is per attempt.
+    def registry(events: list[str]) -> list[dict]:
+        state = {"latched": False, "cleared": False, "running": True, "ok": set(), "bad": set()}
+        out = []
+        for event in events:
+            kind, _, n = event.partition(":")
+            if kind == "latched":
+                state["latched"] = True
+            elif kind == "issued":
+                # An attempt is issued only while attempts are active.
+                assert out and out[-1]["attempts_active"], (events, event)
+            elif kind == "driver_ok":
+                state["ok"].add(n)
+            elif kind == "contradiction":
+                state["bad"].add(n)
+            elif kind in ("reset", "binding_changed", "retired"):
+                state["cleared"] = True
+            elif kind == "shutdown":
+                state["running"] = False
+            elif kind == "restart":
+                state["running"] = True
+            accepted = bool(state["ok"] - state["bad"])
+            active = (state["latched"] and not state["cleared"] and state["running"]
+                      and not accepted)
+            out.append({"event": event, "attempts_active": active})
+        return out
+
+    def trip(name: str, note: str, events: list[str]) -> dict:
+        return {"name": name, "note": note, "events": registry(events)}
+
+    trips = [
+        trip("accepted_ends", "",
+             ["latched", "issued:1", "driver_error:1", "issued:2", "driver_ok:2"]),
+        trip("contradiction_resumes", "",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1"]),
+        trip("contradiction_before_acceptance", "order does not matter",
+             ["latched", "issued:1", "contradiction:1", "driver_ok:1"]),
+        trip("reset_then_contradiction", "a cleared trip is never revived",
+             ["latched", "issued:1", "driver_ok:1", "reset", "contradiction:1"]),
+        trip("contradiction_then_reset", "",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1", "reset"]),
+        trip("later_acceptance_stands", "a contradiction on an earlier attempt revives nothing",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1", "issued:2", "driver_ok:2",
+              "contradiction:1"]),
+        trip("earlier_contradiction_after_later_acceptance", "",
+             ["latched", "issued:1", "driver_error:1", "issued:2", "driver_ok:2",
+              "contradiction:1"]),
+        trip("shutdown_restart_resumes", "the latch is durable",
+             ["latched", "issued:1", "driver_error:1", "shutdown", "restart"]),
+        trip("contradiction_after_restart", "a contradiction after a restart resumes attempts",
+             ["latched", "issued:1", "driver_ok:1", "shutdown", "restart", "contradiction:1"]),
+        trip("binding_change_ends", "",
+             ["latched", "issued:1", "binding_changed", "contradiction:1"]),
+        trip("retirement_ends", "an orphan is retired only after its binding leaves force",
+             ["latched", "issued:1", "driver_ok:1", "binding_changed", "retired",
+              "contradiction:1"]),
+    ]
+
+    corpus = {
+        "contract": "ori-specs/firmware-command-result/v1.md",
+        "version": 1,
+        "comment": (
+            "Golden vectors for firmware-command-result/v1. A receiver must accept every "
+            "'results' case whose expect is accept and refuse every other with its declared "
+            "reason, judging each on its own against verifier_context. 'digests', "
+            "'judgments' and 'lifecycle' fix the command digest, the device's duplicate "
+            "table and the runtime's conclusions. Signed with disclosed TEST-ONLY seeds: "
+            "never provision them."
+        ),
+        "device_test_seed_hex": DEVICE_SEED_HEX,
+        "device_public_key_b64": b64(device_public),
+        "runtime_test_seed_hex": RUNTIME_SEED_HEX,
+        "runtime_public_key_b64": b64(runtime_public),
+        "signature_encoding": "ed25519:<standard-base64-64-byte-signature>",
+        "verifier_context": {"device_id": DEVICE_ID, "capability_hash": CAPABILITY_HASH,
+                             "posture": POSTURE, "public_key_b64": b64(device_public)},
+        "reasons": {
+            "member_set": "a member the contract does not define, or a required one missing",
+            "unsupported_version": "v is not the integer 1",
+            "unknown_kind": "kind is not one of the six kinds",
+            "outcome_not_allowed": "outcome is not one its kind allows",
+            "digest_form": "command_digest is not sha256: and 64 lowercase hex digits",
+            "family_keys": "the payload carries more than one family key beside signature",
+        },
+        "results": results,
+        "digests": digests,
+        "bound": bound,
+        "registry": trips,
+        "judgments": judgments,
+        "lifecycle": lifecycle,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

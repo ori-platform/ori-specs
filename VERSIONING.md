@@ -436,6 +436,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | evidence-transport | v2 | `draft` | `frozen` | shipment, evidence-authority `43f03e8`, 2026-10-01; audit complete |
 | firmware-commands | v1 | `draft` | `frozen` | claiming-merge, runtime `95a08b7`, 2026-07-17; audit complete |
 | firmware-commands | v2 | `draft` | `amendable` | — |
+| firmware-command-result | v1 | `draft` | `amendable` | — |
 | firmware-mqtt-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `92e8620`, 2026-07-23; audit complete |
 | firmware-telemetry | v1 | `draft` | `frozen` | claiming-merge, runtime `8aefc63`, 2026-07-16; audit complete |
 | firmware-telemetry | v2 | `draft` | `amendable` | — |

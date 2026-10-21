@@ -1,0 +1,2170 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the firmware-command-result/v1 corpus against the contracts.
+
+Shares no code with scripts/generate-firmware-command-result-vectors-v1. Both
+keys are re-derived from their disclosed seeds and every signature verified
+with this script's own affine curve arithmetic. The result object's members,
+the kinds and the outcomes each allows, the stored dispositions, the duplicate
+and conflict table, the refusal reasons, the lifecycle events, the command
+domain, the Layer 1 family keys and the corpus digest are read from the
+contract documents, never from the corpus or the generator.
+
+Held to:
+
+- each result: canonical bytes and wire payload reproduce from its object, its
+  signature verifies under the device key; an accept case is accepted by the
+  receiver model below, and a refusal is refused for its declared reason and
+  accepted once that one rule is switched off, so no other rule refuses it;
+- each digest: the command is v1's grammar, its bytes and wire message
+  reproduce, the runtime key's signature verifies over the command domain's
+  preimage and over no other, and `command_digest` is SHA-256 of that preimage;
+- each judgment: exactly one row of the duplicate and conflict table holds,
+  and its result is the expected one;
+- each lifecycle: the events are recordable in that order, and the Tier D,
+  `outcome_uncertain` and executed conclusions follow from the text;
+- coverage: an accept case per (kind, outcome), a refusal per reason and for
+  the reserved kind, every table row and every stored disposition judged, and
+  every lifecycle event recorded;
+- the corpus seeds are the fault corpus's and the command corpus's, as the
+  text says, and the digest firmware-command-result/v1.md pins is the corpus's.
+
+    python3 scripts/check-firmware-command-result-vectors-v1
+    python3 scripts/check-firmware-command-result-vectors-v1 --mutations
+
+`--mutations` corrupts the corpus and the contract text and switches off each
+rule of the model in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+import types
+from typing import Callable
+
+
+def _load_contract_markdown() -> types.ModuleType:
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+markdown = _load_contract_markdown()
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "firmware-command-result" / "command-result-vectors-v1.json"
+RESULT_V1 = ROOT / "firmware-command-result" / "v1.md"
+TELEMETRY_V2 = ROOT / "firmware-telemetry" / "v2.md"
+COMMANDS_V1 = ROOT / "firmware-commands" / "v1.md"
+COMMANDS_V2 = ROOT / "firmware-commands" / "v2.md"
+# The text names these corpora as the source of its seeds.
+FAULT_CORPUS = ROOT / "firmware-telemetry" / "fault-vectors-v2.json"
+COMMAND_CORPUS = ROOT / "firmware-commands" / "command-vectors-v2.json"
+
+P = 2**255 - 19
+D = (-121665 * pow(121666, -1, P)) % P
+L = 2**252 + 27742317777372353535851937790883648493
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+BY = 4 * pow(5, -1, P) % P
+# firmware-telemetry/v1.md's canonical integer zone, and firmware-commands/v1.md's
+# fleet identifier alphabet. Both are prose the checker cannot parse into a
+# value, so they are held here and their sentences in CLAUSES below.
+INT_MAX = 2**53 - 1
+FLEET = re.compile(r"[A-Za-z0-9._-]+\Z")
+DIGEST_FORM = re.compile(r"sha256:[0-9a-f]{64}\Z")
+SIGNATURE_PREFIX = "ed25519:"
+
+# The sentences whose rules this checker evaluates by its own code rather than
+# reads as a table or list. Each must stand verbatim, whitespace folded, so a
+# sentence whose meaning changes, its polarity included, fails here.
+CLAUSES = {
+    "r": (
+        "It is signed by the device key over its canonical bytes, exactly as the "
+        "other four families are, with no signing domain.",
+        "Every member is required, and the object's members are exactly these. A "
+        "receiver refuses a command result with any other member, a missing one, a "
+        "`kind` outside the table, or an `outcome` the table does not allow for its "
+        "`kind`, even when its signature verifies.",
+        "No kind in this version carries it, a device MUST NOT sign it, and a "
+        "receiver refuses it as an unknown kind.",
+        "A device signs a command result only for a command whose signature verified.",
+        "A consumer MUST NOT require `accepted` or `attempted` before `driver_reported`.",
+        # The bound on repeated authenticated input, held verbatim; its figures
+        # are also parsed, and the bound group exercises them.
+        "**One duplicate and one conflict per mark.** A device signs at most one "
+        "`duplicate` and at most one `conflict` for the command at its mark in a boot. "
+        "It records each in one flag held in memory beside the mark, set when it signs "
+        "the result and cleared when the mark advances or the device boots;",
+        "A device signs `refused` with `storage_failure` within a budget its release "
+        "fixes, no larger than this: the first 4 in a boot, and after them each one "
+        "at least 60,000 ms, on a monotonic clock, after the previous one it signed. "
+        "It holds the `(cmd_seq, command_digest)` of each it signed in a table of at "
+        "least 8, held in memory, that evicts the one it signed longest ago; a command "
+        "the table holds is not signed again and spends no budget. A refusal left "
+        "unsigned past the budget was not answered, so it is not held.",
+        "**Every other result is produced once.** A command whose freshness write "
+        "commits moves the mark past it, so its `accepted`, `attempted`, "
+        "`driver_reported` and any refusal after the freshness write are signed once, "
+        "by the transition that produces them.",
+        "A device MUST NOT sign it before its rate check has passed.",
+        "Nor can `device_accepted` or `actuation_attempted` beside a refusal of the "
+        "same command, since a device signs neither before every check, its rate "
+        "check included, has passed.",
+        "Three results never contradict anything:",
+        "A command has at most one `timed_out`: the first of the two.",
+        "**The first result of each kind and outcome for each command is always "
+        "signed,** except a duplicate or conflict after the first at its mark, and a "
+        "`storage_failure` refusal past its budget.",
+        "It holds six groups:",
+        "A device in this group signs only `driver_reported` for a command it drives, "
+        "and the figures are at their limits: a `storage_failure` table of 8 and the "
+        "budget's ceiling.",
+        # The registry rules, held verbatim; the registry group exercises them.
+        "A contradiction invalidates the driver acceptance it contradicts, whatever "
+        "order the reports arrived in, and is raised as a critical event. Acceptance "
+        "is judged per command: an uncontradicted acceptance of a later attempt for "
+        "the same trip still stands.",
+        "Attempts resume after an invalidated acceptance only while the trip is still "
+        "latched and eligible under",
+        "no successful local reset has cleared it, its commissioned binding is still in "
+        "force, it has not been retired as an orphan, and no other attempt for it holds "
+        "an uncontradicted acceptance. A contradiction that arrives after any of those "
+        "revives nothing, and is still recorded. Shutdown does not end eligibility: the "
+        "latch is durable, so a trip with no uncontradicted acceptance resumes its "
+        "attempts at the next start, and a contradiction that arrives after a restart "
+        "resumes them as one before it would.",
+        "Every `reset` in it is a successful local reset, one the safety registry "
+        "accepted; a refused reset changes nothing. Every contradiction names an "
+        "attempt that was issued;",
+        "an attempt issued, which happens only while attempts are active,",
+        "A command at the mark is judged by this table whatever `capability_hash` it "
+        "carries itself.",
+        "A command whose freshness write failed (`storage_failure`) stored nothing, so "
+        "a resend of it meets no record: its `cmd_seq` is still above the mark, and it "
+        "is judged as a new command.",
+        "A device judges a repeat only against **the last fresh command**: the "
+        "command whose `cmd_seq` set its high-water mark.",
+        "in one durable record that is written atomically with the mark.",
+        "Anything below the mark is `replayed`, whatever its bytes, and gets no result.",
+        "so a stored judgment made under another `capability_hash` never answers "
+        "for a command under the current one.",
+        "**A repeat never actuates again.** Neither a `duplicate` nor a `conflict` "
+        "drives any output.",
+        "A runtime records a command's lifecycle as events it never rewrites,",
+        "Derived from the events, and never one of them: **`outcome_uncertain`** "
+        "holds for every signed command that has no `terminal_outcome_observed`.",
+        "The command's result deadline, measured from `signed`, passed with no final "
+        "result attached:",
+        "The `timed_out` event stays, because it was true when recorded, and no "
+        "earlier event is rewritten or removed.",
+        "So `terminal_outcome_observed` records the state observed and ends "
+        "`outcome_uncertain`, and a runtime MUST NOT conclude that a firmware command "
+        "executed, from any combination of events.",
+        "and a runtime MUST NOT set either true for a firmware command.",
+        "**A contradiction is a security event.** Two final dispositions for one "
+        "`(device_id, cmd_seq, command_digest)` that disagree,",
+        "cannot both come from an honest device.",
+        "A runtime MUST record a contradiction as a security event, keep every report "
+        "of it as evidence, and conclude nothing from either.",
+        "The runtime restarted while the command had no final result attached and no "
+        "`timed_out` recorded.",
+        "so the runtime records this at its start, once, and never re-arms a deadline "
+        "for the command.",
+        "measured on a monotonic clock within one run of the runtime, never by "
+        "subtracting wall-clock times. A restart ends every deadline as "
+        "`timed_out(restart)`. Either is in doubt: it never ends Tier D attempts and "
+        "never reads as a refusal.",
+        "**Only uncontradicted acceptance ends attempts.**",
+        "While its freshness read fails, it cannot compare at all: every verified "
+        "command, below, at or above the mark, is a `storage_failure` refusal, and "
+        "neither flag above is read or changed.",
+        "and whether its final-disposition write succeeds, starting from a stated mark "
+        "and record.",
+        # Per-delivery storage_failure, and labels within a cmd_seq.
+        "and either its freshness read or write failed (`storage_failure`, whatever its "
+        "`cmd_seq`), or its `cmd_seq` was above the mark and a later check refused it.",
+        "The device refused this delivery, under that verdict, and this delivery "
+        "actuated nothing.",
+        "For a command whose signature verified and whose freshness read succeeded",
+        "It never answers the delivery it drove with `refused` and `storage_failure`: "
+        "that verdict answers one delivery whose freshness read or write failed, and "
+        "says that delivery actuated nothing,",
+        "A later delivery of a command it drove can still be refused so, when that "
+        "delivery's freshness read fails; it says nothing about the earlier one.",
+        "which reports the failed freshness read or write on its own; "
+        "`storage_degraded` covers the evidence buffer and the final-disposition "
+        "write, not this.",
+        "A digest label names a command's bytes within its `cmd_seq`: two steps with "
+        "the same `cmd_seq` and label are the same command, and labels at different "
+        "`cmd_seq` values say nothing about each other, since a real digest covers the "
+        "`cmd_seq`.",
+        "A runtime records at most one of `issued` and `publish_unconfirmed` for a "
+        "command, and never records `issued` after `publish_unconfirmed`, even if an "
+        "acknowledgement later arrives.",
+        "`device_accepted` and `actuation_attempted` are lifecycle events only.",
+        "`driver_reported(error)`, `device_refused`, `device_conflict`, a "
+        "`device_duplicate` with any other disposition, `timed_out`, "
+        "`publish_unconfirmed`, a `seq` gap and no result each leave the attempts going,",
+        "A `driver_reported(ok)` that attaches late ends further attempts from then "
+        "on, and changes nothing already done.",
+        "`terminal_outcome_observed` does not end the attempts, even when it matches.",
+        "`driver_reported(ok)` ends attempts; it does not end `outcome_uncertain`.",
+        "Every refusal's signature verifies, so a receiver that refuses it has "
+        "refused it for that reason and not at the signature. The reasons are closed:",
+        "each device result as it attached (`device_refused_` or `device_duplicate_` "
+        "followed by the verdict or disposition),",
+        "whether the observed state is the one commanded. Each is a command issued "
+        "for a Tier D trip. With it, what the runtime may conclude: which `timed_out` "
+        "it records, if any (`deadline`, `restart` or none),",
+        "whether it records a contradiction, whether it raises a critical event, and "
+        "`executed`, which is false in every case.",
+        "**An observed failure is critical.** A `terminal_outcome_observed` that "
+        "differs from the command, on a command issued for a Tier D trip, is the one "
+        "case where the runtime knows the protection failed while the hazard may "
+        "stand. The runtime MUST raise it as a critical operator and audit event,",
+    ),
+    "t2": (
+        "The list is closed. A payload carrying any other top-level key, more than "
+        "one of these keys, or a key it cannot match exactly is rejected",
+        "A payload carries exactly one family key. A consumer refuses one that "
+        "carries two or more, and never routes it by the first key it tests.",
+    ),
+    "c1": (
+        "`cmd_seq` is a canonical decimal integer (no leading zeros, no sign) within "
+        "`1 .. 2^53 - 1`.",
+        "`action`, `channel`, and `device_id` are fleet identifiers: "
+        "`[A-Za-z0-9._-]`, non-empty,",
+        "`capability_hash` is `sha256:` plus exactly 64 lowercase hex characters",
+        "`v` must be `1`.",
+    ),
+    "c2": (
+        "It signs a preimage of three parts, in this order: the domain of the "
+        "message's purpose; one zero byte, NUL; and the canonical bytes of the "
+        "signed object exactly as transmitted.",
+    ),
+}
+# Receiver rules a refusal reason names, in the order the model applies them.
+REASON_RULES = (
+    "family_keys", "member_set", "unsupported_version", "digest_form",
+    "unknown_kind", "outcome_not_allowed",
+)
+
+
+class Failure(Exception):
+    pass
+
+
+# --- Ed25519, affine, verification only --------------------------------------
+
+def _add(p: tuple[int, int], q: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = p
+    x2, y2 = q
+    t = D * x1 * x2 * y1 * y2 % P
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + t, -1, P) % P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - t, -1, P) % P
+    return x3, y3
+
+
+def _mul(k: int, p: tuple[int, int]) -> tuple[int, int]:
+    acc = (0, 1)
+    while k:
+        if k & 1:
+            acc = _add(acc, p)
+        p = _add(p, p)
+        k >>= 1
+    return acc
+
+
+def _recover_x(y: int, sign: int) -> int | None:
+    if y >= P:
+        return None
+    u = (y * y - 1) % P
+    v = (D * y * y + 1) % P
+    x = u * pow(v, 3, P) * pow(u * pow(v, 7, P), (P - 5) // 8, P) % P
+    if v * x * x % P == (P - u) % P:
+        x = x * SQRT_M1 % P
+    elif v * x * x % P != u:
+        return None
+    if x == 0 and sign:
+        return None
+    if x & 1 != sign:
+        x = P - x
+    return x
+
+
+def _decode(raw: bytes) -> tuple[int, int] | None:
+    n = int.from_bytes(raw, "little")
+    y = n & ((1 << 255) - 1)
+    x = _recover_x(y, n >> 255)
+    return None if x is None else (x, y)
+
+
+def _encode(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+BASE = (_recover_x(BY, 0), BY)
+
+
+def public_key(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return _encode(_mul(a, BASE))  # type: ignore[arg-type]
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    """ed25519-verification/v1: S < L, R canonical, [S]B = R + [k]A by bytes."""
+    if len(signature) != 64 or len(public) != 32:
+        return False
+    a = _decode(public)
+    r = _decode(signature[:32])
+    s = int.from_bytes(signature[32:], "little")
+    if a is None or _encode(a) != public:
+        return False
+    if s >= L or r is None or _encode(r) != signature[:32]:
+        return False
+    k = int.from_bytes(
+        hashlib.sha512(signature[:32] + public + message).digest(), "little"
+    )
+    return _mul(s, BASE) == _add(r, _mul(k, a))  # type: ignore[arg-type]
+
+
+def signature_bytes(wire: object, where: str) -> bytes:
+    if type(wire) is not str or not wire.startswith(SIGNATURE_PREFIX):
+        raise Failure(f"{where}: signature encoding")
+    text = wire[len(SIGNATURE_PREFIX):]
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except ValueError as error:
+        raise Failure(f"{where}: signature base64: {error}") from None
+    if len(raw) != 64 or base64.b64encode(raw).decode() != text:
+        raise Failure(f"{where}: signature is not canonical base64 of 64 bytes")
+    return raw
+
+
+# --- canonical JSON ------------------------------------------------------------
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def parse_exact(raw: bytes, where: str) -> object:
+    """Parse JSON bytes refusing duplicate keys, and require them canonical."""
+    def pairs(items: list[tuple[str, object]]) -> dict:
+        keys = [k for k, _ in items]
+        if len(keys) != len(set(keys)):
+            raise Failure(f"{where}: duplicate key")
+        return dict(items)
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Failure(f"{where}: not JSON: {error}") from None
+    if canonical(value) != raw:
+        raise Failure(f"{where}: bytes are not canonical JSON")
+    return value
+
+
+# --- contract text ------------------------------------------------------------
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _table(body: str) -> list[list[str]]:
+    """Body rows of the first table in `body`, cells stripped, `\\|` unescaped."""
+    rows: list[list[str]] = []
+    seen_separator = False
+    for line in body.split("\n"):
+        if not line.startswith("|"):
+            if seen_separator:
+                break
+            continue
+        cells = [c.strip().replace("\\|", "|")
+                 for c in re.split(r"(?<!\\)\|", line)[1:-1]]
+        if all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+            seen_separator = True
+            continue
+        if seen_separator:
+            rows.append(cells)
+    if not rows:
+        raise Failure("expected table not found")
+    return rows
+
+
+def _ticks(cell: str) -> list[str]:
+    return re.findall(r"`([^`]+)`", cell)
+
+
+def _token_list(cell: str, where: str) -> list[str]:
+    """A cell that is only backticked tokens joined by ', ' and ' or '."""
+    if not re.fullmatch(r"`[a-z_]+`(?:(?:, | or |, or )`[a-z_]+`)*", cell):
+        raise Failure(f"{where}: cell is not a token list: {cell!r}")
+    return _ticks(cell)
+
+
+def _json_fence(body: str, where: str) -> object:
+    match = re.search(r"```json\n(.*?)\n```", body, re.S)
+    if match is None:
+        raise Failure(f"{where}: no JSON example")
+    return json.loads(match.group(1))
+
+
+def contract_texts() -> dict[str, str]:
+    return {
+        "r": RESULT_V1.read_text(),
+        "t2": TELEMETRY_V2.read_text(),
+        "c1": COMMANDS_V1.read_text(),
+        "c2": COMMANDS_V2.read_text(),
+    }
+
+
+STORED = "<stored disposition>"
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    r, t2, c1, c2 = texts["r"], texts["t2"], texts["c1"], texts["c2"]
+    if markdown.non_canonical(r):
+        raise Failure(f"non-canonical headings: {markdown.non_canonical(r)}")
+    for key, clauses in CLAUSES.items():
+        flat = _flat(texts[key])
+        for clause in clauses:
+            if clause not in flat:
+                raise Failure(f"{key} no longer says: {clause!r}")
+
+    # The result object: its members from the field table, which the example
+    # must agree with, and `v` from its row.
+    obj_body = markdown.own_body(r, "## The result object")
+    field_rows = _table(obj_body)
+    members: list[str] = []
+    for row in field_rows:
+        members += _ticks(row[0])
+    if len(members) != len(set(members)):
+        raise Failure("the field table names a member twice")
+    example = _json_fence(obj_body, "result object")
+    if sorted(example) != ["command_result", "signature"]:
+        raise Failure("the example payload's top-level keys")
+    if sorted(example["command_result"]) != sorted(members):
+        raise Failure("the example and the field table name different members")
+    v_row = next((row for row in field_rows if row[0] == "`v`"), None)
+    if v_row is None or not re.fullmatch(r"`(\d+)`\.", v_row[2]):
+        raise Failure("no `v` row giving its value")
+    version = int(_ticks(v_row[2])[0])
+    if example["command_result"]["v"] != version:
+        raise Failure("the example's `v` differs from the field table's")
+    digest_row = next((row for row in field_rows if row[0] == "`command_digest`"), None)
+    if digest_row is None:
+        raise Failure("no `command_digest` row")
+    named_domains = [t for t in _ticks(digest_row[2]) if t.startswith("ori.")]
+
+    # The command domain, from firmware-commands/v2's Signing Domains table.
+    domain_rows = _table(markdown.own_body(c2, "## Signing Domains"))
+    command_domain = [_ticks(row[1]) for row in domain_rows if row[0] == "Command"]
+    if len(command_domain) != 1 or len(command_domain[0]) != 1:
+        raise Failure("firmware-commands/v2 names no single command domain")
+    liveness_domain = [_ticks(row[1]) for row in domain_rows
+                       if row[0].startswith("Runtime liveness")]
+    if len(liveness_domain) != 1 or len(liveness_domain[0]) != 1:
+        raise Failure("firmware-commands/v2 names no single liveness domain")
+    domain = command_domain[0][0]
+    if named_domains != [domain]:
+        raise Failure(f"command_digest names {named_domains}, firmware-commands/v2 {domain}")
+
+    # The command grammar, from firmware-commands/v1's Wire Format.
+    wire_body = markdown.own_body(c1, "## Wire Format")
+    order = re.search(r"Field order is exactly as shown: (.*?) —", _flat(wire_body))
+    if order is None:
+        raise Failure("firmware-commands/v1 gives no field order")
+    command_fields = _ticks(order.group(1))
+    wire_example = _json_fence(wire_body, "command wire format")
+    if list(wire_example["command"]) != command_fields or \
+            sorted(wire_example) != ["command", "signature"]:
+        raise Failure("firmware-commands/v1's example and field order disagree")
+
+    # Kinds and the outcomes each allows.
+    kinds_body = markdown.own_body(r, "### Kinds")
+    dup_body = markdown.own_body(r, "### Duplicate and conflict")
+    dispositions = _dispositions(dup_body)
+    allowed: dict[str, list[str]] = {}
+    for row in _table(kinds_body):
+        kind = _ticks(row[0])
+        if len(kind) != 1 or row[0] != f"`{kind[0]}`":
+            raise Failure(f"kind cell {row[0]!r}")
+        cell = row[1]
+        if cell == '`""`':
+            outcomes = [""]
+        elif cell.startswith("The stored disposition, under [Duplicate and conflict]"):
+            outcomes = list(dispositions)
+        else:
+            outcomes = _token_list(cell, f"kind {kind[0]}")
+        if kind[0] in allowed:
+            raise Failure(f"kind {kind[0]} twice")
+        allowed[kind[0]] = outcomes
+    reserved = re.findall(r"`([a-z_]+)` is reserved for", _flat(kinds_body))
+    if len(reserved) != 1 or reserved[0] in allowed:
+        raise Failure("the reserved kind is not one name outside the table")
+    unauth = re.search(r"A message refused as (.*?) gets no result\.", _flat(kinds_body))
+    if unauth is None:
+        raise Failure("no sentence naming the unauthenticated verdicts")
+    unauthenticated = _token_list(unauth.group(1), "unauthenticated verdicts")
+    unanswered = re.search(r"- A command refused as (.*?) gets no result, only its",
+                           kinds_body.replace("\n  ", " "))
+    if unanswered is None:
+        raise Failure("no sentence naming the verdicts a replay gets no result for")
+    unanswered_verdicts = _token_list(unanswered.group(1), "unanswered verdicts")
+
+    # The refused outcomes are firmware-commands/v2's verdicts less the ones
+    # that get no result. A refusal disposition is stored only by a verdict that
+    # consumes the sequence, since only those leave a record at the mark.
+    error_rows = _table(markdown.own_body(c2, "## Error Semantics"))
+    verdicts = [_ticks(row[0])[0] for row in error_rows]
+    consuming = [_ticks(row[0])[0] for row in error_rows if "Consumes the sequence." in row[1]]
+    if "refused" not in allowed or sorted(allowed["refused"]) != sorted(
+            set(verdicts) - set(unauthenticated) - set(unanswered_verdicts)):
+        raise Failure("refused outcomes are not firmware-commands/v2's verdicts less "
+                      "the ones that get no result")
+    refusal_dispositions = [d for d in dispositions if d in verdicts]
+    if sorted(refusal_dispositions) != sorted(consuming):
+        raise Failure("refusal dispositions are not the verdicts that consume the sequence")
+
+    # The duplicate and conflict table.
+    table = []
+    for row in _table(dup_body):
+        if len(row) != 4:
+            raise Failure(f"duplicate table row {row}")
+        table.append(_judgment_row(row))
+
+    # Refusal reasons.
+    golden = markdown.own_body(r, "## Golden vectors")
+    reasons = re.findall(r"^  - `([a-z_]+)`:", golden, re.M)
+    if len(reasons) != len(set(reasons)) or not reasons:
+        raise Failure("reasons list")
+
+    # Lifecycle events. The table names what a runtime records; the Golden
+    # vectors name the corpus's tokens for them. `name(a | b)` is one token per
+    # alternative; device_refused and device_duplicate carry their verdict or
+    # disposition; an observation carries the two values the Golden vectors
+    # give; any other argument is a value the token does not carry. The
+    # `timed_out(kind)` rows are the runtime's conclusions, not inputs: the
+    # corpus records, for each kind, the one input token the table does not
+    # name and whose name contains that kind (deadline_passed, restart).
+    life_body = markdown.own_body(r, "## Runtime lifecycle")
+    bullet = re.search(r"\*\*`lifecycle`\*\*: what happened to a command, in order: (.*?)\. "
+                       r"With it,", _flat(golden))
+    if bullet is None:
+        raise Failure("no lifecycle group in the Golden vectors")
+    golden_tokens = _ticks(bullet.group(1))
+    observed_values = re.search(r"`terminal_outcome_observed_([a-z]+)` or `_([a-z]+)`",
+                                bullet.group(1))
+    if observed_values is None:
+        raise Failure("the Golden vectors give no observation values")
+    match_value, differ_value = observed_values.groups()
+    carried = {"device_refused": list(allowed.get("refused", [])),
+               "device_duplicate": list(dispositions)}
+    for prefix in carried:
+        if f"{prefix}_" not in golden_tokens:
+            raise Failure(f"the Golden vectors give no {prefix}_ token form")
+    life_rows = _table(life_body)
+    recorded: list[str] = []
+    timed_rows: dict[str, str] = {}
+    for row in life_rows:
+        for token in _ticks(row[0]):
+            m = re.fullmatch(r"([a-z_]+)(?:\((.*)\))?", token)
+            if m is None:
+                raise Failure(f"event token {token!r}")
+            name, argument = m.groups()
+            if name == "timed_out":
+                if not argument or argument in timed_rows:
+                    raise Failure(f"timed_out row {token!r}")
+                timed_rows[argument] = row[1]
+            elif argument and "|" in argument:
+                recorded += [f"{name}_{a.strip()}" for a in argument.split("|")]
+            elif name in carried:
+                recorded += [f"{name}_{v}" for v in carried[name]]
+            elif name == "terminal_outcome_observed":
+                recorded += [f"{name}_{match_value}", f"{name}_{differ_value}"]
+            else:
+                recorded.append(name)
+    named = [t for t in golden_tokens
+             if not t.startswith("_") and not t.endswith("_")
+             and not t.startswith("terminal_outcome_observed_")]
+    inputs = [t for t in named if t not in recorded]
+    timed_inputs: dict[str, str] = {}
+    for kind_ in timed_rows:
+        holders = [t for t in inputs if kind_ in t]
+        if len(holders) != 1:
+            raise Failure(f"no single input token for timed_out({kind_})")
+        timed_inputs[holders[0]] = kind_
+    if sorted(timed_inputs) != sorted(inputs) or "deadline" not in timed_rows \
+            or "restart" not in timed_rows:
+        raise Failure("the inputs beside the table's events are not one per timed_out kind")
+    deadline = next(t for t, k in timed_inputs.items() if k == "deadline")
+    restart = next(t for t, k in timed_inputs.items() if k == "restart")
+    events = recorded + inputs
+    first = named[0]
+    if first not in events:
+        raise Failure("the lifecycle's first token is not an event")
+
+    def expand(token: str) -> list[str]:
+        m = re.fullmatch(r"([a-z_]+)(?:\(([a-z_]+)\))?", token)
+        if m is None:
+            raise Failure(f"event token {token!r}")
+        name, argument = m.groups()
+        if argument:
+            return [f"{name}_{argument}"]
+        return [e for e in events if e == name or
+                (e.startswith(name + "_") and name != "device_duplicate")]
+
+    finality = re.search(
+        r"no final result attached: no (.*?), and no `device_duplicate` with a final "
+        r"disposition\. (.*?) are not final\.", timed_rows["deadline"])
+    if finality is None:
+        raise Failure("the timed_out(deadline) row names no final and non-final results")
+    not_final = [e for t in _ticks(finality.group(2)) for e in expand(t)]
+    final = [e for t in _ticks(finality.group(1)) for e in expand(t)] + [
+        f"device_duplicate_{d}" for d in dispositions
+        if f"device_duplicate_{d}" not in not_final]
+    for e in final + not_final:
+        if e not in events:
+            raise Failure(f"finality names {e}, not an event")
+    if "no final result attached" not in timed_rows["restart"]:
+        raise Failure("the timed_out(restart) row does not wait on a final result")
+
+    # What each result asserts, for the contradiction rule. A refusal and a
+    # duplicate assert their verdict or disposition; a driver result asserts the
+    # stored disposition the dispositions list gives it, `driver_<outcome>` (a
+    # naming the text uses and does not state: held); device_conflict asserts
+    # that other bytes hold the sequence. The results the text names as acting
+    # assert that the device decided to act, which agrees with either driver
+    # result and contradicts every refusal.
+    asserts: dict[str, str] = {}
+    for prefix, values in carried.items():
+        for v in values:
+            asserts[f"{prefix}_{v}"] = v
+    driver_values = []
+    for outcome in allowed.get("driver_reported", []):
+        if f"driver_{outcome}" not in dispositions:
+            raise Failure(f"driver_reported({outcome}) has no stored disposition")
+        asserts[f"driver_reported_{outcome}"] = f"driver_{outcome}"
+        driver_values.append(f"driver_{outcome}")
+    asserts["device_conflict"] = "conflict"
+    flat_life = _flat(life_body)
+    acting_match = re.search(r"Nor can `([a-z_]+)` or `([a-z_]+)` beside a refusal of the "
+                             r"same command", flat_life)
+    if acting_match is None:
+        raise Failure("the lifecycle names no acting results that contradict a refusal")
+    acting_events = list(acting_match.groups())
+    for e in acting_events:
+        if e not in events:
+            raise Failure(f"acting result {e} is not a lifecycle event")
+        asserts[e] = "acting"
+    # The results that never contradict anything, from their list.
+    start = life_body.find("Three results never contradict anything:")
+    block = life_body[start:life_body.find("\n- ", start)]
+    heads = [_flat(item).split(":", 1)[0] for item in re.split(r"\n  - ", block)[1:]]
+    not_binding_events: list[str] = []
+    for head in heads:
+        m = re.fullmatch(r"`([a-z_]+)\(([a-z_]+)\)`", head) \
+            or re.fullmatch(r"`([a-z_]+)` with `([a-z_]+)`", head)
+        if m is not None:
+            name, value = m.groups()
+            name = {"refused": "device_refused"}.get(name, name)
+            not_binding_events.append(f"{name}_{value}")
+        elif re.fullmatch(r"`[a-z_]+`", head):
+            not_binding_events.append(_ticks(head)[0])
+        else:
+            raise Failure(f"non-contradicting result not understood: {head!r}")
+    if len(heads) != 3:
+        raise Failure("the list of results that never contradict is not three")
+    for e in not_binding_events:
+        if e not in asserts:
+            raise Failure(f"non-contradicting result {e} is not an asserting event")
+    # Cross-check against firmware-commands/v2: pending, and every verdict that
+    # consumes nothing, stored nothing durable, so they must be in the list.
+    derived = {f"device_duplicate_{d}" for d in dispositions
+               if f"device_duplicate_{d}" in not_final}
+    derived |= {f"device_refused_{v}" for v in set(allowed.get("refused", [])) - set(consuming)}
+    if not derived <= set(not_binding_events):
+        raise Failure("a result that stores nothing is not in the never-contradicts list")
+
+    # The bound: per-mark flags for the kinds the text names, and the
+    # storage_failure table and budget, parsed.
+    kinds_flat = _flat(kinds_body)
+    flagged = re.search(r"A device signs at most one `([a-z_]+)` and at most one `([a-z_]+)` "
+                        r"for the command at its mark in a boot\.", kinds_flat)
+    table_size = re.search(r"It holds the `\(cmd_seq, command_digest\)` of each it signed in "
+                           r"a table of at least (\d+), held in memory, that evicts the one it "
+                           r"signed longest ago", kinds_flat)
+    budget = re.search(
+        r"A device signs `([a-z_]+)` with `([a-z_]+)` within a budget its release fixes, "
+        r"no larger than this: the first (\d+) in a boot, and after them each one at least "
+        r"([\d,]+) ms, on a monotonic clock, after the previous one it signed\.", kinds_flat)
+    if flagged is None or table_size is None or budget is None:
+        raise Failure("the bound's flags, table size or budget is not stated")
+    for k in flagged.groups() + (budget.group(1),):
+        if k not in allowed:
+            raise Failure(f"the bound names {k}, not a kind")
+    bound = {"flagged": list(flagged.groups()), "size": int(table_size.group(1)),
+             "budget_kind": budget.group(1), "budget_outcome": budget.group(2),
+             "first": int(budget.group(3)),
+             "interval_ms": int(budget.group(4).replace(",", "")),
+             # Rule switches the mutations and coverage turn off or change.
+             "flags_clear_on_mark": True, "flags_clear_on_boot": True, "shared_flag": False,
+             "answered_table": 0, "reset_on_boot": True, "held_spends": False,
+             "unsigned_held": False, "read_checked": True, "write_checked": True,
+             "record_epoch_checked": True, "command_epoch_checked": True,
+             "commit2_checked": True, "read_keeps_flags": True, "key_has_seq": True}
+    ending_match = re.search(
+        r"driver acceptance is `([a-z_]+)\(([a-z_]+)\)`, or a `([a-z_]+)` whose stored "
+        r"disposition is `([a-z_]+)`, and nothing earlier",
+        _flat(markdown.own_body(r, "### Tier D")))
+    if ending_match is None:
+        raise Failure("Tier D names no driver acceptance")
+    a, b, c_, d_ = ending_match.groups()
+    ending_events = [f"{a}_{b}", f"{c_}_{d_}"]
+    for e in ending_events:
+        if e not in events:
+            raise Failure(f"Tier D's driver acceptance {e} is not a lifecycle event")
+
+    families = [_ticks(row[0])[0] for row in
+                _table(markdown.own_body(t2, "### Layer 1 evidence families"))]
+    if "command_result" not in families or sorted(example) != ["command_result", "signature"]:
+        raise Failure("firmware-telemetry/v2 carries no command_result family")
+
+    pin = re.search(r"Its SHA-256 is\s+`([0-9a-f]{64})`", golden)
+    return {
+        "members": members,
+        "version": version,
+        "domain": domain,
+        "liveness_domain": liveness_domain[0][0],
+        "command_fields": command_fields,
+        "allowed": allowed,
+        "reserved": reserved[0],
+        "dispositions": dispositions,
+        "table": table,
+        "reasons": reasons,
+        "events": events,
+        "first_event": first,
+        "deadline": deadline,
+        "restart": restart,
+        "asserts": asserts,
+        "not_binding_events": not_binding_events,
+        "acting_events": acting_events,
+        "driver_values": driver_values,
+        "bound": bound,
+        "registry_rules": dict(REGISTRY_RULES),
+        # Rule switches the mutations turn off; the text sets each to True.
+        "contradiction_blocks_ending": True,
+        "contradiction_critical": True,
+        "restart_ends_deadline": True,
+        "final": final,
+        "not_final": not_final,
+        "ending_events": ending_events,
+        "observed": {f"terminal_outcome_observed_{match_value}": True,
+                     f"terminal_outcome_observed_{differ_value}": False},
+        "families": families,
+        "pin": None if pin is None else pin.group(1),
+    }
+
+
+def _dispositions(body: str) -> list[str]:
+    """The sub-bullets of 'A duplicate answers with what the device recorded'."""
+    start = body.find("- **A duplicate answers with what the device recorded")
+    if start < 0:
+        raise Failure("no stored-disposition list")
+    end = body.find("\n- ", start + 1)
+    block = body[start:end if end > 0 else len(body)]
+    items = re.split(r"\n  - ", block)[1:]
+    if not items:
+        raise Failure("stored-disposition list is empty")
+    found: list[str] = []
+    for item in items:
+        head = _flat(item).split(":", 1)[0]
+        found += _token_list(head, "stored disposition")
+    if len(found) != len(set(found)):
+        raise Failure("a stored disposition is listed twice")
+    return found
+
+
+# The table's prose cells, mapped to predicates. They are phrases, not tokens,
+# so they cannot be parsed generically; a cell outside these maps fails.
+SEQ_CELLS = {"Below it": "below", "Equal to it": "equal", "Above it": "above"}
+HASH_CELLS = {"any": None, "": None, "Differs from the device's current one": False,
+              "Equals the current one": True}
+DIGEST_CELLS = {"any": None, "": None, "Equals the stored one": True, "Differs": False}
+RESULT_PHRASES = {
+    "No result: a `command_rejected` fault, `replayed`, only": ("none", ""),
+    # "once per mark in a boot" bounds how often; the bound group exercises it.
+    "`duplicate`, with the stored disposition, once per mark in a boot": ("duplicate", STORED),
+    "`conflict`, once per mark in a boot": ("conflict", ""),
+    "Freshness passes; the command is judged as a new command": ("new", ""),
+}
+
+
+def _judgment_row(row: list[str]) -> dict:
+    seq, stored_hash, digest, result = row
+    if seq not in SEQ_CELLS or stored_hash not in HASH_CELLS or digest not in DIGEST_CELLS:
+        raise Failure(f"duplicate table row not understood: {row}")
+    if result in RESULT_PHRASES:
+        outcome = RESULT_PHRASES[result]
+    else:
+        tokens = _token_list(result, "duplicate table result")
+        if len(tokens) > 2:
+            raise Failure(f"duplicate table result {result!r}")
+        outcome = (tokens[0], tokens[1] if len(tokens) == 2 else "")
+    return {"seq": SEQ_CELLS[seq], "hash": HASH_CELLS[stored_hash],
+            "digest": DIGEST_CELLS[digest], "result": outcome, "cells": row}
+
+
+# --- receiver model -------------------------------------------------------------
+
+def judge(payload: dict, context: dict, model: dict, public: bytes,
+          off: frozenset[str]) -> str | None:
+    """Return None to accept, or the name of the first rule that refuses.
+
+    Rules a corpus reason names can be switched off; the others cannot. A rule
+    reads only members that are present, so a missing member is refused by
+    member_set alone.
+    """
+    keys = set(payload)
+    if "signature" not in keys or keys - {"signature"} - set(model["families"]):
+        return "payload_keys"
+    present = keys & set(model["families"])
+    if len(present) > 1 and "family_keys" not in off:
+        return "family_keys"
+    if "command_result" not in present:
+        return "family"
+    obj = payload["command_result"]
+    if type(obj) is not dict:
+        return "object"
+    if not verify(public, canonical(obj), signature_bytes(payload["signature"], "payload")):
+        return "signature"
+    if set(obj) != set(model["members"]) and "member_set" not in off:
+        return "member_set"
+    if "v" in obj and not (type(obj["v"]) is int and obj["v"] == model["version"]):
+        if "unsupported_version" not in off:
+            return "unsupported_version"
+    if "alg" in obj and obj["alg"] != "ed25519":
+        return "alg"
+    for name in ("device_id", "capability_hash", "posture"):
+        if name in obj and obj[name] != context[name]:
+            return name
+    for name, low in (("boot_id", 0), ("seq", 0), ("device_uptime_ms", 0), ("cmd_seq", 1)):
+        if name in obj and (type(obj[name]) is not int or not low <= obj[name] <= INT_MAX):
+            return name
+    if "command_digest" in obj:
+        digest = obj["command_digest"]
+        if (type(digest) is not str or not DIGEST_FORM.match(digest)) \
+                and "digest_form" not in off:
+            return "digest_form"
+    for name in ("kind", "outcome"):
+        if name in obj and type(obj[name]) is not str:
+            return name
+    kind = obj.get("kind")
+    if kind is not None and kind not in model["allowed"] and "unknown_kind" not in off:
+        return "unknown_kind"
+    # An unknown kind allows nothing: its refusal must stand on the kind alone,
+    # which the isolation check then proves.
+    if kind in model["allowed"] and "outcome" in obj \
+            and obj["outcome"] not in model["allowed"][kind] \
+            and "outcome_not_allowed" not in off:
+        return "outcome_not_allowed"
+    return None
+
+
+def judge_repeat(case: dict, model: dict) -> tuple[str, str]:
+    device, command = case["device"], case["command"]
+    record = device["record"]
+    for where, value in (("mark", device["mark"]), ("record cmd_seq", record["cmd_seq"]),
+                         ("command cmd_seq", command["cmd_seq"])):
+        if type(value) is not int or not 1 <= value <= INT_MAX:
+            raise Failure(f"{case['name']}: {where} is not a sequence")
+    for where, value in (("device capability_hash", device["capability_hash"]),
+                         ("record capability_hash", record["capability_hash"]),
+                         ("record command_digest", record["command_digest"]),
+                         ("command capability_hash", command["capability_hash"]),
+                         ("command command_digest", command["command_digest"])):
+        if type(value) is not str or not DIGEST_FORM.match(value):
+            raise Failure(f"{case['name']}: {where} form")
+    # The record is the last fresh command's, written atomically with the mark.
+    if record["cmd_seq"] != device["mark"]:
+        raise Failure(f"{case['name']}: the record is not the mark's command")
+    if record["disposition"] not in model["dispositions"]:
+        raise Failure(f"{case['name']}: disposition {record['disposition']!r} is not stored")
+    # A fixture must be a state a device can reach. The digest covers the
+    # command bytes, cmd_seq and capability_hash included, so an equal digest
+    # means the same cmd_seq and the same carried hash as the stored command.
+    digest_same = command["command_digest"] == record["command_digest"]
+    if digest_same and command["cmd_seq"] != record["cmd_seq"]:
+        raise Failure(f"{case['name']}: one digest for two cmd_seq values")
+    if digest_same and record["disposition"] != "pending":
+        # Every stored refusal but capability_mismatch, and every driver
+        # disposition, passed the capability check: the carried hash was the one
+        # the command was received under. capability_mismatch means it was not.
+        mismatch = record["disposition"] == "capability_mismatch"
+        if (command["capability_hash"] != record["capability_hash"]) != mismatch:
+            raise Failure(f"{case['name']}: the command's own capability_hash cannot have "
+                          f"been stored as {record['disposition']}")
+    seq = command["cmd_seq"]
+    relation = "below" if seq < device["mark"] else "equal" if seq == device["mark"] else "above"
+    hash_same = record["capability_hash"] == device["capability_hash"]
+    rows = [row for row in model["table"]
+            if row["seq"] == relation
+            and row["hash"] in (None, hash_same)
+            and row["digest"] in (None, digest_same)]
+    if len(rows) != 1:
+        raise Failure(f"{case['name']}: {len(rows)} rows of the table hold")
+    kind, outcome = rows[0]["result"]
+    if outcome == STORED:
+        outcome = record["disposition"]
+    case.setdefault("_row", rows[0]["cells"])
+    return kind, outcome
+
+
+def conclude(events: list[str], model: dict, where: str) -> dict:
+    vocabulary = set(model["events"])
+    for event in events:
+        if event not in vocabulary:
+            raise Failure(f"{where}: unknown event {event!r}")
+    # A lifecycle belongs to a command the runtime signed and recorded before
+    # publishing: that event comes first, once.
+    first = model["first_event"]
+    if not events or events[0] != first or events.count(first) != 1:
+        raise Failure(f"{where}: lifecycle does not start with one {first}")
+    for once in ("issued", "publish_unconfirmed", model["deadline"]):
+        if events.count(once) > 1:
+            raise Failure(f"{where}: {once} twice")
+    # At most one of issued and publish_unconfirmed, so never issued after it.
+    if "issued" in events and "publish_unconfirmed" in events:
+        raise Failure(f"{where}: both issued and publish_unconfirmed")
+    # timed_out: the deadline, or a restart, with no final result attached.
+    # Only the first is recorded: a restart ends a deadline that is still
+    # running, and a deadline is never re-armed after a restart.
+    timed_out = None
+    final_seen = False
+    restarted = False
+    for event in events:
+        if event in model["final"]:
+            final_seen = True
+        elif event == model["deadline"]:
+            if not final_seen and timed_out is None and not (
+                    restarted and model["restart_ends_deadline"]):
+                timed_out = "deadline"
+        elif event == model["restart"] and model["restart_ends_deadline"]:
+            restarted = True
+            if not final_seen and timed_out is None:
+                timed_out = "restart"
+    asserted = sorted({model["asserts"][e] for e in events if e in model["asserts"]
+                       and e not in model["not_binding_events"]})
+    agreeing = set(model["driver_values"]) | {"acting"}
+
+    def agree(a: str, b: str) -> bool:
+        return a == b or ("acting" in (a, b) and {a, b} <= agreeing)
+    contradiction = any(not agree(a, b) for i, a in enumerate(asserted)
+                        for b in asserted[i + 1:])
+    observed = [e for e in events if e in model["observed"]]
+    accepted = any(e in model["ending_events"] for e in events)
+    return {
+        "timed_out": timed_out,
+        # Driver acceptance ends the attempts, from whenever it attaches, unless
+        # the history holds a contradiction, in any order; then they resume.
+        "attempts_ended": accepted and not (
+            contradiction and model["contradiction_blocks_ending"]),
+        "outcome_uncertain": not observed,
+        "contradiction": contradiction,
+        # Every lifecycle case is a Tier D command: an observation that differs
+        # is critical, and so is a contradiction.
+        "critical": any(not model["observed"][e] for e in observed)
+        or (contradiction and model["contradiction_critical"]),
+        # No firmware command is concluded executed in this version.
+        "executed": False,
+    }
+
+
+STEP_MEMBERS = ["boot", "checks", "cmd_seq", "commit2", "digest", "driver", "epoch",
+                "read", "signed", "t_ms", "write"]
+
+
+def simulate(case: dict, model: dict, bound: dict) -> list[list[str]]:
+    """What a device signs for each verified command, in the order of the text's
+    command path: freshness read, the mark and record, freshness write, the
+    capability check, the other checks, the driver. The schema's enumerations
+    (current/earlier, ok/fails, pass/verdict, ok/error) are the corpus's."""
+    where = case["name"]
+    start = case["start"]
+    record = dict(start["record"])
+    mark = start["mark"]
+    if sorted(start) != ["mark", "record"] or \
+            sorted(record) != ["cmd_seq", "digest", "disposition", "epoch"]:
+        raise Failure(f"{where}: start members")
+    if record["cmd_seq"] != mark or record["disposition"] not in model["dispositions"] \
+            or record["epoch"] not in ("current", "earlier"):
+        raise Failure(f"{where}: the start record is not the mark's")
+    verdicts = [v for v in model["allowed"]["refused"]]
+    out: list[list[str]] = []
+    flags: set[str] = set()
+    table: list[tuple] = []
+    answered: list[tuple] = []
+    count, last, boot, now = 0, None, None, None
+    for step in case["steps"]:
+        if sorted(step) != STEP_MEMBERS:
+            raise Failure(f"{where}: step members")
+        for name in ("boot", "t_ms", "cmd_seq"):
+            if type(step[name]) is not int or step[name] < 0:
+                raise Failure(f"{where}: step {name}")
+        if type(step["digest"]) is not str or step["epoch"] not in ("current", "earlier") \
+                or step["read"] not in ("ok", "fails") or step["write"] not in ("ok", "fails") \
+                or step["commit2"] not in ("ok", "fails") \
+                or step["driver"] not in model["allowed"]["driver_reported"] \
+                or (step["checks"] != "pass" and step["checks"] not in verdicts):
+            raise Failure(f"{where}: step enumerations")
+        if type(step["signed"]) is not list:
+            raise Failure(f"{where}: step signed")
+        for result in step["signed"]:
+            kind, _, outcome = result.partition(":")
+            if kind not in model["allowed"] or outcome not in model["allowed"][kind]:
+                raise Failure(f"{where}: signed {result!r}")
+        if boot is not None and step["boot"] < boot:
+            raise Failure(f"{where}: boot decreases")
+        if step["boot"] != boot:
+            if boot is not None and bound["flags_clear_on_boot"]:
+                flags = set()
+            if boot is None or bound["reset_on_boot"]:
+                table, count, last = [], 0, None
+            if boot is not None:
+                answered = []
+            boot, now = step["boot"], None
+        if now is not None and step["t_ms"] < now:
+            raise Failure(f"{where}: the monotonic clock runs back")
+        now = step["t_ms"]
+        signed: list[str] = []
+
+        def storage_failure() -> None:
+            nonlocal count, last
+            # A label names bytes within its cmd_seq only, so the key carries both.
+            key = (step["cmd_seq"], step["digest"]) if bound["key_has_seq"] \
+                else (step["digest"],)
+            held = key in table
+            if held and not bound["held_spends"]:
+                return
+            within = count < bound["first"] or now - last >= bound["interval_ms"]
+            if within:
+                count, last = count + 1, now
+            if within and not held:
+                signed.append(f"{bound['budget_kind']}:{bound['budget_outcome']}")
+            if (within or bound["unsigned_held"]) and not held:
+                table.append(key)
+                if len(table) > bound["size"]:
+                    table.pop(0)
+
+        def once(kind: str, outcome: str) -> None:
+            flag = "repeat" if bound["shared_flag"] else kind
+            if bound["answered_table"]:
+                key = (step["cmd_seq"], step["digest"], kind, outcome)
+                if key in answered:
+                    return
+                answered.append(key)
+                if len(answered) > bound["answered_table"]:
+                    answered.pop(0)
+            elif flag in flags:
+                return
+            flags.add(flag)
+            signed.append(f"{kind}:{outcome}")
+
+        seq = step["cmd_seq"]
+        if step["read"] == "fails" and bound["read_checked"]:
+            storage_failure()
+            if not bound["read_keeps_flags"]:
+                flags = set()
+        elif seq < mark:
+            pass
+        elif seq == mark:
+            if record["epoch"] != "current" and bound["record_epoch_checked"]:
+                pass
+            elif step["digest"] == record["digest"]:
+                once(bound["flagged"][0], record["disposition"])
+            else:
+                once(bound["flagged"][1], "")
+        elif step["write"] == "fails" and bound["write_checked"]:
+            storage_failure()
+        else:
+            mark = seq
+            if bound["flags_clear_on_mark"]:
+                flags = set()
+            # The record holds the device's accepted approval when it recorded.
+            record = {"cmd_seq": seq, "digest": step["digest"], "epoch": "current",
+                      "disposition": "pending"}
+            verdict = None
+            if step["epoch"] != "current" and bound["command_epoch_checked"]:
+                verdict = "capability_mismatch"
+            elif step["checks"] != "pass":
+                verdict = step["checks"]
+            # The signed result never waits on the stored record: a failed
+            # final-disposition write leaves it `pending`.
+            if verdict is not None:
+                signed.append(f"refused:{verdict}")
+                final = verdict
+            else:
+                signed.append(f"driver_reported:{step['driver']}")
+                final = f"driver_{step['driver']}"
+            if step["commit2"] == "ok" or not bound["commit2_checked"]:
+                record["disposition"] = final
+        out.append(signed)
+    return out
+
+
+# Variants of the bound a device could wrongly implement; the group must tell
+# each from the contract's. The first is the earlier design, a table of 8
+# answered results in place of the per-mark flags.
+BOUND_VARIANTS = (
+    ("a table of answered results instead of flags", lambda b: b.update(answered_table=8)),
+    ("flags kept when the mark advances", lambda b: b.update(flags_clear_on_mark=False)),
+    ("flags kept across a boot", lambda b: b.update(flags_clear_on_boot=False)),
+    ("one flag for duplicate and conflict", lambda b: b.update(shared_flag=True)),
+    ("a table of one fewer", lambda b: b.update(size=b["size"] - 1)),
+    ("a table of one more", lambda b: b.update(size=b["size"] + 1)),
+    ("one fewer free refusal", lambda b: b.update(first=b["first"] - 1)),
+    ("one more free refusal", lambda b: b.update(first=b["first"] + 1)),
+    ("an interval 1 ms shorter", lambda b: b.update(interval_ms=b["interval_ms"] - 1)),
+    ("an interval 1 ms longer", lambda b: b.update(interval_ms=b["interval_ms"] + 1)),
+    ("a budget kept across a boot", lambda b: b.update(reset_on_boot=False)),
+    ("a held command spends budget", lambda b: b.update(held_spends=True)),
+    ("an unsigned refusal held", lambda b: b.update(unsigned_held=True)),
+    ("a failed read ignored", lambda b: b.update(read_checked=False)),
+    ("a failed write ignored", lambda b: b.update(write_checked=False)),
+    ("an earlier-epoch record answers", lambda b: b.update(record_epoch_checked=False)),
+    ("the command's approval unchecked", lambda b: b.update(command_epoch_checked=False)),
+    ("a failed final-disposition write ignored", lambda b: b.update(commit2_checked=False)),
+    ("a failed read clears the flags", lambda b: b.update(read_keeps_flags=False)),
+    ("labels compared across cmd_seq", lambda b: b.update(key_has_seq=False)),
+)
+
+
+REGISTRY_EVENTS = ("latched", "issued", "driver_ok", "driver_error", "contradiction", "reset",
+                   "shutdown", "restart", "binding_changed", "retired")
+
+
+def registry(case: dict, rules: dict) -> list[bool]:
+    """Whether a Tier D trip's attempts are active after each event, from the
+    Tier D bullets. The event tokens are the corpus's names for the events the
+    Golden vectors list."""
+    where = case["name"]
+    latched = eligible = running = False
+    binding_left = False
+    ok: set[int] = set()
+    contradicted: set[int] = set()
+    issued: set[int] = set()
+    active = False
+    out = []
+    for index, entry in enumerate(case["events"]):
+        if sorted(entry) != ["attempts_active", "event"] or \
+                type(entry["attempts_active"]) is not bool:
+            raise Failure(f"{where}: registry entry members")
+        name, _, number = entry["event"].partition(":")
+        if name not in REGISTRY_EVENTS:
+            raise Failure(f"{where}: registry event {entry['event']!r}")
+        attempt = None
+        if name in ("issued", "driver_ok", "driver_error", "contradiction"):
+            if not number.isdigit() or int(number) < 1:
+                raise Failure(f"{where}: {entry['event']} names no attempt")
+            attempt = int(number)
+        elif number:
+            raise Failure(f"{where}: {entry['event']} carries an attempt")
+        if (index == 0) != (name == "latched"):
+            raise Failure(f"{where}: a trip starts with latched, once")
+        if name == "latched":
+            latched = eligible = running = True
+        elif name == "issued":
+            # An attempt is issued only while attempts are active, once.
+            if not active or attempt in issued:
+                raise Failure(f"{where}: attempt {attempt} issued while attempts are "
+                              f"not active, or twice")
+            issued.add(attempt)
+        elif attempt is not None and attempt not in issued:
+            # Driver results and contradictions name an attempt already issued.
+            raise Failure(f"{where}: {entry['event']} names an attempt never issued")
+        elif name == "driver_ok":
+            ok.add(attempt)
+        elif name == "contradiction":
+            if rules["contradiction"]:
+                contradicted.add(attempt)
+        elif name == "reset" and rules["reset"]:
+            eligible = False
+        elif name == "binding_changed":
+            binding_left = True
+            if rules["binding"]:
+                eligible = False
+        elif name == "retired":
+            if not binding_left:
+                raise Failure(f"{where}: retired before its binding left force")
+            if rules["retired"]:
+                eligible = False
+        elif name == "shutdown":
+            running = False
+            if rules["shutdown_ends"]:
+                eligible = False
+        elif name == "restart":
+            running = True
+        accepted = any(a not in contradicted for a in ok) if rules["per_command"] else \
+            bool(ok) and not contradicted
+        active = latched and eligible and running and not accepted
+        out.append(active)
+    return out
+
+
+REGISTRY_RULES = {"contradiction": True, "reset": True, "binding": True, "retired": True,
+                  "shutdown_ends": False, "per_command": True}
+REGISTRY_VARIANTS = (
+    ("contradictions ignored", {"contradiction": False}),
+    ("reset ignored", {"reset": False}),
+    ("a binding change ignored", {"binding": False}),
+    ("shutdown ends eligibility", {"shutdown_ends": True}),
+    ("acceptance judged per trip", {"per_command": False}),
+)
+
+
+# --- corpus -------------------------------------------------------------------
+
+def _keys(corpus: dict) -> tuple[bytes, bytes]:
+    fault = json.loads(FAULT_CORPUS.read_bytes())
+    command = json.loads(COMMAND_CORPUS.read_bytes())
+    if corpus["device_test_seed_hex"] != fault["test_seed_hex"]:
+        raise Failure("device seed is not the fault corpus's")
+    if corpus["runtime_test_seed_hex"] != command["runtime_test_seed_hex"]:
+        raise Failure("runtime seed is not the command corpus's")
+    device = public_key(bytes.fromhex(corpus["device_test_seed_hex"]))
+    runtime = public_key(bytes.fromhex(corpus["runtime_test_seed_hex"]))
+    for label, value, key in (
+            ("device_public_key_b64", corpus["device_public_key_b64"], device),
+            ("verifier_context public_key_b64",
+             corpus["verifier_context"]["public_key_b64"], device),
+            ("runtime_public_key_b64", corpus["runtime_public_key_b64"], runtime)):
+        if base64.b64encode(key).decode() != value:
+            raise Failure(f"{label} does not derive from its seed")
+    return device, runtime
+
+
+def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
+    if corpus.get("contract") != "ori-specs/firmware-command-result/v1.md" \
+            or corpus.get("version") != 1:
+        raise Failure("corpus names another contract or version")
+    device, runtime = _keys(corpus)
+    context = corpus["verifier_context"]
+    if sorted(context) != ["capability_hash", "device_id", "posture", "public_key_b64"]:
+        raise Failure("verifier_context members")
+    if sorted(corpus["reasons"]) != sorted(model["reasons"]):
+        raise Failure("the corpus's reasons are not the contract's")
+    for reason in model["reasons"]:
+        if reason not in REASON_RULES:
+            raise Failure(f"no receiver rule for reason {reason}")
+
+    for group in ("results", "digests", "bound", "registry", "judgments", "lifecycle"):
+        names = [case["name"] for case in corpus[group]]
+        if len(names) != len(set(names)):
+            raise Failure(f"{group}: a case name is used twice")
+
+    for case in corpus["results"]:
+        where = case["name"]
+        obj = case["object"]
+        body = canonical(obj)
+        if bytes.fromhex(case["canonical_hex"]) != body:
+            raise Failure(f"{where}: canonical bytes")
+        raw = signature_bytes(case["signature"], where)
+        if not verify(device, body, raw):
+            raise Failure(f"{where}: signature does not verify under the device key")
+        payload = parse_exact(bytes.fromhex(case["payload_hex"]), where)
+        if type(payload) is not dict or payload.get("command_result") != obj \
+                or payload.get("signature") != case["signature"]:
+            raise Failure(f"{where}: payload is not this object and signature")
+        if canonical(payload["command_result"]) != body:
+            raise Failure(f"{where}: payload's object bytes")
+        verdict = judge(payload, context, model, device, off)
+        if case["expect"] == "accept":
+            if case["reason"] is not None:
+                raise Failure(f"{where}: an accept case names a reason")
+            if sorted(payload) != ["command_result", "signature"]:
+                raise Failure(f"{where}: an accept payload carries another key")
+            if verdict is not None:
+                raise Failure(f"{where}: refused ({verdict})")
+        elif case["expect"] == "refuse":
+            if case["reason"] not in model["reasons"]:
+                raise Failure(f"{where}: undeclared reason {case['reason']}")
+            if verdict != case["reason"]:
+                raise Failure(f"{where}: refused for {verdict}, not {case['reason']}")
+            if judge(payload, context, model, device, off | {case["reason"]}) is not None:
+                raise Failure(f"{where}: refused for more than its declared reason")
+        else:
+            raise Failure(f"{where}: expect {case['expect']!r}")
+
+    for case in corpus["digests"]:
+        where = case["name"]
+        command = case["command"]
+        if type(command) is not dict or list(command) != model["command_fields"]:
+            raise Failure(f"{where}: command members or order")
+        for name in ("action", "channel", "device_id"):
+            if type(command[name]) is not str or not FLEET.match(command[name]):
+                raise Failure(f"{where}: {name} is not a fleet identifier")
+        if type(command["capability_hash"]) is not str or \
+                not DIGEST_FORM.match(command["capability_hash"]):
+            raise Failure(f"{where}: capability_hash form")
+        if type(command["cmd_seq"]) is not int or not 1 <= command["cmd_seq"] <= INT_MAX:
+            raise Failure(f"{where}: cmd_seq")
+        if type(command["v"]) is not int or command["v"] != 1:
+            raise Failure(f"{where}: command v")
+        object_bytes = bytes.fromhex(case["command_hex"])
+        if object_bytes != canonical(command):
+            raise Failure(f"{where}: command bytes")
+        raw = signature_bytes(case["signature"], where)
+        preimage = model["domain"].encode("ascii") + b"\x00" + object_bytes
+        if not verify(runtime, preimage, raw):
+            raise Failure(f"{where}: runtime signature does not verify in the command domain")
+        for other in (object_bytes,
+                      model["liveness_domain"].encode("ascii") + b"\x00" + object_bytes,
+                      model["domain"].encode("ascii") + object_bytes):
+            if verify(runtime, other, raw):
+                raise Failure(f"{where}: signature verifies over another preimage")
+        message = parse_exact(bytes.fromhex(case["message_hex"]), where)
+        if message != {"command": command, "signature": case["signature"]}:
+            raise Failure(f"{where}: wire message")
+        if case["command_digest"] != "sha256:" + hashlib.sha256(preimage).hexdigest():
+            raise Failure(f"{where}: command_digest is not SHA-256 of the preimage")
+        if case["command_digest"] == "sha256:" + hashlib.sha256(object_bytes).hexdigest():
+            raise Failure(f"{where}: command_digest is over the object alone")
+
+    rows_seen: set[int] = set()
+    dispositions_seen: set[str] = set()
+    for case in corpus["judgments"]:
+        work = copy.deepcopy(case)
+        kind, outcome = judge_repeat(work, model)
+        if case["expect"] != {"kind": kind, "outcome": outcome}:
+            raise Failure(f"{case['name']}: table gives {kind}/{outcome!r}, "
+                          f"corpus {case['expect']}")
+        if kind not in ("new", "none") and outcome not in model["allowed"][kind]:
+            raise Failure(f"{case['name']}: {kind} cannot carry {outcome!r}")
+        rows_seen.add(next(i for i, row in enumerate(model["table"])
+                           if row["cells"] == work["_row"]))
+        if kind == "duplicate":
+            dispositions_seen.add(outcome)
+
+    for case in corpus["bound"]:
+        got = simulate(case, model, model["bound"])
+        want = [step["signed"] for step in case["steps"]]
+        if got != want:
+            raise Failure(f"{case['name']}: the text signs {got}, corpus {want}")
+    for label, edit in BOUND_VARIANTS:
+        variant = copy.deepcopy(model["bound"])
+        edit(variant)
+        if all(simulate(c, model, variant) == [step["signed"] for step in c["steps"]]
+               for c in corpus["bound"]):
+            raise Failure(f"coverage: the bound group does not tell {label} from the text")
+    # Codex's cycle: more conflicting commands for one mark than any table
+    # holds, each repeated, signs one conflict in the boot.
+    if not any(len({s["digest"] for s in c["steps"] if s["cmd_seq"] == c["start"]["mark"]
+                    and s["digest"] != c["start"]["record"]["digest"]}) > model["bound"]["size"]
+               and sum(r.startswith(model["bound"]["flagged"][1] + ":")
+                       for s in c["steps"] for r in s["signed"]) == 1
+               for c in corpus["bound"]):
+        raise Failure("coverage: no conflict cycle beyond a table signing one conflict")
+    for case in corpus["registry"]:
+        got = registry(case, model["registry_rules"])
+        want = [e["attempts_active"] for e in case["events"]]
+        if got != want:
+            raise Failure(f"{case['name']}: the text gives {got}, corpus {want}")
+    for label, change in REGISTRY_VARIANTS:
+        rules = dict(model["registry_rules"], **change)
+        if all(registry(c, rules) == [e["attempts_active"] for e in c["events"]]
+               for c in corpus["registry"]):
+            raise Failure(f"coverage: the registry group does not tell {label} from the text")
+
+    events_seen: set[str] = set()
+    for case in corpus["lifecycle"]:
+        expected = conclude(case["events"], model, case["name"])
+        if case["expect"] != expected:
+            raise Failure(f"{case['name']}: text gives {expected}, corpus {case['expect']}")
+        events_seen |= set(case["events"])
+
+    # Coverage.
+    accepted = [c["object"] for c in corpus["results"] if c["expect"] == "accept"]
+    for kind, outcomes in model["allowed"].items():
+        for outcome in outcomes:
+            if not any(o.get("kind") == kind and o.get("outcome") == outcome for o in accepted):
+                raise Failure(f"coverage: no accept case for {kind}/{outcome!r}")
+    refusals = [c for c in corpus["results"] if c["expect"] == "refuse"]
+    for reason in model["reasons"]:
+        if not any(c["reason"] == reason for c in refusals):
+            raise Failure(f"coverage: no refusal for {reason}")
+    if not any(c["reason"] == "unknown_kind" and c["object"].get("kind") == model["reserved"]
+               for c in refusals):
+        raise Failure(f"coverage: reserved kind {model['reserved']} is not refused")
+    for index, row in enumerate(model["table"]):
+        if index not in rows_seen:
+            raise Failure(f"coverage: no judgment for table row {row['cells']}")
+    for disposition in model["dispositions"]:
+        if disposition not in dispositions_seen:
+            raise Failure(f"coverage: no duplicate judgment answering {disposition}")
+    def classes(events: list[str]) -> list[frozenset[str]]:
+        return _classes(events, model)
+    for group in classes(model["events"]):
+        if not group & events_seen:
+            raise Failure(f"coverage: no lifecycle records any of {sorted(group)}")
+    # Finality: each final result before the deadline keeps timed_out
+    # unrecorded, and each non-final one does not.
+    deadline = model["deadline"]
+
+    def alone_before(x: dict, group: frozenset[str]) -> bool:
+        if deadline not in x["events"]:
+            return False
+        before = x["events"][:x["events"].index(deadline)]
+        return bool(group & set(before)) and not any(
+            e in model["final"] for e in before if e not in group)
+    for group in classes(model["final"]) + classes(model["not_final"]):
+        expected = "deadline" if group & set(model["not_final"]) else None
+        if not any(alone_before(x, group) and x["expect"]["timed_out"] == expected
+                   for x in corpus["lifecycle"]):
+            raise Failure(f"coverage: no lifecycle with {sorted(group)} alone before "
+                          f"{deadline}")
+    # Contradiction, swept: each binding refusal disposition, as a refusal and as
+    # a duplicate, against driver_ok; driver_ok against driver_error; and the
+    # non-binding ones (pending, storage_failure) beside driver_ok, which do not
+    # contradict. A contradiction that arrives after acceptance must be present.
+    lifecycles = corpus["lifecycle"]
+    refusal_values = [v for v in model["allowed"]["refused"]]
+    binding_refusals = sorted({v for e, v in model["asserts"].items()
+                               if v in refusal_values and e not in model["not_binding_events"]})
+
+    def paired(tokens: set[str], other: set[str], should: bool) -> bool:
+        return any(tokens & set(x["events"]) and other & set(x["events"])
+                   and x["expect"]["contradiction"] is should for x in lifecycles)
+    for value in binding_refusals:
+        tokens = {e for e, v in model["asserts"].items()
+                  if v == value and e not in model["not_binding_events"]}
+        if not paired(tokens, {"driver_reported_ok"}, True):
+            raise Failure(f"coverage: no lifecycle pairing {value} with driver_reported_ok")
+    for event in model["not_binding_events"]:
+        # The text gives both orders for storage_failure (a redelivery driven
+        # after it, a delivery after one was driven); the others need one.
+        orders = ((True,), (False,)) if event.endswith("_storage_failure") else ((True, False),)
+        for allowed_orders in orders:
+            if not any(event in x["events"] and "driver_reported_ok" in x["events"]
+                       and (x["events"].index(event) < x["events"].index("driver_reported_ok"))
+                       in allowed_orders and x["expect"]["contradiction"] is False
+                       for x in lifecycles):
+                raise Failure(f"coverage: no lifecycle with {event} beside "
+                              f"driver_reported_ok in order {allowed_orders}")
+    refusal_tokens = {e for e, v in model["asserts"].items()
+                      if v in refusal_values and e not in model["not_binding_events"]}
+    for event in model["acting_events"]:
+        if not paired({event}, refusal_tokens, True):
+            raise Failure(f"coverage: no lifecycle with {event} beside a refusal")
+    # The text's own second example, token for token: driver_reported(ok)
+    # against driver_reported(error).
+    driver_tokens = [e for e in model["asserts"] if e.startswith("driver_reported_")]
+    if not any(set(driver_tokens) <= set(x["events"]) and x["expect"]["contradiction"]
+               for x in lifecycles):
+        raise Failure("coverage: no lifecycle with both driver results as a contradiction")
+    if not any(x["expect"]["contradiction"] and any(
+            e in model["ending_events"] for e in x["events"][:next(
+                i for i, e in enumerate(x["events"]) if e in refusal_tokens)])
+            for x in lifecycles if refusal_tokens & set(x["events"])):
+        raise Failure("coverage: no contradiction arriving after driver acceptance")
+    # The restart boundary: a restart alone, a restart after a final result,
+    # a restart after the deadline, and a deadline after a restart.
+    dl, rs = model["deadline"], model["restart"]
+    for label, test, expected in (
+            ("restart with no final result", lambda e: rs in e and not any(
+                x in model["final"] or x == dl for x in e[:e.index(rs)]), "restart"),
+            ("restart after a final result", lambda e: rs in e and any(
+                x in model["final"] for x in e[:e.index(rs)]), None),
+            ("restart after the deadline", lambda e: rs in e and dl in e[:e.index(rs)]
+             and not any(x in model["final"] for x in e[:e.index(rs)]), "deadline"),
+            ("deadline after a restart", lambda e: rs in e and dl in e[e.index(rs):]
+             and not any(x in model["final"] for x in e), "restart")):
+        if not any(test(x["events"]) and x["expect"]["timed_out"] == expected
+                   for x in lifecycles):
+            raise Failure(f"coverage: no lifecycle with {label}")
+    # A consumer must not require accepted or attempted before driver_reported.
+    for event in ("driver_reported_ok", "driver_reported_error"):
+        if not any(event in x["events"] and "actuation_attempted" not in x["events"]
+                   for x in corpus["lifecycle"]):
+            raise Failure(f"coverage: no lifecycle with {event} and no actuation_attempted")
+    if not corpus["digests"]:
+        raise Failure("coverage: no digest case")
+
+
+def run(corpus_bytes: bytes, model: dict, off: frozenset[str] = frozenset()) -> None:
+    check(json.loads(corpus_bytes), model, off)
+    if model["pin"] is None:
+        raise Failure("firmware-command-result/v1.md pins no corpus digest")
+    if hashlib.sha256(corpus_bytes).hexdigest() != model["pin"]:
+        raise Failure("corpus digest differs from the one firmware-command-result/v1.md pins")
+
+
+# --- mutations ----------------------------------------------------------------
+
+def mutations(corpus_bytes: bytes, model: dict) -> int:
+    base = json.loads(corpus_bytes)
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(base)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def accept(kind: str, outcome: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c["results"] if x["expect"] == "accept"
+                              and x["object"]["kind"] == kind
+                              and x["object"]["outcome"] == outcome)
+
+    def refusal(reason: str) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c["results"] if x["reason"] == reason)
+
+    def judgment(kind: str, outcome: str | None = None) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c["judgments"] if x["expect"]["kind"] == kind
+                              and outcome in (None, x["expect"]["outcome"]))
+
+    def lifecycle(test: Callable[[list[str]], bool]) -> Callable[[dict], dict]:
+        return lambda c: next(x for x in c["lifecycle"] if test(x["events"]))
+
+    driver_ok = accept("driver_reported", "ok")
+
+    def resign_free_edit(case: dict, **fields: object) -> None:
+        case["object"].update(fields)
+
+    def flip(wire: str) -> str:
+        raw = bytearray(base64.b64decode(wire[len(SIGNATURE_PREFIX):]))
+        raw[40] ^= 1
+        return SIGNATURE_PREFIX + base64.b64encode(bytes(raw)).decode()
+
+    def flip_result(c: dict) -> None:
+        case = driver_ok(c)
+        case["signature"] = flip(case["signature"])
+        payload = json.loads(bytes.fromhex(case["payload_hex"]))
+        payload["signature"] = case["signature"]
+        case["payload_hex"] = canonical(payload).hex()
+
+    def edit_object(c: dict) -> None:
+        case = driver_ok(c)
+        resign_free_edit(case, outcome="error")
+        case["canonical_hex"] = canonical(case["object"]).hex()
+        case["payload_hex"] = canonical(
+            {"command_result": case["object"], "signature": case["signature"]}).hex()
+
+    def payload_whitespace(c: dict) -> None:
+        case = driver_ok(c)
+        case["payload_hex"] = bytes.fromhex(case["payload_hex"]).replace(
+            b",", b", ", 1).hex()
+
+    def second_family_on_accept(c: dict) -> None:
+        case = driver_ok(c)
+        payload = json.loads(bytes.fromhex(case["payload_hex"]))
+        payload["fault"] = {}
+        case["payload_hex"] = canonical(payload).hex()
+
+    def flip_digest_signature(c: dict) -> None:
+        c["digests"][0]["signature"] = flip(c["digests"][0]["signature"])
+
+    def digest_over_object(c: dict) -> None:
+        case = c["digests"][0]
+        case["command_digest"] = "sha256:" + hashlib.sha256(
+            bytes.fromhex(case["command_hex"])).hexdigest()
+
+    def digest_without_nul(c: dict) -> None:
+        case = c["digests"][0]
+        case["command_digest"] = "sha256:" + hashlib.sha256(
+            model["domain"].encode() + bytes.fromhex(case["command_hex"])).hexdigest()
+
+    def reorder_command(c: dict) -> None:
+        case = c["digests"][0]
+        case["command"] = dict(reversed(list(case["command"].items())))
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            run(corpus_bytes, mutated)
+        return go
+
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            pattern = r"\s+".join(re.escape(part) for part in old.split())
+            if old.startswith("\n") or old.endswith("\n") or old.startswith(" "):
+                pattern = re.escape(old)
+            found = re.search(pattern, texts[key])
+            if found is None:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = texts[key][:found.start()] + new + texts[key][found.end():]
+            run(corpus_bytes, contract_model(texts))
+        return go
+
+    def flip_expect(field: str, test: Callable[[list[str]], bool]) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            case = lifecycle(test)(c)
+            case["expect"][field] = not case["expect"][field]
+        return edit
+
+    has = lambda e: (lambda events: e in events)  # noqa: E731
+
+    cases: list[tuple[str, Callable[[], None]]] = [
+        ("result signature bit flipped", corpus_mutant(flip_result)),
+        ("result outcome edited after signing", corpus_mutant(edit_object)),
+        ("canonical_hex edited", corpus_mutant(
+            lambda c: driver_ok(c).update(canonical_hex=driver_ok(c)["canonical_hex"] + "20"))),
+        ("payload not canonical", corpus_mutant(payload_whitespace)),
+        ("second family key on an accept case", corpus_mutant(second_family_on_accept)),
+        ("accept case marked refuse", corpus_mutant(
+            lambda c: driver_ok(c).update(expect="refuse", reason="member_set"))),
+        ("verifier context names another device", corpus_mutant(
+            lambda c: c["verifier_context"].update(device_id="ori-fw-other"))),
+        ("verifier context names another posture", corpus_mutant(
+            lambda c: c["verifier_context"].update(posture="development"))),
+        ("device seed swapped", corpus_mutant(lambda c: c.update(device_test_seed_hex="43" * 32))),
+        ("runtime seed swapped", corpus_mutant(
+            lambda c: c.update(runtime_test_seed_hex="12" * 32))),
+        ("reason added to the corpus", corpus_mutant(lambda c: c["reasons"].update(extra="x"))),
+        ("reason dropped from the corpus", corpus_mutant(
+            lambda c: c["reasons"].pop("digest_form"))),
+        ("digest signature bit flipped", corpus_mutant(flip_digest_signature)),
+        ("digest over the object alone", corpus_mutant(digest_over_object)),
+        ("digest without NUL", corpus_mutant(digest_without_nul)),
+        ("command members reordered", corpus_mutant(reorder_command)),
+        ("message_hex edited", corpus_mutant(
+            lambda c: c["digests"][0].update(message_hex=c["digests"][0]["message_hex"][:-2]))),
+        ("digests dropped", corpus_mutant(lambda c: c["digests"].clear())),
+        ("record not the mark's command", corpus_mutant(
+            lambda c: judgment("duplicate")(c)["device"]["record"].update(
+                cmd_seq=judgment("duplicate")(c)["device"]["mark"] + 1))),
+        ("unknown stored disposition", corpus_mutant(
+            lambda c: judgment("duplicate")(c)["device"]["record"].update(disposition="executed"))),
+        ("duplicate answers pending as driver_ok", corpus_mutant(
+            lambda c: judgment("duplicate", "pending")(c)["expect"].update(outcome="driver_ok"))),
+        ("conflict relabelled duplicate", corpus_mutant(
+            lambda c: judgment("conflict")(c)["expect"].update(kind="duplicate"))),
+        ("new relabelled refused", corpus_mutant(
+            lambda c: judgment("new")(c)["expect"].update(kind="refused", outcome="replayed"))),
+        ("replay relabelled conflict", corpus_mutant(
+            lambda c: judgment("none")(c)["expect"].update(kind="conflict", outcome=""))),
+        ("no-result relabelled refused", corpus_mutant(
+            lambda c: judgment("none")(c)["expect"].update(kind="refused", outcome="replayed"))),
+        ("capability_mismatch stored for the device's own hash", corpus_mutant(
+            lambda c: judgment("duplicate", "capability_mismatch")(c)["command"].update(
+                capability_hash=judgment("duplicate", "capability_mismatch")(c)
+                ["device"]["record"]["capability_hash"]))),
+        ("one digest for two sequences", corpus_mutant(
+            lambda c: judgment("none")(c)["command"].update(
+                command_digest=judgment("none")(c)["device"]["record"]["command_digest"],
+                cmd_seq=judgment("none")(c)["device"]["mark"] - 1))),
+        ("lifecycle without signed", corpus_mutant(
+            lambda c: c["lifecycle"][0]["events"].pop(0))),
+        ("timed_out given as an input event", corpus_mutant(
+            lambda c: c["lifecycle"][0]["events"].append("timed_out"))),
+        ("deadline passing twice", corpus_mutant(
+            lambda c: lifecycle(has(model["deadline"]))(c)["events"].append(model["deadline"]))),
+        ("timed_out after a final result flipped", corpus_mutant(
+            flip_expect("timed_out", lambda e: model["deadline"] in e and any(
+                x in model["final"] for x in e[:e.index(model["deadline"])])))),
+        ("timed_out with no final result flipped", corpus_mutant(
+            flip_expect("timed_out", lambda e: model["deadline"] in e and not any(
+                x in model["final"] for x in e[:e.index(model["deadline"])])))),
+        ("attempts end at a stored driver_ok flipped", corpus_mutant(
+            flip_expect("attempts_ended", has("device_duplicate_driver_ok")))),
+        ("attempts end at a stored pending flipped", corpus_mutant(
+            flip_expect("attempts_ended", has("device_duplicate_pending")))),
+        ("attempts end at publish_unconfirmed flipped", corpus_mutant(
+            flip_expect("attempts_ended", has("publish_unconfirmed")))),
+        ("attempts end at driver_reported_ok flipped", corpus_mutant(
+            flip_expect("attempts_ended", has("driver_reported_ok")))),
+        ("attempts end at observation flipped", corpus_mutant(
+            flip_expect("attempts_ended", has("terminal_outcome_observed_matches")))),
+        ("uncertain under driver_reported_ok flipped", corpus_mutant(
+            flip_expect("outcome_uncertain", has("driver_reported_ok")))),
+        ("executed when observed matches flipped", corpus_mutant(
+            flip_expect("executed", has("terminal_outcome_observed_matches")))),
+        ("executed when observed differs flipped", corpus_mutant(
+            flip_expect("executed", has("terminal_outcome_observed_differs")))),
+        ("issued after publish_unconfirmed", corpus_mutant(
+            lambda c: lifecycle(has("publish_unconfirmed"))(c)["events"].append("issued"))),
+        ("critical when observed differs flipped", corpus_mutant(
+            flip_expect("critical", has("terminal_outcome_observed_differs")))),
+        ("critical when observed matches flipped", corpus_mutant(
+            flip_expect("critical", has("terminal_outcome_observed_matches")))),
+        ("critical without observation flipped", corpus_mutant(
+            flip_expect("critical", lambda e: not any(
+                x.startswith("terminal_outcome_observed_") for x in e)))),
+        ("unknown event", corpus_mutant(
+            lambda c: c["lifecycle"][0]["events"].append("executed"))),
+        ("reserved kind refusal dropped", corpus_mutant(
+            lambda c: c["results"].remove(next(
+                x for x in c["results"] if x["object"].get("kind") == model["reserved"])))),
+        ("model: executed set by driver_reported_ok", model_mutant(
+            lambda m: m["observed"].update(driver_reported_ok=True))),
+        ("model: attempts end at device_accepted", model_mutant(
+            lambda m: m["ending_events"].append("device_accepted"))),
+        ("model: stored driver_ok does not end attempts", model_mutant(
+            lambda m: m["ending_events"].remove("device_duplicate_driver_ok"))),
+        ("model: pending counted final", model_mutant(
+            lambda m: m["final"].append("device_duplicate_pending"))),
+        ("model: device_refused not final", model_mutant(
+            lambda m: m["final"].remove("device_refused"))),
+        ("model: pending not a disposition", model_mutant(
+            lambda m: (m["dispositions"].remove("pending"),
+                       m["allowed"]["duplicate"].remove("pending")))),
+        ("model: corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
+        ("model: no pin", model_mutant(lambda m: m.update(pin=None))),
+        ("model: liveness domain for commands", model_mutant(
+            lambda m: m.update(domain=m["liveness_domain"]))),
+    ]
+    # Lifecycles a weaker model would accept, appended with the conclusions of
+    # this model except for the one a weakening would change. Each must be
+    # refused. Codex's case first: a duplicate answering rate_limited, then
+    # driver_reported(ok) and a matching observation, read as an execution.
+    def add_lifecycle(label: str, events: list[str], **wrong: object) -> None:
+        def edit(c: dict) -> None:
+            expect = conclude(events, model, label)
+            expect.update(wrong)
+            c["lifecycle"].append({"name": f"mutant {label}", "note": "",
+                                   "events": events, "expect": expect})
+        cases.append((f"lifecycle {label}", corpus_mutant(edit)))
+    head = [model["first_event"], "issued"]
+    codex = head + ["device_duplicate_rate_limited", "driver_reported_ok",
+                    "terminal_outcome_observed_matches"]
+    add_lifecycle("codex P2 read as execution", codex, attempts_ended=True,
+                  contradiction=False, critical=False, executed=True)
+    add_lifecycle("codex P2 read as ordinary", codex, attempts_ended=True,
+                  contradiction=False, critical=False)
+    refusal_values = model["allowed"]["refused"]
+    contradicting = [e for e, v in model["asserts"].items()
+                     if e not in model["not_binding_events"]
+                     and (v in refusal_values or v in model["driver_values"][1:]
+                          or (v == "driver_error"))]
+    for acting in model["acting_events"]:
+        for event in [e for e in contradicting if model["asserts"][e] in refusal_values]:
+            add_lifecycle(f"{acting} beside {event} let through", head + [acting, event],
+                          contradiction=False, critical=False)
+    for event in contradicting:
+        for order in ("before", "after"):
+            events = head + ([event, "driver_reported_ok"] if order == "before"
+                             else ["driver_reported_ok", event])
+            add_lifecycle(f"{event} {order} driver_ok let through", events,
+                          contradiction=False, attempts_ended=True, critical=False)
+            add_lifecycle(f"{event} {order} driver_ok ends attempts", events,
+                          attempts_ended=True)
+            add_lifecycle(f"{event} {order} driver_ok not critical", events, critical=False)
+        add_lifecycle(f"{event} before a stored driver_ok let through",
+                      head + [event, "device_duplicate_driver_ok"],
+                      contradiction=False, attempts_ended=True, critical=False)
+    for event in model["not_binding_events"]:
+        for events in (head + [event, "driver_reported_ok"], head + ["driver_reported_ok", event]):
+            add_lifecycle(f"{event} beside driver_ok read as a contradiction {events[-1]}",
+                          events, contradiction=True, attempts_ended=False, critical=True)
+    add_lifecycle("executed concluded", head + ["driver_reported_ok",
+                  "terminal_outcome_observed_matches"], executed=True)
+    dl, rs = model["deadline"], model["restart"]
+    add_lifecycle("deadline re-armed after restart", head + [rs, dl], timed_out="deadline")
+    add_lifecycle("restart overrides the deadline", head + [dl, rs], timed_out="restart")
+    add_lifecycle("restart after a final result", head + ["driver_reported_ok", rs],
+                  timed_out="restart")
+    add_lifecycle("restart ignored", head + [rs], timed_out=None)
+    add_lifecycle("restart ends attempts", head + [rs], attempts_ended=True)
+    add_lifecycle("restart read as a refusal of a late result",
+                  head + [rs, "driver_reported_ok"], attempts_ended=False)
+    for label, edit in (
+            ("model: contradiction does not block ending",
+             lambda m: m.update(contradiction_blocks_ending=False)),
+            ("model: contradiction not critical",
+             lambda m: m.update(contradiction_critical=False)),
+            ("model: restart ignored", lambda m: m.update(restart_ends_deadline=False)),
+            ("model: nothing binds", lambda m: m.update(not_binding_events=list(m["asserts"]))),
+            ("model: pending binds",
+             lambda m: m["not_binding_events"].remove("device_duplicate_pending")),
+            ("model: storage_failure binds",
+             lambda m: m["not_binding_events"].remove("device_refused_storage_failure")),
+            ("model: conflict binds", lambda m: m["not_binding_events"].remove("device_conflict")),
+            ("model: acting asserts nothing",
+             lambda m: [m["asserts"].pop(e) for e in m["acting_events"]]),
+            ("model: acting contradicts driver results",
+             lambda m: m.update(driver_values=[])),
+            ("model: driver error asserts driver_ok",
+             lambda m: m["asserts"].update(driver_reported_error="driver_ok")),
+            ("model: duplicate refusal asserts nothing",
+             lambda m: m["asserts"].pop("device_duplicate_rate_limited")),
+            ("model: restart counted final", lambda m: m["final"].append(m["restart"]))):
+        cases.append((label, model_mutant(edit)))
+    for label, edit in BOUND_VARIANTS:
+        cases.append((f"model: bound with {label}", model_mutant(
+            lambda m, e=edit: e(m["bound"]))))
+    for label, change in REGISTRY_VARIANTS:
+        cases.append((f"model: registry with {label}", model_mutant(
+            lambda m, ch=change: m["registry_rules"].update(ch))))
+    cases.append(("bound step flipped", corpus_mutant(
+        lambda c: c["bound"][0]["steps"][0].update(signed=[]))))
+    cases.append(("codex conflict cycle signs every replay", corpus_mutant(
+        lambda c: [s.update(signed=["conflict:"]) for s in c["bound"][0]["steps"]])))
+    cases.append(("registry entry flipped", corpus_mutant(
+        lambda c: c["registry"][1]["events"][-1].update(
+            attempts_active=not c["registry"][1]["events"][-1]["attempts_active"]))))
+    cases.append(("retired without a binding change", corpus_mutant(
+        lambda c: [x for x in c["registry"] if any(e["event"] == "retired" for e in x["events"])][0]
+        .update(events=[e for e in [x for x in c["registry"] if any(
+            e["event"] == "retired" for e in x["events"])][0]["events"]
+            if e["event"] != "binding_changed"]))))
+    cases.append(("contradiction naming an unissued attempt", corpus_mutant(
+        lambda c: c["registry"][1]["events"].append(
+            {"event": "contradiction:9", "attempts_active": False}))))
+    cases.append(("attempt issued while inactive", corpus_mutant(
+        lambda c: [x for x in c["registry"] if x["name"] == "accepted_ends"][0]["events"].append(
+            {"event": "issued:3", "attempts_active": False}))))
+    cases.append(("driver result before its issue", corpus_mutant(
+        lambda c: c["registry"][0]["events"].pop(1))))
+    cases.append(("attempt issued twice", corpus_mutant(
+        lambda c: c["registry"][0]["events"].insert(2, {"event": "issued:1",
+                                                        "attempts_active": True}))))
+    cases.append(("registry group dropped", corpus_mutant(lambda c: c.update(registry=[]))))
+    cases.append(("bound clock runs back", corpus_mutant(
+        lambda c: c["bound"][0]["steps"][-1].update(t_ms=-1))))
+    cases.append(("bound group dropped", corpus_mutant(lambda c: c.update(bound=[]))))
+    for kind, outcomes in model["allowed"].items():
+        for outcome in outcomes:
+            cases.append((f"accept {kind}/{outcome!r} dropped", corpus_mutant(
+                lambda c, k=kind, o=outcome: c.update(results=[
+                    x for x in c["results"] if not (
+                        x["expect"] == "accept" and x["object"]["kind"] == k
+                        and x["object"]["outcome"] == o)]))))
+    for reason in model["reasons"]:
+        cases.append((f"refusal relabelled from {reason}", corpus_mutant(
+            lambda c, r=reason: refusal(r)(c).update(
+                reason=next(x for x in model["reasons"] if x != r)))))
+        cases.append((f"{reason} refusal moved to accept", corpus_mutant(
+            lambda c, r=reason: refusal(r)(c).update(expect="accept", reason=None))))
+        cases.append((f"{reason} refusals dropped", corpus_mutant(
+            lambda c, r=reason: c.update(results=[x for x in c["results"]
+                                                  if x["reason"] != r]))))
+        cases.append((f"rule off: {reason}", lambda r=reason: run(
+            corpus_bytes, model, frozenset({r}))))
+    for index, row in enumerate(model["table"]):
+        def drop_row(c: dict, i: int = index) -> None:
+            c["judgments"] = [j for j in c["judgments"] if _row_index(j, model) != i]
+        cases.append((f"judgments for row {index + 1} dropped", corpus_mutant(drop_row)))
+    for disposition in model["dispositions"]:
+        cases.append((f"duplicate judging {disposition} dropped", corpus_mutant(
+            lambda c, d=disposition: c.update(judgments=[
+                j for j in c["judgments"]
+                if not (j["expect"]["kind"] == "duplicate" and j["expect"]["outcome"] == d)]))))
+    for group in _classes(model["events"], model):
+        cases.append((f"lifecycles recording {sorted(group)} dropped", corpus_mutant(
+            lambda c, g=group: c.update(lifecycle=[x for x in c["lifecycle"]
+                                                   if not g & set(x["events"])]))))
+    for group in _classes(model["final"], model) + _classes(model["not_final"], model):
+        def drop_alone(c: dict, g: frozenset[str] = group) -> None:
+            d = model["deadline"]
+            c["lifecycle"] = [x for x in c["lifecycle"] if not (
+                d in x["events"] and g & set(x["events"][:x["events"].index(d)]))]
+        cases.append((f"lifecycles with {sorted(group)} before the deadline dropped",
+                      corpus_mutant(drop_alone)))
+
+    text_cases = [
+        ("kind row removed", "r",
+         "| `attempted` | `\"\"` |", "| `attemptd` | `\"\"` |"),
+        ("refused outcome dropped", "r",
+         "`unknown_action`, `rate_limited` or `storage_failure` | The command's",
+         "`unknown_action` or `rate_limited` | The command's"),
+        ("replayed restored as a refused outcome", "r",
+         "| `refused` | `capability_mismatch`,", "| `refused` | `replayed`, "
+          "`capability_mismatch`,"),
+        ("storage_failure stored again", "r",
+         "  - `capability_mismatch`, `unknown_action` or `rate_limited`:",
+         "  - `capability_mismatch`, `unknown_action`, `rate_limited` or `storage_failure`:"),
+        ("attempted required", "r",
+         "A consumer MUST NOT require `accepted` or\n`attempted` before `driver_reported`.",
+         "A consumer MUST require `accepted` or\n`attempted` before `driver_reported`."),
+        ("storage_failure resend becomes a duplicate", "r",
+         "and it is\njudged as a new command.", "and it is\na duplicate."),
+        ("driver_reported allows a third outcome", "r",
+         "| `ok` or `error` |", "| `ok`, `error` or `unknown` |"),
+        ("accepted takes an outcome", "r", "| `accepted` | `\"\"` |", "| `accepted` | `ok` |"),
+        ("reserved kind renamed", "r",
+         "`feedback_observed` is reserved for", "`feedback_seen` is reserved for"),
+        ("reserved kind accepted", "r",
+         "a receiver refuses it as an unknown kind", "a receiver accepts it"),
+        ("bad_signature gets a result", "r",
+         "`wrong_device` or `bad_signature` gets no result", "`wrong_device` gets no result"),
+        ("disposition dropped", "r",
+         "  - `driver_ok` or `driver_error`: the", "  - `driver_ok`: the"),
+        ("disposition added", "r",
+         "  - `driver_ok` or `driver_error`: the", "  - `driver_ok`, `executed` or "
+          "`driver_error`: the"),
+        ("below the mark becomes a conflict", "r",
+         "| Below it | any | any | No result: a `command_rejected` fault, `replayed`, only |",
+         "| Below it | any | any | `conflict` |"),
+        ("other epoch answers as a duplicate", "r",
+         "| Equal to it | Differs from the device's current one | any | No result: a "
+          "`command_rejected` fault, `replayed`, only |",
+         "| Equal to it | Differs from the device's current one | any | `duplicate`, with the "
+          "stored disposition, once a boot |"),
+        ("conflict row removed", "r",
+         "| Equal to it | Equals the current one | Differs | `conflict`, once per mark in a boot "
+         "|\n", ""),
+        ("table rows overlap", "r",
+         "| Equal to it | Equals the current one | Differs | `conflict`, once per mark in a boot |",
+         "| Equal to it | any | Differs | `conflict`, once per mark in a boot |"),
+        ("table cell reworded", "r", "| Above it | | |", "| Beyond it | | |"),
+        ("reason dropped", "r", "  - `digest_form`: "
+         "`command_digest`", "  `digest_form`: `command_digest`"),
+        ("reason added", "r", "  - `member_set`:", "  - `alg_wrong`: x;\n  - `member_set`:"),
+        ("member added to the field table", "r",
+         "| `kind` | `string` |", "| `kind`, `note` | `string` |"),
+        ("v becomes 2", "r", "| `v` | `int` | `1`. |", "| `v` | `int` | `2`. |"),
+        ("domain named wrongly in the field table", "r",
+         "the domain `ori.firmware_command.v2`", "the domain `ori.firmware_liveness.v2`"),
+        ("driver acceptance is acceptance", "r",
+         "driver acceptance is `driver_reported(ok)`, or a",
+         "driver acceptance is `device_accepted(ok)`, or a"),
+        ("observation ends attempts", "r",
+         "`terminal_outcome_observed` does not end the attempts",
+         "`terminal_outcome_observed` ends the attempts"),
+        ("driver ok ends uncertainty", "r",
+         "it does not end `outcome_uncertain`", "it ends `outcome_uncertain`"),
+        ("issued after publish_unconfirmed allowed", "r",
+         "and never records `issued` after `publish_unconfirmed`,",
+         "and may record `issued` after `publish_unconfirmed`,"),
+        ("events may be rewritten", "r",
+         "and no earlier event is rewritten or removed", "and an earlier event may be removed"),
+        ("event dropped", "r", "`device_conflict`, `actuation_attempted`", "`actuation_attempted`"),
+        ("observation values renamed", "r",
+         "`terminal_outcome_observed_matches` or `_differs`",
+         "`terminal_outcome_observed_same` or `_differs`"),
+        ("stored driver_ok no longer driver acceptance", "r",
+         "`driver_reported(ok)`, or a\n`device_duplicate` whose stored disposition is "
+          "`driver_ok`, and nothing\nearlier.",
+         "`driver_reported(ok)` and nothing\nearlier."),
+        ("conflict not final", "r",
+         "no `driver_reported`, `device_refused` or `device_conflict`,",
+         "no `driver_reported` or `device_refused`,"),
+        ("pending made final", "r",
+         "`device_accepted`, `actuation_attempted` and `device_duplicate(pending)` are not final.",
+         "`device_accepted` and `actuation_attempted` are not final."),
+        ("replay answered again", "r",
+         "- A command refused as `replayed` gets no result,",
+         "- A command refused as `storage_failure` gets no result,"),
+        ("two duplicates per mark", "r", "A device signs at most one\n  `duplicate`",
+         "A device signs at most two\n  `duplicate`"),
+        ("flag kept when the mark advances", "r",
+         "cleared when the mark advances or the device boots", "cleared when the device boots"),
+        ("storage_failure table shrunk", "r", "in a table of at least 8, held in memory",
+         "in a table of at least 7, held in memory"),
+        ("held command spends budget", "r", "is not signed again and spends no budget",
+         "is not signed again and spends budget"),
+        ("unsigned refusal held", "r", "so it is not held.", "so it is held."),
+        ("first duplicate may be withheld", "r",
+         "except a duplicate or conflict after the first at its mark,", "except a duplicate,"),
+        ("five groups", "r", "It holds six groups:", "It holds five groups:"),
+        ("per-trip acceptance", "r",
+         "Acceptance is judged per command: an uncontradicted acceptance of a later\n  attempt for "
+         "the same trip still stands.", "Acceptance is judged per trip."),
+        ("reset revives", "r", "A contradiction that arrives after any of those revives nothing,",
+         "A contradiction that arrives after any of those revives the trip,"),
+        ("shutdown ends eligibility", "r", "Shutdown does not end eligibility:",
+         "Shutdown ends eligibility:"),
+        ("storage_failure only above the mark", "r",
+         "(`storage_failure`, whatever its `cmd_seq`)", "(`storage_failure`, above the mark)"),
+        ("refusal speaks for every delivery", "r",
+         "The device refused this delivery, under that verdict, and this delivery actuated "
+         "nothing.", "The device refused this command, under that verdict. Nothing was actuated."),
+        ("table applies on a failed read", "r",
+         "For a command whose signature verified and whose freshness read succeeded",
+         "For a command whose signature verified"),
+        ("driven delivery answered storage_failure", "r",
+         "It never answers the delivery\n  it drove with `refused` and `storage_failure`",
+         "It may answer the delivery\n  it drove with `refused` and `storage_failure`"),
+        ("later read failure speaks for the earlier", "r",
+         "it says nothing about the earlier\n  one.", "it says the earlier one was not driven."),
+        ("storage_degraded reports freshness", "r",
+         "`storage_degraded` covers the evidence buffer and the\n  "
+         "final-disposition write, not this.",
+         "`storage_degraded` reports it too."),
+        ("labels compared across cmd_seq", "r",
+         "and labels at different\n  `cmd_seq` values say nothing about each other,",
+         "and equal labels at different\n  `cmd_seq` values are the same command,"),
+        ("issued while inactive", "r",
+         "issued, which happens only while attempts are active,", "issued at any time,"),
+        ("refused reset counted", "r", "a refused reset changes nothing.",
+         "a refused reset clears the trip."),
+        ("conflict phrase changed", "r", "| `conflict`, once per mark in a boot |",
+         "| `conflict`, once a boot |"),
+        ("storage_failure budget raised", "r", "the first 4 in a boot", "the first 5 in a boot"),
+        ("budget interval shortened", "r", "at least 60,000 ms, on a monotonic clock",
+         "at least 59,999 ms, on a monotonic clock"),
+        ("accepted before the rate check", "r",
+         "A device MUST NOT sign it before its rate check has passed.",
+         "A device MAY sign it before its rate check has passed."),
+        ("acting beside a refusal allowed", "r",
+         "Nor can `device_accepted` or `actuation_attempted`", "Nor can `actuation_attempted`"),
+        ("conflict contradicts", "r", "  - `device_conflict`: it answers", "  - it answers"),
+        ("storage_failure contradicts", "r",
+         "  - `refused` with `storage_failure`: the device", "  - the device"),
+        ("two timed_out", "r", "A command has at most one `timed_out`: the first of the two.",
+         "A command may have two `timed_out`."),
+        ("executed may be concluded", "r",
+         "a runtime MUST NOT conclude that a\n  firmware command executed",
+         "a runtime MAY conclude that a\n  firmware command executed"),
+        ("outcome boolean may be set", "r",
+         "and a runtime MUST NOT set either\n  true", "and a runtime MAY set either\n  true"),
+        ("contradiction resolved by choice", "r",
+         "and conclude nothing from either.", "and conclude from the later."),
+        ("pending contradicts", "r",
+         "  - `device_duplicate(pending)`: an honest device",
+         "  - an honest device"),
+        ("contradicted acceptance stands", "r",
+         "A contradiction invalidates the driver acceptance it contradicts,",
+         "A contradiction leaves the driver acceptance it contradicts standing,"),
+        ("contradiction not critical", "r",
+         "whatever order the reports arrived in, and is raised as a critical event.",
+         "whatever order the reports arrived in."),
+        ("read failure judged at the mark", "r",
+         "every verified command, below, at or above the mark, is a\n  `storage_failure` refusal",
+         "every verified command above the mark is a\n  `storage_failure` refusal"),
+        ("restart re-arms the deadline", "r",
+         "and never re-arms a deadline for the command.",
+         "and re-arms a deadline for the command."),
+        ("timed_out(restart) row removed", "r",
+         "| `timed_out(restart)` |", "| `restarted` |"),
+        ("deadline by wall clock", "r",
+         "never by subtracting wall-clock times", "or by subtracting wall-clock times"),
+        ("refusal token form removed", "r",
+         "(`device_refused_` or `device_duplicate_` followed by the verdict or\n  disposition)",
+         "(`device_duplicate_` followed by the disposition)"),
+        ("restart input renamed", "r", "`deadline_passed`, `restart`, and",
+         "`deadline_passed`, `reboot`, and"),
+        ("driver_ok disposition renamed", "r",
+         "  - `driver_ok` or `driver_error`: the", "  - `driver_success` or `driver_error`: the"),
+        ("observed failure not critical", "r",
+         "The runtime MUST raise it as a critical operator and audit event",
+         "The runtime MAY raise it as an operator event"),
+        ("lifecycle cases not Tier D", "r",
+         "Each is a command issued for a Tier D trip.", ""),
+        ("deadline measured from issued", "r",
+         "The command's result deadline, measured from `signed`,",
+         "The command's result deadline, measured from `issued`,"),
+        ("record not atomic", "r", "written atomically with the\nmark", "written after the\nmark"),
+        ("signing domain added to results", "r",
+         "with no signing domain", "with the result domain"),
+        ("corpus pin replaced", "r", "Its SHA-256 is\n`", "Its SHA-256 is\n`0"),
+        ("command domain changed", "c2",
+         "| Command | `ori.firmware_command.v2` |", "| Command | `ori.firmware_command.v3` |"),
+        ("verdict added to commands v2", "c2",
+         "| `storage_failure` | The high-water mark",
+         "| `power_failure` | x |\n| `storage_failure` | The high-water mark"),
+        ("preimage without NUL", "c2", "one zero byte, NUL; and", "and"),
+        ("command field order changed", "c1",
+         "`action`, `capability_hash`, `channel`,\n  "
+          "`cmd_seq`", "`capability_hash`, `action`, `channel`,\n  `cmd_seq`"),
+        ("family list opened", "t2", "The list is closed.", "The list is open."),
+        ("first family key routes", "t2",
+         "and never routes it by the first key it tests", "and routes it by the first key"),
+        ("command_result family removed", "t2",
+         "| `command_result` | Firmware command results |", "| `command_results` | Firmware "
+          "command results |"),
+        ("non-canonical heading added", "r",
+         "### Tier C\n", "### Tier C\n\n  ### Unassigned Authority\n"),
+    ]
+    for label, key, old, new in text_cases:
+        cases.append((f"text: {label}", text_mutant(key, old, new)))
+
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except AssertionError as stale:
+            print(f"STALE    {label}: {stale}")
+            survived += 1
+            continue
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    print(f"{len(cases)} mutants")
+    return survived
+
+
+def _classes(events: list[str], model: dict) -> list[frozenset[str]]:
+    """Coverage classes: each event, except that the device_refused tokens and
+    the device_duplicate tokens with a final disposition each form one class,
+    as the timed_out row treats them. The contradiction sweep covers them one
+    disposition at a time."""
+    groups = []
+    for prefix in ("device_refused_", "device_duplicate_"):
+        group = frozenset(e for e in events if e.startswith(prefix) and e in model["final"])
+        if group:
+            groups.append(group)
+    grouped = set().union(*groups) if groups else set()
+    return [frozenset({e}) for e in events if e not in grouped] + groups
+
+
+def _row_index(case: dict, model: dict) -> int:
+    work = copy.deepcopy(case)
+    judge_repeat(work, model)
+    return next(i for i, row in enumerate(model["table"]) if row["cells"] == work["_row"])
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        model = contract_model()
+    except (Failure, ValueError, KeyError) as failure:
+        print(f"firmware-command-result/v1 contracts: {failure}")
+        return 1
+    try:
+        corpus_bytes = CORPUS.read_bytes()
+    except OSError as error:
+        print(f"firmware-command-result/v1 corpus: {error}")
+        return 1
+    try:
+        run(corpus_bytes, model)
+    except (Failure, KeyError, TypeError, ValueError) as failure:
+        print(f"firmware-command-result/v1 corpus: {type(failure).__name__}: {failure}")
+        return 1
+    corpus = json.loads(corpus_bytes)
+    accepts = sum(c["expect"] == "accept" for c in corpus["results"])
+    print(
+        f"firmware-command-result/v1 corpus: {accepts} results accepted, "
+        f"{len(corpus['results']) - accepts} refused each for its declared reason, "
+        f"{len(corpus['digests'])} digests, {len(corpus['bound'])} bound sequences, "
+        f"{len(corpus['judgments'])} judgments, "
+        f"{len(corpus['lifecycle'])} lifecycles as the text gives them"
+    )
+    if argv == ["--mutations"]:
+        survived = mutations(corpus_bytes, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
