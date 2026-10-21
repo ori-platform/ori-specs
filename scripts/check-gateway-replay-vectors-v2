@@ -21,6 +21,9 @@ Held to:
   here decides them;
 - coverage: every "cases cover" bullet is shown by events whose structure
   shows it, never by a case's name.
+- closed: every prose sentence of the section, in order, outside the table,
+  the event list and the cover list, which are parsed; an added, removed or
+  changed sentence anywhere in the section fails;
 - one place for replay claims: every other section of gateway-api/v2.md whose
   own body touches replay, freshness, staleness, skew, signing time, capture or
   retransmission, the replay-settings obligation in runtime-config/v2.md and
@@ -104,6 +107,16 @@ HELD = {
         "at or after it. A receiver that stores its floor again resumes from the floor "
         "and keys it stored, under the same start rule. A restart discards every "
         "authentication not yet recorded.",
+        "**A stored floor that cannot be read refuses.** A receiver whose state store "
+        "exists but whose stored floor it cannot read, at a start or later, treats `F` "
+        "as unbounded until a read succeeds, so every envelope that passes checks 1 and "
+        "2 is refused as `before_replay_floor`. It never waits for a read: it refuses "
+        "at once, and tries the read again off the path that verifies. Until the read "
+        "succeeds it drops no key and writes no floor, so no prune or eviction can "
+        "lower what it stored; it admits nothing, so it needs no eviction. The "
+        "unbounded `F` is a refusal, not a floor: it is never stored, and its end "
+        "lowers no floor.",
+        "A store that does not exist holds no floor.",
         "**Only a floor raised by a dropped key is stored,** never a clock reading.",
         "The start rule covers keys dropped while no floor was kept, for envelopes "
         "signed before that start:",
@@ -141,10 +154,18 @@ HELD = {
         "the new one.",
         "A rotation that keeps the earlier secret as the previous one leaves them, since "
         "that secret still verifies.",
+        "A rotation carried out by restarting the receiver is a restart, under the "
+        "start rule in [The floor](#the-floor).",
         "A floor ahead of the clock ends in one of three ways:",
+        "**Wait** until the clock passes it, after correcting the clock if it ran fast. "
+        "This readmits nothing and needs no coordination, so it comes first; its cost is "
+        "the stall. The ways below are for when that wait is too long.",
         "**Restart a receiver that stores nothing and finds no floor an earlier run "
-        "stored,** after correcting its clock. Its floor begins at the corrected clock, "
-        "by the start rule in [The floor](#the-floor).",
+        "stored,** after correcting its clock, under a new secret generation as the "
+        "reset below requires. Its floor begins at the corrected clock, by the start "
+        "rule in [The floor](#the-floor). Without the new generation, every envelope it "
+        "accepted while its clock ran fast would come back into its window as the "
+        "corrected clock reaches it.",
         "**Reset the replay tables of a receiver whose state holds a stored floor,** "
         "whether it still stores its floor or only reads one an earlier run stored. "
         "This is an operator procedure, not a receiver's choice, and the only "
@@ -157,10 +178,15 @@ HELD = {
         "secret verifies, including any configured previous secret. Nothing signed "
         "before the reset verifies after it, so the reset readmits nothing.",
         "A receiver cannot tell new key material from a retired secret brought back, so "
-        "an operator MUST NOT bring back a secret retired by such a reset, in any later "
+        "after a reset, or a restart that lowers a floor as above, an operator MUST NOT "
+        "bring back any secret that verified at that receiver before it, in any later "
         "configuration, as the current secret or the previous one: doing so readmits "
-        "envelopes signed under it that were dropped at the reset.",
-        "Replacing a receiver's whole state store is not a recovery.",
+        "envelopes signed under it that the floor no longer refuses. Until the other "
+        "party moves to the new generation, every envelope it sends is refused.",
+        "Replacing a receiver's whole state store, or restoring an older copy of it, is "
+        "not a recovery: it discards what the store holds beside its replay tables. An "
+        "operator who does either deliberately moves the receiver to a new secret "
+        "generation before it starts again, under the same MUST NOT.",
     ),
     "Senders": (
         "Every sender signs a fresh envelope for every message it publishes, including "
@@ -190,11 +216,17 @@ HELD = {
         "**A stored floor ahead of the clock has no in-band remedy.** A receiver whose "
         "state holds a stored floor refuses every envelope signed below it until its "
         "clock passes it, or until an operator resets its replay tables as "
-        "[Recovery](#recovery) describes. This version defines that procedure and no command for it;",
+        "[Recovery](#recovery) describes. This version defines that procedure and no "
+        "command for it; a refused envelope is logged with the floor and the clock, and "
+        "evidence awaiting acknowledgement is kept and carried again. Meanwhile export "
+        "requests, reasoning responses, heartbeats, inbound evidence and its "
+        "acknowledgements, and LAN messages are refused; Tier D and dispatch never "
+        "consult the floor.",
+        "A floor raised past envelopes that senders signed while their clocks ran fast "
+        "can sit that far ahead of the corrected clock, so the wait has no bound but the "
+        "clock; this differs from a start clock that ran fast, which is never stored.",
         "The floor gives no complete replay protection across the loss of a stored "
         "floor,",
-        "A receiver whose state cannot be read at a start starts from its clock, with "
-        "the same gap.",
     ),
     "Replay vectors": (
         "Each case is a receiver context and a run of events in order.",
@@ -207,6 +239,8 @@ HELD = {
         "happens while the receiver is stopped, nor an authentication discarded before "
         "it is recorded, by a restart or by a rotation that keeps no earlier secret: a "
         "discarded authentication has no event that could follow it.",
+        "Nor does it model storage turned back on, since each case fixes whether its "
+        "receiver stores.",
     ),
 }
 EVENTS = (
@@ -216,6 +250,10 @@ EVENTS = (
     (("evict",), "a full receiver drops its held key with the smallest signing time."),
     (("restart",), "the receiver starts again, with a new skew where the case gives one."),
     (("rotate",), "a rotation that keeps the previous secret, or one that keeps none."),
+    (("floor_unreadable", "floor_read"), "the stored floor becomes unreadable, and a read of "
+     "it succeeds again. Between them the floor an event gives is the one the receiver "
+     "keeps, unchanged; a `restart` between them leaves the floor unreadable, and gives "
+     "the greater of the kept floor and its clock."),
 )
 B_FLOOR = "an envelope signed exactly at the floor, and one millisecond below it"
 B_SKEW = "both skew bounds and one millisecond beyond each"
@@ -232,6 +270,8 @@ B_RESTART = ("a restart that stores its floor and keys, one that stores neither,
 B_AUTH = "a key dropped between `authenticate` and `commit`"
 B_EVICT = ("a full receiver evicting a key, and an evicted key signed ahead of the clock "
            "raising the stored floor above a sender behind it, across a restart")
+B_UNREAD = ("a stored floor that cannot be read, refusing every envelope that passes checks "
+            "1 and 2 and dropping no key, until a read succeeds, across a restart too")
 B_ROTATE = "a rotation that keeps the previous secret and one that keeps none"
 B_STOREOFF = ("a receiver that no longer stores its floor reading one an earlier run stored, "
               "across a restart")
@@ -295,10 +335,10 @@ def bullets(lines: list[str], after: Callable[[str], bool]) -> list[str]:
     return [flat(item) for item in items]
 
 
-def contract_model(text: str) -> dict:
+def contract_model(text: str, guard: bool = True) -> dict:
     sec = sections(text)
     norm = {name: flat("\n".join(lines)) for name, lines in sec.items()}
-    for name, phrases in HELD.items():
+    for name, phrases in HELD.items() if guard else ():
         for phrase in phrases:
             if flat(phrase) not in norm[name]:
                 raise Failure(f"{name}: rule text changed: {phrase!r}")
@@ -365,10 +405,10 @@ def contract_model(text: str) -> dict:
     rv = sec["Replay vectors"]
     events = []
     for item in bullets(rv, lambda line: line.rstrip().endswith("The events are:")):
-        m = re.fullmatch(r"((?:`[a-z]+`(?: and |, )?)+): (.+)", item)
+        m = re.fullmatch(r"((?:`[a-z_]+`(?: and |, )?)+): (.+)", item)
         if not m:
             raise Failure(f"event bullet unrecognised: {item!r}")
-        events.append((tuple(re.findall(r"`([a-z]+)`", m.group(1))), m.group(2)))
+        events.append((tuple(re.findall(r"`([a-z_]+)`", m.group(1))), m.group(2)))
     if tuple(events) != EVENTS:
         raise Failure(f"event list changed: {events}")
     cover = [b.rstrip(";.") for b in bullets(rv, lambda line: line.strip() == "The cases cover:")]
@@ -454,6 +494,27 @@ def guarded_sections(text: str) -> dict[str, list[str]]:
     return out
 
 
+def closed_sections(text: str) -> dict[str, list[str]]:
+    """Every prose sentence of this section, by subsection. The table, the
+    event list and the cover list are parsed instead, and left out here."""
+    out = {}
+    for name, lines in sections(text).items():
+        keep = [line for line in lines if not line.startswith("|")]
+        for lead in ("The events are:", "The cases cover:"):
+            at = next((i for i, line in enumerate(keep) if line.rstrip().endswith(lead)), None)
+            if at is None:
+                continue
+            i = at + 1
+            while i < len(keep) and not keep[i].strip():
+                i += 1
+            j = i
+            while j < len(keep) and keep[j].strip():
+                j += 1
+            keep = keep[:i] + keep[j:]
+        out[f"### {name}" if name else f"## {SECTION}"] = sentences("\n".join(keep))
+    return out
+
+
 def status_notes(status: dict) -> dict[str, list[str]]:
     out = {"notes": sentences(status["notes"])}
     for n, entry in enumerate(status["adoption"]):
@@ -476,7 +537,13 @@ def compare(where: str, held: tuple[str, ...], now: list[str]) -> None:
                   f"{now[i]!r}" if i < len(now) else f"{where}: sentences removed")
 
 
-def check_inventory(text: str, runtime_config: str, status: dict) -> None:
+def check_inventory(text: str, runtime_config: str, status: dict,
+                    guard: bool = True) -> None:
+    if guard:
+        for head, now_closed in closed_sections(text).items():
+            if head not in CLOSED:
+                raise Failure(f"closed passages changed: {head!r}")
+            compare(f"gateway-api/v2.md {SECTION}, {head}", CLOSED[head], now_closed)
     now = guarded_sections(text)
     if set(now) != set(INVENTORY):
         raise Failure(f"guarded sections changed: new {sorted(set(now) - set(INVENTORY))}, "
@@ -510,12 +577,66 @@ def print_inventory(text: str, status: dict) -> None:
             print("    ),")
         print("}")
     print("# BEGIN INVENTORY")
+    block("CLOSED", closed_sections(text))
     block("INVENTORY", guarded_sections(text))
     block("STATUS_NOTES", status_notes(status))
     print("# END INVENTORY")
 
 
 # BEGIN INVENTORY
+CLOSED = {
+    '## Envelope Freshness and Replay': (
+        "907e544e10739af2", "321f315320f9448c", "c16175e806c9447f", "32f3e956cfd84ac0",
+        "31e6e280eca03f63", "4aeef3a3c1380201", "5f5ad92f01e8f8d1", "8e0ed0e8d7dae52c",
+        "8306effa78b6ff0e", "ea165c9512cd800c",
+    ),
+    '### Order of checks': (
+        "9f3f06e67863375e", "add504bd0f1203ea", "34059d674e611468", "a5fae435cd1bbed6",
+        "9aff481ebc0cf273", "d7fc7a0156e4638a", "b7360a1ee590b7d6", "3b4bdd7e3b60ab16",
+        "260be94fb3cc5e6a",
+    ),
+    '### Retention': (
+        "fe182cdb3d442027", "066fa807f8b14451", "3ccec9f6d7bfa6fd", "91b46e886c2fbd00",
+    ),
+    '### The floor': (
+        "b9f272acbe19f575", "c0d96f62f41b5186", "ac96316c6646f468", "c597d20e4a7fcce3",
+        "5585e88cfefbba8f", "cb7eabc6712a4e90", "ca5739c7d2ec6144", "472aab5f7b05ca1e",
+        "f3e9dc6933c115d1", "66ecc8bc1fa05f10", "9e4ab298a6ea203f", "617e6e3200eb4026",
+        "1748c5d824e07965", "900d1ba318d9e9cc", "f4364e6023d0bc58", "961b603f30df4688",
+        "247b895faaa0063b", "d0d71819b6c3d1ae", "eca19c7572e6abd9", "314fc8c3c28b922f",
+        "4870f5d1de4005ea", "b4d569b60fdf9451", "a642249b4c564d14",
+    ),
+    '### What the floor costs': (
+        "8b17e745a4b28523", "e0e95077b6909475", "b6574e4725cf4065", "386ad7d7fbe27753",
+        "c2d93a2d40003e83", "104544d83908e364", "d38d58d08941640e", "78fa57f9fbf6c55f",
+        "06a590b269e84791", "761475668313fcfe", "3e80eb8b09cca3b1", "6068f356e9db47f8",
+        "d45a6161b4bb5dfa",
+    ),
+    '### Recovery': (
+        "619adcc4fef6807f", "28ab1da1b2977d23", "112be67200ee38fe", "44065851a3b34a42",
+        "0c7cb451e2d18fd4", "a7ce7cfc6a37f69b", "afe7c16d2e6768b1", "bb4a3123fdcf46dd",
+        "06c4482c9449b898", "71c51150b0446fea", "86cb2f389fc56c00", "795dc32be6628cde",
+        "d1b50131f044e372", "ebac958e0b90cb82", "036385a7db91fbe1", "f7bb7cf1c5cf9194",
+        "caa4b3ea22095bed", "f9759808d1ddd584", "e5114e161d8c6927",
+    ),
+    '### Senders': (
+        "c2a0a98badf09500", "2337998959e3ff1d", "97c8db8cec0c83c6", "f62fc2bd79035287",
+        "de8d54d759e41924", "ea6149fe9685480a", "0d3516cf3275fee5",
+    ),
+    '### Limits and later versions': (
+        "c6613b2bc1350392", "1a093ac822fa3cf4", "40ac7b42eaf349c4", "163eb1ef4d4a50df",
+        "cb6c9be2c2d2d7b4", "52c15b2c4de7eafa", "6dc9b551a2da5870", "a44ef3a2ee4f2eff",
+        "773d5734c68d999b", "2bf7f7c73fd88de2", "8979123931d8c1cb", "8defdbd9fd4a1b72",
+        "8a123c15216d339d", "9332dd29553fa096", "9d12a72b5e1b1153", "a10aedd24b562822",
+        "07d43d04eb32fe9a", "579fe76e14eac208", "49cc247d72a5157a", "95550767a4965289",
+        "e3997041950dcac3", "02e6a2bef7b8daf4", "791ee0edd657384f", "cfcee60d876303e1",
+    ),
+    '### Replay vectors': (
+        "dbd83f21b3c4c282", "a2963ebd6e47a247", "361d7c705465f134", "c1be6321390f1053",
+        "e335b4e3e393e9ce", "dc287454edbdbc1a", "fc33d96a38a0c41b", "26549a5509500421",
+        "6f390a9ff1540603", "cb3f91d54eee30e5",
+    ),
+}
 INVENTORY = {
     '## LAN Tier C Reply Relay': (
         "d0e7ab50508c3525", "83f940aa289acc27", "0e2fc95ac65bdc28", "87d07873c56f60cc",
@@ -687,8 +808,8 @@ STATUS_NOTES = {
     'adoption[0] runtime producer': (
         "7636f71480c9589d", "b9ae8504f83fa8cf", "f57e5d580dc008a9", "29cc75c4ddb2d911",
         "a5e66bd74badb42a", "cfd3e5e61be850ee", "03548165981c8cf5", "e566cef7cadd1485",
-        "c6a90e7849ca3b3d", "f967b9df2c94143b", "289b0232acaab549", "1226e06d8ba3377e",
-        "0966f76c623879aa", "b95c9ae9a20bf400",
+        "c6a90e7849ca3b3d", "5bf80d51a190d425", "f967b9df2c94143b", "289b0232acaab549",
+        "1226e06d8ba3377e", "0966f76c623879aa", "b95c9ae9a20bf400",
     ),
     'adoption[1] gateway gateway': (
         "5c380aab69df24f7", "763600babc148902", "9d326ad342737521", "c60c28a6f9a05d70",
@@ -714,6 +835,7 @@ class Receiver:
         self.base = ctx["start_clock_ms"]         # the clock at the last start
         self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
         self.pending: dict[str, tuple[str, int, int]] = {}
+        self.unreadable = False                   # F unbounded: a refusal, not a floor
 
     @property
     def floor(self) -> int:
@@ -723,6 +845,8 @@ class Receiver:
     def fails(self, c: dict, key: str, s: int, t: int) -> bool:
         if c["rhs"] == "held":
             return key in self.held
+        if c["rhs"] == "F" and self.unreadable:
+            return True
         rhs = {"t-S": t - self.skew, "t+S": t + self.skew, "F": self.floor}[c["rhs"]]
         return not OPS[c["op"]](s, rhs)
 
@@ -744,21 +868,25 @@ class Receiver:
         return self.ttl is None or OPS[self.m["ttl_op"]](t, r + self.ttl)
 
 
-def replay(model: dict, case: dict, rotate_as: dict | None = None) -> list[dict]:
-    """`rotate_as` is for mutants only: a rotation the contract does not allow."""
+def replay(model: dict, case: dict, rotate_as: dict | None = None,
+           unread_as: str | None = None) -> list[dict]:
+    """`rotate_as` and `unread_as` are for mutants only: a rotation, or a
+    receiver with an unreadable floor, that the contract does not allow."""
     rx = Receiver(model, case["context"])
     trace = []
     for i, ev in enumerate(case["events"]):
         kind, t = ev["event"], ev["t"]
         rec = {"i": i, "kind": kind, "t": t, "ev": ev, "pre_floor": rx.floor,
                "pre_raised": rx.raised, "pre_skew": rx.skew, "pre_held": dict(rx.held),
-               "pre_pending": dict(rx.pending),
+               "pre_pending": dict(rx.pending), "unreadable": rx.unreadable,
                "reason": None, "dropped": [], "fails": None, "key": ev.get("key"),
                "s": ev.get("signed_at_ms")}
         if kind in ("receive", "authenticate"):
             rec["fails"] = [rx.fails(c, ev["key"], ev["signed_at_ms"], t)
                             for c in model["checks"]]
             rec["reason"] = rx.verify(list(range(4)), ev["key"], ev["signed_at_ms"], t)
+            if rx.unreadable and unread_as == "first":
+                rec["reason"] = model["checks"][2]["reason"]
             if rec["reason"] is None:
                 if kind == "receive":
                     rx.held[ev["key"]] = (ev["signed_at_ms"], t)
@@ -777,18 +905,33 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None) -> list[dict]
             if rec["reason"] is None:
                 rx.held[key] = (s, r)              # receipt time from the authenticate
         elif kind == "prune":
-            for key in [k for k, (s, r) in rx.held.items() if rx.retention_ended(s, r, t)]:
-                rec["dropped"].append(rx.drop(key))
+            # An unreadable floor drops no key and writes no floor.
+            if not rx.unreadable or unread_as == "drop":
+                for key in [k for k, (s, r) in rx.held.items() if rx.retention_ended(s, r, t)]:
+                    rec["dropped"].append(rx.drop(key))
         elif kind == "evict":
-            if not rx.held:
+            if rx.unreadable:
+                pass                               # it admits nothing, so evicts nothing
+            elif not rx.held:
                 raise Failure(f"event {i}: evict with nothing held")
-            least = min(s for s, _ in rx.held.values())
-            ties = sorted(k for k, (s, _) in rx.held.items() if s == least)
-            # Any one of several sharing the smallest signing time may go; the
-            # declared held keys name which, and must be one of them.
-            want = set(ev["expected"]["held"])
-            pick = next((k for k in ties if set(rx.held) - {k} == want), ties[0])
-            rec["dropped"].append(rx.drop(pick))
+            else:
+                least = min(s for s, _ in rx.held.values())
+                ties = sorted(k for k, (s, _) in rx.held.items() if s == least)
+                # Any one of several sharing the smallest signing time may go; the
+                # declared held keys name which, and must be one of them.
+                want = set(ev["expected"]["held"])
+                pick = next((k for k in ties if set(rx.held) - {k} == want), ties[0])
+                rec["dropped"].append(rx.drop(pick))
+        elif kind == "floor_unreadable":
+            if rx.unreadable:
+                raise Failure(f"event {i}: floor_unreadable while already unreadable")
+            rx.unreadable = True
+        elif kind == "floor_read":
+            if not rx.unreadable and unread_as is None:
+                raise Failure(f"event {i}: floor_read with the floor readable")
+            rx.unreadable = False                  # its end lowers no floor
+            if unread_as == "lowered":
+                rx.raised = None
         elif kind == "restart":
             if not rx.stores:
                 rx.raised, rx.held = None, {}
@@ -796,6 +939,8 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None) -> list[dict]
             if "skew_ms" in ev:
                 rx.skew = ev["skew_ms"]
             rx.pending = {}
+            if unread_as == "restart_clears":
+                rx.unreadable = False
         elif kind == "rotate":
             # A rotation keeps the floor and every held key whether or not it keeps
             # the earlier secret; only an offline reset, never an event, lowers it.
@@ -822,6 +967,8 @@ EVENT_FIELDS = {
     "evict": ({"event", "t", "expected"}, set()),
     "restart": ({"event", "t", "expected"}, {"skew_ms"}),
     "rotate": ({"event", "keeps_previous", "t", "expected"}, set()),
+    "floor_unreadable": ({"event", "t", "expected"}, set()),
+    "floor_read": ({"event", "t", "expected"}, set()),
 }
 REASONED = {"receive", "authenticate", "commit"}
 
@@ -862,6 +1009,15 @@ def check_shape(corpus: dict, model: dict) -> None:
                     or not is_int(h["signed_at_ms"]) or not is_int(h["received_at_ms"]):
                 raise Failure(f"{name}: context held entry {h}")
             sig[h["key"]] = h["signed_at_ms"]
+            # A receiver that stores nothing holds only keys it accepted this run:
+            # received since its start, within the skew, at or above its start floor.
+            if not ctx["stores"]:
+                start = max(ctx["start_clock_ms"], ctx["stored_floor_ms"] or ctx["start_clock_ms"])
+                r = h["received_at_ms"]
+                if r < ctx["start_clock_ms"] or h["signed_at_ms"] < start \
+                        or not r - ctx["skew_ms"] <= h["signed_at_ms"] <= r + ctx["skew_ms"]:
+                    raise Failure(f"{name}: held key {h['key']} cannot be held by a receiver "
+                                  f"that stores nothing")
         for i, ev in enumerate(case["events"]):
             kind = ev.get("event")
             if kind not in EVENT_FIELDS:
@@ -872,6 +1028,9 @@ def check_shape(corpus: dict, model: dict) -> None:
             if not is_int(ev["t"]) or ("skew_ms" in ev and not (is_int(ev["skew_ms"])
                                                                 and ev["skew_ms"] >= 0)):
                 raise Failure(f"{name} event {i}: types")
+            if kind == "floor_unreadable" and not ctx["stores"] \
+                    and ctx["stored_floor_ms"] is None:
+                raise Failure(f"{name} event {i}: floor_unreadable with no store to read")
             if kind == "rotate" and type(ev["keeps_previous"]) is not bool:
                 raise Failure(f"{name} event {i}: keeps_previous")
             if "signed_at_ms" in ev:
@@ -1173,6 +1332,56 @@ def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]],
                    and found < r["t"] < r["pre_raised"] and r["floor"] == r["t"]
                    and r["raised"] is None for r in tr)
 
+    def unreadable_spans(tr):
+        for a in tr:
+            if a["kind"] == "floor_unreadable":
+                b = next((x for x in tr[a["i"] + 1:] if x["kind"] == "floor_read"), None)
+                if b is not None:
+                    yield a, tr[a["i"] + 1:b["i"]], b
+
+    def unread_refuses(ctx, tr):
+        # an envelope the kept floor admits, passing checks 1 and 2, is refused
+        return any(r["kind"] == "receive" and r["reason"] == FLOOR and not r["fails"][0]
+                   and not r["fails"][1] and r["s"] >= r["pre_floor"]
+                   and r["key"] not in r["pre_held"]
+                   for _, span, _ in unreadable_spans(tr) for r in span)
+
+    def unread_keeps(ctx, tr):
+        # a prune finds a key whose retention has ended and drops nothing
+        ttl = ctx["replay_ttl_ms"]
+        return any(r["kind"] == "prune" and not r["dropped"] and r["held"] == r["pre_held"]
+                   and r["floor"] == r["pre_floor"]
+                   and any(r["t"] > s + r["pre_skew"] and (ttl is None or r["t"] >= rc + ttl)
+                           for s, rc in r["pre_held"].values())
+                   for _, span, _ in unreadable_spans(tr) for r in span)
+
+    def unread_restart(ctx, tr):
+        # a restart inside the span leaves the floor unreadable: after it, an
+        # envelope the floor it gives would admit is still refused
+        for _, span, _ in unreadable_spans(tr):
+            for j, rs in enumerate(span):
+                if rs["kind"] == "restart" and any(
+                        r["kind"] == "receive" and r["reason"] == FLOOR and not r["fails"][0]
+                        and not r["fails"][1] and r["s"] >= rs["floor"]
+                        for r in span[j + 1:]):
+                    return True
+        return False
+
+    def unread_ends(ctx, tr):
+        # the read restores the kept floor, which refuses again, and the key the
+        # unreadable prune kept is dropped by the next
+        for a, span, b in unreadable_spans(tr):
+            if b["floor"] != a["pre_floor"] or b["held"] != a["pre_held"]:
+                continue
+            after = _segment_after(tr, b["i"])
+            if any(r["kind"] == "receive" and r["reason"] == FLOOR and not r["fails"][0]
+                   and r["s"] < b["floor"] for r in after) \
+                    and any(r["kind"] == "prune" and any(k in a["pre_held"]
+                                                         for k, _, _ in r["dropped"])
+                            for r in after):
+                return True
+        return False
+
     idx = {c["rhs"]: n for n, c in enumerate(model["checks"])}
 
     def precedence(a, b):
@@ -1258,6 +1467,13 @@ def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]],
                     rotation(False))],
         B_COMMIT: [("a committed key dropped at its authentication's receipt plus ttl, "
                     "before its commit's", commit_receipt)],
+        B_UNREAD: [("while unreadable, an envelope the kept floor admits is refused at the "
+                    "floor", unread_refuses),
+                   ("while unreadable, a prune drops nothing though a key's retention has "
+                    "ended", unread_keeps),
+                   ("the read restores the kept floor, which refuses again, and a later "
+                    "prune drops the kept key", unread_ends),
+                   ("a restart inside the span leaves the floor unreadable", unread_restart)],
         B_PREC: [("stale and below the floor", precedence("t-S", "F")),
                  ("future and below the floor", precedence("t+S", "F")),
                  ("below the floor and held", precedence("F", "held"))],
@@ -1265,7 +1481,7 @@ def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]],
 
 
 COVERAGE = (B_FLOOR, B_SKEW, B_TTL, B_COMMIT, B_SENDERS, B_CLOCK, B_SKEWCHG, B_RESTART,
-            B_STOREOFF, B_AUTH, B_EVICT, B_ROTATE, B_PREC)
+            B_STOREOFF, B_AUTH, B_EVICT, B_ROTATE, B_UNREAD, B_PREC)
 
 
 def witnesses(corpus: dict, model: dict, traces: dict) -> dict[tuple[str, str], list[str]]:
@@ -1287,10 +1503,11 @@ def check_coverage(corpus: dict, model: dict, traces: dict) -> None:
 # ---------------------------------------------------------------- run
 
 def check(text: str, corpus: dict, rc: str | None = None,
-          st: dict | None = None) -> tuple[dict, dict]:
-    model = contract_model(text)
+          st: dict | None = None, guard: bool = True) -> tuple[dict, dict]:
+    model = contract_model(text, guard)
     check_inventory(text, rc if rc is not None else RUNTIME_CONFIG.read_text(encoding="utf-8"),
-                    st if st is not None else json.loads(STATUS.read_text(encoding="utf-8")))
+                    st if st is not None else json.loads(STATUS.read_text(encoding="utf-8")),
+                    guard)
     check_shape(corpus, model)
     traces = check_replay(corpus, model)
     check_coverage(corpus, model, traces)
@@ -1298,9 +1515,9 @@ def check(text: str, corpus: dict, rc: str | None = None,
 
 
 def outcome(text: str, corpus: dict, rc: str | None = None,
-            st: dict | None = None) -> str | None:
+            st: dict | None = None, guard: bool = True) -> str | None:
     try:
-        check(text, corpus, rc, st)
+        check(text, corpus, rc, st, guard)
     except Failure as failure:
         return str(failure)
     except (KeyError, TypeError, ValueError, IndexError, StopIteration) as failure:
@@ -1379,6 +1596,29 @@ def mutations(text: str, corpus: dict) -> int:
             cm(f"{case['name']}: a rotation {'keeping' if keeps else 'keeping none'} "
                f"{what}", recast)
 
+    unchanged: list[str] = []
+    for how, what in (("first", "refuses ahead of checks 1 and 2"),
+                      ("drop", "lets a prune drop keys"),
+                      ("lowered", "comes back with a lowered floor"),
+                      ("restart_clears", "becomes readable at a restart")):
+        for ci, case in enumerate(corpus["cases"]):
+            if not any(e["event"] == "floor_unreadable" for e in case["events"]):
+                continue
+
+            def unread(c, ci=ci, case=case, how=how):
+                for ev, rec in zip(c["cases"][ci]["events"],
+                                   replay(model, case, unread_as=how)):
+                    ev["expected"] = {"floor_ms": rec["floor"], "held": sorted(rec["held"])}
+                    if ev["event"] in REASONED:
+                        ev["expected"]["reason"] = rec["reason"]
+            label = f"{case['name']}: an unreadable floor {what}"
+            probe = copy.deepcopy(corpus)
+            unread(probe)
+            if probe == corpus:
+                unchanged.append(f"{label}: the case reads the same under it")
+            else:
+                cm(label, unread)
+
     def after_rotation(c):
         c["cases"].append({
             "name": "zz-mutant-commit-after-rotation", "note": "",
@@ -1417,6 +1657,16 @@ def mutations(text: str, corpus: dict) -> int:
                                                      prev["expected"]["floor_ms"])
     cm("corpus: storage off writes its run's raise across a restart", written)
 
+    def unreachable(c):
+        for case in c["cases"]:
+            ctx = case["context"]
+            if not ctx["stores"] and ctx["stored_floor_ms"] is not None:
+                f = ctx["stored_floor_ms"]
+                ctx["held"].append({"key": "zz-mutant", "signed_at_ms": f - 1000,
+                                    "received_at_ms": f - 1000})
+    cm("corpus: a receiver that stores nothing holds a key below the floor it found",
+       unreachable)
+
     cm("header: contract", lambda c: c.__setitem__("contract", "ori-specs/gateway-api/v1.md"))
     cm("header: section", lambda c: c.__setitem__("section", "Envelope Freshness"))
     cm("header: reasons reordered", lambda c: c["reasons"].reverse())
@@ -1427,7 +1677,7 @@ def mutations(text: str, corpus: dict) -> int:
     # Cases that are the only witness of some coverage part.
     _, traces = (model, check_replay(corpus, model)) if base is None or \
         base.startswith("cover bullets") else (model, None)
-    equivalent = []
+    equivalent = list(unchanged)
     if traces is not None:
         sole: dict[str, list[str]] = {}
         for (bullet, label), w in witnesses(corpus, model, traces).items():
@@ -1532,13 +1782,62 @@ def mutations(text: str, corpus: dict) -> int:
        "  every start;", "ignores that floor at\n  every start;")
     tm("text: storage off writes the floor", "it never raises or writes it,",
        "it raises and writes it,")
-    tm("text: unreadable state keeps protection", "cannot be read at a start starts from its "
-       "clock, with the same gap.", "cannot be read at a start keeps its protection.")
+    tm("text: unreadable floor waits for a read", "It never waits for a\n  read: it "
+       "refuses at once,", "It waits for a\n  read before it refuses,")
+    tm("text: unreadable floor starts from the clock", "treats `F` as unbounded until a read "
+       "succeeds,", "starts from its clock,")
+    tm("text: an unreadable floor lets a prune drop", "Until the read succeeds it drops no "
+       "key and writes no floor,", "Until the read succeeds it drops keys as usual,")
+    tm("text: the unbounded F is stored", "it is never\n  stored, and its end lowers no "
+       "floor.", "it is\n  stored until a read succeeds.")
+    tm("text: unreadable floor refuses ahead of checks 1 and 2", "so every envelope that "
+       "passes\n  checks 1 and 2 is refused as `before_replay_floor`.", "so every envelope "
+       "is\n  refused as `before_replay_floor`, before checks 1 and 2.")
+    tm("text: a fast start clock is stored", "this differs from a\n  start clock that ran "
+       "fast, which is never stored.", "so does a\n  start clock that ran fast.")
+    tm("text: stuck floor reaches dispatch", "Tier D and dispatch never\n  consult the "
+       "floor.", "Tier D and dispatch\n  consult the floor.")
+    tm("text: the other party's envelopes admitted", "Until the other\nparty moves to the "
+       "new generation, every envelope it sends is refused.", "")
+    tm("text: stateless restart without a new generation", ", under a new secret "
+       "generation as the\n  reset below requires.", ".")
+    tm("text: a restart-rotation is not a restart", "A rotation carried out by restarting "
+       "the\nreceiver is a restart,", "A rotation carried out by restarting the\n"
+       "receiver is a rotation,")
+    tm("text: restore without a new generation", "An\noperator who does either "
+       "deliberately moves the receiver to a new secret\ngeneration before it starts "
+       "again, under the same MUST NOT.", "")
+    # The forgeries an adversarial review found the phrase holds accepted.
+    tm("forgery 1: the reset keeps evidence only", "evidence awaiting acknowledgement, "
+       "action\n    records and operator decisions are kept;",
+       "evidence awaiting acknowledgement is kept;")
+    tm("forgery 1: the reset may clear the rest", "action\n    records and operator "
+       "decisions are kept;", "action\n    records and operator decisions may be cleared;")
+    wait = ("- **Wait** until the clock passes it, after correcting the clock if it ran\n"
+            "  fast. This readmits nothing and needs no coordination, so it comes first; its\n"
+            "  cost is the stall. The ways below are for when that wait is too long.\n")
+    tm("forgery 2: the Wait bullet deleted", wait, "")
+    tm("forgery 3: a fourth way, by rotation", wait,
+       wait + "- **Rotate the secret,** which drops the stored floor and keys.\n")
+    tm("text: waiting without correcting a fast clock", ", after correcting the clock if "
+       "it ran\n  fast.", ".")
+    tm("text: waiting needs coordination", "This readmits nothing and needs no "
+       "coordination,", "This needs coordination,")
+    tm("forgery 4: a rotation may drop the floor", "only permitted path that lowers a "
+       "stored floor.\n", "only permitted path that lowers a stored floor. A rotation "
+       "that keeps no earlier secret may also drop it.\n")
+    tm("forgery 5: the tables deleted while running", "A store lost by\naccident is "
+       "covered", "An operator may instead delete the replay tables while the receiver "
+       "runs. A store lost by\naccident is covered")
+    tm("forgery 6: stuck floor drops evidence", "and evidence awaiting acknowledgement is "
+       "kept and carried again.", "and evidence awaiting acknowledgement is dropped.")
+    tm("forgery 7: the store-replacement rationale replaced", "it discards what the store "
+       "holds beside its replay tables.", "it is only slower than a reset.")
     tm("text: corpus claims to model the reset", "The corpus does not model the operator "
        "reset", "The corpus models the operator reset")
     tm("text: a command clears the floor", "and no command clears them.",
        "and a command may clear them.")
-    tm("text: MUST NOT bring back", "MUST NOT bring back a secret", "may bring back a secret")
+    tm("text: MUST NOT bring back", "MUST NOT\nbring back any secret", "may\nbring back any secret")
     tm("text: bring back only as current", "secret or the previous one:", "secret:")
     tm("text: limits no longer bound claims", "it stops outside the cases",
        "it stops in every case, even the cases")
@@ -1612,11 +1911,23 @@ def mutations(text: str, corpus: dict) -> int:
             ":", ": also", 1) if blk.startswith("- `") else blk + " too"
         tm(f"text: bullet reworded: {label}…", blk, reworded)
 
+    for head in [f"## {SECTION}"] + [f"### {n}" for n in SUBSECTIONS]:
+        tm(f"closed: a sentence added under {head}", f"{head}\n\n",
+           f"{head}\n\nA receiver may lower its floor.\n\n")
+
+    # Mutants of what the replay reads from the text: refused with the held and
+    # closed sentences switched off too, so the model refuses them itself.
+    parsed = re.compile(r"text: (table rows|checks \d|reason \S+ renamed|\d [≥≤] |retention|"
+                        r"recheck|drop raises by 2|start takes the lesser)")
+    base_model = outcome(text, corpus, guard=False)
     survived = 0
     for label, make in cases:
         got = outcome(*make())
         if got is None if base is None else got == base:
             print(f"SURVIVED {label}")
+            survived += 1
+        elif parsed.match(label) and outcome(*make(), guard=False) == base_model:
+            print(f"SURVIVED by the held text only {label}")
             survived += 1
     print(f"{len(cases)} mutants, {len(cases) - survived} refused, {survived} survived")
     for e in equivalent:

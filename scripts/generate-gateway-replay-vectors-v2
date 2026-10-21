@@ -34,6 +34,7 @@ class Receiver:
         self.start = ctx["start_clock_ms"]
         self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
         self.pending: dict[str, tuple[int, int]] = {}
+        self.unreadable = False
 
     def floor(self) -> int:
         return max(x for x in (self.stored_floor, self.read_floor, self.start) if x is not None)
@@ -51,7 +52,7 @@ class Receiver:
         return None
 
     def _tail(self, key: str, signed: int) -> str | None:
-        if signed < self.floor():
+        if self.unreadable or signed < self.floor():
             return "before_replay_floor"
         if key in self.held:
             return "replay_detected"
@@ -75,6 +76,12 @@ class Receiver:
             if reason is None:
                 self.held[ev["key"]] = (signed, received)
             return reason
+        if kind in ("floor_unreadable", "floor_read"):
+            self.unreadable = kind == "floor_unreadable"
+            return None
+        if kind in ("prune", "evict") and self.unreadable:
+            # Nothing is dropped and no floor written until the stored floor can be read again.
+            return None
         if kind == "prune":
             t = ev["t"]
             for key, (signed, received) in sorted(self.held.items()):
@@ -135,6 +142,14 @@ def prune(t: int) -> dict:
 
 def evict(t: int) -> dict:
     return {"event": "evict", "t": t}
+
+
+def unreadable(t: int) -> dict:
+    return {"event": "floor_unreadable", "t": t}
+
+
+def readable(t: int) -> dict:
+    return {"event": "floor_read", "t": t}
 
 
 def restart(t: int, skew: int | None = None) -> dict:
@@ -260,6 +275,17 @@ CASES = (
      ctx(stores=True, start=0),
      [rx("a", 10250, 10000), rx("b", 10260, 10000), evict(10000), rx("c", 10100, 10100),
       restart(10120), rx("d", 10200, 10200), rx("e", 10251, 10251)]),
+    ("unreadable_floor_refuses_and_drops_nothing",
+     "while the stored floor cannot be read, an envelope that passes checks 1 and 2 is refused as below the "
+     "floor, and no prune drops a key or writes a floor; once a read succeeds the stored floor stands",
+     ctx(stored=10000, start=0, held=(("a", 10100, 10100),)),
+     [unreadable(10150), rx("b", 10150, 10150), rx("c", 9000, 10150), prune(10500), readable(10500),
+      rx("e", 9999, 10200), prune(10500), rx("d", 10500, 10500)]),
+    ("unreadable_floor_survives_restart",
+     "a restart while the stored floor cannot be read leaves it unreadable, refusing an envelope its floor "
+     "would admit, until a read succeeds",
+     ctx(stored=10000, start=0),
+     [unreadable(20000), restart(21000), rx("p", 21000, 21000), readable(21000), rx("q", 21000, 21000)]),
     ("restart_with_storage_off_keeps_earlier_floor",
      "a receiver that no longer stores its floor reads one an earlier run stored at every start, never "
      "raises it, and loses its own run's raise at a restart",
