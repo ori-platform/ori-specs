@@ -132,6 +132,9 @@ Stated limits:
   is in an assessed snapshot.
 - The checker cannot tell whether an amended rule really resolves the item
   it names, or whether a fix fixes it; review does.
+- An item recorded by mistake leaves only at a later snapshot or by an
+  amended rule. A resolution naming a fix that fixed nothing misstates the
+  record; review refuses it.
 
 `vendored_revision` is input-document provenance only. It is not a conformance
 claim and not a conformance result, and a vendored revision that differs from

@@ -589,15 +589,40 @@ def amends_document(rev: str, path: str) -> bool:
         return False
     old = _git_out(ROOT, "show", f"{rev}^1:{path}")
     new = _git_out(ROOT, "show", f"{rev}:{path}")
-    return new is not None and (old is None or normative_digest(old) != normative_digest(new))
+    return new is not None and (old is None or normative_words(old) != normative_words(new))
 
 
-def first_recorded(text: str, status_rel: str) -> str | None:
-    """The ori-specs commit at which a status record first carried text, from the record's log."""
-    if text in RECORDED_AT:
-        return RECORDED_AT[text]
-    out = _git_out(ROOT, "log", "--reverse", "--format=%H", "-S", text, "HEAD", "--", status_rel)
-    return (out or "").split()[0] if (out or "").split() else None
+def normative_words(text: str) -> str:
+    """A document's text outside its Status block with whitespace collapsed, so a re-wrap changes nothing."""
+    return " ".join(" ".join(normative_lines(text)).split())
+
+
+def carries(rec: object, item: tuple[str, str]) -> bool:
+    """Whether a parsed status record's assessments, active or superseded, record the item."""
+    field = dict(RECORDED_KINDS)[item[0]]
+    for e in rec.get("adoption") or [] if isinstance(rec, dict) else []:
+        if not isinstance(e, dict):
+            continue
+        prior = e.get("prior_assessments") if isinstance(e.get("prior_assessments"), list) else []
+        for a in [e.get("assessment"), *prior]:
+            if isinstance(a, dict) and isinstance(a.get(field), list) and item[1] in a[field]:
+                return True
+    return False
+
+
+def first_recorded(item: tuple[str, str], status_rel: str) -> str | None:
+    """The ori-specs commit at which a status record's assessments first recorded the item, found by parsing each
+    version of the record in its log, oldest first, so an escaped or repeated string cannot mislead it."""
+    if item[1] in RECORDED_AT:
+        return RECORDED_AT[item[1]]
+    for rev in (_git_out(ROOT, "log", "--reverse", "--format=%H", "HEAD", "--", status_rel) or "").split():
+        blob = _git_out(ROOT, "show", f"{rev}:{status_rel}")
+        try:
+            if blob is not None and carries(json.loads(blob), item):
+                return rev
+        except (json.JSONDecodeError, RecursionError):
+            continue
+    return None
 
 
 def recorded_items(entry: dict) -> dict[tuple[str, str], list[str]]:
@@ -695,7 +720,7 @@ def check_assessment_history(rec: dict, w: str, e: dict, asm: dict, bad: Callabl
                                           f"recorded this {item[0]}, so no fix can resolve it there")
         else:
             rev = str(r.get("contract_revision", ""))
-            first = first_recorded(item[1], status_rel) if HEX.match(rev) else None
+            first = first_recorded(item, status_rel) if HEX.match(rev) else None
             if not HEX.match(rev) or "commit" in r:
                 bad("resolution-invalid", f"{rw} is an amended rule, so it names contract_revision, the ori-specs "
                                           "commit the active assessment was judged under, and no commit")
@@ -705,9 +730,12 @@ def check_assessment_history(rec: dict, w: str, e: dict, asm: dict, bad: Callabl
             elif not amends_document(rev, doc):
                 bad("resolution-invalid", f"{rw}'s contract_revision {rev} is not a commit in this repository's "
                                           f"history that changed the normative text of {doc}")
-            elif first is None or not strictly_descends(ROOT, rev, first):
-                bad("resolution-invalid", f"{rw}'s contract_revision {rev} does not descend from {first or 'the '
-                                          'commit that recorded it'}, where this {item[0]} was first recorded")
+            elif first is None:
+                bad("resolution-invalid", f"{rw}: no commit of {status_rel} records this {item[0]} in an assessment, "
+                                          "so no amended rule can be shown to follow it")
+            elif not strictly_descends(ROOT, rev, first):
+                bad("resolution-invalid", f"{rw}'s contract_revision {rev} does not descend from {first}, where "
+                                          f"this {item[0]} was first recorded")
     for k in owed:
         if named.count(k) != 1:
             bad("resolution-missing", f"{w} does not keep the {k[0]} {k[1]!r} that a superseded assessment recorded, "
@@ -4280,6 +4308,20 @@ def mutations() -> int:
     # invented an anchor (keeping emphasis marks, a link's destination) would let a missing section look present.
     # The quoted-title heading a CommonMark comparison found the earlier parsing anchored as #rule-title: both the
     # anchor the earlier parsing invented and the one GitHub renders are refused, the latter for its form.
+    # A re-wrap amends nothing, and an item is found in a record however JSON escapes it.
+    doc = "# D\n\nA receiver MUST refuse a\nstale envelope.\n"
+    for name, good in (
+            ("a re-wrap leaves the normative words unchanged",
+             normative_words(doc) == normative_words(doc.replace("a\nstale", "a stale"))),
+            ("a changed word changes them", normative_words(doc) != normative_words(doc.replace("stale", "old"))),
+            ("an item quoting \" and \\ is found in a parsed record", carries(json.loads(json.dumps({
+                "adoption": [{"prior_assessments": [{"divergences": ['takes "x" \\ y']}]}]})),
+                ("divergence", 'takes "x" \\ y'))),
+            ("an item in notes alone is not found", not carries({"notes": "d", "adoption": [{}]},
+                                                                  ("divergence", "d")))):
+        print(f"{'ok  ' if good else 'FAIL'} {name}")
+        total += 1
+        failed += not good
     # A fix in a private repository is rendered as unverified by CI; one in a public repository is not.
     for repo, want in (("edge-firmware", "(1 resolution unverified by CI)"), ("gateway", None)):
         line = render_adoption({"adoption": [{
