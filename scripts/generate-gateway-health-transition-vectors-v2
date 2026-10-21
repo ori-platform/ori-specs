@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate the gateway-api/v2 health transition corpus.
+
+Each case is the first item of a `health` export response, already verified,
+and whether the gateway has read a marked item from that device before. Nothing
+here is shared with scripts/check-gateway-health-transition-vectors-v2, which
+reads the three readings, the projection-only members and the latch from the
+contract rather than from this file.
+
+    python3 scripts/generate-gateway-health-transition-vectors-v2          # write
+    python3 scripts/generate-gateway-health-transition-vectors-v2 --check  # reproduce
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "gateway-api" / "vectors" / "health-transition-v2.json"
+
+MARK = "runtime-health/v4/remote"
+DEVICE = "ori-rt-1a2b3c"
+ABSENT = object()
+
+
+def snapshot(critical: object = False, status: object = ABSENT, **extra: object) -> dict:
+    """A snapshot as runtimes after v2.5.0 serve it, trimmed: it carries firmware_reading_age,
+    which v2.5.0 does not send, so case 3b never applies to it."""
+    item: dict = {"device_id": DEVICE, "uptime_s": 812.5, "capability_posture": {"available": True},
+                  "firmware_reading_age": {"state": "available"}}
+    if critical is not ABSENT:
+        item["critical"] = critical
+    if status is not ABSENT:
+        item["status"] = status
+    item.update(extra)
+    return item
+
+
+def v250(critical: object = ABSENT, status: object = ABSENT, **extra: object) -> dict:
+    """A snapshot in v2.5.0's encoding: only members v2.5.0 sends."""
+    item: dict = {"device_id": DEVICE, "uptime_s": 812.5, "health_socket_path": "/run/ori/h.sock",
+                  "capability_posture": {"available": True}, "sensors": [],
+                  "alert_outbox": {}, "evidence": {}, "commissioning": {},
+                  "firmware_liveness": {"state": "available"}, "telemetry_export": {}}
+    if critical is not ABSENT:
+        item["critical"] = critical
+    if status is not ABSENT:
+        item["status"] = status
+    item.update(extra)
+    return item
+
+
+REASONS = {"ok": [], "degraded": ["commissioning_problem"],
+           "critical": ["firmware_liveness_device_expired"]}
+
+
+def projection(status: object = "ok", mark: object = MARK) -> dict:
+    """A projection whose critical and degradation_reasons agree with its status, as
+    runtime-health/v4 requires."""
+    item: dict = {"projection": mark, "device_id": DEVICE, "uptime_s": 812.5,
+                  "critical": status == "critical",
+                  "degradation_reasons": REASONS.get(status, []) if isinstance(status, str) else [],
+                  "unknown_critical_blocks": []}
+    if status is not ABSENT:
+        item["status"] = status
+    return item
+
+
+def bare(mark: object) -> dict:
+    """A snapshot carrying `projection` and no other projection-only member."""
+    return dict(snapshot(False, "ok"), projection=mark)
+
+
+# (name, note, latched before, item, severity, latched after)
+CASES = (
+    ("marked_ok", "a projection's status is its severity", False, projection("ok"), "ok", True),
+    ("marked_degraded", "", False, projection("degraded"), "degraded", True),
+    ("marked_critical", "", False, projection("critical"), "critical", True),
+    ("marked_status_absent", "a projection without status is unknown, never ok", False,
+     projection(ABSENT), "unknown", True),
+    ("marked_status_other", "a status outside v4's three", False, projection("healthy"),
+     "unknown", True),
+    ("marked_status_not_string", "a status of another JSON type", False, projection(0),
+     "unknown", True),
+    ("marked_while_latched", "the latch changes nothing for a marked item", True,
+     projection("degraded"), "degraded", True),
+    ("marked_critical_true_status_absent", "critical is never read as less, a missing status "
+     "included", False, dict(projection(ABSENT), critical=True), "critical", True),
+    ("marked_status_critical_without_critical", "either signal reads critical", False,
+     dict(projection("critical"), critical=False), "critical", True),
+    ("projection_alone_other_value", "projection with another value is projection-only on its "
+     "own", False, bare("runtime-health/v3"), "unknown", False),
+    ("projection_alone_extended", "the marker is compared whole, never by prefix", False,
+     bare(MARK + "/2"), "unknown", False),
+    ("projection_alone_trailing_space", "the marker is compared whole, never after trimming",
+     False, bare(MARK + " "), "unknown", False),
+    ("projection_alone_not_string", "", False, bare(4), "unknown", False),
+    ("unmarked_unknown_critical_blocks", "a projection-only member", False,
+     snapshot(False, unknown_critical_blocks=[]), "unknown", False),
+    ("unmarked_action_log_records", "", False,
+     snapshot(False, action_log_records={"state": "available"}), "unknown", False),
+    ("unmarked_safety_registry", "", False, snapshot(False, safety_registry={"state": "available"}),
+     "unknown", False),
+    ("unmarked_skill_hooks", "", False, snapshot(False, skill_hooks={"state": "available"}),
+     "unknown", False),
+    ("unmarked_member_with_critical", "critical is never read as less, a projection-only member "
+     "included", False, snapshot(True, unknown_critical_blocks=[]), "critical", False),
+    ("unmarked_member_latched", "a projection-only member from a latched device", True,
+     snapshot(False, skill_hooks={"state": "available"}), "unknown", True),
+    ("snapshot_with_runtime_additions", "members runtimes send today beyond v3 are not "
+     "projection-only", False,
+     snapshot(False, commissioning={}, firmware_liveness={"state": "available"},
+              telemetry_export={}), "ok", False),
+    ("snapshot_critical_true", "critical first", False, snapshot(True), "critical", False),
+    ("snapshot_critical_true_status_ok", "critical whatever status says", False,
+     snapshot(True, "ok"), "critical", False),
+    ("snapshot_ok_status_absent", "the explicit critical false of a producer that always "
+     "writes it", False, snapshot(False), "ok", False),
+    ("snapshot_ok_status_ok", "", False, snapshot(False, "ok"), "ok", False),
+    ("snapshot_degraded", "", False, snapshot(False, "degraded"), "degraded", False),
+    ("snapshot_false_status_critical", "either signal reads critical", False,
+     snapshot(False, "critical"), "critical", False),
+    ("snapshot_false_status_other", "", False, snapshot(False, "warning"), "unknown", False),
+    ("snapshot_false_status_not_string", "", False, snapshot(False, True), "unknown", False),
+    ("snapshot_false_status_null", "null is a value of another type, not absence", False,
+     snapshot(False, None), "unknown", False),
+    ("snapshot_critical_absent", "a later release that omitted critical is never ok", False,
+     snapshot(ABSENT), "unknown", False),
+    ("snapshot_critical_absent_status_ok", "", False, snapshot(ABSENT, "ok"), "unknown", False),
+    ("snapshot_critical_string", "critical is a JSON boolean", False, snapshot("false"),
+     "unknown", False),
+    ("snapshot_critical_integer", "", False, snapshot(0), "unknown", False),
+    ("snapshot_critical_null", "", False, snapshot(None), "unknown", False),
+    ("v250_healthy", "v2.5.0's absences are its verdict that no condition holds", False, v250(),
+     "ok", False),
+    ("v250_degraded", "", False, v250(status="degraded",
+                                      degradation_reasons=["commissioning_problem"]),
+     "degraded", False),
+    ("v250_status_critical", "v2.5.0's one path that sets status critical without critical",
+     False, v250(status="critical"), "critical", False),
+    ("v250_critical_true_status_degraded", "v2.5.0's liveness path sets critical beside a "
+     "degraded status", False, v250(True, "degraded"), "critical", False),
+    ("v250_status_other", "v2.5.0 writes no other status", False, v250(status="warning"),
+     "unknown", False),
+    ("v250_with_later_member", "a member v2.5.0 never sends rules out 3b", False,
+     v250(firmware_controller_profiles={"state": "available"}), "unknown", False),
+    ("v250_latched", "3b gives way to the latch", True, v250(), "unknown", True),
+    ("v250_status_ok", "v2.5.0 never writes ok, so an explicit ok is not its encoding", False,
+     v250(status="ok"), "unknown", False),
+    ("v250_status_null", "", False, v250(status=None), "unknown", False),
+    ("latched_status_critical_without_critical", "either signal reads critical, the latch "
+     "included", True, snapshot(False, "critical"), "critical", True),
+    ("status_critical_trailing_space", "the critical status is compared whole", False,
+     snapshot(False, "critical "), "unknown", False),
+    ("latched_snapshot_ok", "once a device has served the projection, an unmarked item is "
+     "refused", True, snapshot(False), "unknown", True),
+    ("latched_snapshot_degraded", "", True, snapshot(False, "degraded"), "unknown", True),
+    ("latched_snapshot_critical", "critical is never read as less, the latch included", True,
+     snapshot(True), "critical", True),
+    ("item_names_another_device", "the latch is the requested device's, whatever device_id the "
+     "item carries", True, snapshot(False, device_id="ori-rt-ffffff"), "unknown", True),
+    ("unlatched_item_names_another_device", "an item naming another device is read for the "
+     "requested one", False, snapshot(False, device_id="ori-rt-ffffff"), "ok", False),
+)
+
+
+def build() -> bytes:
+    cases = [{"name": name, "note": note, "requested_device_id": DEVICE, "latched": latched,
+              "item": item,
+              "expect": {"severity": severity, "latched_after": after}}
+             for name, note, latched, item, severity, after in CASES]
+    corpus = {
+        "contract": ("ori-specs/gateway-api/v2.md"
+                     "#reading-status-while-runtimes-adopt-runtime-healthv4"),
+        "version": 2,
+        "comment": (
+            "Golden vectors for reading the health export's status while runtimes adopt "
+            "runtime-health/v4. Each case is items[0] of a verified health export response "
+            "and whether the gateway has read a marked item before from requested_device_id, the "
+            "device the export was requested from. A "
+            "gateway must read each case as the severity given, and hold or not hold the "
+            "device's latch afterwards as given."
+        ),
+        "severities": ["ok", "degraded", "critical", "unknown"],
+        "cases": cases,
+    }
+    return (json.dumps(corpus, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = build()
+    if argv == ["--check"]:
+        if OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator")
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv:
+        print(__doc__)
+        return 2
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)} sha256 {hashlib.sha256(data).hexdigest()}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

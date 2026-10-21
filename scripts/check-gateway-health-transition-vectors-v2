@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 health-transition corpus against the contract.
+
+Shares no code with scripts/generate-gateway-health-transition-vectors-v2, and
+was written without reading it. The reading is modelled here from gateway-api/v2.md
+`health` > "Reading `status` while runtimes adopt runtime-health/v4": the
+marker, the severities, the five projection-only members, the case-3 table,
+the members v2.5.0 sends and 3b's readings are parsed from the text; the rules
+whose prose cannot be parsed reliably (the two rules before the readings, the
+latch, case 1's and case 2's outcomes) are held to their sentences word for
+word, whitespace folded.
+
+Held to:
+
+- the text: the subsection sits under `health`; two rules, then three numbered
+  readings; the marker equals runtime-health/v4's `projection` row; case 1's
+  severities and the critical rule's are runtime-health/v4's `status`
+  vocabulary; each projection-only member is a v4 Remote Health Projection
+  member and none is a runtime-health/v3 Health Payload member or one v2.5.0
+  sends, nor are `status`, `critical` or `degradation_reasons` v3 members;
+  every v3 member is one v2.5.0 sends; the case-3 table is total and
+  deterministic over a sample domain, and its `true` row agrees with the
+  critical rule;
+- the header: contract anchor, version, severities in v4's order plus
+  unknown, unique case names, exact keys and JSON types;
+- every case: severity and latched_after as the model here reads them, and no
+  `ok` except from the three sources the absence rule names;
+- coverage: every alternative of every case-3 table row; each projection-only
+  member alone on an unmarked item; a marked item with each severity, an
+  absent, another-string and a non-string `status`; the critical rule by
+  `critical: true` and by `status` alone, on marked, case-2, case-3 and
+  latched unmarked items; 3b's every reading, an explicit `status: "ok"`, and
+  an item 3b refuses for a later member; the latch before and after, for
+  marked and unmarked items; an item naming another device while the
+  requested one is latched; markers extended past the string, with trailing
+  whitespace and not a string; a snapshot carrying members beyond v3 that are
+  not projection-only.
+
+    python3 scripts/check-gateway-health-transition-vectors-v2
+    python3 scripts/check-gateway-health-transition-vectors-v2 --mutations
+
+`--mutations` corrupts the corpus, the contract text and the model, and plants
+a reading bug in turn; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-api" / "v2.md"
+HEALTH_V3 = ROOT / "runtime-health" / "v3.md"
+HEALTH_V4 = ROOT / "runtime-health" / "v4.md"
+CORPUS = ROOT / "gateway-api" / "vectors" / "health-transition-v2.json"
+HEADING = "#### Reading `status` while runtimes adopt runtime-health/v4"
+PARENT = "## Supported Export Types > ### `health`"
+NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+# Sentences whose rules the model below implements by its own code. A data
+# check cannot see their meaning change, so each is held word for word.
+HELD = (
+    # what runtimes write today
+    "Runtime releases after v2.5.0 write `critical` always, as a JSON boolean; "
+    "v2.5.0 writes it only when it is `true`.",
+    # the order: verification, then two rules, then the readings
+    "A gateway reads the severity of `items[0]` only once its response has "
+    "verified under the [Export Auth Envelope](#export-auth-envelope), and then "
+    "by two rules before any other:",
+    # rule 1
+    "**Critical is never read as less.** An item whose `critical` is the JSON "
+    "boolean `true`, or whose `status` is the string `critical`, reads "
+    "`critical`, whatever its `projection`, its other members or the latch below.",
+    # rule 2
+    "**Absence alone is never read as health.** A reading yields `ok` only from "
+    "an explicit `status` of `ok` in a marked item, an explicit `critical: false`, "
+    "or the v2.5.0 encoding of 3b, whose absences are that release's stated verdict.",
+    # case 1
+    "When `projection` is the string",
+    "the item is the projection, and its severity is its `status`:",
+    "is that severity. A `status` that is absent, any other string, or not a "
+    "string is `unknown`, and is logged. This reading uses `status` and the rule "
+    "above alone; the projection's other members are read under "
+    "runtime-health/v4's own consumer rules.",
+    # case 2
+    "**Unmarked, with a projection-only member.** When `projection` is absent or "
+    "is not that string, and the item carries any of",
+    "it is neither shape. It is `unknown`, logged, and never read as a snapshot.",
+    # case 3
+    "**Unmarked otherwise,** read as the pre-v4 snapshot, by `critical` first:",
+    "That table yields `ok` only for an explicit `critical: false` from a "
+    "producer that always writes it. A `critical: false` beside `status` "
+    "`critical` reads `critical`, by the rule above.",
+    # 3b
+    "**3b, the v2.5.0 encoding.** v2.5.0 writes `critical` only when it is "
+    "`true`, and `status` only while a condition holds, so its healthy export "
+    "carries neither: the absence of both is that runtime's signed verdict that "
+    "no condition holds. An unmarked item whose `critical` is absent, and whose "
+    "every top-level member is one v2.5.0 sends, reads by `status` instead of the "
+    "table:",
+    "Every later release writes `critical` always and sends members outside that "
+    "set, `firmware_reading_age` among them, so an item from one that omitted "
+    "`critical` reads `unknown` by the table, never `ok` by 3b. That rests on the "
+    "releases as they are: a later release that omitted `critical` and sent only "
+    "those members would read `ok` here, which is why every release after v2.5.0 "
+    "writes `critical` always.",
+    # the latch
+    "**Once a device serves the projection, it is held to it.** A gateway that "
+    "has read a marked item, whatever its severity, from the device an export was "
+    "requested from refuses every later unmarked item from that device, as "
+    "`unknown`, logged, for as long as the gateway runs, except that an item the "
+    "rule above reads `critical` still reads `critical`.",
+    "The device is the one the request named and the response's topic carried, "
+    "both verified, never the item's own `device_id` member, which its sender "
+    "writes. It holds this in memory only.",
+    "reads `unknown` until the gateway restarts, unless it reports critical: that "
+    "fails towards `unknown`, visibly, and never towards `ok`.",
+    "[vectors/health-transition-v2.json](vectors/health-transition-v2.json) fixes "
+    "these readings.",
+)
+
+ABSENT = object()
+CASE_KEYS = {"name", "note", "requested_device_id", "latched", "item", "expect"}
+HEADER_KEYS = {"contract", "version", "comment", "severities", "cases"}
+# Reading bugs a mutant may plant; the real reading plants none.
+BUGS = ("critical_rule_off", "status_rule_off", "latch_spares_status_critical",
+        "truthy_critical", "absent_critical_false", "string_false_bool",
+        "null_status_absent", "marker_prefix", "marker_rstrip", "no_latch",
+        "latch_on_item_device", "case2_off", "no_3b", "3b_any_members",
+        "3b_status_ok", "3b_before_latch", "status_rstrip")
+
+
+class Failure(Exception):
+    pass
+
+
+def _contract_markdown():
+    """scripts/contract-markdown, by path: the repository holds no *.py file."""
+    path = pathlib.Path(__file__).resolve().parent / "contract-markdown"
+    loader = importlib.machinery.SourceFileLoader("contract_markdown", str(path))
+    spec = importlib.util.spec_from_loader("contract_markdown", loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["contract_markdown"] = module
+    loader.exec_module(module)
+    return module
+
+
+CM = _contract_markdown()
+
+
+def fold(text: str) -> str:
+    return " ".join(text.split())
+
+
+def github_anchor(title: str) -> str:
+    """The anchor GitHub renders for a heading: lower case, punctuation other
+    than `-` and `_` dropped, each space a hyphen."""
+    return re.sub(r"[^\w\- ]", "", title.lower()).replace(" ", "-")
+
+
+def _ticked(text: str) -> list[str]:
+    return re.findall(r"`([^`]+)`", text)
+
+
+def _ticked_list(text: str, what: str) -> list[str]:
+    """`a`, `b` or `c` / `a`, `b` and `c`, exactly, as a list."""
+    if not re.fullmatch(r"(?:`[a-z_0-9]+`, )*`[a-z_0-9]+` (?:or|and) `[a-z_0-9]+`", text):
+        raise Failure(f"{what} not understood: {text!r}")
+    names = _ticked(text)
+    if len(set(names)) != len(names):
+        raise Failure(f"{what} repeats a member: {names!r}")
+    return names
+
+
+def _table_rows(body: str) -> list[list[str]]:
+    rows = []
+    for line in body.split("\n"):
+        match = re.fullmatch(r"\s*\|(.*)\|\s*", line)
+        if match:
+            rows.append([cell.strip() for cell in match.group(1).split("|")])
+    return rows
+
+
+def _first_column_members(body: str) -> set[str]:
+    rows = _table_rows(body)
+    if len(rows) < 3 or not re.fullmatch(r"[-: ]+", "".join(rows[1])):
+        raise Failure("no member table")
+    out: set[str] = set()
+    for row in rows[2:]:
+        out.update(_ticked(row[0]))
+    return out
+
+
+# --- contract text ------------------------------------------------------------
+
+def contract_texts() -> dict[str, str]:
+    return {"g": CONTRACT.read_text(), "v3": HEALTH_V3.read_text(),
+            "v4": HEALTH_V4.read_text()}
+
+
+def _alternatives(cell: str) -> list[str]:
+    return [part for part in re.split(r",\s*(?:or\s+)?|\s+or\s+", cell) if part]
+
+
+def _literal(token: str) -> object:
+    return {"true": True, "false": False}.get(token, token)
+
+
+def _parse_table(body: str) -> list[dict]:
+    rows = _table_rows(body)
+    if len(rows) < 3 or rows[0] != ["`critical`", "`status`", "Severity"]:
+        raise Failure(f"case-3 table header is {rows[:1]!r}")
+    if not all(re.fullmatch(r"-{3,}", cell) for cell in rows[1]):
+        raise Failure("case-3 table has no separator row")
+    parsed = []
+    for row in rows[2:]:
+        if len(row) != 3:
+            raise Failure(f"case-3 row of {len(row)} cells: {row!r}")
+        columns = []
+        for cell in row[:2]:
+            alts = []
+            for alt in _alternatives(cell):
+                if alt in ("anything", "absent", "not a boolean", "not a string",
+                           "any other value"):
+                    alts.append(("phrase", alt))
+                elif re.fullmatch(r"`[^`]+`", alt):
+                    alts.append(("literal", _literal(alt[1:-1])))
+                else:
+                    raise Failure(f"case-3 cell phrase not understood: {alt!r}")
+            columns.append(alts)
+        severity = _alternatives(row[2])
+        if not re.fullmatch(r"`[a-z]+`", severity[0]) or severity[1:] not in ([], ["logged"]):
+            raise Failure(f"case-3 severity cell not understood: {row[2]!r}")
+        parsed.append({"critical": columns[0], "status": columns[1],
+                       "severity": severity[0][1:-1], "logged": severity[1:] == ["logged"],
+                       "cells": tuple(row[:2])})
+    return parsed
+
+
+def contract_model(texts: dict[str, str] | None = None) -> dict:
+    texts = contract_texts() if texts is None else texts
+    g = texts["g"]
+    paths = [path for path, _, _ in CM.sections(g) if path.endswith(HEADING)]
+    if paths != [PARENT + " > " + HEADING]:
+        raise Failure(f"subsection not found once under `health`: {paths!r}")
+    body = CM.own_body(g, HEADING)
+    if CM.non_canonical(body):
+        raise Failure(f"subsection holds non-canonical lines: {CM.non_canonical(body)[:3]}")
+    flat = fold(body)
+    for sentence in HELD:
+        if fold(sentence) not in flat:
+            raise Failure(f"gateway-api/v2.md no longer says: {sentence!r}")
+
+    # Two rules, then three numbered readings, as the text counts them.
+    rules = re.search(r"and then by (\w+) rules before any other:(.*?)Otherwise a gateway",
+                      flat)
+    if rules is None:
+        raise Failure("the rules before the readings are not found")
+    bullets = re.findall(r"(?:^|\s)- \*\*", rules.group(2))
+    if NUMBER_WORDS.get(rules.group(1)) != len(bullets):
+        raise Failure(f"the text counts {rules.group(1)} rules and states {len(bullets)}")
+    ways = re.search(r"Otherwise a gateway reads it in one of (\w+) ways, which decide only "
+                     r"between `([a-z]+)`, `([a-z]+)` and `([a-z]+)`:", flat)
+    if ways is None:
+        raise Failure("the three readings' sentence is not found")
+    numbered = re.findall(r"^ {0,3}(\d+)\. \*\*", body, re.M)
+    if numbered != [str(n) for n in range(1, NUMBER_WORDS.get(ways.group(1), 0) + 1)] \
+            or len(numbered) != 3:
+        raise Failure(f"readings numbered {numbered!r} for {ways.group(1)} ways")
+
+    marker = re.search(r"When `projection` is the string `([^`]+)`, the item is the "
+                       r"projection", flat)
+    if marker is None:
+        raise Failure("case 1 names no marker")
+    sev = re.search(r"its severity is its `status`: `([a-z]+)` or `([a-z]+)` is that "
+                    r"severity\.", flat)
+    if sev is None:
+        raise Failure("case 1 names no severities")
+    marked_severities = list(sev.groups())
+    unknown = re.search(r"or not a string is `([a-z]+)`, and is logged", flat)
+    if unknown is None or unknown.group(1) in marked_severities:
+        raise Failure("case 1 names no unknown severity")
+    rule = re.search(r"An item whose `critical` is the JSON boolean `(true)`, or whose "
+                     r"`status` is the string `([a-z]+)`, reads `([a-z]+)`", flat)
+    if rule is None or rule.group(2) != rule.group(3):
+        raise Failure("the critical rule names no severity, or a status other than it")
+    critical = rule.group(3)
+    decided = set(ways.groups()[1:])
+    if decided != set(marked_severities) | {unknown.group(1)} or critical in decided:
+        raise Failure(f"the readings decide {sorted(decided)}, not case 1's severities "
+                      "plus unknown")
+
+    members = re.search(r"and the item carries any of (.*?), it is neither shape\.", flat)
+    if members is None:
+        raise Failure("case 2 lists no members")
+    only = _ticked_list(members.group(1), "case 2 member list")
+    count = re.search(r"No runtime release has sent any of these (\w+) outside the "
+                      r"projection\.", flat)
+    if count is None or NUMBER_WORDS.get(count.group(1)) != len(only):
+        raise Failure(f"case 2 lists {only!r}, which the text does not count")
+
+    case3 = re.search(r"^ {0,3}3\. .*?(?=^\*\*Once a device)", body, re.M | re.S)
+    if case3 is None:
+        raise Failure("case 3 has no body")
+    table = _parse_table(case3.group(0))
+
+    # 3b: the members v2.5.0 sends, and its readings by status.
+    sends = re.search(r"The members v2\.5\.0 sends are (.*?), and while a condition holds "
+                      r"(.*?)\. Every later release", flat)
+    if sends is None:
+        raise Failure("3b names no member set")
+    # `critical` is qualified in the set: v2.5.0 sends it only as `true`, which
+    # is why 3b requires it absent.
+    qualifier = "`critical` (only as `true`)"
+    if sends.group(2).count(qualifier) != 1:
+        raise Failure("the v2.5.0 set no longer sends `critical` only as `true`")
+    v250 = _ticked_list(sends.group(1), "v2.5.0 members") + _ticked_list(
+        sends.group(2).replace(qualifier, "`critical`"), "v2.5.0 condition members")
+    later = re.search(r"sends members outside that set, `([a-z_]+)` among them", flat)
+    if later is None or later.group(1) in v250:
+        raise Failure("the later member the text names is in the v2.5.0 set")
+    if len(set(v250)) != len(v250):
+        raise Failure("the v2.5.0 member set repeats a member")
+    reads = re.search(r"reads by `status` instead of the table: absent is `([a-z]+)`, "
+                      r"`([a-z]+)` is `([a-z]+)`, and any other value or type is "
+                      r"`([a-z]+)`, logged, `([a-z]+)` included, since v2\.5\.0 never "
+                      r"writes it\.", flat)
+    if reads is None:
+        raise Failure("3b's readings are not understood")
+    b3 = {"absent": reads.group(1), "status": {reads.group(2): reads.group(3)},
+          "other": reads.group(4)}
+    if reads.group(5) != reads.group(1) or reads.group(5) in b3["status"]:
+        raise Failure("3b's explicit exclusion is not its absent reading")
+    if b3["other"] != unknown.group(1) or not set(b3["status"].values()) <= decided \
+            or b3["absent"] not in decided:
+        raise Failure("3b reads outside ok, degraded and unknown")
+
+    # runtime-health/v4 and v3 cross-checks.
+    v4, v3 = texts["v4"], texts["v3"]
+    projection_body = CM.own_body(v4, "## Remote Health Projection")
+    projection_members = _first_column_members(projection_body)
+    row = re.search(r"^\| `projection` \| `([^`]+)`\. \|\s*$", projection_body, re.M)
+    if row is None or row.group(1) != marker.group(1):
+        raise Failure("the marker differs from runtime-health/v4's `projection` row")
+    v4_payload = CM.own_body(v4, "## Health Payload")
+    status_row = re.search(r"^\| `status` \| `string` \| `([a-z]+)`, `([a-z]+)` or "
+                           r"`([a-z]+)`\.", v4_payload, re.M)
+    if status_row is None or set(status_row.groups()) != set(marked_severities) | {critical}:
+        raise Failure("case 1's and the critical rule's severities differ from "
+                      "runtime-health/v4's `status`")
+    severities = list(status_row.groups())
+    v3_members = _first_column_members(CM.own_body(v3, "## Health Payload"))
+    if later.group(1) not in projection_members:
+        raise Failure(f"{later.group(1)} is not a runtime-health/v4 projection member")
+    for name in only:
+        if name not in projection_members:
+            raise Failure(f"{name} is not a runtime-health/v4 projection member")
+        if name in v3_members:
+            raise Failure(f"{name} is a runtime-health/v3 Health Payload member")
+        if name in v250:
+            raise Failure(f"{name} is a member v2.5.0 sends")
+    named_today = {"status", "degradation_reasons", "critical"}
+    if named_today & v3_members:
+        raise Failure("runtime-health/v3 defines a member the text says it does not")
+    if not named_today <= set(v250):
+        raise Failure("v2.5.0's set lacks a member the text says it sends")
+    if not v3_members <= set(v250):
+        raise Failure(f"v2.5.0 does not send v3's {sorted(v3_members - set(v250))}")
+    additions = projection_members - v3_members - set(only) - named_today
+    return {"marker": marker.group(1), "severities": severities,
+            "marked": marked_severities, "unknown": unknown.group(1),
+            "critical": critical, "only": only, "table": table, "v250": v250, "b3": b3,
+            "additions": sorted(additions), "anchor": github_anchor(HEADING.lstrip("# "))}
+
+
+# --- the reading ----------------------------------------------------------------
+
+def _matches(alt: tuple[str, object], value: object, siblings: list[object]) -> bool:
+    kind, token = alt
+    present = value is not ABSENT
+    if kind == "literal":
+        return present and type(value) is type(token) and value == token
+    if token == "anything":
+        return True
+    if token == "absent":
+        return not present
+    if token == "not a boolean":
+        return present and type(value) is not bool
+    if token == "not a string":
+        return present and type(value) is not str
+    # any other value: a string no sibling row names.
+    return present and type(value) is str and not any(
+        type(s) is str and s == value for s in siblings)
+
+
+def table_rows_matching(model: dict, critical: object, status: object) -> list[int]:
+    table = model["table"]
+    out = []
+    for index, row in enumerate(table):
+        siblings = [token for other in table if other["cells"][0] == row["cells"][0]
+                    for kind, token in other["status"] if kind == "literal"]
+        if any(_matches(a, critical, []) for a in row["critical"]) and \
+                any(_matches(a, status, siblings) for a in row["status"]):
+            out.append(index)
+    return out
+
+
+def is_marked(item: dict, model: dict, bugs: frozenset[str]) -> bool:
+    value = item.get("projection", ABSENT)
+    if type(value) is not str:
+        return False
+    if "marker_prefix" in bugs and value.startswith(model["marker"]):
+        return True
+    if "marker_rstrip" in bugs and value.rstrip() == model["marker"]:
+        return True
+    return value == model["marker"]
+
+
+def is_3b(item: dict, model: dict, bugs: frozenset[str] = frozenset()) -> bool:
+    """Unmarked and without a projection-only member assumed: `critical`
+    absent, and every top-level member one v2.5.0 sends."""
+    return "critical" not in item and (
+        "3b_any_members" in bugs or all(name in model["v250"] for name in item))
+
+
+def read(item: dict, requested: str, latched: bool, model: dict,
+         bugs: frozenset[str] = frozenset()) -> tuple[str, bool]:
+    """(severity, latched_after) for items[0] of a verified response."""
+    critical = item.get("critical", ABSENT)
+    status = item.get("status", ABSENT)
+    if "string_false_bool" in bugs and critical in ("true", "false"):
+        critical = critical == "true"
+    if "absent_critical_false" in bugs and critical is ABSENT:
+        critical = False
+    if "null_status_absent" in bugs and status is None:
+        status = ABSENT
+    marked = is_marked(item, model, bugs)
+    if "latch_on_item_device" in bugs:
+        latched = latched and item.get("device_id") == requested
+    if "no_latch" in bugs:
+        latched = False
+    # The latch is held for any marked item, whatever its severity.
+    latched_after = latched or marked
+    by_critical = critical is True or ("truthy_critical" in bugs and bool(critical)
+                                       and critical is not ABSENT)
+    by_status = type(status) is str and (status == model["critical"] or (
+        "status_rstrip" in bugs and status.rstrip() == model["critical"]))
+    if "status_rule_off" in bugs or ("latch_spares_status_critical" in bugs
+                                     and latched and not marked):
+        by_status = False
+    if (by_critical or by_status) and "critical_rule_off" not in bugs:
+        return model["critical"], latched_after
+    severity = _reading(item, critical, status, marked, latched, model, bugs)
+    # Absence alone is never read as health: ok has three sources only.
+    if severity == "ok" and not (
+        (marked and status == "ok") or critical is False
+        or (not marked and not latched and is_3b(item, model, bugs))
+    ):
+        raise Failure("ok read from absence alone")
+    return severity, latched_after
+
+
+def _reading(item: dict, critical: object, status: object, marked: bool, latched: bool,
+             model: dict, bugs: frozenset[str]) -> str:
+    if marked:
+        if type(status) is str and status in model["marked"]:
+            return status
+        return model["unknown"]
+    three_b = "no_3b" not in bugs and is_3b(item, model, bugs) and not any(
+        name in item for name in model["only"])
+    if latched and not (three_b and "3b_before_latch" in bugs):
+        return model["unknown"]
+    if "case2_off" not in bugs and any(name in item for name in model["only"]):
+        return model["unknown"]
+    if three_b:
+        if status is ABSENT:
+            return model["b3"]["absent"]
+        if "3b_status_ok" in bugs and status == "ok":
+            return "ok"
+        if type(status) is str and status in model["b3"]["status"]:
+            return model["b3"]["status"][status]
+        return model["b3"]["other"]
+    rows = table_rows_matching(model, critical, status)
+    if len(rows) != 1:
+        raise Failure(f"case-3 table matches rows {rows} for {critical!r}, {status!r}")
+    return model["table"][rows[0]]["severity"]
+
+
+def shape(item: dict, latched: bool, model: dict) -> str:
+    """Which reading decides the item, ignoring the critical rule."""
+    if is_marked(item, model, frozenset()):
+        return "marked"
+    if latched:
+        return "latched"
+    if any(name in item for name in model["only"]):
+        return "case2"
+    if is_3b(item, model):
+        return "case3b"
+    return "case3"
+
+
+def check_model(model: dict) -> None:
+    critical_values = [ABSENT, True, False, "false", "true", 0, 1, None]
+    status_values = [ABSENT, "ok", "degraded", "critical", "warning", "", None, 0, True]
+    for critical in critical_values:
+        for status in status_values:
+            rows = table_rows_matching(model, critical, status)
+            if len(rows) != 1:
+                raise Failure(f"case-3 table is not total and deterministic: {critical!r}, "
+                              f"{status!r} match rows {rows}")
+    for row in model["table"]:
+        if row["logged"] != (row["severity"] == model["unknown"]):
+            raise Failure(f"case-3 row {row['cells']!r}: logged exactly when unknown")
+        if row["severity"] not in model["severities"] + [model["unknown"]]:
+            raise Failure(f"case-3 row {row['cells']!r}: severity outside the four")
+        if row["critical"] == [("literal", True)] and row["severity"] != model["critical"]:
+            raise Failure("the case-3 `true` row contradicts the critical rule")
+        if row["severity"] == "ok" and row["critical"] != [("literal", False)]:
+            raise Failure("a case-3 row yields ok without an explicit critical: false")
+
+
+# --- the corpus -------------------------------------------------------------------
+
+def check(corpus: dict, model: dict, bugs: frozenset[str] = frozenset()) -> None:
+    if set(corpus) != HEADER_KEYS:
+        raise Failure(f"header keys {sorted(corpus)}")
+    if corpus["contract"] != "ori-specs/gateway-api/v2.md#" + model["anchor"]:
+        raise Failure(f"contract {corpus['contract']!r} is not the subsection's anchor "
+                      f"#{model['anchor']}")
+    if type(corpus["version"]) is not int or corpus["version"] != 2:
+        raise Failure("version is not 2")
+    if corpus["severities"] != model["severities"] + [model["unknown"]]:
+        raise Failure(f"severities {corpus['severities']!r} differ from the text's")
+    names: set[str] = set()
+    for case in corpus["cases"]:
+        name = case.get("name")
+        if set(case) != CASE_KEYS:
+            raise Failure(f"{name}: keys {sorted(case)}")
+        if type(name) is not str or not name or name in names:
+            raise Failure(f"duplicate or empty case name {name!r}")
+        names.add(name)
+        if type(case["note"]) is not str or type(case["item"]) is not dict:
+            raise Failure(f"{name}: note or item of the wrong type")
+        if type(case["requested_device_id"]) is not str or not case["requested_device_id"]:
+            raise Failure(f"{name}: requested_device_id")
+        if type(case["latched"]) is not bool:
+            raise Failure(f"{name}: latched is not a JSON boolean")
+        expect = case["expect"]
+        if type(expect) is not dict or set(expect) != {"severity", "latched_after"} \
+                or type(expect["latched_after"]) is not bool \
+                or expect["severity"] not in corpus["severities"]:
+            raise Failure(f"{name}: expect")
+        try:
+            got = read(case["item"], case["requested_device_id"], case["latched"], model, bugs)
+        except Failure as failure:
+            raise Failure(f"{name}: {failure}") from None
+        want = (expect["severity"], expect["latched_after"])
+        if got != want:
+            raise Failure(f"{name}: read as {got}, corpus says {want}")
+    coverage(corpus["cases"], model)
+
+
+def coverage(cases: list[dict], model: dict) -> None:
+    def where(pred: Callable[[dict, dict], bool]) -> bool:
+        return any(pred(c, c["item"]) for c in cases)
+
+    def critical_true(item: dict) -> bool:
+        return item.get("critical", ABSENT) is True
+
+    def status_critical(item: dict) -> bool:
+        return item.get("status", ABSENT) == model["critical"]
+
+    def by_rule(item: dict) -> bool:
+        return critical_true(item) or status_critical(item)
+
+    def shaped(name: str) -> Callable[[dict, dict], bool]:
+        return lambda c, i: shape(i, c["latched"], model) == name
+
+    marker = model["marker"]
+    table = model["table"]
+    for index, row in enumerate(table):
+        siblings = [token for other in table if other["cells"][0] == row["cells"][0]
+                    for kind, token in other["status"] if kind == "literal"]
+        for ca in row["critical"]:
+            for sa in row["status"]:
+                if not where(lambda c, i: shaped("case3")(c, i)
+                             and _matches(ca, i.get("critical", ABSENT), [])
+                             and _matches(sa, i.get("status", ABSENT), siblings)
+                             and table_rows_matching(model, i.get("critical", ABSENT),
+                                                     i.get("status", ABSENT)) == [index]):
+                    raise Failure(f"coverage: case-3 row {row['cells']!r} by {ca[1]!r} "
+                                  f"and {sa[1]!r}")
+    for name in model["only"]:
+        if not where(lambda c, i: shaped("case2")(c, i) and not by_rule(i)
+                     and [m for m in model["only"] if m in i] == [name]):
+            raise Failure(f"coverage: {name} alone on an unmarked, unlatched item")
+    for status in model["marked"] + [ABSENT, "other", "non-string"]:
+        def has(c: dict, i: dict, status: object = status) -> bool:
+            if not shaped("marked")(c, i) or by_rule(i):
+                return False
+            value = i.get("status", ABSENT)
+            if status == "other":
+                return type(value) is str and value not in model["severities"]
+            if status == "non-string":
+                return value is not ABSENT and type(value) is not str
+            return value is status if status is ABSENT else value == status
+        if not where(has):
+            raise Failure(f"coverage: a marked item with status {status!r}")
+    b3 = model["b3"]
+    for label, pred in (
+        ("critical: true on a marked item whose status is not critical",
+         lambda c, i: shaped("marked")(c, i) and critical_true(i) and not status_critical(i)),
+        ("status critical on a marked item without critical: true",
+         lambda c, i: shaped("marked")(c, i) and status_critical(i) and not critical_true(i)),
+        ("critical: true on a case-2 item",
+         lambda c, i: shaped("case2")(c, i) and critical_true(i)),
+        ("status critical beside critical: false on a case-3 item",
+         lambda c, i: shaped("case3")(c, i) and status_critical(i)
+         and i.get("critical", ABSENT) is False),
+        ("critical: true on an unmarked item from a latched device",
+         lambda c, i: shaped("latched")(c, i) and critical_true(i)),
+        ("status critical without critical: true from a latched device",
+         lambda c, i: shaped("latched")(c, i) and status_critical(i) and not critical_true(i)),
+        ("3b with status absent",
+         lambda c, i: shaped("case3b")(c, i) and "status" not in i),
+        *[(f"3b with status {s!r}",
+           lambda c, i, s=s: shaped("case3b")(c, i) and i.get("status", ABSENT) == s)
+          for s in list(b3["status"]) + [model["critical"]]],
+        ("3b with an explicit status ok",
+         lambda c, i: shaped("case3b")(c, i) and i.get("status", ABSENT) == "ok"),
+        ("3b with another status string",
+         lambda c, i: shaped("case3b")(c, i) and type(i.get("status")) is str
+         and i["status"] not in model["severities"]),
+        ("3b with a status that is not a string",
+         lambda c, i: shaped("case3b")(c, i) and "status" in i
+         and type(i["status"]) is not str),
+        ("critical: true on an otherwise-3b item",
+         lambda c, i: shaped("case3")(c, i) and critical_true(i)
+         and all(n in model["v250"] for n in i)),
+        ("critical absent beside a member v2.5.0 does not send",
+         lambda c, i: shaped("case3")(c, i) and "critical" not in i and "status" not in i),
+        ("a 3b item from a latched device",
+         lambda c, i: shaped("latched")(c, i) and is_3b(i, model)
+         and not any(n in i for n in model["only"])),
+        ("a marked item from an unlatched device",
+         lambda c, i: shape(i, False, model) == "marked" and not c["latched"]),
+        ("a marked item from a latched device",
+         lambda c, i: shape(i, False, model) == "marked" and c["latched"]),
+        ("an unmarked item from an unlatched device",
+         lambda c, i: shape(i, False, model) != "marked" and not c["latched"]),
+        ("an unmarked snapshot from a latched device that would read ok",
+         lambda c, i: shaped("latched")(c, i) and shape(i, False, model) == "case3"
+         and read(i, c["requested_device_id"], False, model)[0] == "ok"),
+        ("a case-2 item from a latched device",
+         lambda c, i: shaped("latched")(c, i) and shape(i, False, model) == "case2"),
+        ("an unmarked item naming another device, from a latched device",
+         lambda c, i: shaped("latched")(c, i) and not by_rule(i)
+         and i.get("device_id") != c["requested_device_id"]),
+        ("a projection extending the marker",
+         lambda c, i: type(i.get("projection")) is str and not c["latched"]
+         and i["projection"].startswith(marker) and i["projection"].rstrip() != marker),
+        ("a projection of the marker with trailing whitespace",
+         lambda c, i: type(i.get("projection")) is str and not c["latched"]
+         and i["projection"] != marker and i["projection"].rstrip() == marker),
+        ("a status of critical with trailing whitespace",
+         lambda c, i: type(i.get("status")) is str and i["status"] != model["critical"]
+         and i["status"].rstrip() == model["critical"] and not critical_true(i)),
+        ("a projection that is not a string",
+         lambda c, i: "projection" in i and type(i["projection"]) is not str),
+        ("a snapshot with members beyond v3 that are not projection-only",
+         lambda c, i: shaped("case3")(c, i) and any(m in i for m in model["additions"])),
+    ):
+        if not where(pred):
+            raise Failure(f"coverage: {label}")
+
+
+# --- mutations ------------------------------------------------------------------
+
+def mutations(corpus: dict, model: dict) -> int:
+    check(corpus, model)  # the baseline must hold, or no mutant proves anything
+
+    def corpus_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(corpus)
+            edit(mutated)
+            check(mutated, model)
+        return go
+
+    def drop(pred: Callable[[dict], bool]) -> Callable[[], None]:
+        return corpus_mutant(lambda c: c.update(
+            cases=[x for x in c["cases"] if not pred(x)]))
+
+    def text_mutant(key: str, old: str, new: str) -> Callable[[], None]:
+        def go() -> None:
+            texts = contract_texts()
+            # The target matches across any run of whitespace, so a reflowed
+            # paragraph keeps its mutant.
+            pattern = re.compile(r"\s+".join(re.escape(word) for word in old.split()))
+            if pattern.search(texts[key]) is None:
+                raise AssertionError(f"mutant target missing from {key}: {old!r}")
+            texts[key] = pattern.sub(lambda _: new, texts[key], count=1)
+            mutated = contract_model(texts)
+            check_model(mutated)
+            check(corpus, mutated)
+        return go
+
+    def model_mutant(edit: Callable[[dict], None]) -> Callable[[], None]:
+        def go() -> None:
+            mutated = copy.deepcopy(model)
+            edit(mutated)
+            check_model(mutated)
+            check(corpus, mutated)
+        return go
+
+    def bug(name: str) -> Callable[[], None]:
+        return lambda: check(corpus, model, frozenset({name}))
+
+    def first_marked(c: dict) -> dict:
+        return next(x for x in c["cases"] if shape(x["item"], x["latched"], model) == "marked")
+
+    def flip_row(m: dict) -> None:
+        row = next(r for r in m["table"] if r["severity"] == "degraded")
+        row["severity"] = "ok"
+
+    def duplicate(c: dict) -> None:
+        c["cases"].append(copy.deepcopy(c["cases"][0]))
+
+    def shaped(name: str) -> Callable[[dict], bool]:
+        return lambda x: shape(x["item"], x["latched"], model) == name
+
+    table_row_degraded = "| `false` | `degraded` | `degraded` |"
+    cases: list[tuple[str, Callable[[], None]]] = [
+        # the corpus
+        ("severity flipped", corpus_mutant(
+            lambda c: c["cases"][0]["expect"].update(severity="unknown"))),
+        ("latched_after flipped", corpus_mutant(
+            lambda c: c["cases"][0]["expect"].update(
+                latched_after=not c["cases"][0]["expect"]["latched_after"]))),
+        ("latched as a string", corpus_mutant(
+            lambda c: c["cases"][0].update(latched="false"))),
+        ("latched_after as a string", corpus_mutant(
+            lambda c: c["cases"][0]["expect"].update(latched_after="true"))),
+        ("duplicate case name", corpus_mutant(duplicate)),
+        ("marked item's marker gains trailing whitespace", corpus_mutant(
+            lambda c: first_marked(c)["item"].update(projection=model["marker"] + " "))),
+        ("severities reordered", corpus_mutant(lambda c: c["severities"].reverse())),
+        ("severities lose unknown", corpus_mutant(lambda c: c["severities"].pop())),
+        ("contract anchor changed", corpus_mutant(
+            lambda c: c.update(contract=c["contract"] + "x"))),
+        ("version 3", corpus_mutant(lambda c: c.update(version=3))),
+        ("requested_device_id dropped", corpus_mutant(
+            lambda c: c["cases"][0].pop("requested_device_id"))),
+        ("extra case key", corpus_mutant(lambda c: c["cases"][0].update(extra=1))),
+        ("degraded snapshots dropped", drop(
+            lambda x: shaped("case3")(x) and x["item"].get("status") == "degraded")),
+        ("items naming another device dropped", drop(
+            lambda x: x["item"].get("device_id") != x["requested_device_id"])),
+        ("latched critical cases dropped", drop(
+            lambda x: shaped("latched")(x) and x["item"].get("critical") is True)),
+        ("3b cases dropped", drop(shaped("case3b"))),
+        ("snapshots with additions dropped", drop(
+            lambda x: shaped("case3")(x)
+            and any(m in x["item"] for m in model["additions"]))),
+        ("marked non-string status dropped", drop(
+            lambda x: shaped("marked")(x) and "status" in x["item"]
+            and type(x["item"]["status"]) is not str)),
+        # the text
+        ("table row flipped", text_mutant(
+            "g", table_row_degraded, "| `false` | `degraded` | `ok` |")),
+        ("table row dropped", text_mutant("g", table_row_degraded, "")),
+        ("table absent row reads critical", text_mutant(
+            "g", "| absent, or not a boolean | anything | `unknown`, logged |",
+            "| absent, or not a boolean | anything | `critical` |")),
+        ("absent critical read as false", text_mutant(
+            "g", "| `false` | absent, or `ok` | `ok` |",
+            "| `false`, or absent | absent, or `ok` | `ok` |")),
+        ("projection-only member dropped from the text", text_mutant(
+            "g", "`unknown_critical_blocks`, `action_log_records`",
+            "`action_log_records`")),
+        ("projection-only member renamed in the text", text_mutant(
+            "g", "`safety_registry` or", "`safety_zones` or")),
+        ("v3 member added to the five", text_mutant(
+            "g", "`skill_hooks`, it is neither", "`skill_hooks`, `sensors`, it is neither")),
+        ("marker shortened to a prefix", text_mutant(
+            "g", "the string `runtime-health/v4/remote`", "the string `runtime-health/v4`")),
+        ("marker gains trailing whitespace", text_mutant(
+            "g", "the string `runtime-health/v4/remote`",
+            "the string `runtime-health/v4/remote `")),
+        ("v4 projection row disagrees on the marker", text_mutant(
+            "v4", "| `projection` | `runtime-health/v4/remote`. |",
+            "| `projection` | `runtime-health/v4/remote/2`. |")),
+        ("v3 gains a projection-only member", text_mutant(
+            "v3", "| `safety_zones` | `array` |",
+            "| `skill_hooks` | `object` | x |\n| `safety_zones` | `array` |")),
+        ("v3 defines critical", text_mutant(
+            "v3", "| `safety_zones` | `array` |",
+            "| `critical` | `bool` | x |\n| `safety_zones` | `array` |")),
+        ("critical rule loses status", text_mutant(
+            "g", "boolean `true`, or whose `status` is the string `critical`, reads",
+            "boolean `true` reads")),
+        ("critical rule spares the latch", text_mutant(
+            "g", "its other members or the latch below", "its other members")),
+        ("absence rule loses 3b", text_mutant(
+            "g", ", or the v2.5.0 encoding of 3b, whose absences are that release's "
+            "stated verdict", "")),
+        ("latch removed", text_mutant(
+            "g", "requested from refuses every later unmarked item",
+            "requested from accepts every later unmarked item")),
+        ("latch keyed on the item's device_id", text_mutant(
+            "g", "never the item's own `device_id` member",
+            "or the item's own `device_id` member")),
+        ("latch exception narrowed to critical: true", text_mutant(
+            "g", "except that an item the rule above reads `critical` still reads",
+            "except that `critical: true` still reads")),
+        ("3b explicit ok exclusion removed", text_mutant(
+            "g", ", `ok` included, since v2.5.0 never writes it.", ".")),
+        ("v2.5.0 critical qualifier removed", text_mutant(
+            "g", "`critical` (only as `true`),", "`critical`,")),
+        ("later member named from the v2.5.0 set", text_mutant(
+            "g", "`firmware_reading_age` among them", "`commissioning` among them")),
+        ("limit sentence removed", text_mutant(
+            "g", "That rests on the releases as they are:", "")),
+        ("latch only for marked ok", text_mutant(
+            "g", "a marked item, whatever its severity,", "a marked item reading `ok`")),
+        ("case 2 read as a snapshot", text_mutant(
+            "g", "and never read as a snapshot", "and then read as a snapshot")),
+        ("case 1 absent status read as ok", text_mutant(
+            "g", "A `status` that is absent, any other string",
+            "A `status` that is any other string")),
+        ("case 1 reads ok only", text_mutant(
+            "g", "`ok` or `degraded` is that severity.", "`ok` or `ok` is that severity.")),
+        ("3b absent reads degraded", text_mutant(
+            "g", "absent is `ok`, `degraded` is", "absent is `degraded`, `degraded` is")),
+        ("3b other reads ok", text_mutant(
+            "g", "any other value or type is `unknown`, logged,",
+            "any other value or type is `ok`, logged,")),
+        ("3b member set gains a later member", text_mutant(
+            "g", "`config_authority`, `firmware_liveness`",
+            "`config_authority`, `firmware_reading_age`, `firmware_liveness`")),
+        ("3b member set loses one v2.5.0 sends", text_mutant(
+            "g", "`commissioning`, `community_skills`,", "`community_skills`,")),
+        ("3b member set loses a v3 member", text_mutant(
+            "g", "`evidence`, `commissioning`", "`commissioning`")),
+        ("3b condition members gain a projection-only member", text_mutant(
+            "g", "`degradation_reasons` and `safety_zones`",
+            "`degradation_reasons`, `skill_hooks` and `safety_zones`")),
+        ("3b paragraph removed", text_mutant(
+            "g", "**3b, the v2.5.0 encoding.**", "**The v2.5.0 encoding.**")),
+        ("a fourth reading added", text_mutant(
+            "g", "**When cases 3 and 3b end.**", "4. **Fallback.** Anything else is `ok`.\n\n"
+            "**When cases 3 and 3b end.**")),
+        ("a third rule added", text_mutant(
+            "g", "- **Absence alone is never read as health.**",
+            "- **Silence is health.** An empty item reads `ok`.\n"
+            "- **Absence alone is never read as health.**")),
+        ("severity renamed in case 1", text_mutant(
+            "g", "`ok` or `degraded` is that severity",
+            "`ok` or `warning` is that severity")),
+        # the model
+        ("table row flipped in the model", model_mutant(flip_row)),
+        ("projection-only member dropped from the model", model_mutant(
+            lambda m: m["only"].remove("unknown_critical_blocks"))),
+        ("projection dropped from the model", model_mutant(
+            lambda m: m["only"].remove("projection"))),
+        ("skill_hooks dropped from the model", model_mutant(
+            lambda m: m["only"].remove("skill_hooks"))),
+        ("marker in the model shortened", model_mutant(
+            lambda m: m.update(marker="runtime-health/v4"))),
+        ("additions emptied", model_mutant(lambda m: m.update(additions=[]))),
+        ("v2.5.0 set gains firmware_reading_age", model_mutant(
+            lambda m: m["v250"].append("firmware_reading_age"))),
+        ("v2.5.0 set gains firmware_controller_profiles", model_mutant(
+            lambda m: m["v250"].append("firmware_controller_profiles"))),
+        ("v2.5.0 set loses health_socket_path", model_mutant(
+            lambda m: m["v250"].remove("health_socket_path"))),
+        ("3b other reads unknown as degraded", model_mutant(
+            lambda m: m["b3"].update(other="degraded"))),
+        # planted reading bugs
+        *[(f"bug: {name}", bug(name)) for name in BUGS],
+    ]
+    survived = 0
+    for label, mutant in cases:
+        try:
+            mutant()
+        except (Failure, KeyError, StopIteration, ValueError, TypeError) as refused:
+            print(f"refused  {label}: {refused}")
+        else:
+            print(f"SURVIVED {label}")
+            survived += 1
+    return survived
+
+
+def main(argv: list[str]) -> int:
+    if argv not in ([], ["--mutations"]):
+        print(__doc__)
+        return 2
+    try:
+        model = contract_model()
+        check_model(model)
+    except (Failure, ValueError) as failure:
+        print(f"gateway-api/v2 health transition text: {failure}")
+        return 1
+    corpus = json.loads(CORPUS.read_bytes())
+    try:
+        check(corpus, model)
+    except Failure as failure:
+        print(f"gateway-api/v2 health-transition corpus: {failure}")
+        return 1
+    print(f"gateway-api/v2 health-transition corpus: {len(corpus['cases'])} cases read as "
+          "the text reads them")
+    if argv == ["--mutations"]:
+        survived = mutations(corpus, model)
+        if survived:
+            print(f"{survived} mutant(s) survived")
+            return 1
+        print("every mutant refused")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
