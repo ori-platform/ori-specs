@@ -353,60 +353,199 @@ def build() -> bytes:
              None, False, False),
     ]
 
-    # A token is the kind, or the kind and its outcome joined by a colon.
-    def key(seq: int, token: str, digest: str = "a") -> dict:
-        kind, _, outcome = token.partition(":")
-        return {"cmd_seq": seq, "digest": digest, "kind": kind, "outcome": outcome}
+    # The bound group: a device receiving verified commands, in the command path's order. A
+    # device here signs only driver_reported for a command it drives.
+    def device(start: dict, steps: list[dict]) -> list[dict]:
+        state = {"mark": start["mark"], "record": dict(start["record"]), "boot": None}
+        out = []
+        for step in steps:
+            if step["boot"] != state["boot"]:
+                state.update(boot=step["boot"], duplicate=False, conflict=False, held=[],
+                             spent=0, last=None)
 
-    def at(boot: int, t_ms: int, k: dict, signed: bool) -> dict:
-        return {"boot": boot, "t_ms": t_ms, **k, "signed": signed}
+            def storage_failure() -> list[str]:
+                k = (step["cmd_seq"], step["digest"])
+                if k in state["held"]:
+                    return []
+                if state["spent"] >= 4 and step["t_ms"] - state["last"] < 60000:
+                    return []
+                state["held"] = (state["held"] + [k])[-8:]
+                state["spent"] += 1
+                state["last"] = step["t_ms"]
+                return ["refused:storage_failure"]
 
-    def flood(name: str, note: str, steps: list[dict]) -> dict:
-        return {"name": name, "note": note, "steps": steps}
+            record = state["record"]
+            if step["read"] == "fails":
+                signed = storage_failure()
+            elif step["cmd_seq"] < state["mark"]:
+                signed = []
+            elif step["cmd_seq"] == state["mark"]:
+                if record["epoch"] != "current":
+                    signed = []
+                elif step["digest"] == record["digest"]:
+                    signed = [] if state["duplicate"] else [f"duplicate:{record['disposition']}"]
+                    state["duplicate"] = True
+                else:
+                    signed = [] if state["conflict"] else ["conflict:"]
+                    state["conflict"] = True
+            elif step["write"] == "fails":
+                signed = storage_failure()
+            else:
+                state.update(mark=step["cmd_seq"], duplicate=False, conflict=False)
+                record.update(cmd_seq=step["cmd_seq"], digest=step["digest"], epoch="current")
+                verdict = "capability_mismatch" if step["epoch"] != "current" else step["checks"]
+                if verdict != "pass":
+                    record["disposition"] = verdict if step["commit2"] == "ok" else "pending"
+                    signed = [f"refused:{verdict}"]
+                else:
+                    # A failed final-disposition write leaves the record pending.
+                    record["disposition"] = (f"driver_{step['driver']}"
+                                             if step["commit2"] == "ok" else "pending")
+                    signed = [f"driver_reported:{step['driver']}"]
+            out.append({**step, "signed": signed})
+        return out
 
-    sf = "refused:storage_failure"
+    def cmd(boot: int, t_ms: int, seq: int, digest: str, *, epoch: str = "current",
+            read: str = "ok", write: str = "ok", checks: str = "pass",
+            driver: str = "ok", commit2: str = "ok") -> dict:
+        return {"boot": boot, "t_ms": t_ms, "cmd_seq": seq, "digest": digest, "epoch": epoch,
+                "read": read, "write": write, "checks": checks, "driver": driver,
+                "commit2": commit2}
+
+    def seq_case(name: str, note: str, steps: list[dict], mark: int = 100,
+                 disposition: str = "driver_ok", epoch: str = "current") -> dict:
+        start = {"mark": mark, "record": {"cmd_seq": mark, "digest": "a", "epoch": epoch,
+                                          "disposition": disposition}}
+        return {"name": name, "note": note, "start": start, "steps": device(start, steps)}
+
+    nine = "bcdefghij"
     bound = [
-        flood("duplicate_once_a_boot", "a repeat of an answered key gets none",
-              [at(1, 0, key(1047, "duplicate:driver_ok"), True),
-               at(1, 10, key(1047, "duplicate:driver_ok"), False)]),
-        flood("conflict_once_a_boot", "the first conflict of a key is always signed",
-              [at(1, 0, key(1047, "conflict", "b"), True),
-               at(1, 10, key(1047, "conflict", "b"), False)]),
-        flood("kinds_are_separate_keys", "one command's accepted, attempted and driver_reported "
-              "are three keys", [at(1, 0, key(1048, "accepted"), True),
-                                 at(1, 1, key(1048, "attempted"), True),
-                                 at(1, 2, key(1048, "driver_reported:ok"), True)]),
-        flood("reboot_clears_the_table", "the table is memory only",
-              [at(1, 0, key(1047, "duplicate:driver_ok"), True),
-               at(2, 0, key(1047, "duplicate:driver_ok"), True)]),
-        flood("table_holds_eight", "eight keys are all held",
-              [at(1, i, key(2000 + i, "conflict", "b"), True) for i in range(8)]
-              + [at(1, 8, key(2000, "conflict", "b"), False)]),
-        flood("ninth_key_evicts_the_oldest", "the oldest key is evicted, and answered again",
-              [at(1, i, key(2000 + i, "conflict", "b"), True) for i in range(9)]
-              + [at(1, 9, key(2000, "conflict", "b"), True),
-                 at(1, 10, key(2008, "conflict", "b"), False)]),
-        flood("storage_failure_budget", "four in a boot, then one per 60,000 ms after the "
-              "previous signed", [at(1, i, key(3000 + i, sf), i < 4) for i in range(6)]
-              + [at(1, 60003, key(3006, sf), True), at(1, 60004, key(3007, sf), False),
-                 at(1, 120002, key(3008, sf), False), at(1, 120003, key(3009, sf), True)]),
-        flood("storage_failure_repeat_spends_nothing", "a held key is not signed and spends no "
-              "budget", [at(1, 0, key(3000, sf), True), at(1, 1, key(3000, sf), False),
-                         at(1, 2, key(3001, sf), True), at(1, 3, key(3002, sf), True),
-                         at(1, 4, key(3003, sf), True), at(1, 5, key(3004, sf), False)]),
-        flood("reboot_resets_the_budget", "the budget is per boot",
-              [at(1, i, key(3000 + i, sf), True) for i in range(4)]
-              + [at(1, 4, key(3004, sf), False), at(2, 0, key(3005, sf), True)]),
-        flood("unsigned_refusal_not_held", "a refusal left unsigned past the budget was not "
-              "answered, so a retry is signed once the budget allows",
-              [at(1, i, key(3000 + i, sf), True) for i in range(4)]
-              + [at(1, 4, key(3004, sf), False), at(1, 60004, key(3004, sf), True)]),
-        flood("outcome_is_in_the_key", "one command honestly refused under two verdicts gets "
-              "both results", [at(1, 0, key(3100, sf), True),
-                               at(1, 1, key(3100, "refused:capability_mismatch"), True)]),
-        flood("budget_spares_other_kinds", "the budget bounds storage_failure only",
-              [at(1, i, key(3000 + i, sf), True) for i in range(4)]
-              + [at(1, 4, key(3004, sf), False), at(1, 5, key(4000, "driver_reported:ok"), True)]),
+        seq_case("conflict_cycle", "nine conflicting commands for the mark, cycled three "
+                 "times: one conflict result", [cmd(1, i, 100, nine[i % 9]) for i in range(27)]),
+        seq_case("conflict_flag_clears_when_mark_advances", "a fresh command clears the flag",
+                 [cmd(1, 0, 100, "b"), cmd(1, 1, 100, "c"), cmd(1, 2, 101, "a"),
+                  cmd(1, 3, 101, "b")]),
+        seq_case("conflict_flag_clears_at_boot", "", [cmd(1, 0, 100, "b"), cmd(2, 0, 100, "c")]),
+        seq_case("duplicate_once_per_mark", "", [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "a")]),
+        seq_case("separate_flags", "duplicate and conflict each have their own flag",
+                 [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "b"), cmd(1, 2, 100, "a"),
+                  cmd(1, 3, 100, "c")]),
+        seq_case("duplicate_flag_clears_at_boot", "", [cmd(1, 0, 100, "a"), cmd(2, 0, 100, "a")]),
+        seq_case("duplicate_survives_storage_churn", "storage failures never let a duplicate "
+                 "be signed twice", [cmd(1, 0, 100, "a")]
+                 + [cmd(1, 1 + i, 200 + i, "x", write="fails") for i in range(10)]
+                 + [cmd(1, 20, 100, "a")]),
+        seq_case("duplicate_answers_stored_refusal", "a duplicate of a refused command",
+                 [cmd(1, 0, 100, "a")], disposition="rate_limited"),
+        seq_case("below_mark_no_result", "", [cmd(1, 0, 99, "z"), cmd(1, 1, 50, "a")]),
+        seq_case("earlier_epoch_at_mark_no_result", "a record from an earlier approval answers "
+                 "nothing", [cmd(1, 0, 100, "a"), cmd(1, 1, 100, "b")], epoch="earlier"),
+        seq_case("fresh_command_driven", "a fresh command is signed once by its transition, "
+                 "and its redelivery is a duplicate", [cmd(1, 0, 101, "b"), cmd(1, 1, 101, "b"),
+                                                      cmd(1, 2, 101, "b")]),
+        seq_case("fresh_command_refused", "", [cmd(1, 0, 101, "b", checks="unknown_action"),
+                                               cmd(1, 1, 101, "b")]),
+        seq_case("fresh_command_other_epoch", "a command naming another approval is refused "
+                 "as capability_mismatch", [cmd(1, 0, 101, "b", epoch="earlier")]),
+        seq_case("storage_failure_budget", "four in a boot, then one per 60,000 ms after the "
+                 "previous signed", [cmd(1, i, 300 + i, "s", write="fails") for i in range(6)]
+                 + [cmd(1, 60003, 306, "s", write="fails"),
+                    cmd(1, 60004, 307, "s", write="fails"),
+                    cmd(1, 120002, 308, "s", write="fails"),
+                    cmd(1, 120003, 309, "s", write="fails")]),
+        seq_case("storage_failure_held_spends_nothing", "",
+                 [cmd(1, 0, 300, "s", write="fails"), cmd(1, 1, 300, "s", write="fails"),
+                  cmd(1, 2, 301, "s", write="fails"), cmd(1, 3, 302, "s", write="fails"),
+                  cmd(1, 4, 303, "s", write="fails"), cmd(1, 5, 304, "s", write="fails")]),
+        seq_case("storage_failure_unsigned_not_held", "a refusal left unsigned past the budget "
+                 "is signed once the budget allows",
+                 [cmd(1, i, 300 + i, "s", write="fails") for i in range(4)]
+                 + [cmd(1, 4, 304, "s", write="fails"),
+                    cmd(1, 60004, 304, "s", write="fails")]),
+        seq_case("storage_failure_table_holds_eight", "the eighth signed key leaves the first held",
+                 [cmd(1, 60000 * i, 300 + i, "s", write="fails") for i in range(8)]
+                 + [cmd(1, 480000, 300, "s", write="fails")]),
+        seq_case("storage_failure_table_evicts_oldest", "the ninth signed key evicts the first",
+                 [cmd(1, 60000 * i, 300 + i, "s", write="fails") for i in range(9)]
+                 + [cmd(1, 540000, 300, "s", write="fails")]),
+        seq_case("storage_failure_read_fails_at_mark", "a failed read cannot judge a duplicate",
+                 [cmd(1, 0, 100, "a", read="fails"), cmd(1, 1, 100, "a")]),
+        seq_case("read_fails_below_mark", "a failed read cannot tell a replay: it is a budgeted "
+                 "storage_failure, held", [cmd(1, 0, 50, "a", read="fails"),
+                                          cmd(1, 1, 50, "a", read="fails")]),
+        seq_case("read_fails_keeps_flags", "a failed read neither reads nor changes the flags",
+                 [cmd(1, 0, 100, "b"), cmd(1, 1, 100, "c", read="fails"), cmd(1, 2, 100, "d")]),
+        seq_case("write_failure_keeps_conflict_flag", "only a committed freshness write clears "
+                 "the flags", [cmd(1, 0, 100, "b"), cmd(1, 1, 101, "z", write="fails"),
+                               cmd(1, 2, 100, "c")]),
+        seq_case("commit2_fails_duplicate_pending", "a driven command whose final disposition "
+                 "was not recorded answers pending", [cmd(1, 0, 101, "b", commit2="fails"),
+                                                      cmd(1, 1, 101, "b")]),
+        seq_case("storage_failure_then_recovered", "one command refused under two verdicts gets "
+                 "both results", [cmd(1, 0, 101, "b", write="fails"),
+                                  cmd(1, 1, 101, "b", epoch="earlier")]),
+        seq_case("storage_failure_budget_per_boot", "",
+                 [cmd(1, i, 300 + i, "s", write="fails") for i in range(5)]
+                 + [cmd(2, 0, 305, "s", write="fails")]),
+    ]
+
+    # The registry group: a Tier D trip's events, with whether its attempts are active after
+    # each. A contradiction invalidates the acceptance it names; acceptance is per attempt.
+    def registry(events: list[str]) -> list[dict]:
+        state = {"latched": False, "cleared": False, "running": True, "ok": set(), "bad": set()}
+        out = []
+        for event in events:
+            kind, _, n = event.partition(":")
+            if kind == "latched":
+                state["latched"] = True
+            elif kind == "issued":
+                # An attempt is issued only while attempts are active.
+                assert out and out[-1]["attempts_active"], (events, event)
+            elif kind == "driver_ok":
+                state["ok"].add(n)
+            elif kind == "contradiction":
+                state["bad"].add(n)
+            elif kind in ("reset", "binding_changed", "retired"):
+                state["cleared"] = True
+            elif kind == "shutdown":
+                state["running"] = False
+            elif kind == "restart":
+                state["running"] = True
+            accepted = bool(state["ok"] - state["bad"])
+            active = (state["latched"] and not state["cleared"] and state["running"]
+                      and not accepted)
+            out.append({"event": event, "attempts_active": active})
+        return out
+
+    def trip(name: str, note: str, events: list[str]) -> dict:
+        return {"name": name, "note": note, "events": registry(events)}
+
+    trips = [
+        trip("accepted_ends", "",
+             ["latched", "issued:1", "driver_error:1", "issued:2", "driver_ok:2"]),
+        trip("contradiction_resumes", "",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1"]),
+        trip("contradiction_before_acceptance", "order does not matter",
+             ["latched", "issued:1", "contradiction:1", "driver_ok:1"]),
+        trip("reset_then_contradiction", "a cleared trip is never revived",
+             ["latched", "issued:1", "driver_ok:1", "reset", "contradiction:1"]),
+        trip("contradiction_then_reset", "",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1", "reset"]),
+        trip("later_acceptance_stands", "a contradiction on an earlier attempt revives nothing",
+             ["latched", "issued:1", "driver_ok:1", "contradiction:1", "issued:2", "driver_ok:2",
+              "contradiction:1"]),
+        trip("earlier_contradiction_after_later_acceptance", "",
+             ["latched", "issued:1", "driver_error:1", "issued:2", "driver_ok:2",
+              "contradiction:1"]),
+        trip("shutdown_restart_resumes", "the latch is durable",
+             ["latched", "issued:1", "driver_error:1", "shutdown", "restart"]),
+        trip("contradiction_after_restart", "a contradiction after a restart resumes attempts",
+             ["latched", "issued:1", "driver_ok:1", "shutdown", "restart", "contradiction:1"]),
+        trip("binding_change_ends", "",
+             ["latched", "issued:1", "binding_changed", "contradiction:1"]),
+        trip("retirement_ends", "an orphan is retired only after its binding leaves force",
+             ["latched", "issued:1", "driver_ok:1", "binding_changed", "retired",
+              "contradiction:1"]),
     ]
 
     corpus = {
@@ -438,6 +577,7 @@ def build() -> bytes:
         "results": results,
         "digests": digests,
         "bound": bound,
+        "registry": trips,
         "judgments": judgments,
         "lifecycle": lifecycle,
     }
