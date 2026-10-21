@@ -76,24 +76,37 @@ commit.
 ### Assessment History
 
 An entry may keep the assessments its `assessment` replaced. It is opt-in: an
-entry without `prior_assessments` needs no migration.
+entry without `prior_assessments` needs no migration. Once an entry has been
+assessed, though, its assessment is never edited in place: correcting even a
+typo is a supersession that keeps the earlier text, since `corrections`
+cannot reach an assessment.
 
 - `prior_assessments[]` is append-only. Each item is a superseded
   `assessment` kept whole, with the `conformance` it carried. When the active
   `assessment` changes, the change appends the one it replaces, unaltered,
-  and nothing else. No item is ever edited, reordered or removed, and an
-  entry that has been assessed is never removed. Assessments are dated in
-  order, oldest first, then the active one.
-- Every divergence of the last superseded assessment that the active one
-  drops appears exactly once in `assessment.resolved[]`, as `{divergence,
-  by, commit | contract_revision, evidence}`, with `divergence` quoted
-  exactly and `evidence` saying what shows it resolved:
+  and nothing else. No item is ever edited, reordered or removed, an entry
+  that has been assessed is never removed, and an entry or record new in a
+  change carries no `prior_assessments`: history is what the default branch
+  already recorded. Assessments are dated in order, oldest first, then the
+  active one. Each implementation has one entry: no two entries of a record
+  share a `role` and `repository`.
+- Every divergence and every missing requirement any superseded assessment
+  recorded that the active one does not keep appears exactly once in
+  `assessment.resolved[]`, as `{divergence | requirement, by, commit |
+  contract_revision, evidence}`, quoted exactly, with `evidence` saying what
+  shows it resolved. The list is cumulative: a later assessment names again
+  what an earlier one resolved.
   - `by: "fix"` names the fixing `commit` in the implementation's
-    repository. It descends from the superseded snapshot's commit and is in
-    the history of the commit the active assessment assessed.
+    repository. It descends from every commit at which an assessment
+    recorded the item, and is in the history of the commit the active
+    assessment assessed. So no fix resolves an item at a commit that
+    recorded it.
   - `by: "amended-rule"` names `contract_revision`: the commit of this
-    repository the active assessment was judged under, which changed the
-    version's document.
+    repository the active assessment was judged under. It changed the
+    normative text of the version's document, not only its Status block or
+    wrapping, and descends from the commit at which this repository's record
+    first carried the item. A frozen version's rules do not change, so it
+    admits no amended-rule resolution.
 - Any snapshot may be reassessed, an earlier one or the same one, with a
   `method` that says why. Such a reassessment can only add divergences: a fix
   cannot descend from a snapshot and also be in an earlier one, so a
@@ -108,17 +121,17 @@ commit on every run, and checks the history against the merge base with the
 default branch. `--verify-resolutions` checks each fix's ancestry, in CI, by
 fetching the public repositories a fix names. A fix in a private repository
 is not fetched, and the status line shows it as "(N resolutions unverified by
-CI)"; `--verify-siblings` checks it against a local checkout.
+CI)", for as long as the active assessment names it; `--verify-siblings`
+checks it against a local checkout. The status line also counts an entry's
+prior assessments.
 
 Stated limits:
-- A cherry-picked hotfix that does not descend from the superseded snapshot
-  cannot resolve a divergence by descent. It is recorded as a new
-  assessment of a snapshot that contains it, and the divergence stays until
-  a fix that descends is in an assessed snapshot.
-- The checker cannot tell whether an amended rule really resolves the
-  divergence it names, or whether a fix fixes it; review does.
-- Missing requirements are kept whole in `prior_assessments`, but dropping
-  one needs no resolution.
+- A cherry-picked hotfix that does not descend from the commits that recorded
+  an item cannot resolve it by descent. It is recorded as a new assessment of
+  a snapshot that contains it, and the item stays until a fix that descends
+  is in an assessed snapshot.
+- The checker cannot tell whether an amended rule really resolves the item
+  it names, or whether a fix fixes it; review does.
 
 `vendored_revision` is input-document provenance only. It is not a conformance
 claim and not a conformance result, and a vendored revision that differs from
