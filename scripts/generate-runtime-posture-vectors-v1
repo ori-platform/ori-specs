@@ -322,7 +322,9 @@ class Gateway:
         if held["run"] != self.run:
             return {"state": "stale", **out}
         age = max(0, held["wall"] - held["issued"]) + max(mono - held["mono"], wall - held["wall"])
-        return {"state": "current" if age <= CURRENT_MS else "stale", **out}
+        if age > CURRENT_MS:
+            held["stale_seen"] = True  # a held record that has read stale stays stale until a fresh one
+        return {"state": "stale" if held.get("stale_seen") else "current", **out}
 
     def restart(self, pins: dict | None = None, devices: list | None = None, readable: bool = True) -> None:
         self.run += 1
@@ -528,6 +530,16 @@ sequence("wall_step_back_never_freshens", "A wall clock stepped back leaves the 
 sequence("wall_step_forward_stales_early", "Elapsed time is the greater of the monotonic and wall elapsed times, so "
          "a suspend the monotonic clock did not count, or a forward wall step, stales the record.",
          [rx(R1, T, 0), observe(T + 10_000_000, 100)])
+sequence("wall_forward_then_back_stays_stale", "A wall clock stepped forward stales the record; stepped back "
+         "again, it lowers the wall elapsed time, but a record that has read stale stays stale.",
+         [rx(R1, T, 0), observe(T + CURRENT_MS + 1, 1), observe(T + 2, 2)])
+sequence("stale_at_boundary_then_back", "One millisecond past the bound on the wall clock is stale, and a step "
+         "back to the bound itself does not make it current again.",
+         [rx(R1, T, 0), observe(T + CURRENT_MS, 1), observe(T + CURRENT_MS + 1, 2), observe(T + CURRENT_MS, 3)])
+sequence("replay_does_not_end_stale", "A replayed copy of a record that has read stale leaves it stale; a fresh "
+         "record ends it.",
+         [rx(R1, T, 0), observe(T + CURRENT_MS + 1, 1), rx(R1, T + 3, 3), observe(T + 4, 4),
+          rx(record(seq=2, issued=T + 5), T + 5, 5)])
 sequence("lower_tuple_sticky", "A validly signed lower record makes the device unknown until a higher one.",
          [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
           rx(record(seq=5, issued=T), T + 2, 2), rx(record(seq=6, issued=T + 3), T + 3, 3)])
@@ -670,7 +682,11 @@ CONFIG_CASES: list[dict] = []
 
 
 def config_verdict(devices: list, keys: dict, state_dir: object) -> str | None:
-    # gateway.state_directory's load rules come first.
+    # gateway.state_directory's load rules come first. These cases hold its value to absent or one plain
+    # absolute path; its own corpus judges every other value.
+    if not (state_dir is None or (isinstance(state_dir, str) and state_dir.startswith("/")
+                                  and all(0x21 <= ord(c) <= 0x7e for c in state_dir))):
+        raise ValueError("state_directory outside this corpus's scope")
     if keys and not state_dir:
         return "required_under_posture"
     seen: dict[bytes, str] = {}
@@ -737,6 +753,9 @@ BOUND = 16_384
 
 
 def readback(request: str, peer: str | None, key_loaded: bool) -> dict:
+    # `request` is the frame's body, the bytes before its first LF; the framing is operator-socket/v3's.
+    if "\n" in request:
+        raise ValueError("a request body holds no LF")
     raw_req = request.encode("utf-8")
     def refused(code: str) -> dict:
         return {"schema_version": 1, "ok": False, "error": {"code": code}}
@@ -811,14 +830,20 @@ def build() -> dict:
                           "would change nothing durable is not made, so `store_write` has no effect on it. "
                           "`wall_ms` and `mono_ms` are the "
                           "gateway's wall and monotonic clocks at the event. `expected` holds the verdict, for a "
-                          "receive, and in `states` the state of each device configured after the event, with "
+                          "receive, and in `states` the state of each device configured after the event, each a "
+                          "judgement the gateway makes then, so a record that reads `stale` stays `stale` until a "
+                          "fresh one is accepted, with "
                           "`reason`, `record_b64`, `received_at_ms`, `last_refusal` and `last_refusal_at_ms` as Carriage gives "
                           "them: each is the device's `posture_record` in Site Health, and its object in the LAN "
                           "posture body without `device_id`."),
-            "config": ("gateway-config/v2 posture key load rules, after gateway.state_directory's, with "
+            "config": ("gateway-config/v2 posture key load rules, after gateway.state_directory's, whose value "
+                       "here is null or one absolute path of printable ASCII with no space; gateway-config/v2's "
+                       "state-directory corpus judges every other value. With "
                        "gateway.auth and evidence disabled: `valid`, and `rule` when refused. `runtime_keys` "
                        "lists its entries in the order they are written."),
             "readback": ("Owned by the runtime, which serves it; a gateway does not consume these cases. "
+                         "`request` is the frame's body, the bytes before its first LF, and holds no LF; the "
+                         "socket's framing is operator-socket/v3's and is not judged here. "
                          "operator-socket/v3 runtime_device_key: the request bytes, the peer (`root`, "
                          "`operator`, `other` or null when credentials cannot be established), whether the "
                          "posture key is loaded, the device and key it would answer, and the answer, whose "

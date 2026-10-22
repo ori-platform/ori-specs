@@ -123,7 +123,13 @@ PINS: list[tuple[str, str]] = [
     ("posture", "A record that arrives while a write is outstanding, for any device, waits for that write; if the write is still outstanding at its 1000 ms bound, the record is `store_unavailable` and changes nothing. Records that waited are then judged in arrival order, each against the state in memory, and their changes wait for the next write."),
     ("posture", "A message that changes nothing durable, as a sticky reason set again to the reason already held does, writes nothing and so cannot fail a write."),
     ("posture", "These rules have no corpus case and are exercised by no vector: a record waiting on an outstanding write that completes within its bound, the group commit's generations, the pacing of read and write retries, Payload Volume drops on the posture topic, and the posture store's file rules in gateway-config/v2."),
-    ("posture", "Against gateway-api/v2's volume bound, a bucket that holds 5 records and gains one every 10 seconds, this leaves at least one record of room for the broker's redelivery of the retained record at a subscribe."),
+    ("posture", "Against gateway-api/v2's volume bound, a bucket that holds 5 records and gains one every 10 seconds, this leaves at least one record of room for the broker's redelivery of the retained record at a subscribe, while delivery does not bunch records; [Limits](#limits-and-later-versions) states what bunching does."),
+    ("posture", "Coalescing bounds when the runtime publishes, not when the gateway receives: records published at 0, 1, 10002, 20003, 30004 and 60002 ms keep both of its limits, but delivered together from 60002 ms, each within check 10's bound, the sixth finds the bucket empty."),
+    ("posture", "Volume drops leave no `last_refusal`."),
+    ("posture", "- **A pause neither clock counts is not counted.** A gateway whose monotonic clock stops while its host is suspended, and whose wall clock is stepped back across the suspend, counts neither, so a record can stay `current` for longer than it is in fact old."),
+    ("posture", "- **A release longer than 64 characters cannot be carried.** runtime-release-bundle/v1 bounds no `runtime_version` length, and `release` holds at most 64 characters, so a runtime installed from a verified bundle with a longer version publishes no record"),
+    ("posture", "ori-runtime#782 enforces it at publication; `null` is never a substitute, since it says the code was not installed from a verified bundle."),
+    ("gateway_api", "are not dropped for volume while nothing else spends the device's bound and delivery does not bunch them. Coalescing bounds publication, not arrival: ordinary delivery delay can bunch records within check 10's skew bound and exhaust the bucket, as runtime-posture/v1 states."),
     ("posture", "A gateway logs the counts, and reports them in its health once its health names a field for them."),
     ("posture", "- **Coalescing.** A runtime publishes at most 2 records in any 10 seconds and at most 5 in any minute, both judged over sliding windows."),
     ("gateway_api", "admits, for each configured device, at least what a token bucket admits that starts full with 5 records, gains one record every 10 seconds, and is judged at each record's arrival; its byte budget is 5 times the topic's maximum payload size, gaining one maximum every 10 seconds. A bound that admits less, such as a bucket of 3 that gains 6 a minute, does not conform."),
@@ -167,7 +173,8 @@ PINS: list[tuple[str, str]] = [
     ("posture", "- **`current`**: a record is held, no sticky reason is held, and its age is at most 900000 ms."),
     ("posture", "- **`stale`**: a record is held, no sticky reason is held, and its age is more than 900000 ms or cannot be computed."),
     ("posture", "A held record's age is its age at receipt, the gateway's wall clock at receipt minus `issued_at_ms`, taken as `0` when negative, plus the time elapsed since receipt: the greater of the elapsed time on the gateway's monotonic clock and on its wall clock."),
-    ("posture", "A later step of the gateway's wall clock never freshens a held record."),
+    ("posture", "**A held record that has read `stale` reads `stale` until a fresh record is accepted**: a later step of the gateway's wall clock back, which lowers the elapsed time computed from it, never makes it `current` again, and a `replayed` copy of it does not end this. The gateway judges a held record's state at least whenever it reports it."),
+    ("posture", "A pause that neither clock counts is not counted, and [Limits](#limits-and-later-versions) states it."),
     ("posture", "A gateway's monotonic clock does not carry across its restarts, so after a restart the age of a record received before it cannot be computed: the record reads `stale` until a fresh one is accepted. The retained copy the broker redelivers on subscribing is `replayed` while it passes check 10, and `stale_timestamp` once it is older."),
     # Key pinning, Carriage
     ("posture", "Its records are `key_mismatch` until the new key is pinned."),
@@ -427,12 +434,36 @@ def build_model(texts: dict[str, str]) -> dict:
         raise Failure("text: runtime-posture/v1 quotes another bucket than gateway-api/v2's volume bound")
     r_short, r_win, r_min = m["coalesce"]
     margin = m["redelivery_margin"]
-    # The runtime's limits leave the stated margin under the bucket: its
-    # burst plus the margin fits the bucket's capacity, and its minute plus
-    # the margin fits a minute's refill.
+    # The qualified claim only, "while delivery does not bunch records": the
+    # runtime's burst plus the margin fits the bucket's capacity, and its
+    # minute plus the margin fits a minute's refill. No arrival guarantee is
+    # asserted; the Limits schedule below shows bunching overruns it.
     if r_short + margin > cap or r_min + margin > 60 // refill_s:
         raise Failure(f"text: a bucket of {cap} gaining 1 per {refill_s} s leaves no margin of {margin} over "
                       f"the runtime's {r_short}/{r_win}s and {r_min}/min")
+    # The Limits schedule: it keeps both publication limits, yet delivered
+    # together it overruns the bucket at exactly the record the text names.
+    sched = one(r"records published at ([\d, and]+) ms keep both of its limits, but delivered together from (\d+) ms, each within check 10's bound, the (\w+) finds the bucket empty",
+                lim, "volume schedule")
+    pubs = [int(x) for x in re.split(r", | and ", sched.group(1))]
+    deliver = int(sched.group(2))
+    nth = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7}[sched.group(3)]
+    for t in pubs:
+        if sum(1 for u in pubs if t <= u < t + r_win * 1000) > r_short or sum(1 for u in pubs if t <= u < t + 60000) > r_min:
+            raise Failure("text: the Limits volume schedule breaks the coalescing limits it says it keeps")
+    if any(deliver - t > m["skew"] for t in pubs) or deliver < max(pubs):
+        raise Failure("text: the Limits volume schedule is not delivered within check 10's bound")
+    tokens, last, dropped = float(cap), 0.0, None
+    for i, _t in enumerate(pubs, start=1):
+        arrive = deliver + (i - 1)
+        tokens = min(cap, tokens + (arrive - last) / (refill_s * 1000))
+        last = arrive
+        if tokens >= 1:
+            tokens -= 1
+        elif dropped is None:
+            dropped = i
+    if dropped != nth:
+        raise Failure(f"text: the Limits schedule says the {sched.group(3)} record is dropped; the bucket drops record {dropped}")
     ga2 = one(r"A conforming runtime publishes at most (\d+) records in any (\d+) seconds and (\d+) in any minute", vol, "posture volume runtime")
     if (int(ga2.group(1)), int(ga2.group(2)), int(ga2.group(3))) != (r_short, r_win, r_min):
         raise Failure("text: gateway-api/v2 quotes another coalescing limit than runtime-posture/v1's")
@@ -1084,6 +1115,9 @@ class Held:
     recv_mono: int
     run: int
     sticky: str | None = None
+    # Set once a judgement reads the record stale; only a fresh accepted
+    # record (a new Held) starts without it.
+    latched_stale: bool = False
 
 
 @dataclass
@@ -1136,8 +1170,11 @@ class Gateway:
         return h.sticky if h is not None else None
 
 
-def report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset) -> dict:
-    out = _report(gw, device, mono, wall, model, mut)
+def report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset, judge: bool = False) -> dict:
+    """The device's posture_record. With judge, this is a judgement the gateway
+    makes and reports, and a stale reading latches; without, a side-effect-free
+    look used only for coverage bookkeeping."""
+    out = _report(gw, device, mono, wall, model, mut, judge)
     lr = gw.last_refusal.get(device)
     if lr is not None:
         out["last_refusal"] = lr[0]
@@ -1146,7 +1183,7 @@ def report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: fro
     return out
 
 
-def _report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset) -> dict:
+def _report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset, judge: bool = False) -> dict:
     avail = not gw.unavailable_for(device, mut)
     h = gw.store.get(gw.slot(device, mut)) if avail and device in gw.pins else None
     sticky = gw.sticky_of(device, h, mut) if avail and device in gw.pins else None
@@ -1195,7 +1232,13 @@ def _report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: fr
         age = receipt + elapsed
         current = age <= model["age"] if "age_edge_exclusive" not in mut else age < model["age"]
         state = "current" if current else "stale"
-        report.ages.append((age, state, mono_el, wall_el, receipt))
+        latched = h.latched_stale and "no_latch" not in mut
+        if latched:
+            state = "stale"
+        if judge:
+            report.ages.append((age, state, mono_el, wall_el, receipt, latched and current))
+    if judge and state == "stale":
+        h.latched_stale = True
     received = h.issued if "received_is_issued" in mut else h.recv_wall
     return {"state": state, "record_b64": base64.b64encode(h.raw).decode(), "received_at_ms": received}
 
@@ -1239,6 +1282,10 @@ def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, n
     issued = int(rec["issued_at_ms"].token)
     h = gw.store.get(key)
     new = Held(msg.raw, pair, issued, msg.wall, mono, gw.run)
+    if "accept_keeps_latch" in mut and h is not None:
+        new.latched_stale = h.latched_stale
+    if h is not None and h.latched_stale:
+        notes.append(("accept_after_latch", None))
     # Decide the verdict and the durable change, then write it.
     verdict, change = None, None
     if h is None:
@@ -1259,6 +1306,8 @@ def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, n
             verdict = "replayed"
             if "replay_refreshes" in mut:
                 h.recv_mono, h.run = mono, gw.run
+            if "replay_ends_latch" in mut:
+                h.latched_stale = False
             if "replay_clears_sticky" in mut:
                 h.sticky = None
                 gw.device_sticky.pop(msg.topic, None)
@@ -1369,9 +1418,8 @@ def load_config(case: dict, model: dict, mut: frozenset) -> str | None:
 
     tail = [r for r in rules if r not in model["config_rules"][lo - 1:hi]]
     sd = case["state_directory"]
-    sd = sd.strip() if isinstance(sd, str) else sd
-    if sd == "":
-        sd = None
+    if "cfg_trims_state_directory" in mut and isinstance(sd, str):
+        sd = sd.strip() or None
 
     def state_dir_fault() -> str | None:
         # gateway.state_directory, in the text's order. The corpus note states
@@ -1421,7 +1469,7 @@ def readback(case: dict, model: dict, mut: frozenset) -> dict:
     if key is None or admission(key) is not None:
         raise Failure(f"readback.{case['name']}: posture_key is not an admitted key")
     raw = case["request"].encode("utf-8")
-    if b"\n" in raw:
+    if "rb_splits_at_lf" in mut and b"\n" in raw:
         raw = raw.split(b"\n", 1)[0]
     codes = list(model["readback_codes"])
     for m in mut:
@@ -1724,6 +1772,8 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                 for note in notes:
                     if note[0] == "noop_flag" and note[1]:
                         edges["noop_write_flag"] = True
+                    if note[0] == "accept_after_latch" and v == "accepted":
+                        edges["accept_resets_latch"] = True
                 after = report(gw, dev, e["mono_ms"], e["wall_ms"], model, frozenset()) if dev in devices else {}
                 br, ar = before.get("reason"), after.get("reason")
                 if br in model["sticky"] and ar in model["sticky"] and ar != br:
@@ -1844,7 +1894,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
             for d in devices:
                 if d not in gw.pins and not gw.available:
                     edges["no_pin_store_unreadable"] = True
-                st = report(gw, d, e["mono_ms"], e["wall_ms"], model, mut)
+                st = report(gw, d, e["mono_ms"], e["wall_ms"], model, mut, judge=True)
                 states[d] = st
                 states_seen.add((st["state"], st.get("reason")))
                 if kind == "restart" and st["state"] == "stale":
@@ -1867,7 +1917,11 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                         age = max(0, h.recv_wall - h.issued) + max(e["mono_ms"] - h.recv_mono, e["wall_ms"] - h.recv_wall)
                         if age > model["age"]:
                             edges["sticky_past_age"] = True
-            for age, state, mono_el, wall_el, receipt in report.ages:
+            for age, state, mono_el, wall_el, receipt, held_by_latch in report.ages:
+                if held_by_latch:
+                    edges["latch_holds_stale"] = True
+                    if kind == "receive" and got.get("verdict") == "replayed":
+                        edges["replay_keeps_latch"] = True
                 edges[f"age:{age - model['age']}:{state}"] = True
                 if state == "stale" and receipt + mono_el <= model["age"] < receipt + wall_el:
                     edges["wall_forward_stales"] = True
@@ -1929,6 +1983,9 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     ("read_recovers", "a read clearing an unreadable store"),
                     ("store_recovers_sticky", "a kept sticky reason in force after a write completes"),
                     ("restart_unreadable", "a restart that finds the store unreadable"),
+                    ("latch_holds_stale", "a record kept stale by its latch when its computed age is back within the bound"),
+                    ("replay_keeps_latch", "a replay of a latched-stale record leaving it stale"),
+                    ("accept_resets_latch", "a fresh record accepted over a latched-stale one"),
                     ("read_finds_earlier_run", "a read finding a record from an earlier run, which reads stale"),
                     ("restart_while_unwritten", "a restart while the store is unwritten, losing the change in memory"),
                     ("cross_device_waits", "a record for another device refused store_unavailable while a write is outstanding"),
@@ -1943,14 +2000,18 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         need(edges.get(k, False), f"no sequence with {what}")
 
     # Config
-    if "with gateway.auth and evidence disabled" not in corpus["note"]["config"]:
+    if "whose value here is null or one absolute path of printable ASCII with no space; gateway-config/v2's state-directory corpus judges every other value" not in corpus["note"]["config"]:
+        bad("corpus: the config note no longer states the state_directory scope the checker holds")
+    if "With gateway.auth and evidence disabled" not in corpus["note"]["config"]:
         bad("corpus: the config note no longer states gateway.auth and evidence disabled, which the loader assumes")
     rules_seen: set = set()
     for c in corpus["config"]:
         where = f"config.{c['name']}"
         sd = c["state_directory"]
-        if sd is not None and not isinstance(sd, str):
-            bad(f"{where}: state_directory is not a string")
+        # The corpus's scope: null, or one absolute path of printable ASCII
+        # with no space. Every other value is the state-directory corpus's.
+        if sd is not None and not (isinstance(sd, str) and re.fullmatch(r"/[!-~]*", sd)):
+            bad(f"{where}: state_directory {sd!r} is outside this corpus's scope; gateway-config/v2's state-directory corpus judges it")
         got = load_config(c, model, mut)
         want = None if c["valid"] else c.get("rule")
         if c["valid"] and "rule" in c:
@@ -1976,8 +2037,13 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
     codes_seen: set = set()
     peers_ok: set = set()
     rb_pairs: set = set()
+    if "`request` is the frame's body, the bytes before its first LF, and holds no LF" not in corpus["note"]["readback"]:
+        bad("corpus: the readback note no longer states that request is the frame's body")
     for c in corpus["readback"]:
         where = f"readback.{c['name']}"
+        if "\n" in c["request"]:
+            bad(f"{where}: request holds an LF; it is the frame's body, and framing is operator-socket/v3's")
+            continue
         got = readback(c, model, mut)
         want = copy.deepcopy(c["expected"])
         if isinstance(want.get("error"), dict):
@@ -2061,6 +2127,9 @@ RECEIVER_MUTANTS = [
     "read_clears_unwritten",
     "restart_keeps_memory",
     "restart_ignores_unreadable",
+    "no_latch",
+    "replay_ends_latch",
+    "accept_keeps_latch",
     "unwritten_admits_other_device",
     "late_write_restores_own_only",
     "failed_write_loses_verdict",
@@ -2190,6 +2259,24 @@ def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
         y["readback"][i]["expected"]["schema_version"] = 2
         out.append((f"readback.{c['name']}: schema_version changed", y))
         out.append((f"readback.{c['name']}: answer changed", x))
+    # Scope: a state_directory outside printable-ASCII absolute paths, claimed
+    # valid, and an LF-bearing readback request, claimed answered.
+    valid_cfg = next(c for c in corpus["config"] if c["valid"] and c["runtime_keys"])
+    for ch in ("\x1c", "\x1d", "\x1e", "\x1f", " ", "\u00a0"):
+        x = copy.deepcopy(corpus)
+        y = copy.deepcopy(valid_cfg)
+        y["name"] = f"scope_prefix_{ord(ch):04x}"
+        y["state_directory"] = ch + y["state_directory"]
+        x["config"].append(y)
+        out.append((f"config: a state_directory prefixed with U+{ord(ch):04X} accepted as valid", x))
+    ok_rb = next(c for c in corpus["readback"] if c["expected"]["ok"])
+    for req in ('{\n"operation":"runtime_device_key"}', '{"operation":"runtime_device_key"}\ntail', '\n{"operation":"runtime_device_key"}'):
+        x = copy.deepcopy(corpus)
+        y = copy.deepcopy(ok_rb)
+        y["name"] = "scope_lf"
+        y["request"] = req
+        x["readback"].append(y)
+        out.append((f"readback: an LF-bearing request {req!r} answered", x))
     for label in corpus["test_keys"]:
         x = copy.deepcopy(corpus)
         ki = x["test_keys"][label]["key_identity"]
