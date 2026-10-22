@@ -16,6 +16,7 @@ Usage: generate-runtime-posture-vectors-v1 [--check]
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import pathlib
@@ -263,6 +264,7 @@ class Gateway:
         self.devices, self.pins = list(devices), dict(pins)
         self.store_mode: str | None = None if store_ok else "unreadable"  # or "unwritten"
         self.states: dict[tuple[str, bytes], dict] = {}
+        self.durable: dict[tuple[str, bytes], dict] = {}
         self.last_refusal: dict[str, tuple[str, int]] = {}
         self.run = 0
 
@@ -298,6 +300,8 @@ class Gateway:
         st.update(change)
         if write_fails:
             self.store_mode = "unwritten"
+        else:
+            self.durable = copy.deepcopy(self.states)
         return verdict
 
     def state(self, device: str, wall: int, mono: int) -> dict:
@@ -320,13 +324,14 @@ class Gateway:
         age = max(0, held["wall"] - held["issued"]) + max(mono - held["mono"], wall - held["wall"])
         return {"state": "current" if age <= CURRENT_MS else "stale", **out}
 
-    def restart(self, pins: dict | None = None, devices: list | None = None) -> None:
+    def restart(self, pins: dict | None = None, devices: list | None = None, readable: bool = True) -> None:
         self.run += 1
         self.last_refusal = {}
-        if self.store_mode == "unwritten":
-            # The state in memory is lost; the durable state is what the gateway starts from. This model
-            # never restarts with an unwritten store.
-            raise ValueError("restart while unwritten is not modelled")
+        # The gateway starts from the store as it was last written; state held only in memory is lost.
+        unreadable = self.store_mode == "unreadable"
+        self.states, self.store_mode = copy.deepcopy(self.durable), None
+        if unreadable or not readable:  # a store unreadable before a restart is unreadable after it
+            self.states, self.store_mode = {}, "unreadable"
         if pins is not None:
             self.pins = dict(pins)
         if devices is not None:
@@ -454,10 +459,6 @@ def store_read(wall: int, mono: int) -> dict:
     return {"event": "store_read_succeeds", "wall_ms": wall, "mono_ms": mono}
 
 
-def store_unreadable(wall: int, mono: int) -> dict:
-    return {"event": "store_read_fails", "wall_ms": wall, "mono_ms": mono}
-
-
 def store_written(wall: int, mono: int) -> dict:
     return {"event": "store_write_completes", "wall_ms": wall, "mono_ms": mono}
 
@@ -466,8 +467,11 @@ def observe(wall: int, mono: int) -> dict:
     return {"event": "observe", "wall_ms": wall, "mono_ms": mono}
 
 
-def restart(wall: int, mono: int, pins: dict | None = None, devices: tuple | None = None) -> dict:
+def restart(wall: int, mono: int, pins: dict | None = None, devices: tuple | None = None,
+            readable: bool = True) -> dict:
     ev = {"event": "restart", "wall_ms": wall, "mono_ms": mono}
+    if not readable:
+        ev["store_readable"] = False
     if pins is not None:
         ev["pinned_keys"] = {d: "ed25519:" + b64(p) for d, p in sorted(pins.items())}
     if devices is not None:
@@ -487,17 +491,15 @@ def sequence(name: str, note: str, events: list, *, pins: dict | None = None, st
                                         ev.get("store_write") in ("fails", "stalls"))
         elif ev["event"] == "restart":
             gw.restart({d: base64.b64decode(k[8:]) for d, k in ev["pinned_keys"].items()}
-                       if "pinned_keys" in ev else None, ev.get("configured_devices"))
-        elif ev["event"] == "store_read_fails":
-            if gw.store_mode is not None:
-                raise ValueError("a read is made only of an available store in this model")
-            gw.store_mode = "unreadable"
+                       if "pinned_keys" in ev else None, ev.get("configured_devices"),
+                       ev.get("store_readable", True))
         elif ev["event"] == "store_read_succeeds":
             if gw.store_mode == "unreadable":
-                gw.store_mode = None
+                gw.store_mode, gw.states = None, copy.deepcopy(gw.durable)
         elif ev["event"] == "store_write_completes":
             if gw.store_mode == "unwritten":
                 gw.store_mode = None
+                gw.durable = copy.deepcopy(gw.states)
         exp["states"] = {d: gw.state(d, ev["wall_ms"], ev["mono_ms"]) for d in gw.devices}
         out.append({**ev, "expected": exp})
     seq = {"name": name, "note": note, "configured_devices": list(devices),
@@ -624,11 +626,24 @@ sequence("store_write_fails_all_devices", "A failed write blanks every pinned de
           rx(record(KEY_B, device=OTHER_DEVICE, seq=1, issued=T + 1), T + 1, 1, device=OTHER_DEVICE),
           rx(record(seq=6, issued=T + 2), T + 2, 2, write="fails"), store_written(T + 3, 3)],
          devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A, OTHER_DEVICE: PUB_B})
-sequence("store_reread_keeps_held", "A store that becomes unreadable mid-run hides every device; the read that "
-         "then succeeds finds what was last written, and the held record, received earlier in the run, keeps its "
-         "monotonic receipt and is current again.",
-         [rx(R1, T, 0), store_unreadable(T + 1, 1), rx(record(seq=2, issued=T + 2), T + 2, 2),
-          store_read(T + 3, 3)])
+sequence("restart_loses_unwritten_change", "A change held only in memory, its write failed, is lost at a "
+         "restart: the gateway starts from the store as last written, so the lower_tuple it had shown is gone and "
+         "the earlier run's record reads stale.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1, write="fails"),
+          restart(T + 2, 0)])
+sequence("store_write_stalls_other_device_waits", "A write stalled past its bound blanks every device; a "
+         "record for another device arriving once the bound has passed, with the write still outstanding, is "
+         "store_unavailable and changes nothing, and the late write, carrying the whole state in memory, restores "
+         "both devices.",
+         [rx(record(seq=5, issued=T), T, 0),
+          rx(record(KEY_B, device=OTHER_DEVICE, seq=1, issued=T + 1), T + 1, 1, device=OTHER_DEVICE),
+          rx(record(seq=6, issued=T + 2), T + 2, 2, write="stalls"),
+          rx(record(KEY_B, device=OTHER_DEVICE, seq=2, issued=T + 1003), T + 1003, 1003, device=OTHER_DEVICE),
+          store_written(T + 1004, 1004)],
+         devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A, OTHER_DEVICE: PUB_B})
+sequence("restart_unreadable_then_read", "A store unreadable at a restart hides every device; the read that "
+         "then succeeds finds the store as last written, and its record, received in the earlier run, reads stale.",
+         [rx(R1, T, 0), restart(T + 1, 0, readable=False), store_read(T + 2, 1)])
 sequence("last_refusal_is_latest", "The last refusal is the most recent one, with the wall clock at its receipt, "
          "and a later accepted record does not clear it.",
          [rx({**R1, "signature": b64(b"\x00" * 64)}, T, 0), rx(record(KEY_B, seq=1, issued=T + 1), T + 1, 1),
@@ -782,14 +797,16 @@ def build() -> dict:
                         "gateway-api/v2's corpora's."),
             "sequences": ("Each sequence runs its events in order against one gateway. `receive` judges a message "
                           "and gives its verdict, its store write failing when `store_write` is `fails`, or "
-                          "outstanding past 1000 ms when it is `stalls`; `observe` "
+                          "outstanding past 1000 ms when it is `stalls`, whose `states` are those once that bound has "
+                          "passed; `observe` "
                           "reads the state; `restart` restarts the gateway, resetting its monotonic clock and its "
-                          "last refusals, and installs `pinned_keys` and `configured_devices` when given; "
-                          "`store_read_fails` is a read of an available store that fails, making it unreadable; "
-                          "`store_read_succeeds` is a read of an unreadable store that succeeds, finding what was "
-                          "last written, or an empty store when the sequence starts unreadable; and "
+                          "last refusals, starting from the store as it was last written, finding it unreadable "
+                          "when `store_readable` is false, and installs `pinned_keys` and `configured_devices` "
+                          "when given; "
+                          "`store_read_succeeds` is a read of an unreadable store that succeeds, finding the "
+                          "store as it was last written, which is empty when the sequence starts unreadable; and "
                           "`store_write_completes` a write of the state in memory that completes, either the "
-                          "outstanding one or a retry; neither clears the other cause. `store_readable` false "
+                          "outstanding one or a retry. The two causes never hold together. `store_readable` false "
                           "starts with the store unreadable, for the reason `store_condition` names. A write that "
                           "would change nothing durable is not made, so `store_write` has no effect on it. "
                           "`wall_ms` and `mono_ms` are the "
