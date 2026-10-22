@@ -291,10 +291,13 @@ EVENTS = (
     (("rotate",), "a rotation that keeps the previous secret, or one that keeps none."),
     (("floor_unreadable", "floor_read"), "the stored floor becomes unreadable, and a read of "
      "it succeeds again. Between them the floor an event gives is the one the receiver "
-     "keeps, unchanged; a `restart` between them leaves the floor unreadable, and gives "
-     "the greater of the stored floor and its clock at that start, under the start rule "
-     "in [The floor](#the-floor): a start floor an earlier run took from its clock was never "
-     "stored, so it does not carry over."),
+     "keeps, unchanged; a `restart` between them leaves the floor unreadable and gives "
+     "its clock at that start and no held keys, the only floor and keys a receiver that "
+     "cannot read its store knows. Every envelope that passes checks 1 and 2 is refused as "
+     "`before_replay_floor` until the read succeeds, whatever floor an event gives. The "
+     "`floor_read` after it gives the stored keys and the greater of the stored floor and "
+     "that clock, under the start rule in [The floor](#the-floor): a start floor an earlier "
+     "run took from its clock was never stored, so it does not carry over."),
 )
 B_FLOOR = "an envelope signed exactly at the floor, and one millisecond below it"
 B_SKEW = "both skew bounds and one millisecond beyond each"
@@ -1139,15 +1142,26 @@ class Receiver:
         self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
         self.pending: dict[str, tuple[str, int, int]] = {}
         self.unreadable = False                   # F unbounded: a refusal, not a floor
+        # started while unreadable: until the read the stored floor and keys are
+        # unknown, and it gives only its clock at that start and no held keys; the
+        # stored ones stay in `held` for the read to restore
+        self.blind = False
+        self.blind_keys = False
+
+    @property
+    def known(self) -> dict:
+        return {} if self.blind_keys else dict(self.held)
 
     @property
     def floor(self) -> int:
+        if self.blind:
+            return self.base
         kept = [f for f in (self.raised, self.found) if f is not None]
         return self.base if not kept else self.m["start"](max(kept), self.base)
 
     def fails(self, c: dict, key: str, s: int, t: int) -> bool:
         if c["rhs"] == "held":
-            return key in self.held
+            return key in self.known
         if c["rhs"] == "F" and self.unreadable:
             return True
         rhs = {"t-S": t - self.skew, "t+S": t + self.skew, "F": self.floor}[c["rhs"]]
@@ -1180,7 +1194,7 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None,
     for i, ev in enumerate(case["events"]):
         kind, t = ev["event"], ev["t"]
         rec = {"i": i, "kind": kind, "t": t, "ev": ev, "pre_floor": rx.floor,
-               "pre_raised": rx.raised, "pre_skew": rx.skew, "pre_held": dict(rx.held),
+               "pre_raised": rx.raised, "pre_skew": rx.skew, "pre_held": rx.known,
                "pre_pending": dict(rx.pending), "unreadable": rx.unreadable,
                "reason": None, "dropped": [], "fails": None, "key": ev.get("key"),
                "s": ev.get("signed_at_ms")}
@@ -1239,6 +1253,12 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None,
             if not rx.unreadable and unread_as is None:
                 raise Failure(f"event {i}: floor_read with the floor readable")
             rx.unreadable = False                  # its end lowers no floor
+            # the stored floor is known again: the start rule over it and the clock
+            # at the last start, which a blind start reported alone
+            rx.blind = rx.blind and unread_as == "read_stays_blind"
+            if rx.blind_keys and unread_as == "read_forgets_held":
+                rx.held = {}
+            rx.blind_keys = False
             if unread_as == "lowered":
                 rx.raised = None
         elif kind == "restart":
@@ -1250,6 +1270,10 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None,
             if "skew_ms" in ev:
                 rx.skew = ev["skew_ms"]
             rx.pending = {}
+            if rx.unreadable and unread_as not in ("blind_reads_stored", "restart_clears"):
+                rx.blind = True
+            if rx.unreadable and unread_as not in ("blind_keeps_held", "restart_clears"):
+                rx.blind_keys = True
             if unread_as == "restart_clears":
                 rx.unreadable = False
         elif kind == "rotate":
@@ -1263,7 +1287,7 @@ def replay(model: dict, case: dict, rotate_as: dict | None = None,
                 rx.raised, rx.held, rx.base, rx.pending = None, {}, t, {}
             elif how == "drop":
                 rx.held = {}
-        rec.update(floor=rx.floor, raised=rx.raised, skew=rx.skew, held=dict(rx.held))
+        rec.update(floor=rx.floor, raised=rx.raised, skew=rx.skew, held=rx.known)
         trace.append(rec)
     return trace
 
@@ -1680,21 +1704,43 @@ def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]],
                     return True
         return False
 
-    def unread_restart_stored(ctx, tr):
-        # a restart inside the span gives the greater of the floor it stored and its
-        # clock, below the earlier run's start floor, which was never stored: after
-        # the read an envelope between the two is admitted, and one below is refused
+    def unread_restart_keys(ctx, tr):
+        # a restart inside the span gives no held keys though it stored some; the
+        # read gives the stored keys back, and one of them replayed after it is
+        # refused as a replay, not admitted above the floor
         for _, span, b in unreadable_spans(tr):
-            for rs in span:
+            for j, rs in enumerate(span):
+                if rs["kind"] != "restart" or not ctx["stores"] or not rs["pre_held"] \
+                        or rs["held"] or any(r["kind"] == "restart" for r in span[j + 1:]):
+                    continue
+                if b["held"] != rs["pre_held"]:
+                    continue
+                if any(r["kind"] == "receive" and r["reason"] == REPLAY
+                       and r["key"] in b["held"] and r["s"] >= r["pre_floor"]
+                       and not r["fails"][0] and not r["fails"][1]
+                       for r in _segment_after(tr, b["i"])):
+                    return True
+        return False
+
+    def unread_restart_stored(ctx, tr):
+        # a restart inside the span gives its clock at that start, below the floor it
+        # stored; the read then gives the greater of the two, the stored floor, below
+        # the earlier run's start floor, which was never stored: after the read an
+        # envelope between the two is admitted, and one below is refused
+        for _, span, b in unreadable_spans(tr):
+            for j, rs in enumerate(span):
                 if rs["kind"] != "restart" or rs["raised"] is None \
-                        or not rs["t"] < rs["raised"] == rs["floor"] < rs["pre_floor"]:
+                        or not rs["floor"] == rs["t"] < rs["raised"] < rs["pre_floor"]:
+                    continue
+                if any(r["kind"] == "restart" for r in span[j + 1:]) \
+                        or b["floor"] != rs["raised"]:
                     continue
                 after = _segment_after(tr, b["i"])
                 if any(r["kind"] == "receive" and r["reason"] is None
-                       and rs["floor"] <= r["s"] < rs["pre_floor"] for r in after) \
+                       and b["floor"] <= r["s"] < rs["pre_floor"] for r in after) \
                         and any(r["kind"] == "receive" and r["reason"] == FLOOR
                                 and not r["fails"][0] and not r["fails"][1]
-                                and r["s"] == rs["floor"] - 1 for r in after):
+                                and r["s"] == b["floor"] - 1 for r in after):
                     return True
         return False
 
@@ -1833,8 +1879,11 @@ def parts(model: dict) -> dict[str, list[tuple[str, Callable[[dict, list[dict]],
                    ("the read restores the kept floor, which refuses again, and a later "
                     "prune drops the kept key", unread_ends),
                    ("a restart inside the span leaves the floor unreadable", unread_restart),
-                   ("a restart inside the span takes the floor it stored, not the earlier "
-                    "run's start floor", unread_restart_stored),
+                   ("a restart inside the span gives its clock, and the read then the "
+                    "floor it stored, not the earlier run's start floor",
+                    unread_restart_stored),
+                   ("a restart inside the span gives no held keys, and the read then the "
+                    "keys it stored, which refuse a replay", unread_restart_keys),
                    ("while unreadable, a held key is refused at the floor, and after the read "
                     "as a replay", unread_held),
                    ("while unreadable, an evict drops nothing and leaves the floor",
@@ -1968,7 +2017,15 @@ def mutations(text: str, corpus: dict) -> int:
                       ("restart_clears", "becomes readable at a restart"),
                       ("carry", "carries the earlier run's start floor across a restart"),
                       ("held_first", "is checked after the held key"),
-                      ("evict_drops", "lets an evict drop a key")):
+                      ("evict_drops", "lets an evict drop a key"),
+                      ("blind_reads_stored", "gives the stored floor at a restart, "
+                       "which it cannot read"),
+                      ("read_stays_blind", "keeps the restart's clock after the read, "
+                       "not the greater of it and the stored floor"),
+                      ("blind_keeps_held", "gives the stored keys at a restart, "
+                       "which it cannot read"),
+                      ("read_forgets_held", "gives no held keys after the read that "
+                       "follows a restart, not the stored keys")):
         for ci, case in enumerate(corpus["cases"]):
             if not any(e["event"] == "floor_unreadable" for e in case["events"]):
                 continue
