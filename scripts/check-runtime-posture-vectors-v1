@@ -54,7 +54,7 @@ import json
 import pathlib
 import re
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Callable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -109,17 +109,20 @@ PINS: list[tuple[str, str]] = [
     ("posture", "A gateway that subscribes per device never receives one."),
     ("posture", "This **skew bound** is 300000 ms whatever skew the gateway configures for envelopes under gateway-api/v2."),
     ("posture", "A record that is `conflict` or `lower_tuple` leaves the held record as it was: only an `accepted` record replaces it. A greater pair's `issued_at_ms` is compared with the held record's `issued_at_ms`, never with the wall clock at the held record's receipt."),
-    ("posture", "**A store write fails closed.** A write that fails, or one still outstanding 1000 ms after it began on the gateway's monotonic clock, makes the store unavailable: every configured device with a pinned key reads `unknown` with reason `store_unavailable`, and the gateway reports itself degraded, from that moment until a read of the store succeeds again."),
-    ("posture", "A store that is unavailable, whether at start, on a read or after a write, is read again off the receive path until a read succeeds; the state it then holds is the state in force, each held record received earlier in the same run keeping the monotonic reading of its receipt."),
+    ("posture", "**The store fails closed, for one of two causes.**"),
+    ("posture", "- **Unreadable.** A store the gateway cannot read, at start or later, holds no state the gateway knows. It is unavailable until a read of it succeeds; the gateway retries the read off the receive path, and the state the read finds is then the state in force. A held record that the gateway received earlier in the same run, recognised by its exact bytes, keeps the monotonic reading of its receipt."),
+    ("posture", "- **Unwritten.** A write that fails, or one still outstanding 1000 ms after it began on the gateway's monotonic clock, leaves the gateway's state in memory known but not durable. The message whose write it was keeps its verdict and its change in memory, so a `conflict` or `lower_tuple` is not lost. The store is then unavailable until a write of the state in memory completes: the outstanding write completing late, which wrote that state, or a fresh write of it."),
+    ("posture", "It never reads the store while it is unwritten."),
+    ("posture", "While the store is unavailable for either cause, every configured device with a pinned key reads `unknown` with reason `store_unavailable`, a record that passes checks 1 to 10 is `store_unavailable` and changes nothing"),
+    ("posture", "if the write is still outstanding at its 1000 ms bound, the record is `store_unavailable`."),
     ("posture", "A message that changes nothing durable, as a sticky reason set again to the reason already held does, writes nothing and so cannot fail a write."),
-    ("posture", "These rules have no corpus case and are exercised by no vector: a record judged after an outstanding write for its device completes, Payload Volume drops on the posture topic, and the posture store's file rules in gateway-config/v2."),
-    ("posture", "This leaves one record in each window of the gateway's volume bound for the broker's redelivery of the retained record at a subscribe."),
-    ("posture", "A message whose write failed is **`store_write_failed`**: it changes no held state, it is counted as a store failure, and it sets no sticky reason, since none could be stored."),
-    ("posture", "A record that arrives for a device while a write for that device is outstanding is judged after that write completes or fails, against the state it leaves."),
+    ("posture", "These rules have no corpus case and are exercised by no vector: a record waiting on an outstanding write for its device, the pacing of write retries, Payload Volume drops on the posture topic, and the posture store's file rules in gateway-config/v2."),
+    ("posture", "Against gateway-api/v2's volume bound, a bucket that holds 5 records and gains one every 10 seconds, this leaves at least one record of room for the broker's redelivery of the retained record at a subscribe."),
+    ("posture", "A record that arrives for a device while a write for that device is outstanding waits for that write"),
     ("posture", "A gateway logs the counts, and reports them in its health once its health names a field for them."),
     ("posture", "- **Coalescing.** A runtime publishes at most 2 records in any 10 seconds and at most 5 in any minute, both judged over sliding windows."),
-    ("gateway_api", "admits, for each configured device, at least 3 records in any 10 seconds and at least 6 in any minute, both judged over sliding windows, so a bound that admits fewer in some window, such as a token bucket that starts a window part-spent, does not conform."),
-    ("gateway_api", "A conforming runtime publishes at most 2 and 5 in those windows, as runtime-posture/v1 has it coalesce, which leaves one in each for the broker's retained redelivery at a subscribe"),
+    ("gateway_api", "admits, for each configured device, at least what a token bucket admits that starts full with 5 records, gains one record every 10 seconds, and is judged at each record's arrival; its byte budget is proportional. A bound that admits less, such as a bucket of 3 that gains 6 a minute, does not conform."),
+    ("gateway_api", "A conforming runtime publishes at most 2 records in any 10 seconds and 5 in any minute, as runtime-posture/v1 has it coalesce"),
     ("posture", "the MQTT client's own retransmission of an unacknowledged QoS 1 message."),
     ("posture", "It is claimed at least once per run and may be claimed again within one, as when the store is reopened; every record under a higher generation orders above every record under a lower one."),
     ("posture", "A runtime without such a clock publishes no record."),
@@ -165,7 +168,7 @@ PINS: list[tuple[str, str]] = [
     ("posture", "Its records are `key_mismatch` until the new key is pinned."),
     ("posture", "- `state` and, when `unknown`, `reason`, as above;"),
     ("posture", "- when the state is `current` or `stale`, `record_b64`, the canonical padded RFC 4648 Base64 of the held record's exact bytes, and `received_at_ms`, the gateway's wall clock at its receipt;"),
-    ("posture", "- `last_refusal`, the reason of the most recent message for that device refused at checks 3 to 10 since the gateway started, when there is one. It names the reason only, never the message"),
+    ("posture", "- `last_refusal` and `last_refusal_at_ms`, the reason of the most recent message for that device refused at checks 3 to 10 since the gateway started, and the gateway's wall clock at its receipt, when there is one. An accepted record does not clear it. It names the reason only, never the message"),
     ("posture", "**No surface presents more than the record says.**"),
     ("posture", "never carries a record under `unknown`, and never carries one record for two devices."),
     # gateway-api/v2.md
@@ -175,7 +178,7 @@ PINS: list[tuple[str, str]] = [
     ("gateway_api", "The rule judges a number by the RFC 8259 grammar alone: its range and spelling stay with the section that reads it and with `gateway-mqtt-canonical-json/v1`"),
     ("gateway_api", "Every topic's defined members hold every key of this example, whether or not that topic's payload carries an envelope, so a variant of one is refused on every topic."),
     ("gateway_api", "[Envelope Freshness and Replay](#envelope-freshness-and-replay) does not apply to it; runtime-posture/v1.md *Receiving* orders it instead, after [Payload Size](#payload-size) and the [Payload Member Rule](#payload-member-rule)."),
-    ("gateway_api", "`state`, one of `current`, `stale` or `unknown`; `reason` when `state` is `unknown`; and, when `state` is `current` or `stale`, `record_b64`, canonical padded RFC 4648 Base64 of the held record's exact bytes, and `received_at_ms`, the gateway's wall clock when it received it; and `last_refusal`, the reason of the most recent message for that device refused at checks 3 to 10 since the gateway started, when there is one."),
+    ("gateway_api", "`state`, one of `current`, `stale` or `unknown`; `reason` when `state` is `unknown`; and, when `state` is `current` or `stale`, `record_b64`, canonical padded RFC 4648 Base64 of the held record's exact bytes, and `received_at_ms`, the gateway's wall clock when it received it; and `last_refusal` and `last_refusal_at_ms`, the reason of the most recent message for that device refused at checks 3 to 10 since the gateway started and the wall clock at its receipt, when there is one."),
     ("gateway_api", "No consumer of the projection may present the record as verified unless it verified it under an independently obtained key, nor present `current` or any member of the record as protection, actuation availability or authority."),
     # gateway-mqtt-canonical-json/v1.md
     ("canonical", "A **verifier** MUST reproduce the number token exactly as it appears on the wire, and MUST NOT re-format it."),
@@ -200,8 +203,9 @@ PINS: list[tuple[str, str]] = [
     ("gateway_config", "Rules 1 to 3 are judged entry by entry, in the order of the keys sorted by code point, and an entry is judged against every rule from 1 to 3 before the next entry is."),
     ("gateway_config", "A store that is not a regular file, is longer than 16,777,216 bytes, cannot be read, or does not parse is unavailable: every configured device with a pinned key reads `unknown` with reason `store_unavailable`"),
     ("gateway_config", "MUST NOT open it through a symbolic link, and MUST read at most 16,777,217 bytes of it."),
-    ("gateway_config", "It reads an unavailable store again off the receive path until a read succeeds."),
-    ("gateway_config", "A write that fails, or is still outstanding 1,000 ms after it began on a monotonic clock, makes the store unavailable, as above, until a read of it succeeds again, and the gateway reports `degraded` in its site health while it is."),
+    ("gateway_config", "It reads an unreadable store again off the receive path until a read succeeds. It MUST NOT replace an unreadable store with an empty one."),
+    ("gateway_config", "A write that fails, or is still outstanding 1,000 ms after it began on a monotonic clock, makes the store unavailable until a write of the gateway's state in memory completes, which the gateway retries no sooner than 1,000 ms after the previous attempt began, never once per message; it never reads the store meanwhile."),
+    ("gateway_config", "While the store is unavailable for either cause, the gateway reports `degraded` in its heartbeat `status` and in its site health."),
     ("gateway_config", "A pin is used for posture records only: the gateway never uses it to verify, hold or classify an evidence artifact, nor any evidence key to verify a posture record."),
     ("gateway_config", "Changing a pin never resets what the gateway holds under any key"),
     # operator-socket/v3.md
@@ -221,7 +225,7 @@ PINS: list[tuple[str, str]] = [
     ("operator_socket", "- `public_key`: `ed25519:` followed by canonical padded RFC 4648 Base64 of the raw 32-byte posture key;"),
     ("operator_socket", "- `key_identity`: that key's `key_identity` as runtime-posture/v1.md defines it, the value its records carry."),
     # lan-app-api/v1.md
-    ("lan", "Each object has exactly `device_id`, `state` (`current`, `stale` or `unknown`), `reason` when `state` is `unknown`, and, when `state` is `current` or `stale`, `record_b64` and `received_at_ms`"),
+    ("lan", "Each object has exactly `device_id`, `state` (`current`, `stale` or `unknown`), `reason` when `state` is `unknown`, `record_b64` and `received_at_ms` when `state` is `current` or `stale`, and `last_refusal` and `last_refusal_at_ms` when there has been a refusal"),
     # ed25519-key-admission/v1.md
     ("admission", "1. `non_canonical`: y ≥ p, whatever bit 255 holds."),
     ("admission", "2. `off_curve`: (y² − 1) / (d·y² + 1) has no square root modulo p, so y is the coordinate of no curve point, whatever bit 255 holds."),
@@ -335,9 +339,12 @@ def build_model(texts: dict[str, str]) -> dict:
     m["verdicts"] = re.findall(r"- \*\*`([a-z_]+)`\*\*:", items[10])
     m["regression"] = int(one(r"whose `issued_at_ms` is more than (\d+) ms, the \*\*regression bound\*\*, below the held record's", items[10], "check 11").group(1))
     m["store_verdict"] = one(r"\*\*`([a-z_]+)`\*\* instead", items[10], "check 11").group(1)
-    m["write_failed_verdict"] = one(r"A message whose write failed is \*\*`([a-z_]+)`\*\*", recv, "write failure").group(1)
+    causes = re.findall(r"^- \*\*([A-Z][a-z]+)\.\*\* ", one(r"\*\*The store fails closed, for one of two causes\.\*\*(.*?)While the store is unavailable for either cause",
+                                                               recv, "store causes", re.S).group(1), re.M)
+    if causes != ["Unreadable", "Unwritten"]:
+        raise Failure(f"text: the store's fail-closed causes are {causes}, not Unreadable and Unwritten")
     m["write_timeout"] = int(one(r"or one still outstanding (\d+) ms after it began on the gateway's monotonic clock", recv, "write timeout").group(1))
-    m["last_refusal_checks"] = [int(x) for x in one(r"`last_refusal`, the reason of the most recent message for that device refused at checks (\d+) to (\d+)",
+    m["last_refusal_checks"] = [int(x) for x in one(r"`last_refusal` and `last_refusal_at_ms`, the reason of the most recent message for that device refused at checks (\d+) to (\d+)",
                                                        post, "last_refusal").groups()]
     if m["last_refusal_checks"] != [3, 10]:
         raise Failure("text: last_refusal no longer covers checks 3 to 10")
@@ -351,7 +358,9 @@ def build_model(texts: dict[str, str]) -> dict:
         raise Failure("text: the republish interval is not a fifth of the skew bound")
     co = one(r"A runtime publishes at most (\d+) records in any (\d+) seconds and at most (\d+) in any minute, both judged over sliding windows", pub, "Coalescing")
     m["coalesce"] = tuple(int(x) for x in co.groups())
-    m["redelivery_margin"] = {"one": 1}[one(r"This leaves (one) record in each window of the gateway's volume bound", pub, "Coalescing").group(1)]
+    rm = one(r"a bucket that holds (\d+) records and gains one every (\d+) seconds, this leaves at least (one) record of room", pub, "Coalescing")
+    m["redelivery_margin"] = {"one": 1}[rm.group(3)]
+    m["runtime_bucket"] = (int(rm.group(1)), int(rm.group(2)))
     m["clock_ahead"] = int(one(r"no value it issues is more than (\d+) ms ahead of the runtime's wall clock", pub, "Signing clock").group(1))
     lim = section(post, "Limits and later versions", 2)
     if int(one(r"The signing clock runs at most (\d+) ms ahead of the runtime's wall clock", lim, "Delayed delivery").group(1)) != m["clock_ahead"]:
@@ -402,17 +411,22 @@ def build_model(texts: dict[str, str]) -> dict:
     if m["record_example_keys"] != set(m["members"]):
         raise Failure("text: gateway-api/v2 Runtime Posture Record example keys differ from runtime-posture/v1's members")
     hp = norm(section(ga, "Site Health HTTP Projection", 2))
-    m["carriage"] = ["state", "reason", "record_b64", "received_at_ms", "last_refusal"]
+    m["carriage"] = ["state", "reason", "record_b64", "received_at_ms", "last_refusal", "last_refusal_at_ms"]
     vol = norm(section(ga, "Payload Volume", 2))
-    gv = one(r"admits, for each configured device, at least (\d+) records in any (\d+) seconds and at least (\d+) in any minute, both judged over sliding windows", vol, "posture volume")
-    g_short, g_win, g_min = (int(x) for x in gv.groups())
+    gv = one(r"admits, for each configured device, at least what a token bucket admits that starts full with (\d+) records, gains one record every (\d+) seconds, and is judged at each record's arrival", vol, "posture volume")
+    cap, refill_s = int(gv.group(1)), int(gv.group(2))
+    if (cap, refill_s) != m["runtime_bucket"]:
+        raise Failure("text: runtime-posture/v1 quotes another bucket than gateway-api/v2's volume bound")
     r_short, r_win, r_min = m["coalesce"]
     margin = m["redelivery_margin"]
-    if g_win != r_win or g_short - r_short != margin or g_min - r_min != margin:
-        raise Failure(f"text: gateway-api/v2 admits {g_short}/{g_win}s and {g_min}/min, runtime-posture/v1 publishes at most "
-                      f"{r_short}/{r_win}s and {r_min}/min: not a margin of {margin} for the retained redelivery")
-    ga2 = one(r"A conforming runtime publishes at most (\d+) and (\d+) in those windows", vol, "posture volume runtime")
-    if (int(ga2.group(1)), int(ga2.group(2))) != (r_short, r_min):
+    # The runtime's limits leave the stated margin under the bucket: its
+    # burst plus the margin fits the bucket's capacity, and its minute plus
+    # the margin fits a minute's refill.
+    if r_short + margin > cap or r_min + margin > 60 // refill_s:
+        raise Failure(f"text: a bucket of {cap} gaining 1 per {refill_s} s leaves no margin of {margin} over "
+                      f"the runtime's {r_short}/{r_win}s and {r_min}/min")
+    ga2 = one(r"A conforming runtime publishes at most (\d+) records in any (\d+) seconds and (\d+) in any minute", vol, "posture volume runtime")
+    if (int(ga2.group(1)), int(ga2.group(2)), int(ga2.group(3))) != (r_short, r_win, r_min):
         raise Failure("text: gateway-api/v2 quotes another coalescing limit than runtime-posture/v1's")
     if f"at least every {m['republish_s']} seconds" not in vol:
         raise Failure("text: gateway-api/v2's posture volume sentence names another republish interval")
@@ -947,6 +961,7 @@ class Message:
     configured: list[str]
     pins: dict[str, bytes]
     wall: int
+    mono: int = 0
 
 
 def signing_input(obj: dict, model: dict) -> bytes:
@@ -1067,9 +1082,14 @@ class Held:
 class Gateway:
     configured: list[str]
     pins: dict[str, bytes]
-    available: bool
-    contents_known: bool = True
+    # The store's two fail-closed causes, held independently.
+    unreadable: bool = False
+    unwritten: bool = False
     run: int = 0
+    # The last completed write's state: what a successful read finds.
+    disk: dict = field(default_factory=dict)
+    # Under the failure_blanks_own_device mutant: the device whose write failed.
+    unwritten_device: str | None = None
     # The durable store: (device, recognised key) -> Held. Its sticky reason
     # belongs to that pair.
     store: dict = field(default_factory=dict)
@@ -1077,6 +1097,20 @@ class Gateway:
     last_refusal: dict = field(default_factory=dict)
     # Under the sticky_per_device mutant: device -> reason.
     device_sticky: dict = field(default_factory=dict)
+
+    @property
+    def available(self) -> bool:
+        return not (self.unreadable or self.unwritten)
+
+    def unavailable_for(self, device: str, mut: frozenset) -> bool:
+        if self.unreadable:
+            return True
+        if self.unwritten:
+            return "failure_blanks_own_device" not in mut or device == self.unwritten_device
+        return False
+
+    def write(self) -> None:
+        self.disk = copy.deepcopy(self.store)
 
     def slot(self, device: str, mut: frozenset) -> tuple | None:
         pin = self.pins.get(device)
@@ -1094,23 +1128,26 @@ def report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: fro
     out = _report(gw, device, mono, wall, model, mut)
     lr = gw.last_refusal.get(device)
     if lr is not None:
-        out["last_refusal"] = lr
+        out["last_refusal"] = lr[0]
+        if "last_refusal_at_missing" not in mut:
+            out["last_refusal_at_ms"] = lr[1]
     return out
 
 
 def _report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset) -> dict:
-    h = gw.store.get(gw.slot(device, mut)) if gw.available and device in gw.pins else None
-    sticky = gw.sticky_of(device, h, mut) if gw.available and device in gw.pins else None
+    avail = not gw.unavailable_for(device, mut)
+    h = gw.store.get(gw.slot(device, mut)) if avail and device in gw.pins else None
+    sticky = gw.sticky_of(device, h, mut) if avail and device in gw.pins else None
     holds = {
         # Each reason's own condition; which one is the reason is the text's
         # list order alone ("the first that holds is the reason").
         "no_pinned_key": device not in gw.pins,
         "no_record": h is None,
-        "store_unavailable": not gw.available,
+        "store_unavailable": not avail,
         "lower_tuple_seen": sticky == "lower_tuple_seen",
         "conflict": sticky == "conflict",
     }
-    if "store_reads_no_record" in mut and not gw.available:
+    if "store_reads_no_record" in mut and not avail:
         holds["store_unavailable"], holds["no_record"] = False, True
     order = list(model["unknown_reasons"])
     if "store_over_pin" in mut:
@@ -1161,23 +1198,24 @@ def refusal_reasons(model: dict) -> list[str]:
 def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, notes: list,
             write_fails: bool = False) -> str:
     fails, rec = judge(msg, model, mut)
-    if "store_before_checks" in mut and not gw.available:
+    if "store_before_checks" in mut and gw.unavailable_for(msg.topic, mut):
         return model["store_verdict"]
     if fails:
         r = fails[0]
         if (r in refusal_reasons(model) and msg.topic in gw.configured and "last_refusal_off" not in mut):
-            gw.last_refusal[msg.topic] = r
+            at = msg.mono if "last_refusal_at_mono" in mut else msg.wall
+            if "last_refusal_at_first" in mut and msg.topic in gw.last_refusal:
+                at = gw.last_refusal[msg.topic][1]
+            gw.last_refusal[msg.topic] = (r, at)
         if "refusal_clears_sticky" in mut:
             k = gw.slot(msg.topic, mut)
             if k in gw.store:
                 gw.store[k].sticky = None
             gw.device_sticky.pop(msg.topic, None)
-        if write_fails:
-            raise Failure("corpus: a write failure on a refused message, which writes nothing")
+        notes.append(("noop_flag", write_fails))
         return r
-    if not gw.available and "no_store_check" not in mut:
-        if write_fails:
-            raise Failure("corpus: a write failure while the store is unavailable, which writes nothing")
+    if gw.unavailable_for(msg.topic, mut) and "no_store_check" not in mut:
+        notes.append(("noop_flag", write_fails))
         return model["store_verdict"]
     key = gw.slot(msg.topic, mut)
     pair = (int(rec["boot_generation"].token), int(rec["posture_seq"].token))
@@ -1220,14 +1258,18 @@ def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, n
     if change is not None and change[0] == "sticky" and gw.sticky_of(msg.topic, h, mut) == change[1]:
         change = None  # a sticky reason set again to the one held writes nothing
     if "last_refusal_includes_ordering" in mut and verdict in ("lower_tuple", "conflict"):
-        gw.last_refusal[msg.topic] = verdict
-    if write_fails and change is None:
-        raise Failure("corpus: a write failure on a message that writes nothing")
-    if write_fails and "write_failure_ignored" not in mut:
-        if "write_fail_keeps_available" not in mut:
-            gw.available = False
-        if "write_fail_applies" not in mut:
-            return model["write_failed_verdict"]
+        gw.last_refusal[msg.topic] = (verdict, msg.wall)
+    if "accept_clears_last_refusal" in mut and verdict == "accepted":
+        gw.last_refusal.pop(msg.topic, None)
+    if change is None:
+        # Nothing durable changes, so nothing is written and no write can fail.
+        notes.append(("noop_flag", write_fails))
+        if write_fails and "noop_write_fails" in mut:
+            gw.unwritten, gw.unwritten_device = True, msg.topic
+        return verdict
+    if write_fails and "failed_write_loses_change" in mut:
+        gw.unwritten, gw.unwritten_device = True, msg.topic
+        return verdict
     if change is not None:
         if change[0] == "hold":
             gw.store[key] = change[1]
@@ -1239,8 +1281,13 @@ def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, n
             gw.store[key] = change[1]
             gw.store[key].sticky = old
             set_sticky(gw, msg.topic, gw.store[key], change[2], mut)
-    if write_fails and "write_fail_applies" in mut:
-        return model["write_failed_verdict"]
+    if write_fails and "write_failure_ignored" not in mut:
+        # Unwritten: the change stays in memory, the store is unavailable.
+        gw.unwritten, gw.unwritten_device = True, msg.topic
+        if "failed_write_loses_verdict" in mut:
+            return model["store_verdict"]
+    else:
+        gw.write()
     return verdict
 
 
@@ -1602,7 +1649,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         if s["store_readable"]:
             if "store_condition" in s:
                 bad(f"{where}: a readable store names a store_condition")
-            gw = Gateway(devices, pins, True)
+            gw = Gateway(devices, pins)
         else:
             cond = s.get("store_condition")
             if cond not in ("unreadable", "corrupt"):
@@ -1610,15 +1657,25 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
             conditions_seen.add(cond)
             # The text: a store that cannot be read, or whose contents do not
             # parse, is unavailable; both conditions read alike.
-            avail = cond == "corrupt" and "corrupt_store_readable" in mut
-            gw = Gateway(devices, pins, avail, contents_known=False)
+            gw = Gateway(devices, pins, unreadable=not (cond == "corrupt" and "corrupt_store_readable" in mut))
+            # What a successful read of it finds is not in the corpus; the
+            # corpus's own expectations (no_record after the read) imply an
+            # empty store, which is modelled and reported.
+            gw.disk = {}
+            gw.store = {}
         held_sticky_refusal = False
+        seq_read_failed = seq_reread = False
         for n, e in enumerate(s["events"]):
             ew = f"{where}.events[{n}]"
             report.ages = []
             notes: list = []
             got: dict = {}
             kind = e["event"]
+            if "read_clears_unwritten" in mut and gw.unwritten and not gw.unreadable:
+                # The wrong gateway reads its store back while unwritten,
+                # finding the last durable state and calling the store sound.
+                gw.store = copy.deepcopy(gw.disk)
+                gw.unwritten = False
             pre = ({d: report(gw, d, e["mono_ms"], e["wall_ms"], model, frozenset()) for d in devices}
                    if kind == "receive" else {})
             if kind == "receive":
@@ -1633,7 +1690,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                 before = pre.get(dev, {})
                 held_before = gw.store.get(gw.slot(dev, frozenset())) if dev in gw.pins else None
                 held_raw_before = held_before.raw if held_before else None
-                msg = Message(e["record"].encode("utf-8"), dev, gw.configured, gw.pins, e["wall_ms"])
+                msg = Message(e["record"].encode("utf-8"), dev, gw.configured, gw.pins, e["wall_ms"], e["mono_ms"])
                 v = receive(gw, msg, e["mono_ms"], model, mut, notes, fails_write)
                 got["verdict"] = v
                 verdicts_seen.add(v)
@@ -1643,8 +1700,14 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     edges["refusal_in_sequence"] = True
                     if not gw.available:
                         edges["refusal_store_unreadable"] = True
-                if fails_write and v == model["write_failed_verdict"]:
+                if fails_write and gw.unwritten:
                     edges[f"write_failed_after:{before.get('state')}"] = True
+                    edges[f"write_failed_verdict:{v}"] = True
+                    if len(devices) > 1:
+                        edges["write_failed_two_devices"] = True
+                for note in notes:
+                    if note[0] == "noop_flag" and note[1]:
+                        edges["noop_write_flag"] = True
                 after = report(gw, dev, e["mono_ms"], e["wall_ms"], model, frozenset()) if dev in devices else {}
                 br, ar = before.get("reason"), after.get("reason")
                 if br in model["sticky"] and ar in model["sticky"] and ar != br:
@@ -1709,14 +1772,44 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     gw.device_sticky.clear()
                 edges["restart"] = True
             elif kind == "store_read_succeeds":
-                if not gw.contents_known:
-                    bad(f"{ew}: a read succeeds on a store whose contents the corpus does not give")
-                if gw.available:
-                    bad(f"{ew}: a read of a store that is not unavailable")
-                if "store_reread_empties" in mut:
-                    gw.store.clear()
+                # Clears only the unreadable cause; the gateway never reads
+                # while the store is unwritten.
+                if gw.unwritten:
+                    bad(f"{ew}: a read while the store is unwritten, which the text says never happens")
+                if not gw.unreadable:
+                    bad(f"{ew}: a read succeeding on a store that is not unreadable")
                 if "store_never_recovers" not in mut:
-                    gw.available = True
+                    found = copy.deepcopy(gw.disk)
+                    if "store_reread_empties" in mut:
+                        found = {}
+                    if "reread_loses_mono" in mut:
+                        for h in found.values():
+                            h.run = -1
+                    gw.store = found
+                    gw.unreadable = False
+                    if "read_clears_unwritten" in mut:
+                        gw.unwritten = False
+                edges["read_recovers"] = True
+                seq_reread = seq_read_failed
+            elif kind == "store_read_fails":
+                # A read of an available store that fails: the store is unreadable.
+                if not gw.available:
+                    bad(f"{ew}: a read failing on a store that is not available")
+                if "read_fails_ignored" not in mut:
+                    gw.unreadable = True
+                edges["read_fails"] = True
+                seq_read_failed = True
+            elif kind == "store_write_completes":
+                # Clears only the unwritten cause: the state in memory is now durable.
+                if not gw.unwritten:
+                    bad(f"{ew}: a write completing while the store is not unwritten")
+                if gw.unreadable:
+                    bad(f"{ew}: a write completing while the store is unreadable")
+                if "late_completion_no_restore" not in mut:
+                    gw.write()
+                    gw.unwritten = False
+                    if "write_clears_unreadable" in mut:
+                        gw.unreadable = False
                 edges["store_recovers"] = True
             elif kind != "observe":
                 bad(f"{ew}: unknown event {kind!r}")
@@ -1734,8 +1827,14 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     edges["sticky_after_restart"] = True
                 if "last_refusal" in st:
                     edges[f"last_refusal_under:{st['state']}"] = True
-                if kind == "store_read_succeeds" and "record_b64" in st:
+                if kind == "store_read_succeeds" and st["state"] == "current" and seq_reread:
+                    edges["reread_keeps_held_current"] = True
+                if kind == "store_write_completes" and "record_b64" in st:
                     edges["store_recovers_held"] = True
+                if kind == "store_write_completes" and st.get("reason") in model["sticky"]:
+                    edges["store_recovers_sticky"] = True
+                if "last_refusal_at_ms" in st:
+                    edges["last_refusal_at"] = True
                 if st.get("reason") in model["sticky"]:
                     h = gw.store.get(gw.slot(d, frozenset()))
                     if h is not None and h.run == gw.run:
@@ -1756,7 +1855,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                 bad(f"{ew}: got {got}, corpus says {want}")
         if held_sticky_refusal:
             edges["refusal_with_sticky"] = True
-    for v in model["verdicts"] + [model["store_verdict"], model["write_failed_verdict"]]:
+    for v in model["verdicts"] + [model["store_verdict"]]:
         need(v in verdicts_seen, f"no sequence receive gives {v}")
     for st in model["states"]:
         if st != "unknown":
@@ -1796,7 +1895,17 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     ("last_refusal_under:unknown", "last_refusal carried under unknown"),
                     ("last_refusal_reset", "a restart clearing last_refusal"),
                     ("write_failed_after:current", "a write failing while a record is current"),
-                    ("store_recovers", "a read succeeding after a failed write"),
+                    ("write_failed_verdict:accepted", "a failed write keeping an accepted verdict"),
+                    ("write_failed_verdict:conflict", "a failed write keeping a conflict verdict"),
+                    ("write_failed_verdict:lower_tuple", "a failed write keeping a lower_tuple verdict"),
+                    ("write_failed_two_devices", "a failed write while two devices are configured"),
+                    ("noop_write_flag", "a store_write flag on a message that writes nothing"),
+                    ("read_recovers", "a read clearing an unreadable store"),
+                    ("read_fails", "a read failing on an available store"),
+                    ("reread_keeps_held_current", "a held record current again after a re-read, its monotonic receipt kept"),
+                    ("store_recovers_sticky", "a kept sticky reason in force after a write completes"),
+                    ("last_refusal_at", "last_refusal_at_ms carried"),
+                    ("store_recovers", "a write completing after a failed one"),
                     ("store_recovers_held", "the held record back in force after the store recovers"),
                     ("store_write:fails", "a write that fails"),
                     ("store_write:stalls", "a write outstanding past the write timeout"),
@@ -1918,10 +2027,20 @@ RECEIVER_MUTANTS = [
     "last_refusal_survives_restart",
     "last_refusal_includes_ordering",
     "write_failure_ignored",
-    "write_fail_keeps_available",
-    "write_fail_applies",
     "store_reread_empties",
     "store_never_recovers",
+    "read_clears_unwritten",
+    "read_fails_ignored",
+    "reread_loses_mono",
+    "failed_write_loses_verdict",
+    "failed_write_loses_change",
+    "noop_write_fails",
+    "failure_blanks_own_device",
+    "late_completion_no_restore",
+    "last_refusal_at_missing",
+    "last_refusal_at_mono",
+    "last_refusal_at_first",
+    "accept_clears_last_refusal",
     "corrupt_store_readable",
     "canon_go_escapes",
     "canon_ascii_only",
@@ -1960,7 +2079,7 @@ def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
         alt = reasons[(reasons.index(c["expected"]) + 1) % len(reasons)]
         x["records"][i]["expected"] = alt
         out.append((f"records.{c['name']}: expected {alt}", x))
-    verdicts = model["verdicts"] + [model["store_verdict"], model["write_failed_verdict"], "key_mismatch"]
+    verdicts = model["verdicts"] + [model["store_verdict"], "key_mismatch"]
     refs = refusal_reasons(model)
     for si, s in enumerate(corpus["sequences"]):
         for ei, e in enumerate(s["events"]):
@@ -1990,6 +2109,8 @@ def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
                         tgt[fld] = v + 1
                     elif fld == "last_refusal":
                         tgt[fld] = refs[(refs.index(v) + 1) % len(refs)]
+                    elif fld == "last_refusal_at_ms":
+                        tgt[fld] = v + 1
                     out.append((f"{here}.{dev}.{fld} changed", x))
                     if fld != "state":
                         x = copy.deepcopy(corpus)
@@ -2002,6 +2123,7 @@ def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
                 if "last_refusal" not in st:
                     x = copy.deepcopy(corpus)
                     x["sequences"][si]["events"][ei]["expected"]["states"][dev]["last_refusal"] = refs[0]
+                    x["sequences"][si]["events"][ei]["expected"]["states"][dev]["last_refusal_at_ms"] = e["wall_ms"]
                     out.append((f"{here}.{dev}: a last_refusal added", x))
             if len(ex["states"]) > 1:
                 x = copy.deepcopy(corpus)

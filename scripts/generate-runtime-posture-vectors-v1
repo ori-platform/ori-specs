@@ -260,9 +260,10 @@ def stateless(data: str, topic_device: str, devices: list, pins: dict, wall: int
 
 class Gateway:
     def __init__(self, devices: list, pins: dict, store_ok: bool = True) -> None:
-        self.devices, self.pins, self.store_ok = list(devices), dict(pins), store_ok
+        self.devices, self.pins = list(devices), dict(pins)
+        self.store_mode: str | None = None if store_ok else "unreadable"  # or "unwritten"
         self.states: dict[tuple[str, bytes], dict] = {}
-        self.last_refusal: dict[str, str] = {}
+        self.last_refusal: dict[str, tuple[str, int]] = {}
         self.run = 0
 
     def slot(self, device: str) -> dict:
@@ -272,9 +273,9 @@ class Gateway:
         reason, obj = stateless(data, topic_device, self.devices, self.pins, wall)
         if reason is not None:
             if topic_device in self.devices:
-                self.last_refusal[topic_device] = reason
+                self.last_refusal[topic_device] = (reason, wall)
             return reason
-        if not self.store_ok:
+        if self.store_mode is not None:
             return "store_unavailable"
         st = self.slot(topic_device)
         pair = (obj["boot_generation"], obj["posture_seq"])
@@ -292,17 +293,20 @@ class Gateway:
             verdict, change = "conflict", {"sticky": "conflict"}
         else:
             verdict, change = "lower_tuple", {"sticky": "lower_tuple_seen"}
-        if write_fails:
-            self.store_ok = False
-            return "store_write_failed"
+        if all(st.get(k) == v for k, v in change.items()):
+            return verdict  # nothing durable changes, so nothing is written and no write can fail
         st.update(change)
+        if write_fails:
+            self.store_mode = "unwritten"
         return verdict
 
     def state(self, device: str, wall: int, mono: int) -> dict:
-        extra = {"last_refusal": self.last_refusal[device]} if device in self.last_refusal else {}
+        extra = {}
+        if device in self.last_refusal:
+            extra = {"last_refusal": self.last_refusal[device][0], "last_refusal_at_ms": self.last_refusal[device][1]}
         if device not in self.pins:
             return {"state": "unknown", "reason": "no_pinned_key", **extra}
-        if not self.store_ok:
+        if self.store_mode is not None:
             return {"state": "unknown", "reason": "store_unavailable", **extra}
         st = self.slot(device)
         if st["sticky"] is not None:
@@ -319,6 +323,10 @@ class Gateway:
     def restart(self, pins: dict | None = None, devices: list | None = None) -> None:
         self.run += 1
         self.last_refusal = {}
+        if self.store_mode == "unwritten":
+            # The state in memory is lost; the durable state is what the gateway starts from. This model
+            # never restarts with an unwritten store.
+            raise ValueError("restart while unwritten is not modelled")
         if pins is not None:
             self.pins = dict(pins)
         if devices is not None:
@@ -446,6 +454,14 @@ def store_read(wall: int, mono: int) -> dict:
     return {"event": "store_read_succeeds", "wall_ms": wall, "mono_ms": mono}
 
 
+def store_unreadable(wall: int, mono: int) -> dict:
+    return {"event": "store_read_fails", "wall_ms": wall, "mono_ms": mono}
+
+
+def store_written(wall: int, mono: int) -> dict:
+    return {"event": "store_write_completes", "wall_ms": wall, "mono_ms": mono}
+
+
 def observe(wall: int, mono: int) -> dict:
     return {"event": "observe", "wall_ms": wall, "mono_ms": mono}
 
@@ -472,8 +488,16 @@ def sequence(name: str, note: str, events: list, *, pins: dict | None = None, st
         elif ev["event"] == "restart":
             gw.restart({d: base64.b64decode(k[8:]) for d, k in ev["pinned_keys"].items()}
                        if "pinned_keys" in ev else None, ev.get("configured_devices"))
+        elif ev["event"] == "store_read_fails":
+            if gw.store_mode is not None:
+                raise ValueError("a read is made only of an available store in this model")
+            gw.store_mode = "unreadable"
         elif ev["event"] == "store_read_succeeds":
-            gw.store_ok = True
+            if gw.store_mode == "unreadable":
+                gw.store_mode = None
+        elif ev["event"] == "store_write_completes":
+            if gw.store_mode == "unwritten":
+                gw.store_mode = None
         exp["states"] = {d: gw.state(d, ev["wall_ms"], ev["mono_ms"]) for d in gw.devices}
         out.append({**ev, "expected": exp})
     seq = {"name": name, "note": note, "configured_devices": list(devices),
@@ -578,14 +602,37 @@ sequence("store_unavailable_one_unpinned", "With the store unavailable, a pinned
          store_ok=False)
 sequence("store_corrupt", "A corrupt store reads as an unreadable one.", [observe(T, 0), rx(R1, T, 1)],
          store_ok=False, store_condition="corrupt")
-sequence("store_write_fails_closed", "A failed write makes the store unavailable until a read succeeds; the "
-         "message changes no state and sets no sticky reason.",
+sequence("store_write_fails_closed", "A failed write keeps its verdict and change in memory and makes the store "
+         "unavailable; it stays so as time passes, a completed write of the state in memory clears it, and the "
+         "conflict then shows.",
          [rx(record(seq=5, issued=T), T, 0), rx(record(seq=5, issued=T + 1), T + 1, 1, write="fails"),
-          rx(record(seq=6, issued=T + 2), T + 2, 2), store_read(T + 3, 3),
-          rx(record(seq=6, issued=T + 4), T + 4, 4)])
-sequence("store_write_stalls_closed", "A write still outstanding 1000 ms after it began fails closed, as a failed "
-         "write does.", [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1, write="stalls"),
-                        store_read(T + 2, 2)])
+          rx(record(seq=6, issued=T + 2), T + 2, 2), observe(T + 3, 3), store_written(T + 4, 4),
+          rx(record(seq=6, issued=T + 5), T + 5, 5)])
+sequence("store_write_stalls_closed", "A write still outstanding 1000 ms after it began fails closed; when it "
+         "completes late, the state it wrote is in force.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1, write="stalls"),
+          store_written(T + 2, 2)])
+sequence("store_unreadable_then_read", "An unreadable store clears when a read succeeds; the read finds an empty "
+         "store, so no record is held.",
+         [observe(T, 0), store_read(T + 1, 1)], store_ok=False)
+sequence("noop_write_cannot_fail", "A sticky reason set again to the one held writes nothing, so a failing store "
+         "cannot fail it.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
+          rx(record(seq=3, issued=T + 2), T + 2, 2, write="fails")])
+sequence("store_write_fails_all_devices", "A failed write blanks every pinned device, not only the one it was for.",
+         [rx(record(seq=5, issued=T), T, 0),
+          rx(record(KEY_B, device=OTHER_DEVICE, seq=1, issued=T + 1), T + 1, 1, device=OTHER_DEVICE),
+          rx(record(seq=6, issued=T + 2), T + 2, 2, write="fails"), store_written(T + 3, 3)],
+         devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A, OTHER_DEVICE: PUB_B})
+sequence("store_reread_keeps_held", "A store that becomes unreadable mid-run hides every device; the read that "
+         "then succeeds finds what was last written, and the held record, received earlier in the run, keeps its "
+         "monotonic receipt and is current again.",
+         [rx(R1, T, 0), store_unreadable(T + 1, 1), rx(record(seq=2, issued=T + 2), T + 2, 2),
+          store_read(T + 3, 3)])
+sequence("last_refusal_is_latest", "The last refusal is the most recent one, with the wall clock at its receipt, "
+         "and a later accepted record does not clear it.",
+         [rx({**R1, "signature": b64(b"\x00" * 64)}, T, 0), rx(record(KEY_B, seq=1, issued=T + 1), T + 1, 1),
+          rx(R1, T + 2, 2)])
 sequence("restart_clears_last_refusal", "A last refusal is since the gateway started, so a restart clears it.",
          [rx(R1, T, 0), rx(record(KEY_B, seq=2, issued=T + 1), T + 1, 1), restart(T + 2, 0)])
 sequence("removed_device_keeps_state", "A device removed from the configuration keeps its state, which serving it "
@@ -738,12 +785,19 @@ def build() -> dict:
                           "outstanding past 1000 ms when it is `stalls`; `observe` "
                           "reads the state; `restart` restarts the gateway, resetting its monotonic clock and its "
                           "last refusals, and installs `pinned_keys` and `configured_devices` when given; "
-                          "`store_read_succeeds` is a read of "
-                          "an unavailable store that succeeds. `store_readable` false starts with the store "
-                          "unavailable, for the reason `store_condition` names. `wall_ms` and `mono_ms` are the "
+                          "`store_read_fails` is a read of an available store that fails, making it unreadable; "
+                          "`store_read_succeeds` is a read of an unreadable store that succeeds, finding what was "
+                          "last written, or an empty store when the sequence starts unreadable; and "
+                          "`store_write_completes` a write of the state in memory that completes, either the "
+                          "outstanding one or a retry; neither clears the other cause. `store_readable` false "
+                          "starts with the store unreadable, for the reason `store_condition` names. A write that "
+                          "would change nothing durable is not made, so `store_write` has no effect on it. "
+                          "`wall_ms` and `mono_ms` are the "
                           "gateway's wall and monotonic clocks at the event. `expected` holds the verdict, for a "
                           "receive, and in `states` the state of each device configured after the event, with "
-                          "`reason`, `record_b64`, `received_at_ms` and `last_refusal` as Carriage gives them."),
+                          "`reason`, `record_b64`, `received_at_ms`, `last_refusal` and `last_refusal_at_ms` as Carriage gives "
+                          "them: each is the device's `posture_record` in Site Health, and its object in the LAN "
+                          "posture body without `device_id`."),
             "config": ("gateway-config/v2 posture key load rules, after gateway.state_directory's, with "
                        "gateway.auth and evidence disabled: `valid`, and `rule` when refused. `runtime_keys` "
                        "lists its entries in the order they are written."),
