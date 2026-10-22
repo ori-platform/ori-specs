@@ -364,7 +364,7 @@ DEFAULTS: dict[str, Any] = {
     "lone_low_from_dc01": False,  # True: a lone DC00 escape is not judged
     "f4_takes_90": False,         # True: F4 accepts 90 as second byte
     "defined_top_only": False,    # True: family members apply to the root object only
-    "item_scope": "items",        # items | all | top: where a topic's item members apply
+    "item_scope": "items",        # items | all | top | pointer | nested: where item members apply
     "items_any_topic": False,     # True: item members apply to every topic's array elements
     "intake_alone": False,        # True: a carried object is judged alone
     "intake_reencoded": frozenset(),  # {"dup", "lone", "utf8"}: what re-encoding hides
@@ -999,6 +999,34 @@ def item_nodes(a: Assessment, array: str) -> list[Node]:
             if isinstance(el, Node) and el.kind == "obj"]
 
 
+def item_containers(a: Assessment, array: str) -> list[Node]:
+    """Every value of the root's `array` member that is a container, of either kind."""
+    if not isinstance(a.root, Node) or a.root.kind != "obj":
+        return []
+    key = tuple(map(ord, array))
+    return [ch for k, ch in a.root.children if k == key and isinstance(ch, Node)]
+
+
+def scoped_nodes(a: Assessment, array: str, scope: str) -> list[Node]:
+    """The reading's scope ("items"), or a mutant's: "pointer" takes every object at
+    /array/N whatever the container, "nested" adds objects in arrays nested in the array."""
+    if scope == "items":
+        return item_nodes(a, array)
+    out: list[Node] = []
+    for box in item_containers(a, array):
+        if scope == "pointer":
+            out += [el for k, el in box.children if isinstance(el, Node) and el.kind == "obj"
+                    and (box.kind == "arr" or re.fullmatch(r"0|[1-9][0-9]*", text_of(k)))]
+        elif scope == "nested" and box.kind == "arr":
+            todo = [box]
+            while todo:
+                arr = todo.pop()
+                for _, el in arr.children:
+                    if isinstance(el, Node):
+                        (out.append if el.kind == "obj" else todo.append)(el)
+    return out
+
+
 def _assess(data: bytes, defined: frozenset, m: dict,
             item: tuple[str, frozenset[str]] | None = None) -> Assessment:
     cps, offs, utf8_errors = decode_utf8(data, m)
@@ -1374,7 +1402,8 @@ def _assess(data: bytes, defined: frozenset, m: dict,
     a.defined = defined
     a.item = item
     scoped = ([] if item is None else a.objects if m["item_scope"] == "all"
-              else [a.root] if m["item_scope"] == "top" else item_nodes(a, item[0]))
+              else [a.root] if m["item_scope"] == "top"
+              else scoped_nodes(a, item[0], m["item_scope"]))
     a.item_nodes = [x for x in scoped if isinstance(x, Node)]
     for node in a.objects:
         dset = sorted(defined) if m["defined_apply"] and (
@@ -1892,6 +1921,24 @@ def properties(m: dict) -> list[tuple[str, Callable[[dict, Assessment], bool]]]:
 
     p("a variant of a health-reading name nested inside an item admitted",
       lambda c, a: item_names_admitted(c, a, lambda n: n is not a.root))
+    def items_shape(c: dict, a: Assessment, test: Callable[[Node], list[Node]]) -> bool:
+        """An admitted case whose `items` value, by `test`, yields objects holding a variant
+        of a name only the health reading gives."""
+        f = c["family"]
+        return exp(c, "accept") and f in items and any(
+            nm.key != tuple(map(ord, d)) and fold(nm.key, m) == fold(tuple(map(ord, d)), m)
+            for box in item_containers(a, items[f][0]) for n in test(box)
+            for nm in n.names for d in health_only(f))
+
+    p("a variant of a health-reading name under a numeric key of an `items` object admitted",
+      lambda c, a: items_shape(c, a, lambda box: [
+          el for k, el in box.children if box.kind == "obj" and isinstance(el, Node)
+          and el.kind == "obj" and re.fullmatch(r"0|[1-9][0-9]*", text_of(k))]))
+    p("a variant of a health-reading name in an object of an array nested in `items` admitted",
+      lambda c, a: items_shape(c, a, lambda box: [
+          el for _, inner in box.children if box.kind == "arr" and isinstance(inner, Node)
+          and inner.kind == "arr" for _, el in inner.children
+          if isinstance(el, Node) and el.kind == "obj"]))
     p("a variant of a health-reading name at the payload's top level admitted",
       lambda c, a: item_names_admitted(c, a, lambda n: n is a.root))
 
@@ -2467,6 +2514,10 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
         # Where the item members apply: the elements of `items` on their topic, nothing else.
         ("model: item members applied at every depth", model_mutant("outcome", item_scope="all")),
         ("model: item members applied at the top level", model_mutant("outcome", item_scope="top")),
+        ("model: item scope by pointer, not container type",
+         model_mutant("outcome", item_scope="pointer")),
+        ("model: item scope includes arrays nested in `items`",
+         model_mutant("outcome", item_scope="nested")),
         ("model: item members applied to the `items` elements of every topic",
          model_mutant("outcome", items_any_topic=True)),
         ("model: item members merged into the topic's members", model_mutant(
