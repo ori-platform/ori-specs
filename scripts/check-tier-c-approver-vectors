@@ -111,6 +111,16 @@ NAMES = {
     "recovery_binds_the_runtime_device",
     "revocation_document_decided_before_binding",
     "recovery_binds_the_runtime_site",
+    "inrun_device_change_locks_admission",
+    "inrun_site_change_locks_admission",
+    "inrun_device_and_site_change_device_decides",
+    "inrun_phone_commit_device_changed",
+    "inrun_phone_commit_site_changed",
+    "inrun_phone_commit_device_over_site",
+    "inrun_phone_commit_after_restore",
+    "inrun_phone_revoked_authorizer_over_device",
+    "inrun_phone_revision_over_device",
+    "inrun_challenge_presented_device_changed",
     "revocation_before_admission",
     "admission_before_revocation_stands",
 }
@@ -381,8 +391,11 @@ MODEL_CHECKS = {
     "restart_site",
     "recover_binds_runtime_device",
     "recover_binds_runtime_site",
+    "apply_device",
+    "apply_site",
+    "apply_keeps_state",
     "revoke_document_first",
-} | {f"commit_order:{n}" for n in (1, 2, 3, 4, 5, 6)}
+} | {f"commit_order:{n}" for n in (1, 2, 3, 4, 5, 6, 7, 8)}
 # The second commit's ten steps, by verdict, in the text's order.
 COMMIT_STEPS = (
     "epoch_changed", "pending_unavailable", "possession_expired", "possession_invalid",
@@ -390,10 +403,9 @@ COMMIT_STEPS = (
     "device_binding_mismatch", "site_binding_mismatch", "epoch_changed",
 )
 # Adjacent steps no scenario can tell apart: swapping them changes no verdict.
-# "Steps 8 to 10 are defence in depth. The device and site are fixed for a run,
-# and a restart ends every pending operation, which step 2 then answers. Only a
-# recovery changes the epoch, and step 1 decides that first." So 7/8, 8/9 and 9/10.
-COMMIT_UNDISTINGUISHED = (7, 8, 9)
+# 9/10: "Step 10 is defence in depth: only a recovery changes the epoch, and step 1
+# decides that first."
+COMMIT_UNDISTINGUISHED = (9,)
 
 
 def credential_channel_of_reply(channel: Any) -> Any:
@@ -518,10 +530,10 @@ class Registry:
     def phone_commit_refusal(self, operation: dict[str, Any]) -> str | None:
         """"At that second commit the runtime decides the reply in this order, and
         the first check that fails is the answer" (tier-c-approvers/v1, the ten
-        numbered steps). "Steps 8 to 10 are defence in depth. The device and site
-        are fixed for a run, and a restart ends every pending operation, which step
-        2 then answers. Only a recovery changes the epoch, and step 1 decides that
-        first. A registry locked without a recovery is step 5, not step 1. From step 3 on, every answer, a commit or any refusal,
+        numbered steps). "Step 10 is defence in depth: only a recovery changes the
+        epoch, and step 1 decides that first. Steps 8 and 9 compare the bindings as
+        they stand at the commit; a restart ends every pending operation, which step
+        2 then answers. A registry locked without a recovery is step 5, not step 1. From step 3 on, every answer, a commit or any refusal,
         consumes the pending operation; step 1 consumes the record of the
         operation the recovery invalidated." `commit_order:<n>` swaps steps n and
         n + 1."""
@@ -639,6 +651,27 @@ class Registry:
                 return "challenge_unavailable"
             challenge["expired"] = True
             return "expired"
+        if kind == "apply_provisioning":
+            # "A document that changes `device.id` or `device.site_id` changes the
+            # identity when it is accepted, whether at start or while the runtime
+            # runs": unlike a restart it closes no proposal and invalidates no
+            # challenge or pending operation. A fixture must name a well-formed change.
+            device, site = operation.get("device_id"), operation.get("site_id")
+            if device is None and site is None:
+                raise AssertionError("apply_provisioning names neither device_id nor site_id")
+            if device is not None and (not isinstance(device, str) or not DEVICE.fullmatch(device)):
+                raise AssertionError(f"apply_provisioning under a malformed device_id: {device!r}")
+            if site is not None and (not isinstance(site, str) or not SITE.fullmatch(site)):
+                raise AssertionError(f"apply_provisioning under a malformed site_id: {site!r}")
+            if device is not None and "apply_device" not in self.disabled:
+                self.config_device = device
+            if site is not None and "apply_site" not in self.disabled:
+                self.config_site = site
+            if "apply_keeps_state" in self.disabled:
+                self.proposals.clear()
+                self.pending_phone.clear()
+                self.challenges.clear()
+            return "applied"
         if kind == "restart":
             # "Every challenge, used or not, is invalidated at process restart"
             # and every pending phone operation dies; a used challenge is then
@@ -1157,6 +1190,7 @@ SUCCESS_FIELDS: dict[tuple[str, str], set[str]] = {
         "initialized", "device_binding", "site_binding", "active", "values", "channels",
         "approvers", "tombstones", "approver_tombstones", "challenges",
     },
+    ("apply_provisioning", "applied"): {"config_device", "config_site"},
     ("restart", "restarted"): {
         "challenges", "used_challenges", "pending_phone", "invalidated_phone",
         "proposals", "authenticated_channels", "config_device", "config_site",
@@ -1217,6 +1251,10 @@ def verify_state_change(where: str, operation: dict[str, Any], verdict: str, bef
         for key, field in (("device_id", "config_device"), ("site_id", "config_site")):
             if after[field] != operation.get(key, before[field]):
                 raise AssertionError(f"{where} restart: started under the wrong {key}")
+    if op == "apply_provisioning":
+        for key, field in (("device_id", "config_device"), ("site_id", "config_site")):
+            if after[field] != operation.get(key, before[field]):
+                raise AssertionError(f"{where} apply_provisioning: applied the wrong {key}")
     if op == "recover" and (after["device_binding"], after["site_binding"]) != (
             before["config_device"], before["config_site"]):
         raise AssertionError(f"{where} recover: not bound to the runtime's device and site")
@@ -1469,6 +1507,23 @@ def mutations(corpus: dict[str, Any]) -> None:
          lambda x: x["op"] == "phone_commit", "possession_expired"),
         ("locked registry before recovery invalidation", "phone_recovery_then_locked_registry",
          lambda x: x["op"] == "phone_commit", "registry_unavailable"),
+        # In-run identity changes: nothing is cleared, and a restore re-enables use.
+        ("in-run change closes the proposal", "inrun_device_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "approved", "proposal_unavailable"),
+        ("in-run restore does not re-enable", "inrun_site_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "approved", "site_binding_mismatch"),
+        ("an undone change still fails the commit", "inrun_phone_commit_after_restore",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("in-run change ends the pending operation", "inrun_phone_commit_device_changed",
+         lambda x: x["op"] == "phone_commit", "pending_unavailable"),
+        ("site recheck before device recheck", "inrun_phone_commit_device_over_site",
+         lambda x: x["op"] == "phone_commit", "site_binding_mismatch"),
+        ("device recheck before authorizer", "inrun_phone_revoked_authorizer_over_device",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("device recheck before revision", "inrun_phone_revision_over_device",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("presentation under a device change consumed", "inrun_challenge_presented_device_changed",
+         lambda x: x["op"] == "enrol", "challenge_stale"),
         ("channel judged before device", "phone_issue_refused_while_device_changed",
          lambda x: x["op"] == "issue" and x.get("challenge_id") == "whatsapp-device-changed",
          "channel_unauthenticated"),
@@ -1637,8 +1692,11 @@ def mutations(corpus: dict[str, Any]) -> None:
         ("restart_site", corpus, frozenset()),
         ("recover_binds_runtime_device", corpus, frozenset()),
         ("recover_binds_runtime_site", corpus, frozenset()),
+        ("apply_device", corpus, frozenset()),
+        ("apply_site", corpus, frozenset()),
+        ("apply_keeps_state", corpus, frozenset()),
         ("revoke_document_first", corpus, frozenset()),
-    ] + [(f"commit_order:{n}", corpus, frozenset()) for n in (1, 2, 3, 4, 5, 6)]
+    ] + [(f"commit_order:{n}", corpus, frozenset()) for n in (1, 2, 3, 4, 5, 6, 7, 8)]
     if {name for name, _, _ in removals} | {"guard"} != MODEL_CHECKS:
         raise AssertionError("model check without a removal mutation")
     # The device-binding checks, each refused for its own reason: the verdict the
@@ -1652,13 +1710,16 @@ def mutations(corpus: dict[str, Any]) -> None:
         "restart_site": ("restart: started under the wrong site_id",),
         "recover_binds_runtime_device": ("recover: not bound to the runtime's device and site",),
         "recover_binds_runtime_site": ("recover: not bound to the runtime's device and site",),
+        "apply_device": ("apply_provisioning: applied the wrong device_id",),
+        "apply_site": ("apply_provisioning: applied the wrong site_id",),
+        "apply_keeps_state": ("apply_provisioning: applied changed",),
         "revoke_document_first": ("revoke: device_binding_mismatch != signature_invalid",
                                   "revoke: device_binding_mismatch != malformed",
                                   "revoke: registry_unavailable != malformed"),
     }
     # Each adjacent pair of second-commit steps swapped: a scenario the text decides
     # at step n is then answered by step n + 1.
-    for n in (1, 2, 3, 4, 5, 6):
+    for n in (1, 2, 3, 4, 5, 6, 7, 8):
         device_reasons[f"commit_order:{n}"] = (
             f"phone_commit: {COMMIT_STEPS[n]} != {COMMIT_STEPS[n - 1]}",)
     for n in COMMIT_UNDISTINGUISHED:
