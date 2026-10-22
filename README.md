@@ -18,7 +18,7 @@ below are checked against those records.
 | CLI commands | [cli-commands/v2.md](cli-commands/v2.md) | `draft` | none recorded | `amendable` |
 | Operator Socket | [operator-socket/v1.md](operator-socket/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, claimed, `non-conforming` at assessed implementation snapshot `4078762` (1 divergence); current `a0380b7` unassessed, cli (runtime) `shipped` in v2.5.0-rc.12, claimed, `non-conforming` at assessed implementation snapshot `4078762` (1 divergence); current `a0380b7` unassessed, installer (runtime) `shipped` in v2.5.0-rc.12, `partial` at assessed implementation snapshot `25e0d9c` (1 missing requirement); current `a0380b7` unassessed | `frozen` (2026-09-29), audit `complete` |
 | Operator Socket | [operator-socket/v2.md](operator-socket/v2.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed`, cli (runtime) `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `complete` |
-| Operator Socket | [operator-socket/v3.md](operator-socket/v3.md) | `draft` | none recorded | `amendable` |
+| Operator Socket | [operator-socket/v3.md](operator-socket/v3.md) | `draft` | runtime `implemented-unreleased`, `unassessed` | `amendable` |
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | `draft` | producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed`, consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `complete` |
 | Commissioned safety binding | [commissioned-safety-binding/v2.md](commissioned-safety-binding/v2.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.11, `unassessed`, producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed` | `frozen` (2026-09-23), audit `complete` |
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | `draft` | none recorded | `amendable` |
@@ -81,7 +81,7 @@ below are checked against those records.
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
 | Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `pending` |
-| Tier C approver registry | [tier-c-approvers/v1.md](tier-c-approvers/v1.md) | `draft` | none recorded | `amendable` |
+| Tier C approver registry | [tier-c-approvers/v1.md](tier-c-approvers/v1.md) | `draft` | runtime `implemented-unreleased`, `unassessed` | `amendable` |
 
 Companion documents carry no record of their own; see
 [VERSIONING.md](VERSIONING.md#companion-documents):
