@@ -126,6 +126,8 @@ PINS: list[tuple[str, str]] = [
     ("posture", "Against gateway-api/v2's volume bound, a bucket that holds 5 records and gains one every 10 seconds, this leaves at least one record of room for the broker's redelivery of the retained record at a subscribe, while delivery does not bunch records; [Limits](#limits-and-later-versions) states what bunching does."),
     ("posture", "Coalescing bounds when the runtime publishes, not when the gateway receives: records published at 0, 1, 10002, 20003, 30004 and 60002 ms keep both of its limits, but delivered together from 60002 ms, each within check 10's bound, the sixth finds the bucket empty."),
     ("posture", "Volume drops leave no `last_refusal`."),
+    ("posture", "together can exceed it, so a genuine record is dropped. The runtime publishes its next record within 60 seconds, but when it arrives, and whether it is admitted, depend on delivery and on what else has spent the bound, so the gap a gateway sees can be longer."),
+    ("posture", "the device reads `unknown(lower_tuple_seen)` until the gateway accepts a higher record. The runtime publishes one within 60 seconds, but delivery delay or a volume drop can make the gateway accept it later."),
     ("posture", "- **A pause neither clock counts is not counted.** A gateway whose monotonic clock stops while its host is suspended, and whose wall clock is stepped back across the suspend, counts neither, so a record can stay `current` for longer than it is in fact old."),
     ("posture", "- **A release longer than 64 characters cannot be carried.** runtime-release-bundle/v1 bounds no `runtime_version` length, and `release` holds at most 64 characters, so a runtime installed from a verified bundle with a longer version publishes no record"),
     ("posture", "ori-runtime#782 enforces it at publication; `null` is never a substitute, since it says the code was not installed from a verified bundle."),
@@ -377,8 +379,20 @@ def build_model(texts: dict[str, str]) -> dict:
     lim = section(post, "Limits and later versions", 2)
     if int(one(r"The signing clock runs at most (\d+) ms ahead of the runtime's wall clock", lim, "Delayed delivery").group(1)) != m["clock_ahead"]:
         raise Failure("text: Limits and Publication give different signing clock bounds")
-    if int(one(r"until the runtime's next record, at most (\d+) seconds later", lim, "reordering").group(1)) != m["republish_s"]:
-        raise Failure("text: the reordering limit and the republish interval differ")
+    # The two limits bound publication, never arrival: each names the
+    # republish interval as when the runtime publishes.
+    for pat, where in ((r"The runtime publishes its next record within (\d+) seconds, but when it arrives", "honest traffic"),
+                       (r"The runtime publishes one within (\d+) seconds, but delivery delay or a volume drop can make the gateway accept it later", "honest reordering")):
+        if int(one(pat, lim, where).group(1)) != m["republish_s"]:
+            raise Failure(f"text: the {where} limit and the republish interval differ")
+    # Nothing may promise when a gateway receives or accepts a record.
+    flat_post = norm(post)
+    for pat in (r"arrives? within \d+ (?:ms|seconds?)", r"at most \d+ (?:ms|seconds?) later",
+                r"(?:receives?|accepts?|admits?) (?:it|one|them|the next one|a higher record|its next record)? ?within \d+ (?:ms|seconds?)",
+                r"until the runtime's next record, at most"):
+        hit = re.search(pat, flat_post)
+        if hit:
+            raise Failure(f"text: runtime-posture/v1 promises an arrival or acceptance time: {hit.group(0)!r}")
 
     # Posture state
     ps = section(post, "Posture state", 2)
@@ -2309,6 +2323,17 @@ def text_mutants(texts: dict[str, str]) -> list[tuple[str, dict[str, str]]]:
     t["gateway_config"] = t["gateway_config"].replace("1. `unknown_device`:", "1. `malformed_key`:@").replace(
         "2. `malformed_key`:", "2. `unknown_device`:").replace("1. `malformed_key`:@", "1. `malformed_key`:")
     out.append(("text: config rules 1 and 2 swapped", t))
+    # Arrival promises restored, each in a place no pin covers.
+    for promise in ("The next record arrives within 60 seconds.",
+                    "It is received at most 60 seconds later.",
+                    "The gateway accepts its next record within 60 seconds."):
+        t = dict(texts)
+        t["posture"] = t["posture"].replace("Nothing false is shown.", "Nothing false is shown. " + promise, 1)
+        out.append((f"text: arrival promise added: {promise}", t))
+    t = dict(texts)
+    t["posture"] = re.sub(r"until\s+the\s+gateway\s+accepts\s+a\s+higher\s+record\.\s+The\s+runtime\s+publishes\s+one\s+within\s+60\s+seconds,\s+but\s+delivery\s+delay\s+or\s+a\s+volume\s+drop\s+can\s+make\s+the\s+gateway\s+accept\s+it\s+later\.",
+                          "until the runtime's next record, at most 60 seconds later.", t["posture"])
+    out.append(("text: the reordering limit's old arrival promise restored", t))
     t = dict(texts)
     t["posture"] = re.sub(r"its\s+age\s+is\s+at\s+most\s+900000\s+ms", "its age is at most 900001 ms", t["posture"])
     out.append(("text: age bound changed", t))
