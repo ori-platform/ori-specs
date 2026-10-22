@@ -72,7 +72,8 @@ class Model:
         self.i = 0
         self.lone = False
         self.deepest = 0
-        self.objects: list[tuple[str, list[str]]] = []
+        # (pointer, member names, whether the object is an element of the root object's `items` array)
+        self.objects: list[tuple[str, list[str], bool]] = []
         self.top = ""
 
     def ws(self) -> None:
@@ -176,10 +177,12 @@ class Model:
             if ch in "{[":
                 self.i += 1
                 frame = [ch == "{", ptr, [], 0]
+                item = (ch == "{" and len(stack) == 2 and stack[0][0] and not stack[1][0]
+                        and stack[1][1] == "/items")
                 stack.append(frame)
                 self.deepest = max(self.deepest, len(stack))
                 if frame[0]:
-                    self.objects.append((ptr, frame[2]))
+                    self.objects.append((ptr, frame[2], item))
                 self.ws()
                 if self.i < len(t) and t[self.i] == ("}" if frame[0] else "]"):
                     self.i += 1
@@ -248,11 +251,12 @@ def assess(payload: bytes, family: str | None) -> str:
     if trailing:
         return "trailing_data"
     defined = FAMILIES[family] if family is not None else []
-    if any(len(set(names)) != len(names) for _, names in m.objects):
+    if any(len(set(names)) != len(names) for _, names, _ in m.objects):
         return "duplicate_member"
-    for _, names in m.objects:
+    for _, names, item in m.objects:
+        here = defined + (ITEM_MEMBERS.get(family, []) if item else [])
         folded: dict[str, set[str]] = {}
-        for n in names + defined:
+        for n in names + here:
             folded.setdefault(fold(n), set()).add(n)
         if any(len(group) > 1 for group in folded.values()):
             return "case_variant_member"
@@ -283,6 +287,22 @@ FAMILIES: dict[str, list[str]] = {
     "ori/{device_id}/evidence/inbound": ['artifact', 'artifact_type', 'auth', 'ciphertext', 'custody_at_ms', 'device_id', 'encrypted', 'encryption', 'envelope_digest', 'key_id', 'local_seq', 'mac', 'nonce', 'scheme', 'signature', 'signed_at_ms', 'v'],
     "ori/{device_id}/evidence/inbound/ack": ['acknowledged_at_ms', 'artifact_digest', 'artifact_type', 'auth', 'ciphertext', 'device_id', 'encrypted', 'encryption', 'nonce', 'outcome', 'reason', 'scheme', 'signature', 'signed_at_ms'],
 }
+# The export response's health item: every name in the first column of the member table under "Reading `status`
+# while runtimes adopt runtime-health/v4", and the five that subsection reads to tell an item's shape, written out
+# by hand. Every top-level member of either producer export in health-transition-baselines-v2.json must be one.
+HEALTH_ITEM_MEMBERS = ['alert_outbox', 'capability_posture', 'commissioning', 'community_skills', 'config_authority',
+                       'critical', 'degradation_reasons', 'device_id', 'device_policy', 'evidence',
+                       'firmware_controller_profiles', 'firmware_liveness', 'firmware_mqtt_operator',
+                       'firmware_reading_age', 'gateway_broker_posture', 'health_socket_path', 'last_alert_timestamps',
+                       'remote_command_lockout', 'safety', 'safety_zones', 'sensors', 'state_store_encryption', 'status',
+                       'telemetry_export', 'uptime_s']
+PROJECTION_SHAPE_MEMBERS = ['action_log_records', 'projection', 'safety_registry', 'skill_hooks',
+                            'unknown_critical_blocks']
+_BASELINES = json.loads((pathlib.Path(__file__).resolve().parent.parent / "gateway-api" / "vectors"
+                         / "health-transition-baselines-v2.json").read_text(encoding="utf-8"))
+assert set(_BASELINES["v2.5.0"]) | set(_BASELINES["e4ba3e92"]) <= set(HEALTH_ITEM_MEMBERS)
+# They hold for the objects that are elements of the payload's `items` array only, never for objects nested in them.
+ITEM_MEMBERS = {T_RESP: sorted(set(HEALTH_ITEM_MEMBERS) | set(PROJECTION_SHAPE_MEMBERS))}
 LAN_MEMBERS = ['allowed_proposal_ids', 'app_signature', 'app_spki_b64', 'app_spki_sha256', 'auth', 'authority_snapshot_digest', 'ciphertext', 'client_nonce', 'created_at_ms', 'device_id', 'encrypted', 'encryption', 'expires_at_ms', 'identity_epoch', 'message_type', 'nonce', 'operation', 'proposal_id', 'proposal_ids', 'reply', 'request_id', 'scheme', 'signature', 'signed_at_ms', 'site_id', 'summary', 'v']
 for topic in (
     "ori/{device_id}/lan/proposal",
@@ -334,6 +354,47 @@ case("clean_export_plaintext", "A decrypted action_log response plaintext, admit
      '"record_key":"k-1","contributed_to":null,"action_taken":"trip_relay","executed":true}],"next_page_token":"",'
      '"complete":true,"error":null}',
      ACCEPT, T_RESP)
+case("clean_export_health_item", "A health export whose item carries status, critical and degradation_reasons.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"device_id":"site-a-edge-01","status":"degraded","critical":false,"degradation_reasons":["x"]}],"next_page_token":"","complete":true,"error":null}',
+     ACCEPT, T_RESP)
+case("export_health_item_status_variant", "STATUS beside status in a health item: status is a member the health "
+     "reading names.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"status":"ok","STATUS":"critical"}],"next_page_token":"","complete":true,"error":null}',
+     "case_variant_member", T_RESP)
+case("export_health_item_status_variant_alone", "Status alone in a health item, where the health reading names status.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"Status":"critical"}],"next_page_token":"","complete":true,"error":null}',
+     "case_variant_member", T_RESP)
+case("export_health_item_critical_variant", "CRITICAL in a health item, where the health reading names critical.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"critical":false,"CRITICAL":true}],"next_page_token":"","complete":true,"error":null}',
+     "case_variant_member", T_RESP)
+case("export_health_item_multi_name_cell_variant", "Alert_Outbox in a health item: alert_outbox shares its member "
+     "table cell with other names, each of which the health reading names.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"Alert_Outbox":{}}],'
+     '"next_page_token":"","complete":true,"error":null}',
+     "case_variant_member", T_RESP)
+case("export_nested_status_variant_tolerated", "Status nested inside a health item's member, a trigger name: the "
+     "health names hold for the item itself only.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"status":"ok",'
+     '"last_alert_timestamps":{"by_trigger":{"Status":1}}}],"next_page_token":"","complete":true,"error":null}',
+     ACCEPT, T_RESP)
+case("export_top_level_status_variant_tolerated", "Status at the response's top level, outside every item.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[],"next_page_token":"",'
+     '"complete":true,"error":null,"Status":1}',
+     ACCEPT, T_RESP)
+case("other_topic_items_variant_tolerated", "Status in an items element on a topic other than the export "
+     "response: the health names hold there only.",
+     '{"items":[{"Status":1}]}', ACCEPT, T_REQ)
+case("export_items_object_not_array", "items as an object whose member is named 0: the health names hold for "
+     "array elements only, so a variant inside is tolerated here.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":{"0":{"Status":1}},'
+     '"next_page_token":"","complete":true,"error":null}', ACCEPT, T_RESP)
+case("export_items_nested_array_not_items", "An object inside an array that is itself an element of items is no "
+     "item.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[[{"Status":1}]],'
+     '"next_page_token":"","complete":true,"error":null}', ACCEPT, T_RESP)
+case("export_health_item_projection_variant", "Projection in a health item, a shape member the health reading names.",
+     '{"request_id":"r-3","export_type":"health","device_id":"site-a-edge-01","items":[{"Projection":"runtime-health/v4/remote"}],"next_page_token":"","complete":true,"error":null}',
+     "case_variant_member", T_RESP)
 case("clean_inbound_evidence", "An inbound evidence message whose artifact is a nested object.",
      '{"device_id":"site-a-edge-01","artifact_type":"custody_acknowledgement","artifact":{"v":1,'
      '"device_id":"site-a-edge-01","local_seq":12,"envelope_digest":"sha256:a079","custody_at_ms":1787000000900,'
@@ -780,12 +841,16 @@ def corpus() -> dict:
                             "or longer than 400 bytes; never an input",
             "family": "the topic whose sections give the payload's defined members (their JSON example keys "
                       "and Field table names, with the Envelope Members keys), which hold for every object "
-                      "of the payload; null for a payload that names no family",
+                      "of the payload, with `item_members` for the elements of `items`; null for a payload "
+                      "that names no family",
             "expected": "accept, or the reason a receiver refuses the payload for",
             "families": "every topic's defined members, sorted, for an implementation to compare its own with",
+            "item_members": ("for a topic that has them, the further defined members that hold only for the "
+                             "objects that are elements of the payload's `items` array, sorted"),
         },
         "reasons": list(REASONS),
         "families": {topic: sorted(names) for topic, names in sorted(FAMILIES.items())},
+        "item_members": {topic: names for topic, names in sorted(ITEM_MEMBERS.items())},
         "cases": out,
     }
 
