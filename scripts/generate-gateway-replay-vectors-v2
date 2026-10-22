@@ -35,9 +35,15 @@ class Receiver:
         self.held = {h["key"]: (h["signed_at_ms"], h["received_at_ms"]) for h in ctx["held"]}
         self.pending: dict[str, tuple[int, int]] = {}
         self.unreadable = False
+        # A restart while the stored floor is unreadable forgets what an earlier run read of it; until a read
+        # succeeds, the only floor the receiver knows is its clock at that start.
+        self.forgot = False
 
     def floor(self) -> int:
         return max(x for x in (self.stored_floor, self.read_floor, self.start) if x is not None)
+
+    def known_floor(self) -> int:
+        return self.start if self.forgot else self.floor()
 
     def _raise(self, signed: int) -> None:
         value = signed + 1
@@ -78,6 +84,8 @@ class Receiver:
             return reason
         if kind in ("floor_unreadable", "floor_read"):
             self.unreadable = kind == "floor_unreadable"
+            if not self.unreadable:
+                self.forgot = False
             return None
         if kind in ("prune", "evict") and self.unreadable:
             # Nothing is dropped and no floor written until the stored floor can be read again.
@@ -100,6 +108,7 @@ class Receiver:
                 self.held = {}
             self.pending = {}
             self.start = ev["t"]
+            self.forgot = self.unreadable
             if "skew_ms" in ev:
                 self.skew = ev["skew_ms"]
             return None
@@ -287,10 +296,16 @@ CASES = (
      ctx(stored=10000, start=0),
      [unreadable(20000), restart(21000), rx("p", 21000, 21000), readable(21000), rx("q", 21000, 21000)]),
     ("unreadable_restart_takes_stored_floor",
-     "a restart while the stored floor cannot be read takes, once a read succeeds, the greater of the stored "
-     "floor and its clock at that start; the earlier run's start floor was never stored and does not carry over",
+     "a restart while the stored floor cannot be read knows only its clock at that start, and takes, once a "
+     "read succeeds, the greater of the stored floor and that clock; the earlier run's start floor was never "
+     "stored and does not carry over",
      ctx(stored=500, start=1000),
      [unreadable(1100), restart(100), readable(600), rx("p", 600, 600), rx("q", 499, 600)]),
+    ("unreadable_restart_forgets_held_keys",
+     "a restart while the stored floor cannot be read knows none of the keys it stored; the read that then "
+     "succeeds gives them back, and a replay of one above the floor is refused as a replay",
+     ctx(stored=10000, start=0, held=(("a", 10100, 10100),)),
+     [unreadable(10150), restart(10050), readable(10100), rx("a", 10100, 10100)]),
     ("unreadable_held_key_refused_below_floor",
      "a held key replayed while the stored floor cannot be read is refused as below the floor, not as a replay, "
      "since the floor check comes first",
@@ -346,8 +361,8 @@ def build() -> dict:
             expected: dict = {}
             if ev["event"] in ("receive", "authenticate", "commit"):
                 expected["reason"] = reason
-            expected["floor_ms"] = receiver.floor()
-            expected["held"] = sorted(receiver.held)
+            expected["floor_ms"] = receiver.known_floor()
+            expected["held"] = [] if receiver.forgot else sorted(receiver.held)
             entry["expected"] = expected
             out.append(entry)
         cases.append({"name": name, "note": note, "context": context, "events": out})
