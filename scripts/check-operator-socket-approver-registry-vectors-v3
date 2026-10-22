@@ -185,8 +185,11 @@ HELD: dict[str, tuple[str, ...]] = {
         "The registry is **locked** when it is absent, corrupt or cannot be read; a locked "
         "registry is not initialized, and an operation that needs an initialized registry "
         "refuses it `registry_unavailable`.",
-        "A change of the runtime's device identity or of the verified `device.site_id` locks "
-        "registry mutation, as [tier-c-approvers/v1.md](../tier-c-approvers/v1.md) states: every "
+        "The runtime's device identity and its verified `device.site_id` are those of the "
+        "provisioning document it accepted when it started, as "
+        "[tier-c-approvers/v1.md](../tier-c-approvers/v1.md) defines them.",
+        "A start under either changed locks registry mutation, as "
+        "[tier-c-approvers/v1.md](../tier-c-approvers/v1.md) states: every "
         "registry operation on an initialized registry whose device binding differs from the "
         "runtime's device identity is refused `device_binding_mismatch`, and one whose site "
         "binding differs from the verified `device.site_id` is refused `site_binding_mismatch`, "
@@ -407,11 +410,18 @@ HELD_APPROVERS = (
     # the runtime's device identity does, and that it refuses a phone candidate first.
     "The durable header contains `initialized`, the registry's `device_id`, `site_id` and "
     "`identity_epoch` bindings,",
-    "A header whose `device_id` is absent or does not match `^[A-Za-z0-9._-]{1,64}$` is "
-    "corrupt, so the registry is locked and only recovery can initialize it again.",
-    "a runtime whose device identity differs from the registry's `device_id` (a store "
-    "restarted under another `device.id` among them), each lock registry mutation and Tier C "
-    "admission, and close open proposals to their safe default.",
+    "While either binding differs, opening a Tier C proposal and admitting a reply are refused "
+    "`device_binding_mismatch` or `site_binding_mismatch`, and `device_binding_mismatch` when "
+    "both differ, before the proposal is looked up.",
+    "A header missing any of its three bindings, or holding one outside its form, is corrupt, "
+    "so the registry is locked and only recovery can initialize it again.",
+    "`device_id` matches `^[A-Za-z0-9._-]{1,128}$`, as runtime-config/v2 defines `device.id`, "
+    "and `site_id` matches `^[A-Za-z0-9._-]{1,64}$`;",
+    "The runtime reads `device.id` and `device.site_id` only at start, so a document that "
+    "changes either takes effect at the next start.",
+    "A runtime that starts under a device identity or signed site other than the registry's "
+    "binding (a store restarted under another `device.id` among them) locks registry mutation, "
+    "proposal opening and Tier C admission.",
     "Nothing the registry holds is inherited under the new identity.",
     "A locked registry and a device or site binding mismatch refuse such a candidate first, "
     "under their own codes.",
@@ -555,6 +565,12 @@ def lan_key(value: Any) -> bytes | None:
 
 def is_id(value: Any) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) is not None
+
+
+def is_device_id(value: Any) -> bool:
+    """A device ID: "`device_id` matches `^[A-Za-z0-9._-]{1,128}$`, as runtime-config/v2
+    defines `device.id`" (a site ID stays at 64)."""
+    return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value) is not None
 
 
 def is_value(channel: Any, value: Any) -> bool:
@@ -1744,7 +1760,9 @@ def p_malformed(st):
         return True
     if "document_dups_unchecked" not in st.D and twice_anywhere(st.raw_document):
         return True
-    ids_ok = is_id(d["device_id"]) and is_id(d["site_id"]) if "document_ids_any_string" not in \
+    device_ok = is_id(d["device_id"]) if "document_device_id_64" in st.D else \
+        is_device_id(d["device_id"])
+    ids_ok = device_ok and is_id(d["site_id"]) if "document_ids_any_string" not in \
         st.D else isinstance(d["device_id"], str) and isinstance(d["site_id"], str)
     if not is_v(d["v"]) or not ids_ok:
         return True
@@ -1959,8 +1977,8 @@ ROWS: dict[str, list[tuple[str, str, Callable[[State], bool]]]] = {
          "key, or the runtime is in unsigned development posture without a verified config "
          "anchor.", p_anchor_unavailable),
         ("malformed", "The document is not exactly the signed object: a missing, unknown, "
-         "repeated or wrong-type member, `device_id` or `site_id` not matching "
-         "`^[A-Za-z0-9._-]{1,64}$`, `v` not `1`, `revision` not a positive integer, `targets` "
+         "repeated or wrong-type member, `device_id` not matching `^[A-Za-z0-9._-]{1,128}$` or "
+         "`site_id` not matching `^[A-Za-z0-9._-]{1,64}$`, `v` not `1`, `revision` not a positive integer, `targets` "
          "empty, "
          "unsorted, repeated, longer than 32 or not of the form `credential:<credential_id>` or "
          "`approver:<approver_id>`, or a noncanonical Base64 `identity_epoch`, `signing_key` or "
@@ -2924,7 +2942,7 @@ def changes_of(out: dict) -> list[str]:
 
 def check_context(name: str, ctx: dict) -> None:
     need(isinstance(ctx, dict) and set(ctx) == CONTEXT_KEYS, f"{name}: context keys")
-    need(is_id(ctx["device_id"]), f"{name}: device_id")
+    need(is_device_id(ctx["device_id"]), f"{name}: device_id")
     need(ctx["verified_site_id"] is None or isinstance(ctx["verified_site_id"], str),
          f"{name}: verified_site_id")
     need(is_uid(ctx["peer_uid"]) and is_uid(ctx["operator_uid"]), f"{name}: uids")
@@ -2939,9 +2957,12 @@ def check_context(name: str, ctx: dict) -> None:
         need(isinstance(reg, dict) and set(reg) == REGISTRY_KEYS, f"{name}: registry keys")
         # "A header whose `device_id` is absent or does not match `^[A-Za-z0-9._-]{1,64}$`
         # is corrupt, so the registry is locked": such a registry is `null`, never held.
-        need(is_id(reg["device_id"]), f"{name}: not a valid context: a registry whose device_id "
-             "is absent or malformed is corrupt, so locked, and is null")
-        need(is_id(reg["site_id"]), f"{name}: registry site_id")
+        # "A header missing any of its three bindings, or holding one outside its form, is
+        # corrupt, so the registry is locked": such a registry is `null`, never held.
+        need(is_device_id(reg["device_id"]) and is_id(reg["site_id"]) and
+             canon_b64(reg["identity_epoch"], 16) is not None,
+             f"{name}: not a valid context: a registry with a binding outside its form is "
+             "corrupt, so locked, and is null")
         need(canon_b64(reg["identity_epoch"], 16) is not None, f"{name}: registry epoch")
         for k in ("registry_revision", "last_external_revision", "credential_sequence"):
             need(type(reg[k]) is int and reg[k] >= 0, f"{name}: registry {k}")
@@ -2990,7 +3011,7 @@ def check_context(name: str, ctx: dict) -> None:
              canon_b64(ch["identity_epoch"], 16) is not None and
              ch["operation"] in ("recover", "local_seed", "enrol") and
              type(ch["registry_revision"]) is int and ch["registry_revision"] >= 0 and
-             is_id(ch["device_id"]) and is_id(ch["site_id"]), f"{name}: challenge object")
+             is_device_id(ch["device_id"]) and is_id(ch["site_id"]), f"{name}: challenge object")
         need(len(ch["candidates"]) == (0 if ch["operation"] == "recover" else 1) and
              all(form_candidate(c) for c in ch["candidates"]), f"{name}: challenge candidates")
         need(ch["challenge_id"] not in seen, f"{name}: two held challenges share an ID")
@@ -3390,6 +3411,26 @@ def coverage(T: dict, corpus: dict, outcomes: list) -> None:
     exists(lambda c, g: g.get("code") == "registry_busy" and ctx(c)["registry"] is not None and
            ctx(c)["registry"]["device_id"] != ctx(c)["device_id"],
            "serialisation decided before device_binding_mismatch")
+    # The device ID's form at its bound: 128 characters, where a site ID stops at 64.
+    def doc_device(c: dict) -> Any:
+        req = request_of(c)
+        doc = req.get("document") if isinstance(req, dict) else None
+        return doc.get("device_id") if isinstance(doc, dict) else None
+    exists(lambda c, g: g["ok"] and isinstance(doc_device(c), str) and len(doc_device(c)) == 128,
+           "a revocation naming a 128-character device_id applied")
+    exists(lambda c, g: g.get("code") == "malformed" and isinstance(doc_device(c), str) and
+           len(doc_device(c)) == 129 and is_device_id(doc_device(c)[:128]),
+           "a revocation naming a 129-character device_id malformed")
+    def doc_site(c: dict) -> Any:
+        req = request_of(c)
+        doc = req.get("document") if isinstance(req, dict) else None
+        return doc.get("site_id") if isinstance(doc, dict) else None
+    exists(lambda c, g: g.get("code") == "malformed" and isinstance(doc_site(c), str) and
+           len(doc_site(c)) == 65 and is_id(doc_site(c)[:64]) and is_device_id(doc_device(c)),
+           "a revocation naming a 65-character site_id malformed")
+    for op in ("approver_registry_binding", "approver_registry_challenge"):
+        exists(lambda c, g, op=op: g["ok"] and g["op"] == op and len(ctx(c)["device_id"]) == 128,
+               f"{op} answered under a 128-character device identity")
     exists(lambda c, g: g.get("code") == "registry_busy" and g.get("presents") and
            g.get("consumes_challenge") is False, "registry_busy consuming no challenge")
     exists(lambda c, g: g.get("code") == "unauthenticated" and op_of(c) in PRESENTING,
@@ -3847,6 +3888,8 @@ DEVICE_DEFECTS: tuple[tuple[str, Callable[[str], bool]], ...] = (
     # a locked registry treated as bound to another device
     ("device_when_locked", answered(DB)),
     ("recover_device_unbound", lambda m: "under the runtime's device identity" in m),
+    # a revocation document's device_id held to the site's 64 characters, not 128
+    ("document_device_id_64", answered("malformed")),
 )
 # The device row of a table moved to just after another row: a case the text
 # answers device_binding_mismatch must then be answered by a row it overtook.
@@ -3911,10 +3954,12 @@ def device_mutants(text: str, approvers: str, corpus: dict) -> list[tuple[str, C
 
     def corpus_judged(c: dict, reason: Callable[[str], bool]) -> Callable[[], str]:
         return lambda: _judge(text, approvers, c, reason)
-    for bad in ("", "edge 1", "x" * 65, None):
+    for key, bad in (("device_id", ""), ("device_id", "edge 1"), ("device_id", "x" * 129),
+                     ("device_id", None), ("site_id", "x" * 65), ("site_id", "site 1"),
+                     ("identity_epoch", "AA==")):
         m = fork(corpus, held)
-        m["cases"][held]["context"]["registry"]["device_id"] = bad
-        out.append((f"device_id {bad!r:.10} held as initialized",
+        m["cases"][held]["context"]["registry"][key] = bad
+        out.append((f"registry {key} {bad!r:.10} held as initialized",
                     corpus_judged(m, lambda msg: "corrupt, so locked" in msg)))
     m = fork(corpus, held)
     del m["cases"][held]["context"]["registry"]["device_id"]
