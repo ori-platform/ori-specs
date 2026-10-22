@@ -423,9 +423,22 @@ def verifies(public_raw: bytes, domain: bytes, signed: dict) -> bool:
     return True
 
 
+def device_mismatch(ctx: dict) -> bool:
+    reg = ctx["registry"]
+    return reg is not None and reg["device_id"] != ctx["device_id"]
+
+
 def site_mismatch(ctx: dict) -> bool:
     reg = ctx["registry"]
     return reg is not None and reg["site_id"] != ctx["verified_site_id"]
+
+
+def binding_checks(ctx: dict) -> None:
+    """The device binding, then the site binding, of an initialized registry."""
+    if device_mismatch(ctx):
+        raise Refused("device_binding_mismatch")
+    if site_mismatch(ctx):
+        raise Refused("site_binding_mismatch")
 
 
 def tombstoned_ids(reg: dict) -> set:
@@ -470,8 +483,7 @@ def challenge_op(ctx: dict, request: dict) -> dict:
     kind, cand = request["challenge_operation"], request["candidate"]
     if kind == "local_seed" and cand["channel"] != "lan_ed25519":
         raise Refused("lan_key_required")
-    if site_mismatch(ctx):
-        raise Refused("site_binding_mismatch")
+    binding_checks(ctx)
     reg, minted = ctx["registry"], ctx["minted"]
     if kind == "recover" and reg is not None:
         raise Refused("recovery_not_available")
@@ -506,8 +518,7 @@ def challenge_op(ctx: dict, request: dict) -> dict:
 
 
 def presented(ctx: dict, request: dict, kind: str) -> tuple[dict, dict]:
-    if site_mismatch(ctx):
-        raise Refused("site_binding_mismatch")
+    binding_checks(ctx)
     held = next((h for h in ctx["challenges"] if h["challenge"]["challenge_id"] == request["challenge_id"]), None)
     if held is not None and held["state"] == "used":
         raise Refused("challenge_reused")
@@ -643,9 +654,8 @@ def revoke_op(ctx: dict, request: dict) -> dict:
     reg = ctx["registry"]
     if reg is None:
         raise Refused("registry_unavailable")
-    if site_mismatch(ctx):
-        raise Refused("site_binding_mismatch")
-    bound_to = (ctx["device_id"], reg["site_id"], reg["identity_epoch"])
+    binding_checks(ctx)
+    bound_to = (reg["device_id"], reg["site_id"], reg["identity_epoch"])
     if (doc["device_id"], doc["site_id"], doc["identity_epoch"]) != bound_to:
         raise Refused("binding_mismatch")
     last = reg["last_external_revision"]
@@ -683,9 +693,8 @@ def binding_op(ctx: dict, request: dict) -> dict:
     reg = ctx["registry"]
     if reg is None:
         raise Refused("registry_unavailable")
-    if site_mismatch(ctx):
-        raise Refused("site_binding_mismatch")
-    return {"device_id": ctx["device_id"], "site_id": reg["site_id"],
+    binding_checks(ctx)
+    return {"device_id": reg["device_id"], "site_id": reg["site_id"],
             "identity_epoch": reg["identity_epoch"], "registry_revision": reg["registry_revision"]}
 
 
@@ -764,6 +773,7 @@ def tomb(credential_id: str, approver_id: str) -> dict:
 
 def registry(**overrides: object) -> dict:
     base = {
+        "device_id": DEVICE_ID,
         "site_id": SITE_ID,
         "identity_epoch": EPOCH,
         "registry_revision": 3,
@@ -857,9 +867,9 @@ def authorization(key: Ed25519PrivateKey, ch: dict, cred: str, *, sha: str | Non
 
 
 def revocation(revision: int, targets: list, *, key: Ed25519PrivateKey = PROVISIONING,
-               epoch: str = EPOCH, site: str = SITE_ID) -> dict:
+               epoch: str = EPOCH, site: str = SITE_ID, device: str = DEVICE_ID) -> dict:
     return sign(key, b"ori.tier_c_approver.revoke.v1", {
-        "v": 1, "device_id": DEVICE_ID, "site_id": site, "identity_epoch": epoch,
+        "v": 1, "device_id": device, "site_id": site, "identity_epoch": epoch,
         "revision": revision, "targets": sorted(targets), "signing_key": "ed25519:" + b64(raw_public(key))})
 
 
@@ -1016,6 +1026,10 @@ case("binding", "the readback of the current binding", {}, request(BINDING))
 case("binding_locked", "a locked registry has no binding to read", LOCKED, request(BINDING))
 case("binding_site_changed", "a registry whose site binding differs from the verified site",
      {"verified_site_id": "site-2"}, request(BINDING))
+case("binding_device_changed", "a registry whose device binding differs from the runtime's device identity",
+     {"device_id": "edge-2"}, request(BINDING))
+case("binding_device_over_site", "both bindings differ: the device binding decides",
+     {"device_id": "edge-2", "verified_site_id": "site-2"}, request(BINDING))
 
 # Challenge.
 case("challenge_recover", "first setup or recovery from a locked registry",
@@ -1058,6 +1072,20 @@ case("challenge_enrol_approver_id_invalid", "an approver ID outside its form", {
 case("challenge_enrol_site_changed", "no challenge while the site binding differs",
      {"verified_site_id": "site-2", "minted": MINTED},
      request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_enrol_device_changed", "no challenge while the device binding differs",
+     {"device_id": "edge-2", "minted": MINTED},
+     request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))))
+case("challenge_enrol_whatsapp_device_changed", "a device binding mismatch is refused before the channel is judged",
+     {"device_id": "edge-2", "minted": MINTED}, request(challenge_req("enrol", "whatsapp", "+2348098765432")))
+case("challenge_recover_device_changed", "no recovery of an initialized registry bound to another device: "
+     "nothing is inherited and the original identity must be restored",
+     {"device_id": "edge-2", "minted": MINTED}, request(challenge_req("recover")))
+case("challenge_recover_device_changed_locked", "a locked registry has no device binding, so recovery under the "
+     "runtime's identity proceeds", {**LOCKED, "device_id": "edge-2", "minted": MINTED},
+     request(challenge_req("recover")))
+case("challenge_device_over_site", "both bindings differ: the device binding decides",
+     {"device_id": "edge-2", "verified_site_id": "site-2", "minted": MINTED},
+     request(challenge_req("enrol", "lan_ed25519", lan_value(CANDIDATE))))
 case("challenge_enrol_locked", "no enrolment challenge for a locked registry",
      {**LOCKED, "minted": MINTED}, request(challenge_req("enrol", "sms", "+2348098765432")))
 
@@ -1077,6 +1105,11 @@ case("recover_registry_initialized", "the registry was initialized after the cha
      {"challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
 case("recover_site_changed", "a site binding mismatch is decided before the challenge is read, and consumes nothing",
      {"verified_site_id": "site-2", "challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+case("recover_device_changed", "a device binding mismatch is decided before the challenge is read, and consumes "
+     "nothing", {"device_id": "edge-2", "challenges": [held(RECOVER_CH, sequence=0)]}, request(RECOVER_REQ))
+case("recover_device_over_site", "both bindings differ: the device binding decides",
+     {"device_id": "edge-2", "verified_site_id": "site-2", "challenges": [held(RECOVER_CH, sequence=0)]},
+     request(RECOVER_REQ))
 
 # Local seed.
 case("local_seed", "the first LAN credential of an empty registry", SEED_CTX, request(seed_req()))
@@ -1199,6 +1232,14 @@ case("revoke_anchor_unavailable", "no usable current provisioning anchor", {"anc
 case("revoke_locked", "a locked registry", LOCKED, request(REVOKE_REQ))
 case("revoke_site_changed", "a registry whose site binding differs from the verified site",
      {"verified_site_id": "site-2"}, request(REVOKE_REQ))
+case("revoke_device_changed", "a registry whose device binding differs from the runtime's device identity, the "
+     "document naming the registry's device", {"device_id": "edge-2"}, request(REVOKE_REQ))
+case("revoke_device_changed_document_names_runtime", "a registry whose device binding differs, the document "
+     "naming the runtime's device: the device binding decides before the document's binding",
+     {"device_id": "edge-2"},
+     request({**REVOKE_REQ, "document": revocation(1, ["credential:owner-phone"], device="edge-2")}))
+case("revoke_device_over_site", "both bindings differ: the device binding decides",
+     {"device_id": "edge-2", "verified_site_id": "site-2"}, request(REVOKE_REQ))
 
 
 # --- framing --------------------------------------------------------------------
@@ -1219,6 +1260,10 @@ case("no_verified_site_challenge", "no verified device.site_id refuses a challen
      {"verified_site_id": None, **LOCKED}, request(challenge_req("recover")))
 case("no_verified_site_before_site_mismatch", "no verified site is decided before site_binding_mismatch",
      {"verified_site_id": None, **ENROL_CTX}, request(enrol_req()))
+case("no_verified_site_before_device_mismatch", "no verified site is decided before device_binding_mismatch",
+     {"verified_site_id": None, "device_id": "edge-2", **ENROL_CTX}, request(enrol_req()))
+case("busy_before_device_mismatch", "serialisation is decided before device_binding_mismatch",
+     {"registry_operation_in_flight": True, "device_id": "edge-2"}, request(BINDING))
 case("order_payload_first", "over the bound, a member named twice, unadmitted and busy: the bound decides",
      {"peer_uid": 1002, "registry_operation_in_flight": True, "verified_site_id": None},
      padded_text('{"operation":"approver_registry_binding","operation":"approver_registry_binding"}', BOUND + 1))
@@ -1245,6 +1290,13 @@ case("ch_order_site_binding_mismatch", "site_binding_mismatch decides over a wha
      "approver, a tombstoned value and a pending value",
      {"verified_site_id": "site-2", "registry": registry(tombstoned_values=[PHONE_X], tombstoned_approvers=["gone"]),
       "pending_phone_values": [PHONE_X]}, request(challenge_req("enrol", "whatsapp", PHONE_X, approver="gone")))
+case("ch_order_device_binding_mismatch", "device_binding_mismatch decides over a site mismatch, a whatsapp "
+     "candidate, a tombstoned approver, a tombstoned value and a pending value",
+     {"device_id": "edge-2", "verified_site_id": "site-2",
+      "registry": registry(tombstoned_values=[PHONE_X], tombstoned_approvers=["gone"]),
+      "pending_phone_values": [PHONE_X]}, request(challenge_req("enrol", "whatsapp", PHONE_X, approver="gone")))
+case("ch_order_lan_key_required_over_device", "lan_key_required decides over a device mismatch",
+     {"device_id": "edge-2"}, request(challenge_req("local_seed", "sms", PHONE_X)))
 case("ch_order_registry_unavailable", "a locked registry decides over a whatsapp candidate, an unknown approver "
      "and a pending value", {**LOCKED, "pending_phone_values": [PHONE_X]},
      request(challenge_req("enrol", "whatsapp", PHONE_X, approver="nobody")))
@@ -1285,6 +1337,10 @@ case("ch_phone_pending_for_value", "a phone value with a pending phone operation
 # --- challenges presented order ------------------------------------------------
 case("cp_order_site_binding_mismatch", "site_binding_mismatch decides over a used challenge for another operation",
      {"verified_site_id": "site-2", "challenges": [held(ENROL_CH, "used")]},
+     request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
+case("cp_order_device_binding_mismatch", "device_binding_mismatch decides over a site mismatch and a used "
+     "challenge for another operation",
+     {"device_id": "edge-2", "verified_site_id": "site-2", "challenges": [held(ENROL_CH, "used")]},
      request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
 case("cp_order_challenge_reused", "challenge_reused decides over a challenge for another operation",
      {"challenges": [held(ENROL_CH, "used")]}, request({**RECOVER_REQ, "challenge_id": ENROL_CH["challenge_id"]}))
@@ -1441,6 +1497,11 @@ case("rv_order_wrong_authority", "wrong_authority decides over every later row",
      request({**REVOKE_REQ, "document": revocation(1, TARGET_X, key=OTHER_CLASS, epoch=OLD_EPOCH)}))
 case("rv_order_site_binding_mismatch", "site_binding_mismatch decides over another epoch, a lower revision and "
      "an unknown target", WIDE, request({**REVOKE_REQ, "document": revocation(1, TARGET_X, epoch=OLD_EPOCH)}))
+case("rv_order_device_binding_mismatch", "device_binding_mismatch decides over a site mismatch, another epoch, "
+     "a lower revision and an unknown target", {**WIDE, "device_id": "edge-2"},
+     request({**REVOKE_REQ, "document": revocation(1, TARGET_X, epoch=OLD_EPOCH)}))
+case("rv_order_registry_unavailable_over_device", "a locked registry has no device binding: registry_unavailable "
+     "decides", {**LOCKED, "device_id": "edge-2"}, request(REVOKE_REQ))
 case("rv_order_binding_mismatch", "binding_mismatch decides over a lower revision and an unknown target",
      {"registry": BELOW_REG}, request({**REVOKE_REQ, "document": revocation(1, TARGET_X, epoch=OLD_EPOCH)}))
 case("rv_order_revision_regressed", "revision_regressed decides over an unknown target", {"registry": BELOW_REG},
@@ -1545,6 +1606,10 @@ case("rv_current_anchor_fails_admission", "a fixture: a configured current ancho
 # --- order witnesses -------------------------------------------------------------
 case("w_ch_site_over_recovery_not_available", "site_binding_mismatch decides while recovery_not_available also "
      "fails", {"verified_site_id": "site-2"}, request(challenge_req("recover")))
+case("w_ch_device_over_recovery_not_available", "device_binding_mismatch decides while recovery_not_available "
+     "also fails", {"device_id": "edge-2"}, request(challenge_req("recover")))
+case("w_ch_device_over_active_authorizer", "device_binding_mismatch decides while active_authorizer_exists also "
+     "fails", {"device_id": "edge-2"}, request(challenge_req("local_seed", "lan_ed25519", lan_value(CANDIDATE))))
 case("w_ch_lan_key_over_registry_unavailable", "lan_key_required decides while the registry is locked", LOCKED,
      request(challenge_req("local_seed", "sms", PHONE_X)))
 case("w_ch_site_over_active_authorizer", "site_binding_mismatch decides while active_authorizer_exists also fails",
@@ -1603,6 +1668,8 @@ conflict_case("w_rv_superseded_over_conflict", "superseded_signer decides", {}, 
 conflict_case("w_rv_wrong_authority_over_conflict", "wrong_authority decides", {},
               revocation(1, OTHER_1, key=OTHER_CLASS))
 conflict_case("w_rv_site_over_conflict", "site_binding_mismatch decides", {"verified_site_id": "site-2"},
+              revocation(1, OTHER_1))
+conflict_case("w_rv_device_over_conflict", "device_binding_mismatch decides", {"device_id": "edge-2"},
               revocation(1, OTHER_1))
 conflict_case("w_rv_binding_over_conflict", "binding_mismatch decides", {}, revocation(1, OTHER_1, epoch=OLD_EPOCH))
 OC_DOC = revocation(1, ["credential:owner-phone"], key=OTHER_CLASS)
@@ -1954,7 +2021,9 @@ def recover_present(state: str) -> dict:
     return {**LOCKED_REG, "challenges": [held(RECOVER_CH, state, 0)]}
 
 
-for row, state, changes in (("site_binding_mismatch", "pending", {"verified_site_id": "site-2",
+for row, state, changes in (("device_binding_mismatch", "pending", {"device_id": "edge-2",
+                                                                    "registry": registry()}),
+                            ("site_binding_mismatch", "pending", {"verified_site_id": "site-2",
                                                                   "registry": registry()}),
                             ("challenge_reused", "used", {}), ("challenge_expired", "expired", {})):
     sweep(f"x_cp_{row}_recover", row, f"sweep: Challenges presented, {row.replace('_', ' ')}",
@@ -1984,6 +2053,9 @@ for op, (ch_, base_ctx, seq_) in CP_CHALLENGES.items():
             return [held(ch_, state, seq_, elapsed_ms=expired_ms if state == "expired" else None)]
 
         site_ctx = {**base_ctx, "registry": base_ctx.get("registry", registry())}
+        sweep(f"x_cp_device_binding_mismatch_{pcell}", "device_binding_mismatch",
+              "sweep: Challenges presented, a device change", {**site_ctx, "challenges": held_as("pending"),
+                                                               "device_id": "edge-2"}, req_)
         sweep(f"x_cp_site_binding_mismatch_{pcell}", "site_binding_mismatch",
               "sweep: Challenges presented, a site change", {**site_ctx, "challenges": held_as("pending"),
                                                              "verified_site_id": "site-2"}, req_)
@@ -2028,6 +2100,9 @@ for op, cells in UNHELD.items():
         sweep(f"x_cp_challenge_unavailable_{op}{suffix}", "challenge_unavailable",
               "sweep: Challenges presented, no challenge held", {**base_reg, "challenges": []}, req_)
         site_reg = registry(**EMPTY) if op == "local_seed" else registry()
+        sweep(f"x_cp_device_binding_mismatch_unheld_{op}{suffix}", "device_binding_mismatch",
+              "sweep: Challenges presented, a device change, no challenge held",
+              {"registry": site_reg, "device_id": "edge-2", "challenges": []}, req_)
         sweep(f"x_cp_site_binding_mismatch_unheld_{op}{suffix}", "site_binding_mismatch",
               "sweep: Challenges presented, a site change, no challenge held",
               {"registry": site_reg, "verified_site_id": "site-2", "challenges": []}, req_)
@@ -2083,6 +2158,7 @@ for row, context_, doc_ in (
     ("superseded_signer", {}, revocation(1, ["credential:owner-phone"], key=PREVIOUS)),
     ("wrong_authority", {}, revocation(1, ["credential:owner-phone"], key=OTHER_CLASS)),
     ("registry_unavailable", LOCKED_REG, REV_DOC),
+    ("device_binding_mismatch", {"device_id": "edge-2"}, REV_DOC),
     ("site_binding_mismatch", {"verified_site_id": "site-2"}, REV_DOC),
     ("binding_mismatch", {}, revocation(1, ["credential:owner-phone"], epoch=OLD_EPOCH)),
     ("revision_regressed", {"registry": registry(last_external_revision=5, last_external_document_sha256="0" * 64)},
@@ -2094,6 +2170,8 @@ for row, context_, doc_ in (
           request({**REVOKE_REQ, "document": doc_}))
 sweep("x_bd_registry_unavailable", "registry_unavailable", "sweep: Binding, a locked registry", LOCKED_REG,
       request(BINDING))
+sweep("x_bd_device_binding_mismatch", "device_binding_mismatch", "sweep: Binding, a device change",
+      {"device_id": "edge-2"}, request(BINDING))
 sweep("x_bd_site_binding_mismatch", "site_binding_mismatch", "sweep: Binding, a site change",
       {"verified_site_id": "site-2"}, request(BINDING))
 
@@ -2134,6 +2212,8 @@ for kind, (channel, value) in CH_KINDS.items():
     for who, approver in (("null", None), ("named", "owner")):
         ccell = f"enrol_{kind}_{who}"
         req_ = request(challenge_req("enrol", channel, value, approver=approver))
+        sweep(f"x_ch_device_binding_mismatch_{ccell}", "device_binding_mismatch",
+              "sweep: Challenge, a device change", {"device_id": "edge-2"}, req_)
         sweep(f"x_ch_site_binding_mismatch_{ccell}", "site_binding_mismatch", "sweep: Challenge, a site change",
               {"verified_site_id": "site-2"}, req_)
         sweep(f"x_ch_registry_unavailable_{ccell}", "registry_unavailable", "sweep: Challenge, a locked registry",
@@ -2229,7 +2309,8 @@ for label, order in (("own_first", ("owner-phone", "other-phone")), ("other_firs
 
 CODES = (
     "payload_too_large", "invalid_arguments", "unauthenticated", "registry_busy", "lan_key_required",
-    "channel_unauthenticated", "site_binding_mismatch", "recovery_not_available", "registry_unavailable",
+    "channel_unauthenticated", "device_binding_mismatch", "site_binding_mismatch", "recovery_not_available",
+    "registry_unavailable",
     "active_authorizer_exists", "approver_unknown", "challenge_reused", "challenge_unavailable",
     "challenge_expired", "candidate_changed", "challenge_stale",
     "possession_invalid", "signature_invalid", "approver_revoked", "credential_reused", "value_tombstoned",
@@ -2251,7 +2332,8 @@ NOTE = {
         "presented) over recover, and over local_seed (a lan challenge) and enrol (a lan or sms challenge) each "
         "x presented candidate kind (lan, sms, whatsapp), a presented kind other than the challenge's being "
         "decided at candidate_changed unless an earlier row fires; challenge_unavailable over the presented "
-        "candidate kind alone, no challenge being held, and site_binding_mismatch also with no challenge held, "
+        "candidate kind alone, no challenge being held, and device_binding_mismatch and site_binding_mismatch "
+        "also with no challenge held, "
         "over recover and the presented kind for local_seed and enrol; an "
         "expired sms challenge sitting between "
         "the 60-second challenge window and the 10-minute possession window; ch "
@@ -2295,8 +2377,8 @@ NOTE = {
         "Every state change the answer commits, sorted, from this closed vocabulary: "
         "challenge_added:<challenge_id> (a pending challenge with its deadline); code_sent:<challenge_id> (a "
         "possession code sent to the challenge's phone candidate); used:<challenge_id> (the challenge marked "
-        "used); registry_created:<identity_epoch> (an empty initialized registry under that epoch and the "
-        "verified site: revision 1, last external revision 0, credential sequence 0, no credentials or "
+        "used); registry_created:<identity_epoch> (an empty initialized registry under that epoch, the "
+        "context's device_id and the verified site: revision 1, last external revision 0, credential sequence 0, no credentials or "
         "tombstones); challenges_cleared, phone_authorizations_cleared and pending_phone_cleared (every held "
         "challenge, received phone authorization and pending phone operation removed); "
         "credential_added:<credential_id> (the candidate made active); sequence:<n> and revision:<n> (the new "
@@ -2316,7 +2398,10 @@ NOTE = {
         "32 bytes) that this fixture deliberately holds although they fail ed25519-key-admission/v1. Every "
         "other key in the context passes it."
     ),
-    "context.device_id": "The running runtime's device identity.",
+    "context.device_id": (
+        "The running runtime's device identity. An initialized registry whose device_id differs from it is "
+        "bound to another device."
+    ),
     "context.verified_site_id": "The device.site_id of the runtime's verified provisioning configuration.",
     "context.peer_uid": (
         "The peer's effective user ID from kernel peer credentials; null when they cannot be established."
@@ -2329,7 +2414,8 @@ NOTE = {
         "anchor, the previous provisioning anchor, and one anchor of another class."
     ),
     "context.registry": (
-        "null when the registry is locked. Otherwise its site binding, identity epoch, registry revision, "
+        "null when the registry is locked. Otherwise its device binding, site binding, identity epoch, registry "
+        "revision, "
         "last external revision, the SHA-256 (lowercase hex) of the Profile 2 canonical JSON of the last "
         "applied revocation document or null, credential sequence, active credentials (each with its "
         "approver ID, credential ID, channel, value as in a challenge candidate, and enrolment sequence), "
@@ -2377,7 +2463,7 @@ NOTE = {
 
 
 STEP_CODES = ("payload_too_large", "invalid_arguments", "unauthenticated", "registry_busy", "registry_unavailable",
-              "site_binding_mismatch", "challenge_reused", "challenge_unavailable", "challenge_expired",
+              "device_binding_mismatch", "site_binding_mismatch", "challenge_reused", "challenge_unavailable", "challenge_expired",
               "candidate_changed")
 UP_TO_SIGNATURE_ROW = {
     ("approver_registry_revoke", "document"): ("anchor_unavailable", "malformed", "unknown_signer",
