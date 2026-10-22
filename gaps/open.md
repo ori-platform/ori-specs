@@ -63,7 +63,8 @@ New implementation gaps should be added here, naming the owning repository.
   phone's challenge-bound reply before enrolment. First setup must leave the
   registry empty; existing provisioning contacts cannot be copied into it.
   The draft `runtime-config/v2` field `device.site_id` has no consumer yet.
-  A signed site-ID change locks Tier C; v1 has no site-transfer operation.
+  A change of the signed site ID or of the device identity locks Tier C; v1
+  has no transfer operation for either.
 - **Local revocation delivery and recovery disclosure**
   ([tier-c-approvers/v1.md](../tier-c-approvers/v1.md)):
   [operator-socket/v3](../operator-socket/v3.md) specifies the bounded local

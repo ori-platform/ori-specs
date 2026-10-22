@@ -23,6 +23,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tier-c-approvers" / "vectors" / "transitions.json"
 SITE_ID = "site-1"
+# The runtime's device identity in the corpus, and the device a revocation names.
+DEVICE_ID = "edge-1"
 EPOCH_1 = base64.b64encode(bytes(range(32, 48))).decode("ascii")
 EPOCH_2 = base64.b64encode(bytes(range(48, 64))).decode("ascii")
 PUBLIC_KEY = "CoCYmi2u1NnDLsVzNMglg2Ied+0M9Z74rgNvSGRBAdg="
@@ -32,6 +34,8 @@ PREVIOUS_KEY = "pATYfctmcQzVhHk+Aa6SZWUQCtxMIBDD2/WXjR68x9k="
 COMMERCIAL_KEY = "CzJf9IyhyTJ8DQpovGI8heykR+smA0porxw3cqIXgMY="
 ID = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 SITE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
+# "`device_id` matches `^[A-Za-z0-9._-]{1,128}$`, as runtime-config/v2 defines `device.id`"
+DEVICE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 PHONE = re.compile(r"\+[1-9][0-9]{1,14}\Z")
 PHONE_CHANNELS = {"sms", "whatsapp"}
 # "Authenticated channel" and "Limits and later versions": in v1 no WhatsApp
@@ -66,11 +70,23 @@ NAMES = {
     "phone_candidate_late_reply_refused",
     "phone_authorizer_revoked_before_commit",
     "phone_recovery_before_commit",
+    "phone_recovery_then_late_reply",
+    "phone_recovery_then_locked_registry",
+    "phone_lock_without_recovery",
+    "phone_lock_without_recovery_late",
+    "phone_lock_without_recovery_wrong_code",
+    "phone_late_over_wrong_code",
+    "phone_wrong_code_over_revoked_authorizer",
+    "phone_expired_then_late_reply",
+    "phone_commit_names_another_value",
     "one_pending_phone_per_candidate_value",
     "whatsapp_candidate_refused_at_issue",
     "sms_ingress_unavailable",
     "phone_registry_change_before_commit",
     "phone_site_change_before_commit",
+    "phone_device_change_before_commit",
+    "phone_device_and_site_change_before_commit",
+    "phone_issue_refused_while_device_changed",
     "phone_pending_expiry_releases_value",
     "duplicate_credential_and_value_refused",
     "challenge_expiry_reuse_change_and_restart",
@@ -90,6 +106,21 @@ NAMES = {
     "recovery_requires_new_epoch_for_revocation",
     "invalid_site_binding_is_malformed",
     "signed_site_change_locks_admission",
+    "device_identity_change_locks_admission",
+    "device_change_decides_over_site_change",
+    "recovery_binds_the_runtime_device",
+    "revocation_document_decided_before_binding",
+    "recovery_binds_the_runtime_site",
+    "inrun_device_change_locks_admission",
+    "inrun_site_change_locks_admission",
+    "inrun_device_and_site_change_device_decides",
+    "inrun_phone_commit_device_changed",
+    "inrun_phone_commit_site_changed",
+    "inrun_phone_commit_device_over_site",
+    "inrun_phone_commit_after_restore",
+    "inrun_phone_revoked_authorizer_over_device",
+    "inrun_phone_revision_over_device",
+    "inrun_challenge_presented_device_changed",
     "revocation_before_admission",
     "admission_before_revocation_stands",
 }
@@ -146,16 +177,6 @@ def canonical_profile2(value: Any) -> bytes:
     raise ValueError("non-JSON value")
 
 
-def binding_id(value: Any) -> bool:
-    if not isinstance(value, str) or not value:
-        return False
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return len(encoded) <= 256 and all(ord(char) >= 32 and ord(char) != 127 for char in value)
-
-
 def verify_wire(corpus: dict[str, Any]) -> None:
     wire = corpus["wire"]
     challenge = wire["challenge"]
@@ -169,7 +190,7 @@ def verify_wire(corpus: dict[str, Any]) -> None:
         or type(challenge["registry_revision"]) is not int
         or challenge["registry_revision"] < 0
         or len(strict_b64(challenge["challenge_id"])) != 16
-        or not binding_id(challenge["device_id"])
+        or not isinstance(challenge["device_id"], str) or not DEVICE.fullmatch(challenge["device_id"])
         or not SITE.fullmatch(challenge["site_id"])
         or len(strict_b64(challenge["identity_epoch"])) != 16
         or challenge["operation"] not in {"recover", "enrol", "local_seed"}
@@ -293,7 +314,7 @@ def revocation_reason(document: Any) -> str | None:
         if (
             type(document["v"]) is not int or document["v"] != 1
             or type(document["revision"]) is not int or document["revision"] < 1
-            or not binding_id(document["device_id"])
+            or not isinstance(document["device_id"], str) or not DEVICE.fullmatch(document["device_id"])
             or not SITE.fullmatch(document["site_id"])
             or len(strict_b64(document["identity_epoch"])) != 16
             or not isinstance(targets, list) or not targets or len(targets) > 32
@@ -361,7 +382,30 @@ MODEL_CHECKS = {
     "guard",
     "restart_ingress",
     "restart_used_markers",
-}
+    # The device binding (tier-c-approvers/v1 "A change of either binding cannot
+    # silently rebind an existing registry"; operator-socket/v3 Order of refusal).
+    "device_check",
+    "device_first",
+    "mismatch_needs_initialized",
+    "restart_device",
+    "restart_site",
+    "recover_binds_runtime_device",
+    "recover_binds_runtime_site",
+    "apply_device",
+    "apply_site",
+    "apply_keeps_state",
+    "revoke_document_first",
+} | {f"commit_order:{n}" for n in (1, 2, 3, 4, 5, 6, 7, 8)}
+# The second commit's ten steps, by verdict, in the text's order.
+COMMIT_STEPS = (
+    "epoch_changed", "pending_unavailable", "possession_expired", "possession_invalid",
+    "registry_unavailable", "authorizer_unavailable", "registry_changed",
+    "device_binding_mismatch", "site_binding_mismatch", "epoch_changed",
+)
+# Adjacent steps no scenario can tell apart: swapping them changes no verdict.
+# 9/10: "Step 10 is defence in depth: only a recovery changes the epoch, and step 1
+# decides that first."
+COMMIT_UNDISTINGUISHED = (9,)
 
 
 def credential_channel_of_reply(channel: Any) -> Any:
@@ -382,6 +426,11 @@ class Registry:
         self.initialized = False
         self.epoch = EPOCH_1
         self.config_site = SITE_ID
+        # The runtime's device identity, and the registry header's device and site
+        # bindings: "A locked registry has neither binding."
+        self.config_device = DEVICE_ID
+        self.device_binding: str | None = None
+        self.site_binding: str | None = None
         self.revision = 0
         self.external_revision = 0
         self.last_external_document: str | None = None
@@ -396,9 +445,28 @@ class Registry:
         self.used_challenges: set[str] = set()
         self.pending_phone: dict[str, dict[str, Any]] = {}
         self.invalidated_phone: dict[str, str] = {}
+        self.commit_pending: dict[str, Any] | None = None   # the operation a commit judges
 
     def active_approvers(self) -> set[str]:
         return {self.approvers[credential] for credential in self.active}
+
+    def binding_refusal(self) -> str | None:
+        """"every registry operation on an initialized registry whose device binding
+        differs from the runtime's device identity is refused
+        `device_binding_mismatch`, and one whose site binding differs from the
+        verified `device.site_id` is refused `site_binding_mismatch` ... When both
+        differ, `device_binding_mismatch` is the answer. A locked registry has
+        neither binding." (operator-socket/v3, Order of refusal)"""
+        if not self.initialized and "mismatch_needs_initialized" not in self.disabled:
+            return None
+        checks = [
+            ("device_binding_mismatch",
+             self.device_binding != self.config_device and "device_check" not in self.disabled),
+            ("site_binding_mismatch", self.site_binding != self.config_site),
+        ]
+        if "device_first" in self.disabled:
+            checks.reverse()
+        return next((code for code, failed in checks if failed), None)
 
     def require_defence_in_depth(self, pending: dict[str, Any]) -> None:
         """"Once the revision recheck holds, the authoriser's activity and the
@@ -424,20 +492,112 @@ class Registry:
         if failing:
             raise AssertionError(f"defence-in-depth recheck failed with revision unchanged: {failing}")
 
+    def phone_possession_refusal(self, operation: dict[str, Any], pending: dict[str, Any]) -> str | None:
+        """Step 4: "the reply carries no possession text: `possession_required`; or
+        it is not on an authenticated ingress, or its code's digest, sender or
+        channel differs from the pending operation's: `possession_invalid`". A
+        reply naming another value or channel than the pending operation's is the
+        "sender or channel differs" clause."""
+        challenge_id = operation["challenge_id"]
+        candidate = pending["candidate"]
+        reply = operation.get("phone_reply")
+        if reply is None:
+            return "possession_required"
+        if operation.get("value") != candidate["value"] or operation.get("channel") != candidate["channel"]:
+            return "possession_invalid"
+        if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
+            return "possession_invalid"
+        prefix = f"ORI-POSSESS-V1 {challenge_id} "
+        text = reply["text"]
+        if not isinstance(text, str) or not text.startswith(prefix):
+            return "possession_invalid"
+        code = text[len(prefix):]
+        try:
+            if len(strict_b64(code)) != 16:
+                return "possession_invalid"
+        except (ValueError, TypeError):
+            return "possession_invalid"
+        if (reply["authenticated"] is not True or
+            (reply["channel"] not in self.authenticated_channels
+             and "reply_auth_channel" not in self.disabled) or
+            reply["sender"] != candidate["value"] or
+            (reply["channel"] != candidate["channel"]
+             and "reply_channel_mismatch" not in self.disabled) or
+            not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), pending["phone_code_sha256"])):
+            return "possession_invalid"
+        return None
+
+    def phone_commit_refusal(self, operation: dict[str, Any]) -> str | None:
+        """"At that second commit the runtime decides the reply in this order, and
+        the first check that fails is the answer" (tier-c-approvers/v1, the ten
+        numbered steps). "Step 10 is defence in depth: only a recovery changes the
+        epoch, and step 1 decides that first. Steps 8 and 9 compare the bindings as
+        they stand at the commit; a restart ends every pending operation, which step
+        2 then answers. A registry locked without a recovery is step 5, not step 1. From step 3 on, every answer, a commit or any refusal,
+        consumes the pending operation; step 1 consumes the record of the
+        operation the recovery invalidated." `commit_order:<n>` swaps steps n and
+        n + 1."""
+        challenge_id = operation["challenge_id"]
+        elapsed = operation.get("phone_elapsed_ms", 0)
+        if type(elapsed) is not int or elapsed < 0:
+            return "malformed"      # a fixture's form, before any step
+        invalidated = self.invalidated_phone.pop(challenge_id, None)
+        pending = self.pending_phone.pop(challenge_id, None)
+        self.commit_pending = pending
+        # A model invariant, not a step: with the revision unchanged since phone
+        # authorization nothing the defence-in-depth rechecks read can have changed
+        # (an initialized registry; a lost one is step 5).
+        if pending is not None and self.initialized and self.revision == pending["revision"]:
+            self.require_defence_in_depth(pending)
+
+        def with_pending(check: Any) -> Any:
+            return lambda: check(pending) if pending is not None else None
+
+        def authorizer(p: dict[str, Any]) -> str | None:
+            return "authorizer_unavailable" if p["authorizer"] not in self.active else None
+
+        def device(p: dict[str, Any]) -> str | None:
+            # "8. the registry's device binding differs from the runtime's device
+            # identity"
+            return "device_binding_mismatch" if self.device_binding != self.config_device else None
+
+        def site(p: dict[str, Any]) -> str | None:
+            # "9. the registry's site binding differs from the verified `device.site_id`"
+            return "site_binding_mismatch" if self.site_binding != self.config_site else None
+        steps = [
+            lambda: invalidated,                                              # 1
+            lambda: "pending_unavailable" if pending is None else None,       # 2
+            lambda: "possession_expired" if elapsed > 600000 else None,      # 3
+            with_pending(lambda p: self.phone_possession_refusal(operation, p)),  # 4
+            lambda: "registry_unavailable" if not self.initialized else None,  # 5
+            with_pending(authorizer),                                         # 6
+            with_pending(lambda p: "registry_changed" if self.revision != p["revision"] else None),  # 7
+            with_pending(device),                                             # 8
+            with_pending(site),                                               # 9
+            with_pending(lambda p: "epoch_changed" if self.epoch != p["epoch"] else None),  # 10
+        ]
+        for n in range(1, len(steps)):
+            if f"commit_order:{n}" in self.disabled:
+                steps[n - 1], steps[n] = steps[n], steps[n - 1]
+        for step in steps:
+            verdict = step()
+            if verdict is not None:
+                return verdict
+        return None
+
     def apply(self, operation: dict[str, Any]) -> str:
         kind = operation["op"]
-        if kind == "config_site_change":
-            self.config_site = operation["site_id"]
-            self.proposals.clear()
-            for challenge_id in self.pending_phone:
-                self.invalidated_phone[challenge_id] = "site_binding_mismatch"
-            self.pending_phone.clear()
-            return "site_locked"
-        if kind == "config_site_restore":
-            self.config_site = SITE_ID
-            return "site_restored"
-        if self.initialized and self.config_site != SITE_ID and kind in {"issue", "recover", "enrol", "local_seed", "revoke", "open", "admit"}:
-            return "site_binding_mismatch"
+        # Revoke judges its document, signer and signature and a locked registry
+        # first (operator-socket/v3 Revoke); `revoke_document_first` off puts the
+        # bindings ahead of them.
+        early = {"issue", "recover", "enrol", "local_seed", "phone_authorize", "open", "admit"}
+        if "revoke_document_first" in self.disabled:
+            early.add("revoke")
+        refusal = self.binding_refusal()
+        if refusal is not None and kind in early:
+            return refusal
+        if kind == "revoke" and "revoke_document_first" in self.disabled and not self.initialized:
+            return "registry_unavailable"
         if kind == "issue":
             challenge_id = operation["challenge_id"]
             if challenge_id in self.challenges or challenge_id in self.used_challenges:
@@ -455,8 +615,9 @@ class Registry:
                 and candidate.get("channel") in PHONE_CHANNELS
                 and candidate.get("channel") not in self.authenticated_channels
             ):
-                # The text has a site binding mismatch (checked above for every
-                # operation) and a locked registry refuse such a candidate first.
+                # "A locked registry and a device or site binding mismatch refuse
+                # such a candidate first, under their own codes": the bindings are
+                # checked above for every operation.
                 if not self.initialized and "issue_locked_first" not in self.disabled:
                     return "registry_unavailable"
                 # Refused at issue for every operation kind: no challenge or
@@ -490,14 +651,47 @@ class Registry:
                 return "challenge_unavailable"
             challenge["expired"] = True
             return "expired"
+        if kind == "apply_provisioning":
+            # "A document that changes `device.id` or `device.site_id` changes the
+            # identity when it is accepted, whether at start or while the runtime
+            # runs": unlike a restart it closes no proposal and invalidates no
+            # challenge or pending operation. A fixture must name a well-formed change.
+            device, site = operation.get("device_id"), operation.get("site_id")
+            if device is None and site is None:
+                raise AssertionError("apply_provisioning names neither device_id nor site_id")
+            if device is not None and (not isinstance(device, str) or not DEVICE.fullmatch(device)):
+                raise AssertionError(f"apply_provisioning under a malformed device_id: {device!r}")
+            if site is not None and (not isinstance(site, str) or not SITE.fullmatch(site)):
+                raise AssertionError(f"apply_provisioning under a malformed site_id: {site!r}")
+            if device is not None and "apply_device" not in self.disabled:
+                self.config_device = device
+            if site is not None and "apply_site" not in self.disabled:
+                self.config_site = site
+            if "apply_keeps_state" in self.disabled:
+                self.proposals.clear()
+                self.pending_phone.clear()
+                self.challenges.clear()
+            return "applied"
         if kind == "restart":
             # "Every challenge, used or not, is invalidated at process restart"
             # and every pending phone operation dies; a used challenge is then
             # challenge_unavailable, not challenge_reused. The ingress set is
             # reread from configuration here and only here.
+            # A restart step's device_id and site_id set the configuration it
+            # starts under; "The runtime reads `device.id` and `device.site_id` only
+            # at start". Each must be well formed (a fixture's form).
             flag = operation.get("sms_ingress")
             if flag is not None and type(flag) is not bool:
                 return "malformed"
+            device, site = operation.get("device_id"), operation.get("site_id")
+            if device is not None and (not isinstance(device, str) or not DEVICE.fullmatch(device)):
+                raise AssertionError(f"restart under a malformed device_id: {device!r}")
+            if site is not None and (not isinstance(site, str) or not SITE.fullmatch(site)):
+                raise AssertionError(f"restart under a malformed site_id: {site!r}")
+            if device is not None and "restart_device" not in self.disabled:
+                self.config_device = device
+            if site is not None and "restart_site" not in self.disabled:
+                self.config_site = site
             self.challenges.clear()
             if "restart_used_markers" not in self.disabled:
                 self.used_challenges.clear()
@@ -534,6 +728,8 @@ class Registry:
                 return "challenge_stale"
         if kind == "lose":
             self.initialized = False
+            self.device_binding = None
+            self.site_binding = None
             self.active.clear()
             self.values.clear()
             self.channels.clear()
@@ -555,6 +751,12 @@ class Registry:
                 return "contacts_forbidden"
             self.epoch = operation["epoch"]
             self.initialized = True
+            # "committing `initialized = true` with the device, site and epoch
+            # bindings": the runtime's device identity and verified site.
+            self.device_binding = (DEVICE_ID if "recover_binds_runtime_device" in self.disabled
+                                   else self.config_device)
+            self.site_binding = (SITE_ID if "recover_binds_runtime_site" in self.disabled
+                                 else self.config_site)
             self.revision = 1
             self.external_revision = 0
             self.last_external_document = None
@@ -565,56 +767,10 @@ class Registry:
             self.pending_phone.clear()
             return "recovered"
         if kind == "phone_commit":
-            challenge_id = operation["challenge_id"]
-            invalidated = self.invalidated_phone.pop(challenge_id, None)
-            if invalidated is not None:
-                return invalidated
-            pending = self.pending_phone.pop(challenge_id, None)
-            if pending is None:
-                return "pending_unavailable"
-            elapsed = operation.get("phone_elapsed_ms", 0)
-            if type(elapsed) is not int or elapsed < 0:
-                return "malformed"
-            if elapsed > 600000:
-                return "possession_expired"
-            if not self.initialized:
-                return "registry_unavailable"
-            if self.config_site != pending["site"]:
-                return "site_binding_mismatch"
-            if self.epoch != pending["epoch"]:
-                return "epoch_changed"
-            if self.revision == pending["revision"]:
-                self.require_defence_in_depth(pending)
-            if pending["authorizer"] not in self.active:
-                return "authorizer_unavailable"
-            if self.revision != pending["revision"]:
-                return "registry_changed"
-            candidate = pending["candidate"]
-            if operation.get("value") != candidate["value"] or operation.get("channel") != candidate["channel"]:
-                return "candidate_changed"
-            reply = operation.get("phone_reply")
-            if reply is None:
-                return "possession_required"
-            if not isinstance(reply, dict) or set(reply) != {"sender", "channel", "text", "authenticated"}:
-                return "possession_invalid"
-            prefix = f"ORI-POSSESS-V1 {challenge_id} "
-            text = reply["text"]
-            if not isinstance(text, str) or not text.startswith(prefix):
-                return "possession_invalid"
-            code = text[len(prefix):]
-            try:
-                if len(strict_b64(code)) != 16:
-                    return "possession_invalid"
-            except (ValueError, TypeError):
-                return "possession_invalid"
-            if (reply["authenticated"] is not True or
-                (reply["channel"] not in self.authenticated_channels
-                 and "reply_auth_channel" not in self.disabled) or
-                reply["sender"] != candidate["value"] or
-                (reply["channel"] != candidate["channel"]
-                 and "reply_channel_mismatch" not in self.disabled) or
-                not hmac.compare_digest(hashlib.sha256(code.encode("ascii")).hexdigest(), pending["phone_code_sha256"])):
-                return "possession_invalid"
+            verdict = self.phone_commit_refusal(operation)
+            if verdict is not None:
+                return verdict
+            candidate = self.commit_pending["candidate"]
             identifier = candidate["credential"]
             approver_id = candidate["approver_id"]
             value = candidate["value"]
@@ -626,7 +782,7 @@ class Registry:
             # names no code for it, so the model asserts instead of answering.
             if approver_id in self.approver_tombstones:
                 return "approver_revoked"
-            if pending["approver_minted"] and approver_id in self.active_approvers():
+            if self.commit_pending["approver_minted"] and approver_id in self.active_approvers():
                 raise AssertionError("unreachable: minted approver ID active at second commit")
             if identifier in self.approvers or identifier in self.tombstones:
                 return "credential_reused"
@@ -643,7 +799,7 @@ class Registry:
             self.approvers[identifier] = approver_id
             self.revision += 1
             return "enrolled"
-        if not self.initialized:
+        if not self.initialized and kind != "revoke":
             return "registry_unavailable"
         if kind == "local_seed":
             if self.active:
@@ -710,7 +866,6 @@ class Registry:
                     "authorizer": operation["authorizer"],
                     "revision": self.revision,
                     "epoch": self.epoch,
-                    "site": self.config_site,
                     "phone_code_sha256": challenge["phone_code_sha256"],
                     "approver_minted": challenge["approver_minted"],
                 }
@@ -738,8 +893,7 @@ class Registry:
             self.revision += 1
             return "enrolled"
         if kind == "open":
-            if self.config_site != SITE_ID:
-                return "site_binding_mismatch"
+            # Bindings decided above for every operation on an initialized registry.
             if operation["proposal"] in self.proposals:
                 return "proposal_exists"
             self.proposals[operation["proposal"]] = {
@@ -769,9 +923,18 @@ class Registry:
             reason = revocation_reason(document)
             if reason is not None:
                 return reason
+            # "`registry_unavailable` | The registry is locked." then the device and
+            # site binding rows, then `binding_mismatch`.
+            if not self.initialized:
+                return "registry_unavailable"
+            refusal = self.binding_refusal()
+            if refusal is not None:
+                return refusal
+            # "The document's `device_id` differs from the runtime's device identity,
+            # or its `site_id` or `identity_epoch` from the registry's."
             if (
-                document["device_id"] != "edge-1"
-                or document["site_id"] != SITE_ID
+                document["device_id"] != self.config_device
+                or document["site_id"] != self.site_binding
                 or document["identity_epoch"] != self.epoch
             ):
                 return "binding_mismatch"
@@ -808,8 +971,7 @@ class Registry:
             self.revision += 1
             return "revoked"
         if kind == "admit":
-            if self.config_site != SITE_ID:
-                return "site_binding_mismatch"
+            # Bindings decided above for every operation on an initialized registry.
             proposal = self.proposals.get(operation["proposal"])
             if proposal is None:
                 return "proposal_unavailable"
@@ -990,7 +1152,8 @@ def require_whatsapp_refusal(scenarios: list[dict[str, Any]]) -> None:
 
 
 STATE_FIELDS = (
-    "initialized", "epoch", "config_site", "revision", "external_revision",
+    "initialized", "epoch", "config_site", "config_device", "device_binding", "site_binding",
+    "revision", "external_revision",
     "last_external_document", "sequence", "active", "values", "channels",
     "tombstones", "approvers", "approver_tombstones", "proposals",
     "challenges", "used_challenges", "pending_phone", "invalidated_phone",
@@ -999,7 +1162,8 @@ STATE_FIELDS = (
 CREDENTIAL_ADD = {"active", "values", "channels", "approvers", "sequence", "revision"}
 PRESENTED = {"recover", "enrol", "local_seed", "phone_authorize"}
 # Refusals that happen before a challenge is found, so nothing is consumed.
-UNCONSUMED = {"challenge_unavailable", "challenge_reused", "site_binding_mismatch"}
+UNCONSUMED = {"challenge_unavailable", "challenge_reused", "device_binding_mismatch",
+              "site_binding_mismatch"}
 # Fields each successful verdict may change. Every other verdict is a refusal
 # and may change only what the text says a refusal consumes.
 SUCCESS_FIELDS: dict[tuple[str, str], set[str]] = {
@@ -1011,7 +1175,8 @@ SUCCESS_FIELDS: dict[tuple[str, str], set[str]] = {
     ("local_seed", "seeded"): {"challenges", "used_challenges"} | CREDENTIAL_ADD,
     ("phone_commit", "enrolled"): {"pending_phone", "invalidated_phone"} | CREDENTIAL_ADD,
     ("recover", "recovered"): {
-        "challenges", "used_challenges", "epoch", "initialized", "revision",
+        "challenges", "used_challenges", "epoch", "initialized", "device_binding",
+        "site_binding", "revision",
         "external_revision", "last_external_document", "sequence", "proposals",
         "pending_phone", "invalidated_phone",
     },
@@ -1022,15 +1187,14 @@ SUCCESS_FIELDS: dict[tuple[str, str], set[str]] = {
     ("open", "opened"): {"proposals"},
     ("admit", "approved"): {"proposals"},
     ("lose", "locked"): {
-        "initialized", "active", "values", "channels", "approvers",
-        "tombstones", "approver_tombstones", "challenges",
+        "initialized", "device_binding", "site_binding", "active", "values", "channels",
+        "approvers", "tombstones", "approver_tombstones", "challenges",
     },
+    ("apply_provisioning", "applied"): {"config_device", "config_site"},
     ("restart", "restarted"): {
         "challenges", "used_challenges", "pending_phone", "invalidated_phone",
-        "proposals", "authenticated_channels",
+        "proposals", "authenticated_channels", "config_device", "config_site",
     },
-    ("config_site_change", "site_locked"): {"config_site", "proposals", "pending_phone", "invalidated_phone"},
-    ("config_site_restore", "site_restored"): {"config_site"},
 }
 
 
@@ -1081,6 +1245,19 @@ def verify_state_change(where: str, operation: dict[str, Any], verdict: str, bef
                 or after["invalidated_phone"] or after["proposals"]
                 or after["authenticated_channels"] != ingress):
             raise AssertionError(f"{where} restart: challenges, used markers, pending operations and proposals not all invalidated, or ingress set wrong")
+        # "a restart step's sms_ingress, device_id and site_id set the
+        # configuration it starts under, and a restart without one keeps that part
+        # unchanged" (the corpus proof note).
+        for key, field in (("device_id", "config_device"), ("site_id", "config_site")):
+            if after[field] != operation.get(key, before[field]):
+                raise AssertionError(f"{where} restart: started under the wrong {key}")
+    if op == "apply_provisioning":
+        for key, field in (("device_id", "config_device"), ("site_id", "config_site")):
+            if after[field] != operation.get(key, before[field]):
+                raise AssertionError(f"{where} apply_provisioning: applied the wrong {key}")
+    if op == "recover" and (after["device_binding"], after["site_binding"]) != (
+            before["config_device"], before["config_site"]):
+        raise AssertionError(f"{where} recover: not bound to the runtime's device and site")
     if op == "issue":
         if set(after["challenges"]) != set(before["challenges"]) | {challenge_id}:
             raise AssertionError(f"{where} issue: challenge set")
@@ -1276,6 +1453,118 @@ def mutations(corpus: dict[str, Any]) -> None:
         if scenario["name"] == "phone_site_change_before_commit"
     )["steps"] if operation["op"] == "phone_commit")["expect"] = "enrolled"
     mutants.append(("changed site accepted at phone commit", changed_site))
+    # The device binding's declared verdicts, each flipped to what a wrong
+    # implementation would answer.
+    def scenario_steps_of(mutant: dict[str, Any], scenario: str) -> list[dict[str, Any]]:
+        return next(x for x in mutant["scenarios"] if x["name"] == scenario)["steps"]
+
+    def device_step(mutant: dict[str, Any], scenario: str, predicate: Any) -> dict[str, Any]:
+        return next(x for x in scenario_steps_of(mutant, scenario) if predicate(x))
+    for label, scenario, predicate, wrong in (
+        ("admission while device changed", "device_identity_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "device_binding_mismatch", "approved"),
+        ("proposal survives device change", "device_identity_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "proposal_unavailable", "approved"),
+        ("revocation applied while device changed", "device_identity_change_locks_admission",
+         lambda x: x["op"] == "revoke" and x["document"]["device_id"] == "edge-2", "revoked"),
+        ("revocation judged on the document's device", "device_identity_change_locks_admission",
+         lambda x: x["op"] == "revoke" and x["document"]["device_id"] == "edge-1", "binding_mismatch"),
+        ("restore does not re-enable", "device_identity_change_locks_admission",
+         lambda x: x["op"] == "open" and x["expect"] == "opened" and x["proposal"] == "after-restore",
+         "device_binding_mismatch"),
+        ("site decides over device", "device_change_decides_over_site_change",
+         lambda x: x["op"] == "admit" and x["expect"] == "device_binding_mismatch", "site_binding_mismatch"),
+        ("site still changed admits", "device_change_decides_over_site_change",
+         lambda x: x["op"] == "open" and x["expect"] == "site_binding_mismatch", "opened"),
+        # a restart ends every pending operation: step 2, not a binding recheck
+        ("pending survives a device restart", "phone_device_change_before_commit",
+         lambda x: x["op"] == "phone_commit", "enrolled"),
+        ("pending judged on the device after restarts", "phone_device_change_before_commit",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("pending judged on the site after restarts", "phone_device_and_site_change_before_commit",
+         lambda x: x["op"] == "phone_commit", "site_binding_mismatch"),
+        ("recovery bound to a constant device", "recovery_binds_the_runtime_device",
+         lambda x: x["op"] == "admit" and x["expect"] == "approved", "device_binding_mismatch"),
+        ("restart back to the old device admits", "recovery_binds_the_runtime_device",
+         lambda x: x["op"] == "open" and x["expect"] == "device_binding_mismatch", "opened"),
+        ("lock without recovery as recovery", "phone_lock_without_recovery",
+         lambda x: x["op"] == "phone_commit", "epoch_changed"),
+        ("lock before window", "phone_lock_without_recovery_late",
+         lambda x: x["op"] == "phone_commit", "registry_unavailable"),
+        ("lock before proof", "phone_lock_without_recovery_wrong_code",
+         lambda x: x["op"] == "phone_commit", "registry_unavailable"),
+        ("another sender accepted", "phone_commit_names_another_value",
+         lambda x: x["op"] == "phone_commit", "enrolled"),
+        ("another sender as candidate_changed", "phone_commit_names_another_value",
+         lambda x: x["op"] == "phone_commit", "candidate_changed"),
+        ("window before pending lookup", "phone_expired_then_late_reply",
+         lambda x: x["op"] == "phone_commit", "possession_expired"),
+        ("proof before window", "phone_late_over_wrong_code",
+         lambda x: x["op"] == "phone_commit", "possession_invalid"),
+        ("authorizer before proof", "phone_wrong_code_over_revoked_authorizer",
+         lambda x: x["op"] == "phone_commit", "authorizer_unavailable"),
+        ("window before recovery invalidation", "phone_recovery_then_late_reply",
+         lambda x: x["op"] == "phone_commit", "possession_expired"),
+        ("locked registry before recovery invalidation", "phone_recovery_then_locked_registry",
+         lambda x: x["op"] == "phone_commit", "registry_unavailable"),
+        # In-run identity changes: nothing is cleared, and a restore re-enables use.
+        ("in-run change closes the proposal", "inrun_device_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "approved", "proposal_unavailable"),
+        ("in-run restore does not re-enable", "inrun_site_change_locks_admission",
+         lambda x: x["op"] == "admit" and x["expect"] == "approved", "site_binding_mismatch"),
+        ("an undone change still fails the commit", "inrun_phone_commit_after_restore",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("in-run change ends the pending operation", "inrun_phone_commit_device_changed",
+         lambda x: x["op"] == "phone_commit", "pending_unavailable"),
+        ("site recheck before device recheck", "inrun_phone_commit_device_over_site",
+         lambda x: x["op"] == "phone_commit", "site_binding_mismatch"),
+        ("device recheck before authorizer", "inrun_phone_revoked_authorizer_over_device",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("device recheck before revision", "inrun_phone_revision_over_device",
+         lambda x: x["op"] == "phone_commit", "device_binding_mismatch"),
+        ("presentation under a device change consumed", "inrun_challenge_presented_device_changed",
+         lambda x: x["op"] == "enrol", "challenge_stale"),
+        ("channel judged before device", "phone_issue_refused_while_device_changed",
+         lambda x: x["op"] == "issue" and x.get("challenge_id") == "whatsapp-device-changed",
+         "channel_unauthenticated"),
+        ("sms issued while device changed", "phone_issue_refused_while_device_changed",
+         lambda x: x["op"] == "issue" and x.get("challenge_id") == "sms-device-changed", "issued"),
+    ):
+        mutant = copy.deepcopy(corpus)
+        device_step(mutant, scenario, predicate)["expect"] = wrong
+        mutants.append((f"device: {label}", mutant))
+    # A restart's configuration: a malformed device or site is a fixture defect;
+    # a restart that drops its device_id keeps the changed device, so the step the
+    # corpus says re-enables use is refused.
+    for label, key, value in (("malformed device", "device_id", "edge 2"),
+                              ("device over 128", "device_id", "x" * 129),
+                              ("malformed site", "site_id", "site 2"),
+                              ("restore without its device", "device_id", None)):
+        mutant = copy.deepcopy(corpus)
+        steps = scenario_steps_of(mutant, "device_identity_change_locks_admission")
+        restarts = [x for x in steps if x["op"] == "restart" and "device_id" in x]
+        step = restarts[-1] if value is None else restarts[0]
+        if value is None:
+            del step[key]
+        else:
+            step[key] = value
+        mutants.append((f"device: restart {label}", mutant))
+    # Finding 6 of the adversarial review: a revocation is judged on its form,
+    # signer and signature, and on a locked registry, before the bindings
+    # (operator-socket/v3 Revoke). A corrupted signature during a device mismatch is
+    # signature_invalid.
+    revoke_order = copy.deepcopy(corpus)
+    bad = device_step(revoke_order, "device_identity_change_locks_admission",
+                      lambda x: x["op"] == "revoke" and x["document"]["device_id"] == "edge-1")
+    sig = bad["document"]["signature"]
+    bad["document"]["signature"] = ("B" if sig[0] != "B" else "C") + sig[1:]
+    bad["expect"] = "signature_invalid"
+    check(revoke_order, announce=False)
+    flipped_order = copy.deepcopy(revoke_order)
+    device_step(flipped_order, "device_identity_change_locks_admission",
+                lambda x: x["op"] == "revoke" and x["expect"] == "signature_invalid")["expect"] = \
+        "device_binding_mismatch"
+    mutants.append(("device: binding decided before a revocation's signature", flipped_order))
     altered_phone_wire = copy.deepcopy(corpus)
     altered_phone_wire["wire"]["phone_candidate"]["reply"]["sender"] = "+2348099999999"
     mutants.append(("phone wire wrong sender", altered_phone_wire))
@@ -1366,13 +1655,13 @@ def mutations(corpus: dict[str, Any]) -> None:
         steps.insert(at, whatsapp_probe("probe-" + after_op, expect))
         return mutant
     locked_probe = with_probe("lose", "recovery_can_seed_but_closes_old_proposals", "registry_unavailable")
-    site_probe = with_probe("config_site_change", "phone_site_change_before_commit", "site_binding_mismatch")
+    site_probe = with_probe("restart", "phone_site_change_before_commit", "site_binding_mismatch")
     for label, probe in (("locked", locked_probe), ("site mismatch", site_probe)):
         check(probe, announce=False)
         flipped = copy.deepcopy(probe)
         for scenario in flipped["scenarios"]:
             for x in scenario["steps"]:
-                if x["challenge_id" if "challenge_id" in x else "op"] in {"probe-lose", "probe-config_site_change"}:
+                if x["challenge_id" if "challenge_id" in x else "op"] in {"probe-lose", "probe-restart"}:
                     x["expect"] = "channel_unauthenticated"
         mutants.append((f"channel_unauthenticated before {label} refusal", flipped))
 
@@ -1396,14 +1685,56 @@ def mutations(corpus: dict[str, Any]) -> None:
         ("restart_used_markers", corpus, frozenset()),
         ("admit_credential_channel", lan_sms_admit, frozenset()),
         ("authorizer_same_approver", corpus, frozenset()),
-    ]
+        ("device_check", corpus, frozenset()),
+        ("device_first", corpus, frozenset()),
+        ("mismatch_needs_initialized", corpus, frozenset()),
+        ("restart_device", corpus, frozenset()),
+        ("restart_site", corpus, frozenset()),
+        ("recover_binds_runtime_device", corpus, frozenset()),
+        ("recover_binds_runtime_site", corpus, frozenset()),
+        ("apply_device", corpus, frozenset()),
+        ("apply_site", corpus, frozenset()),
+        ("apply_keeps_state", corpus, frozenset()),
+        ("revoke_document_first", corpus, frozenset()),
+    ] + [(f"commit_order:{n}", corpus, frozenset()) for n in (1, 2, 3, 4, 5, 6, 7, 8)]
     if {name for name, _, _ in removals} | {"guard"} != MODEL_CHECKS:
         raise AssertionError("model check without a removal mutation")
+    # The device-binding checks, each refused for its own reason: the verdict the
+    # corpus declares against the one the model then gives, or the state law the
+    # text gives the device change.
+    device_reasons: dict[str, tuple[str, ...]] = {
+        "device_check": ("!= device_binding_mismatch",),
+        "device_first": ("site_binding_mismatch != device_binding_mismatch",),
+        "mismatch_needs_initialized": ("device_binding_mismatch != issued",),
+        "restart_device": ("restart: started under the wrong device_id",),
+        "restart_site": ("restart: started under the wrong site_id",),
+        "recover_binds_runtime_device": ("recover: not bound to the runtime's device and site",),
+        "recover_binds_runtime_site": ("recover: not bound to the runtime's device and site",),
+        "apply_device": ("apply_provisioning: applied the wrong device_id",),
+        "apply_site": ("apply_provisioning: applied the wrong site_id",),
+        "apply_keeps_state": ("apply_provisioning: applied changed",),
+        "revoke_document_first": ("revoke: device_binding_mismatch != signature_invalid",
+                                  "revoke: device_binding_mismatch != malformed",
+                                  "revoke: registry_unavailable != malformed"),
+    }
+    # Each adjacent pair of second-commit steps swapped: a scenario the text decides
+    # at step n is then answered by step n + 1.
+    for n in (1, 2, 3, 4, 5, 6, 7, 8):
+        device_reasons[f"commit_order:{n}"] = (
+            f"phone_commit: {COMMIT_STEPS[n]} != {COMMIT_STEPS[n - 1]}",)
+    for n in COMMIT_UNDISTINGUISHED:
+        try:
+            check(corpus, announce=False, disabled=frozenset({f"commit_order:{n}"}))
+        except AssertionError as exc:
+            raise AssertionError(f"commit steps {n}/{n + 1} are now told apart; make the swap a "
+                                 f"model-check removal: {exc}") from exc
     for name, variant, others in removals:
         check(variant, announce=False, disabled=others)
         try:
             check(variant, announce=False, disabled=others | {name})
-        except AssertionError:
+        except AssertionError as exc:
+            if name in device_reasons and not any(r in str(exc) for r in device_reasons[name]):
+                raise AssertionError(f"removing model check {name} refused for another reason: {exc}") from exc
             continue
         raise AssertionError(f"removing model check {name} was accepted")
     # Flagged fixtures on a channel without ingress are legitimate and pass;
@@ -1421,7 +1752,7 @@ def mutations(corpus: dict[str, Any]) -> None:
     # Forbidden writes injected after each refusal class. Each must be caught.
     def forbidden_writes() -> dict[str, Any]:
         def pending(model: Registry) -> None:
-            model.pending_phone["injected"] = {"candidate": {}, "authorizer": "", "revision": 0, "epoch": "", "site": "", "phone_code_sha256": ""}
+            model.pending_phone["injected"] = {"candidate": {}, "authorizer": "", "revision": 0, "epoch": "", "phone_code_sha256": ""}
         def credential(model: Registry) -> None:
             model.active["injected"] = 0
         def approval(model: Registry) -> bool:
@@ -1439,6 +1770,9 @@ def mutations(corpus: dict[str, Any]) -> None:
             "pending phone operation": pending,
             "active credential": credential,
             "tombstone": lambda m: m.tombstones.add("injected"),
+            "device binding": lambda m: setattr(m, "device_binding", "injected"),
+            "site binding": lambda m: setattr(m, "site_binding", "injected"),
+            "runtime device identity": lambda m: setattr(m, "config_device", "injected"),
             "new proposal": lambda m: m.proposals.__setitem__("injected", {"cutoff": 0, "epoch": m.epoch, "approved": False}),
             "proposal approval": approval,
         }
