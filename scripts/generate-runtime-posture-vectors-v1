@@ -40,7 +40,7 @@ BINDING = "sha256:" + hashlib.sha256(b"ori runtime-posture/v1 test binding").hex
 INADMISSIBLE = bytes.fromhex("01" + "00" * 31)  # ed25519-key-admission/v1 vectors: small order
 
 DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
-RELEASE_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.(0|[1-9][0-9]*))?")
+RELEASE_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?")
 HASH_RE = re.compile(r"sha256:[0-9a-f]{64}")
 MEMBERS = {"v", "device_id", "release", "deployment_profile", "commissioned_binding", "key_identity",
            "boot_generation", "posture_seq", "issued_at_ms", "signature"}
@@ -260,61 +260,69 @@ def stateless(data: str, topic_device: str, devices: list, pins: dict, wall: int
 
 class Gateway:
     def __init__(self, devices: list, pins: dict, store_ok: bool = True) -> None:
-        self.devices, self.pins, self.store_ok = devices, dict(pins), store_ok
+        self.devices, self.pins, self.store_ok = list(devices), dict(pins), store_ok
         self.states: dict[tuple[str, bytes], dict] = {}
+        self.last_refusal: dict[str, str] = {}
         self.run = 0
 
-    def slot(self, device: str) -> dict | None:
-        pin = self.pins.get(device)
-        return None if pin is None else self.states.setdefault((device, recognised(pin)),
-                                                               {"held": None, "sticky": None})
+    def slot(self, device: str) -> dict:
+        return self.states.setdefault((device, recognised(self.pins[device])), {"held": None, "sticky": None})
 
-    def receive(self, topic_device: str, data: str, wall: int, mono: int) -> str:
+    def receive(self, topic_device: str, data: str, wall: int, mono: int, write_fails: bool = False) -> str:
         reason, obj = stateless(data, topic_device, self.devices, self.pins, wall)
         if reason is not None:
+            if topic_device in self.devices:
+                self.last_refusal[topic_device] = reason
             return reason
         if not self.store_ok:
             return "store_unavailable"
         st = self.slot(topic_device)
         pair = (obj["boot_generation"], obj["posture_seq"])
         held = st["held"]
+        if held is not None and pair == held["pair"] and data == held["bytes"]:
+            return "replayed"
         if held is None or pair > held["pair"]:
             if held is not None and obj["issued_at_ms"] < held["issued"] - SKEW_MS:
-                st["sticky"] = "conflict"
-                return "conflict"
-            st["held"] = {"bytes": data, "pair": pair, "issued": obj["issued_at_ms"], "wall": wall,
-                          "mono": mono, "run": self.run}
-            st["sticky"] = None
-            return "accepted"
-        if pair == held["pair"]:
-            if data == held["bytes"]:
-                return "replayed"
-            st["sticky"] = "conflict"
-            return "conflict"
-        st["sticky"] = "lower_tuple_seen"
-        return "lower_tuple"
+                verdict, change = "conflict", {"sticky": "conflict"}
+            else:
+                verdict = "accepted"
+                change = {"held": {"bytes": data, "pair": pair, "issued": obj["issued_at_ms"], "wall": wall,
+                                   "mono": mono, "run": self.run}, "sticky": None}
+        elif pair == held["pair"]:
+            verdict, change = "conflict", {"sticky": "conflict"}
+        else:
+            verdict, change = "lower_tuple", {"sticky": "lower_tuple_seen"}
+        if write_fails:
+            self.store_ok = False
+            return "store_write_failed"
+        st.update(change)
+        return verdict
 
-    def state(self, device: str, mono: int) -> dict:
+    def state(self, device: str, wall: int, mono: int) -> dict:
+        extra = {"last_refusal": self.last_refusal[device]} if device in self.last_refusal else {}
         if device not in self.pins:
-            return {"state": "unknown", "reason": "no_pinned_key"}
+            return {"state": "unknown", "reason": "no_pinned_key", **extra}
         if not self.store_ok:
-            return {"state": "unknown", "reason": "store_unavailable"}
+            return {"state": "unknown", "reason": "store_unavailable", **extra}
         st = self.slot(device)
         if st["sticky"] is not None:
-            return {"state": "unknown", "reason": st["sticky"]}
+            return {"state": "unknown", "reason": st["sticky"], **extra}
         held = st["held"]
         if held is None:
-            return {"state": "unknown", "reason": "no_record"}
-        out = {"record_b64": b64(held["bytes"].encode("utf-8")), "received_at_ms": held["wall"]}
+            return {"state": "unknown", "reason": "no_record", **extra}
+        out = {"record_b64": b64(held["bytes"].encode("utf-8")), "received_at_ms": held["wall"], **extra}
         if held["run"] != self.run:
             return {"state": "stale", **out}
-        age = max(0, held["wall"] - held["issued"]) + (mono - held["mono"])
+        age = max(0, held["wall"] - held["issued"]) + max(mono - held["mono"], wall - held["wall"])
         return {"state": "current" if age <= CURRENT_MS else "stale", **out}
 
-    def restart(self, pins: dict | None = None) -> None:
+    def restart(self, pins: dict | None = None, devices: list | None = None) -> None:
         self.run += 1
+        self.last_refusal = {}
         if pins is not None:
             self.pins = dict(pins)
+        if devices is not None:
+            self.devices = list(devices)
 
 
 # --- record cases (checks 3 to 10) --------------------------------------------------------------
@@ -385,6 +393,21 @@ _SIG = base64.b64decode(GOOD["signature"])
 _S_PLUS_L = (int.from_bytes(_SIG[32:], "little") + ORDER).to_bytes(32, "little")
 rcase("signature_invalid_s_not_reduced", "The signature's S plus the group order, a malleable form "
       "ed25519-verification/v1 refuses.", text({**GOOD, "signature": b64(_SIG[:32] + _S_PLUS_L)}))
+for name, note, obj in (
+    ("malformed_release_newline", "release with a trailing line feed.", {**GOOD, "release": "2.5.1\n"}),
+    ("malformed_release_rc_leading_zero", "rc.01.", {**GOOD, "release": "2.5.1-rc.01"}),
+    ("malformed_release_rc_zero", "rc.0, which no runtime release uses.", {**GOOD, "release": "2.5.1-rc.0"}),
+    ("malformed_release_leading_zero", "01.2.3.", {**GOOD, "release": "01.2.3"}),
+    ("malformed_device_empty", "An empty device_id.", {**GOOD, "device_id": ""}),
+    ("malformed_device_angle", "A literal < in device_id: canonical, and outside the pattern.",
+     {**GOOD, "device_id": "a<b"}),
+    ("malformed_device_line_separator", "A literal U+2028 in device_id: canonical, and outside the pattern.",
+     {**GOOD, "device_id": "a\u2028b"}),
+):
+    rcase(name, note, text(obj))
+rcase("not_canonical_escaped_value", "A value with a character written as an escape the canonical form writes "
+      "literally.", text(GOOD).replace('"production"', '"pr\\u006fduction"'))
+rcase("not_canonical_escaped_name", "A member name written with an escape.", text(GOOD).replace('"v":1', '"\\u0076":1'))
 rcase("skew_past_edge", "issued_at_ms exactly 300000 ms before the gateway's clock.", text(GOOD),
       wall=GOOD["issued_at_ms"] + SKEW_MS)
 rcase("stale_timestamp", "One millisecond past the bound.", text(GOOD), wall=GOOD["issued_at_ms"] + SKEW_MS + 1)
@@ -412,37 +435,53 @@ rcase("precedence_signature_over_skew", "A bad signature on a stale record: sign
 SEQUENCES: list[dict] = []
 
 
-def rx(rec: dict, wall: int, mono: int, device: str = DEVICE) -> dict:
-    return {"event": "receive", "topic_device": device, "record": text(rec), "wall_ms": wall, "mono_ms": mono}
+def rx(rec: dict, wall: int, mono: int, device: str = DEVICE, write: str | None = None) -> dict:
+    ev = {"event": "receive", "topic_device": device, "record": text(rec), "wall_ms": wall, "mono_ms": mono}
+    if write is not None:
+        ev["store_write"] = write
+    return ev
+
+
+def store_read(wall: int, mono: int) -> dict:
+    return {"event": "store_read_succeeds", "wall_ms": wall, "mono_ms": mono}
 
 
 def observe(wall: int, mono: int) -> dict:
     return {"event": "observe", "wall_ms": wall, "mono_ms": mono}
 
 
-def restart(wall: int, mono: int, pins: dict | None = None) -> dict:
+def restart(wall: int, mono: int, pins: dict | None = None, devices: tuple | None = None) -> dict:
     ev = {"event": "restart", "wall_ms": wall, "mono_ms": mono}
     if pins is not None:
         ev["pinned_keys"] = {d: "ed25519:" + b64(p) for d, p in sorted(pins.items())}
+    if devices is not None:
+        ev["configured_devices"] = list(devices)
     return ev
 
 
-def sequence(name: str, note: str, events: list, *, pins: dict | None = None, store_ok: bool = True) -> None:
+def sequence(name: str, note: str, events: list, *, pins: dict | None = None, store_ok: bool = True,
+             devices: tuple = (DEVICE,), store_condition: str = "unreadable") -> None:
     pins = {DEVICE: PUB_A} if pins is None else pins
-    gw = Gateway([DEVICE], pins, store_ok)
+    gw = Gateway(list(devices), pins, store_ok)
     out = []
     for ev in events:
         exp: dict = {}
         if ev["event"] == "receive":
-            exp["verdict"] = gw.receive(ev["topic_device"], ev["record"], ev["wall_ms"], ev["mono_ms"])
+            exp["verdict"] = gw.receive(ev["topic_device"], ev["record"], ev["wall_ms"], ev["mono_ms"],
+                                        ev.get("store_write") in ("fails", "stalls"))
         elif ev["event"] == "restart":
             gw.restart({d: base64.b64decode(k[8:]) for d, k in ev["pinned_keys"].items()}
-                       if "pinned_keys" in ev else None)
-        exp.update(gw.state(DEVICE, ev["mono_ms"]))
+                       if "pinned_keys" in ev else None, ev.get("configured_devices"))
+        elif ev["event"] == "store_read_succeeds":
+            gw.store_ok = True
+        exp["states"] = {d: gw.state(d, ev["wall_ms"], ev["mono_ms"]) for d in gw.devices}
         out.append({**ev, "expected": exp})
-    SEQUENCES.append({"name": name, "note": note, "configured_devices": [DEVICE],
-                      "pinned_keys": {d: "ed25519:" + b64(p) for d, p in sorted(pins.items())},
-                      "store_readable": store_ok, "events": out})
+    seq = {"name": name, "note": note, "configured_devices": list(devices),
+           "pinned_keys": {d: "ed25519:" + b64(p) for d, p in sorted(pins.items())},
+           "store_readable": store_ok, "events": out}
+    if not store_ok:
+        seq["store_condition"] = store_condition
+    SEQUENCES.append(seq)
 
 
 T = WALL
@@ -458,8 +497,11 @@ sequence("receipt_age_counts", "A record received 300000 ms after it was signed 
          [rx(R1, T + SKEW_MS, 0), observe(T, 600_000), observe(T, 600_001)])
 sequence("future_receipt_age_floored", "A record signed ahead of the gateway's clock has receipt age 0.",
          [rx(record(issued=T + SKEW_MS), T, 0), observe(T, CURRENT_MS), observe(T, CURRENT_MS + 1)])
-sequence("wall_step_changes_nothing", "A later step of the gateway's wall clock neither freshens nor stales.",
-         [rx(R1, T, 0), observe(T + 10_000_000, 100), observe(T - 10_000_000, CURRENT_MS + 1)])
+sequence("wall_step_back_never_freshens", "A wall clock stepped back leaves the monotonic elapsed time in force.",
+         [rx(R1, T, 0), observe(T - 10_000_000, 100), observe(T - 10_000_000, CURRENT_MS + 1)])
+sequence("wall_step_forward_stales_early", "Elapsed time is the greater of the monotonic and wall elapsed times, so "
+         "a suspend the monotonic clock did not count, or a forward wall step, stales the record.",
+         [rx(R1, T, 0), observe(T + 10_000_000, 100)])
 sequence("lower_tuple_sticky", "A validly signed lower record makes the device unknown until a higher one.",
          [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
           rx(record(seq=5, issued=T), T + 2, 2), rx(record(seq=6, issued=T + 3), T + 3, 3)])
@@ -499,6 +541,59 @@ sequence("refusal_keeps_sticky", "A record refused at checks 1 to 10 clears no s
 sequence("later_sticky_replaces", "A later sticky reason replaces an earlier one.",
          [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
           rx(record(seq=5, issued=T + 2), T + 2, 2)])
+sequence("equal_conflict_keeps_held", "A conflict leaves the held record as it was: the original replayed is "
+         "replayed, and the conflict stays.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=5, issued=T + 1), T + 1, 1),
+          rx(record(seq=5, issued=T), T + 2, 2)])
+sequence("greater_conflict_keeps_held", "An issued-regression conflict leaves the held record as it was, so a later "
+         "genuine record at the same pair is accepted.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=6, issued=T - SKEW_MS - 1), T - 100, 1),
+          rx(record(seq=6, issued=T + 2), T + 2, 2)])
+sequence("regression_judged_on_issued", "The regression bound compares issued_at_ms values, not the wall clock at "
+         "the held record's receipt.",
+         [rx(record(seq=5, issued=T), T + 200_000, 0), rx(record(seq=6, issued=T - 250_000), T, 1)])
+sequence("conflict_then_lower", "A lower record after a conflict replaces the sticky reason.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=5, issued=T + 1), T + 1, 1),
+          rx(record(seq=4, issued=T + 2), T + 2, 2)])
+sequence("sticky_past_age", "A sticky reason stays unknown past the age bound, never stale.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1), observe(T, CURRENT_MS + 5)])
+sequence("repin_returns_sticky", "A sticky reason belongs to its key: re-pinned to B, B reads clean; back to A, "
+         "A's reason returns.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
+          restart(T + 2, 0, {DEVICE: PUB_B}), rx(record(KEY_B, seq=1, issued=T + 3), T + 3, 1),
+          restart(T + 4, 0, {DEVICE: PUB_A}), observe(T + 5, 1)])
+sequence("higher_boot_lower_seq", "A higher boot generation orders above every record of a lower one.",
+         [rx(record(boot=1, seq=5, issued=T), T, 0), rx(record(boot=2, seq=1, issued=T + 1), T + 1, 1)])
+sequence("stale_retained_after_restart", "After a gateway restart, a retained record older than the skew bound is "
+         "stale_timestamp, and the device stays stale.",
+         [rx(R1, T, 0), restart(T + SKEW_MS + 100_000, 0), rx(R1, T + SKEW_MS + 100_000, 1)])
+sequence("last_refusal_shows_key_mismatch", "A device whose records all arrive under another key shows the reason.",
+         [rx(R1, T, 0), rx(record(KEY_B, seq=2, issued=T + 1), T + 1, 1)])
+sequence("two_devices_independent", "Two devices hold independent states and sticky reasons.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
+          rx(record(KEY_B, device=OTHER_DEVICE, seq=1, issued=T + 2), T + 2, 2, device=OTHER_DEVICE)],
+         devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A, OTHER_DEVICE: PUB_B})
+sequence("store_unavailable_one_unpinned", "With the store unavailable, a pinned device is store_unavailable and an "
+         "unpinned one no_pinned_key.", [observe(T, 0)], devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A},
+         store_ok=False)
+sequence("store_corrupt", "A corrupt store reads as an unreadable one.", [observe(T, 0), rx(R1, T, 1)],
+         store_ok=False, store_condition="corrupt")
+sequence("store_write_fails_closed", "A failed write makes the store unavailable until a read succeeds; the "
+         "message changes no state and sets no sticky reason.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=5, issued=T + 1), T + 1, 1, write="fails"),
+          rx(record(seq=6, issued=T + 2), T + 2, 2), store_read(T + 3, 3),
+          rx(record(seq=6, issued=T + 4), T + 4, 4)])
+sequence("store_write_stalls_closed", "A write still outstanding 1000 ms after it began fails closed, as a failed "
+         "write does.", [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1, write="stalls"),
+                        store_read(T + 2, 2)])
+sequence("restart_clears_last_refusal", "A last refusal is since the gateway started, so a restart clears it.",
+         [rx(R1, T, 0), rx(record(KEY_B, seq=2, issued=T + 1), T + 1, 1), restart(T + 2, 0)])
+sequence("removed_device_keeps_state", "A device removed from the configuration keeps its state, which serving it "
+         "again resumes.",
+         [rx(record(seq=5, issued=T), T, 0), rx(record(seq=4, issued=T + 1), T + 1, 1),
+          restart(T + 2, 0, {OTHER_DEVICE: PUB_B}, devices=(OTHER_DEVICE,)),
+          restart(T + 3, 0, {DEVICE: PUB_A, OTHER_DEVICE: PUB_B}, devices=(DEVICE, OTHER_DEVICE))],
+         devices=(DEVICE, OTHER_DEVICE), pins={DEVICE: PUB_A, OTHER_DEVICE: PUB_B})
 sequence("no_pin", "No pinned key: unknown(no_pinned_key), and records are refused.", [rx(R1, T, 0)], pins={})
 sequence("store_unavailable", "An unreadable store: unknown(store_unavailable), nothing accepted.",
          [observe(T, 0), rx(R1, T, 1)], store_ok=False)
@@ -564,6 +659,10 @@ ccase("order_entry_by_entry", "The first entry by code point fails rule 2 and a 
                                                                             "z-device": KA})
 ccase("order_code_point", "Entries are judged in code point order, not as written.", ["a-device", DEVICE],
       {"z-device": KA, "a-device": "ed25519:x"})
+ccase("order_rule_3_entry_by_entry", "The first entry fails rule 3 and a later one rule 2: rule 3 is judged with "
+      "its entry.", ["a-device", DEVICE], {"a-device": "ed25519:" + b64(INADMISSIBLE), DEVICE: "ed25519:x"})
+ccase("whitespace_value", "A value with surrounding whitespace is malformed.", [DEVICE], {DEVICE: " " + KA})
+ccase("whitespace_key", "A key with surrounding whitespace names no configured device.", [DEVICE], {" " + DEVICE: KA})
 ccase("unknown_and_malformed_entry", "One entry that is both an unknown device and a malformed value.", [DEVICE],
       {OTHER_DEVICE: "ed25519:x"})
 ccase("order_entry_before_duplicate", "A malformed entry is named before a duplicate of two other entries.",
@@ -581,8 +680,13 @@ def readback(request: str, peer: str | None, key_loaded: bool) -> dict:
         return {"schema_version": 1, "ok": False, "error": {"code": code}}
     if len(raw_req) > BOUND:
         return refused("payload_too_large")
+    def pairs(items: list) -> dict:
+        names = [k for k, _ in items]
+        if len(set(names)) != len(names):
+            raise ValueError("member named twice")
+        return dict(items)
     try:
-        obj = json.loads(raw_req)
+        obj = json.loads(raw_req, object_pairs_hook=pairs)
     except ValueError:
         return refused("invalid_arguments")
     if not (isinstance(obj, dict) and set(obj) == {"operation"} and obj["operation"] == "runtime_device_key"):
@@ -612,6 +716,10 @@ kcase("form_before_caller", "An unaccepted member from an unadmitted peer: form 
       '{"operation":"runtime_device_key","x":1}', "other")
 kcase("caller_before_key", "An unadmitted peer while the key is not loaded: the caller first.", REQ, "other", False)
 kcase("over_bound", "A request over 16384 bytes.", REQ[:-1] + " " * (BOUND - len(REQ) + 1) + "}")
+kcase("operation_twice", "The operation member named twice.",
+      '{"operation":"runtime_device_key","operation":"runtime_device_key"}')
+kcase("operation_case_variant", "A member that differs from operation only in case.", '{"Operation":"runtime_device_key"}')
+kcase("operation_escaped", "operation written with an escape is operation.", '{"\\u006fperation":"runtime_device_key"}')
 kcase("over_bound_before_form", "Over the bound and not JSON: the bound is decided first.", "x" * (BOUND + 1))
 
 
@@ -626,15 +734,21 @@ def build() -> dict:
                         "wall clock reads `gateway_wall_ms`; `expected` is `pass` or the reason. Checks 1 and 2 are "
                         "gateway-api/v2's corpora's."),
             "sequences": ("Each sequence runs its events in order against one gateway. `receive` judges a message "
-                          "and gives its verdict; `observe` reads the state; `restart` restarts the gateway, "
-                          "resetting its monotonic clock, and installs `pinned_keys` when given. `wall_ms` and "
-                          "`mono_ms` are the gateway's wall and monotonic clocks at the event. `expected` holds "
-                          "the verdict, for a receive, and the device's state after the event, with `reason`, "
-                          "`record_b64` and `received_at_ms` as Carriage gives them."),
+                          "and gives its verdict, its store write failing when `store_write` is `fails`, or "
+                          "outstanding past 1000 ms when it is `stalls`; `observe` "
+                          "reads the state; `restart` restarts the gateway, resetting its monotonic clock and its "
+                          "last refusals, and installs `pinned_keys` and `configured_devices` when given; "
+                          "`store_read_succeeds` is a read of "
+                          "an unavailable store that succeeds. `store_readable` false starts with the store "
+                          "unavailable, for the reason `store_condition` names. `wall_ms` and `mono_ms` are the "
+                          "gateway's wall and monotonic clocks at the event. `expected` holds the verdict, for a "
+                          "receive, and in `states` the state of each device configured after the event, with "
+                          "`reason`, `record_b64`, `received_at_ms` and `last_refusal` as Carriage gives them."),
             "config": ("gateway-config/v2 posture key load rules, after gateway.state_directory's, with "
                        "gateway.auth and evidence disabled: `valid`, and `rule` when refused. `runtime_keys` "
                        "lists its entries in the order they are written."),
-            "readback": ("operator-socket/v3 runtime_device_key: the request bytes, the peer (`root`, "
+            "readback": ("Owned by the runtime, which serves it; a gateway does not consume these cases. "
+                         "operator-socket/v3 runtime_device_key: the request bytes, the peer (`root`, "
                          "`operator`, `other` or null when credentials cannot be established), whether the "
                          "posture key is loaded, the device and key it would answer, and the answer, whose "
                          "`detail` is never compared."),
