@@ -12,8 +12,8 @@ blind to the filesystem (so case-sensitive), and the
 condition the model assumes, so a contract that changes a load rule fails here
 until the model changes with it.
 
-Each case is `gateway.auth.enabled`, the `gateway.state_directory` value as
-written (`null` when the key is absent) and the courier's `enabled` flag and two
+Each case is `gateway.auth.enabled`, whether `posture.runtime_keys` has an
+entry, the `gateway.state_directory` value as written (`null` when the key is absent) and the courier's `enabled` flag and two
 queue directories. The checker recomputes each verdict, and the effective value
 of a valid case or the rule of a refused case, and requires the corpus to
 exercise every rule and every boundary the text draws.
@@ -44,11 +44,14 @@ SECTION_END = "**Start and mark requirements.**"
 LOAD_RULES = "**Load rules.**"
 
 REQUIRED = "required_under_auth"
+REQUIRED_POSTURE = "required_under_posture"
 ABSOLUTE = "absolute"
 SEPARATE = "separate_from_evidence_queues"
-RULES = (REQUIRED, ABSOLUTE, SEPARATE)
+RULES = (REQUIRED, REQUIRED_POSTURE, ABSOLUTE, SEPARATE)
 
-# The load-rule lead paragraph and the three bullets, in order, each the exact sentences this model implements.
+# The load-rule lead paragraph and the four bullets, in order, each the exact sentences this model implements.
+# Each bullet opens with its rule's name, backticked and followed by a colon, and that name is the corpus's
+# `rule` for a case refused under it.
 LEAD = (
     "**Load rules.**",
     "Before any rule applies, surrounding whitespace is removed from the value, from the queue directories alike.",
@@ -56,7 +59,7 @@ LEAD = (
     "A value that is then empty is absent.",
     "The trimmed value is the configured state directory.",
     ("The rules below apply in order, whether or not authentication is enabled unless a rule says otherwise, and a "
-     "configuration is refused at load for the first rule it breaks:"),
+     "configuration is refused at load for the first rule it breaks, which the refusal names:"),
 )
 BULLETS = (
     (REQUIRED, (
@@ -64,9 +67,13 @@ BULLETS = (
         ("A configuration that enables authentication without it, which loaded before this key existed, is refused, "
          "so upgrading such a gateway means adding the key."),
     )),
-    (ABSOLUTE, ("A value that is present is an absolute path: it begins with `/`.",)),
+    (REQUIRED_POSTURE, (
+        ("`state_directory` is required when [`posture.runtime_keys`](#posture) has at least one entry, whether or "
+         "not authentication is enabled, because the posture store lives there."),
+    )),
+    (ABSOLUTE, ("a value that is present is an absolute path: it begins with `/`.",)),
     (SEPARATE, (
-        ("While `evidence.enabled` is true, a present state directory is neither equal to, inside, nor containing "
+        ("while `evidence.enabled` is true, a present state directory is neither equal to, inside, nor containing "
          "`evidence.queue_directory` or `evidence.return_queue_directory`."),
         ("Each path is first cleaned lexically: repeated and trailing `/` and `.` components are removed, each `..` removes the "
          "component before it, and a `..` at the root stays at the root."),
@@ -88,9 +95,13 @@ LIMITS = (
     ("A symbolic link above the state directory, a queue directory reached through one, a bind mount, or a "
      "case-insensitive filesystem can place the state directory inside evidence storage without breaking the load "
      "rule."),
+    # From the posture section: these rules come before the posture rules, and name this refusal.
+    ("The [`gateway.state_directory`](#gatewaystate_directory) load rules are judged before these, so a pin with "
+     "no state directory is refused there, as `required_under_posture`."),
 )
 TABLE_ROW = re.compile(
-    r"^\|\s*`state_directory`\s*\|\s*`string`\s*\|\s*`\"\"`\s*\|\s*When `gateway\.auth\.enabled`\s*\|", re.MULTILINE)
+    r"^\|\s*`state_directory`\s*\|\s*`string`\s*\|\s*`\"\"`\s*\|\s*When `gateway\.auth\.enabled`, or when "
+    r"`posture\.runtime_keys` has an entry\s*\|", re.MULTILINE)
 
 # The Unicode White_Space property (PropList.txt), written as code points.
 WHITE_SPACE = frozenset(chr(c) for c in (
@@ -100,7 +111,7 @@ WHITE_SPACE = frozenset(chr(c) for c in (
 ASCII_SPACE = frozenset(" \t\n\r\v\f")
 PYTHON_SPACE = frozenset(chr(c) for c in range(0x110000) if chr(c).isspace())
 
-CASE_KEYS = {"name", "auth_enabled", "state_directory", "evidence", "valid"}
+CASE_KEYS = {"name", "auth_enabled", "posture_keys_configured", "state_directory", "evidence", "valid"}
 EVIDENCE_KEYS = {"enabled", "queue_directory", "return_queue_directory"}
 QUEUES = ("queue_directory", "return_queue_directory")
 
@@ -138,6 +149,10 @@ MODEL_MUTANTS = {
     "effective_cleaned": False,             # the effective value is the cleaned path
     "effective_untrimmed": False,           # the effective value keeps its whitespace
     "separation_before_absolute": False,    # a relative value is compared after resolving against `/`
+    "no_posture_rule": False,               # posture keys do not require the state directory
+    "posture_before_auth": False,           # the posture rule is judged, and named, before the auth rule
+    "posture_on_untrimmed": False,          # the posture rule reads a whitespace-only value as present
+    "posture_only_with_auth": False,        # the posture rule applies only while authentication is enabled
 }
 
 
@@ -164,7 +179,7 @@ def contract_errors(text: str) -> list[str]:
     errors: list[str] = []
     if not TABLE_ROW.search(text):
         errors.append("the gateway table no longer gives state_directory type string, default \"\", required "
-                      "when gateway.auth.enabled")
+                      "when gateway.auth.enabled or when posture.runtime_keys has an entry")
     section = section_of(text)
     if section is None:
         return errors + ["gateway-config/v2.md lacks the gateway.state_directory section before its start rules"]
@@ -187,7 +202,12 @@ def contract_errors(text: str) -> list[str]:
     if len(bullets) != len(BULLETS):
         errors.append(f"the load rules have {len(bullets)} bullets; this model implements {len(BULLETS)}")
     for (rule, sentences), bullet in zip(BULLETS, bullets):
-        if _norm(" ".join(bullet)) != _norm(" ".join(sentences)):
+        named = re.match(r"`([a-z_]+)`: ", _norm(" ".join(bullet)))
+        if named is None or named.group(1) != rule:
+            errors.append(f"the load rule this model calls {rule} is named "
+                          f"{named.group(1) if named else 'nothing'} in the text")
+            continue
+        if _norm(" ".join(bullet))[named.end():] != _norm(" ".join(sentences)):
             errors.append(f"the {rule} load rule no longer reads as this model implements it; change the model "
                           "and BULLETS with it")
     tail = _norm(paragraphs[2]) if len(paragraphs) > 2 else ""
@@ -270,8 +290,16 @@ def validate(case: dict) -> str:
     raw = case["state_directory"]
     value = "" if raw is None else trim(raw, auth)
     present = value != "" or (MODEL_MUTANTS["blank_present_without_auth"] and not auth and raw not in (None, ""))
+    posture = case["posture_keys_configured"] and not MODEL_MUTANTS["no_posture_rule"]
+    if MODEL_MUTANTS["posture_only_with_auth"] and not auth:
+        posture = False
+    posture_present = present or (MODEL_MUTANTS["posture_on_untrimmed"] and raw not in (None, ""))
+    if MODEL_MUTANTS["posture_before_auth"] and posture and not posture_present:
+        raise Refused(REQUIRED_POSTURE)
     if auth and not present:
         raise Refused(REQUIRED)
+    if posture and not posture_present:
+        raise Refused(REQUIRED_POSTURE)
     if not present:
         return ""
     evidence = case["evidence"]
@@ -320,7 +348,8 @@ def facts(case: dict) -> dict:
     value = "" if raw is None else trim_true(raw)
     ev = case["evidence"]
     rel = {k: true_relation(value, ev[k]) for k in QUEUES} if value.startswith("/") else {k: None for k in QUEUES}
-    return {"raw": raw, "value": value, "auth": case["auth_enabled"], "courier": ev["enabled"], "rel": rel}
+    return {"raw": raw, "value": value, "auth": case["auth_enabled"], "posture": case["posture_keys_configured"],
+            "courier": ev["enabled"], "rel": rel}
 
 
 def trim_true(value: str) -> str:
@@ -381,6 +410,8 @@ def shape_errors(document: dict) -> list[str]:
             continue
         if not isinstance(case["auth_enabled"], bool):
             errors.append(f"{label}: auth_enabled is not a bool")
+        if not isinstance(case["posture_keys_configured"], bool):
+            errors.append(f"{label}: posture_keys_configured is not a bool")
         if case["state_directory"] is not None and not isinstance(case["state_directory"], str):
             errors.append(f"{label}: state_directory is neither null nor a string")
         ev = case["evidence"]
@@ -529,6 +560,14 @@ COVERAGE = (
     ("an overlap accepted while the courier is disabled", True, None, lambda f, c: not f["courier"] and _overlap(f)),
     ("a value that reads as inside a queue but resolves outside it through `..`", True, None,
      lambda f, c: f["courier"] and _escapes_by_dotdot(f, c)),
+    ("posture keys, auth disabled, and an absolute value", True, None,
+     lambda f, c: f["posture"] and not f["auth"] and f["value"] != ""),
+    ("posture keys, auth disabled, and the key absent", False, REQUIRED_POSTURE,
+     lambda f, c: f["posture"] and not f["auth"] and f["raw"] is None),
+    ("posture keys, auth disabled, and the key only whitespace", False, REQUIRED_POSTURE,
+     lambda f, c: f["posture"] and not f["auth"] and _ws_only(f)),
+    ("posture keys and auth enabled, the key absent: the auth rule is named first", False, REQUIRED,
+     lambda f, c: f["posture"] and f["auth"] and f["value"] == ""),
     ("auth enabled and the key absent", False, REQUIRED, lambda f, c: f["raw"] is None),
     ("auth enabled and the key empty", False, REQUIRED, lambda f, c: f["raw"] == ""),
     ("auth enabled and the key only whitespace", False, REQUIRED, lambda f, c: _ws_only(f)),
@@ -666,6 +705,8 @@ def mutate(document: dict, text: str, baseline: list[str]) -> tuple[int, list[st
         ("queue directories not distinct", lambda d: d["cases"][0]["evidence"].__setitem__(
             "return_queue_directory", d["cases"][0]["evidence"]["queue_directory"] + "/.")),
         ("auth as a string", lambda d: d["cases"][0].__setitem__("auth_enabled", "true")),
+        ("posture as a string", lambda d: d["cases"][0].__setitem__("posture_keys_configured", "true")),
+        ("posture flag missing", lambda d: d["cases"][0].pop("posture_keys_configured")),
         ("unknown rule", lambda d: next(c for c in d["cases"] if not c["valid"]).__setitem__("rule", "other")),
         ("note loses a rule name", lambda d: d.__setitem__("note", d["note"].replace(f"`{SEPARATE}`", ""))),
     )
@@ -696,8 +737,24 @@ def mutate(document: dict, text: str, baseline: list[str]) -> tuple[int, list[st
     last = BULLETS[-1][1][-1]
     pattern = r"\s+".join(re.escape(w) for w in last.split())
     edited, count = re.subn(pattern, lambda m: m.group(0) + "\n- A fourth rule.", text, count=1)
-    run("contract: a fourth load rule", document, edited) if count == 1 else survived.append("last rule not found")
-    for old, new in (("When `gateway.auth.enabled`", "Yes"), ("| `string`   | `\"\"`    |", "| `string`   | `\"/\"`   |")):
+    for rule, other in ((REQUIRED, REQUIRED_POSTURE), (ABSOLUTE, SEPARATE)):
+        renamed = text.replace(f"- `{rule}`: ", f"- `{other}`: ", 1)
+        run(f"contract: the {rule} bullet named {other}", document, renamed)
+    run("contract: a bullet's name dropped", document, text.replace("- `absolute`: a value", "- A value", 1))
+    run("contract: a fifth load rule", document, edited) if count == 1 else survived.append("last rule not found")
+    # The auth and posture bullets, as written, exchanged: the rule order is the text's.
+    order = re.search(r"^(- `required_under_auth`: `state_directory` is required when `gateway\.auth\.enabled`.*?\n)"
+                      r"(- `required_under_posture`: `state_directory` is required when \[`posture\.runtime_keys`\].*?\n)"
+                      r"(?=- )",
+                      text, re.MULTILINE | re.DOTALL)
+    if order:
+        swapped = text[:order.start()] + order.group(2) + order.group(1) + text[order.end():]
+        run("contract: the auth and posture rules swapped", document, swapped)
+    else:
+        total += 1
+        survived.append("contract: auth and posture rules not found in order")
+    for old, new in (("When `gateway.auth.enabled`", "Yes"),
+                     (", or when `posture.runtime_keys` has an entry", ""), ("| `string`   | `\"\"`    |", "| `string`   | `\"/\"`   |")):
         row = next((ln for ln in text.splitlines() if ln.startswith("| `state_directory`")), "")
         run(f"contract: table row {old!r} -> {new!r}", document, text.replace(row, row.replace(old, new), 1))
     for flag in MODEL_MUTANTS:

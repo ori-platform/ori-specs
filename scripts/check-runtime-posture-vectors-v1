@@ -1,0 +1,1819 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the runtime-posture/v1 corpus against the contract texts.
+
+Shares no code with scripts/generate-runtime-posture-vectors-v1, and was
+written without reading it. Every expected value is recomputed from
+runtime-posture/v1.md, the amended sections of gateway-api/v2.md,
+gateway-config/v2.md `## posture`, operator-socket/v3.md *Runtime Device Key
+Readback*, and the Ed25519 key admission and verification contracts.
+
+Held to:
+
+- the text: every sentence this checker relies on is pinned, and the ordered
+  vocabularies (the receiver's checks and reasons, the Payload Member Rule's
+  rows, the ordering verdicts, the posture states and reasons, the config load
+  rules, the readback's order of refusal) and the bounds (skew, age, issued
+  regression, payload size, socket bound, integer maximum, string patterns)
+  are parsed from it, so an edit fails here until it is re-pinned;
+- keys: both test keys re-derived from their disclosed seeds with this
+  script's own curve arithmetic, `key_identity` as SHA-256 of the RFC 8410
+  SPKI DER, admission implemented from ed25519-key-admission/v1, recognition
+  as the 32 bytes with bit 255 cleared;
+- signatures: verified twice, with this script's own strict cofactorless
+  equation (ed25519-verification/v1) and with OpenSSL through `cryptography`,
+  and the two must agree;
+- record cases: checks 1 and 2 must admit each one (they are gateway-api/v2's
+  corpora's), and checks 3 to 10 give exactly the expected verdict; every
+  precedence case has a second failing check behind its first; each
+  signature-refusal case is refused for the construction its note declares;
+- sequences: the verdict per receive and the state, reason, `record_b64` and
+  `received_at_ms` after every event, from Posture state and Carriage;
+- config: the gateway-config/v2 posture load rules, entry by entry in code
+  point order, then duplicates, then the state directory;
+- readback: the operator-socket/v3 order of refusal and the answer;
+- coverage: every verdict, state and reason, every rule boundary, every
+  precedence pair, every config rule and every readback code.
+
+    python3 scripts/check-runtime-posture-vectors-v1
+    python3 scripts/check-runtime-posture-vectors-v1 --mutations
+
+`--mutations` runs wrong receivers, wrong config loaders and wrong readback
+servers against the corpus, flips every expected value in the corpus, and cuts
+every pinned sentence from the text; every mutant must be refused.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import functools
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from dataclasses import dataclass, field, replace
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "runtime-posture" / "vectors" / "posture-v1.json"
+TEXT_FILES = {
+    "posture": ROOT / "runtime-posture" / "v1.md",
+    "gateway_api": ROOT / "gateway-api" / "v2.md",
+    "gateway_config": ROOT / "gateway-config" / "v2.md",
+    "operator_socket": ROOT / "operator-socket" / "v3.md",
+    "lan": ROOT / "lan-app-api" / "v1.md",
+    "admission": ROOT / "ed25519-key-admission" / "v1.md",
+    "verification": ROOT / "ed25519-verification" / "v1.md",
+    "canonical": ROOT / "gateway-mqtt-canonical-json" / "v1.md",
+}
+
+sys.setrecursionlimit(20000)
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Pinned sentences. Each is held, whitespace-normalised, as a substring of its
+# document. Every rule below that the model implements rests on one of these.
+# ---------------------------------------------------------------------------
+
+PINS: list[tuple[str, str]] = [
+    # runtime-posture/v1.md, Identities
+    ("posture", "`sha256:` followed by the 64 lowercase hex characters of SHA-256 over the key's RFC 8410 SubjectPublicKeyInfo DER: the 12-byte prefix `302a300506032b6570032100` followed by the raw 32-byte key"),
+    ("posture", "The 32 key bytes with bit 255 cleared, as [ed25519-key-admission/v1.md](../ed25519-key-admission/v1.md) *Recognising a key* defines it"),
+    ("posture", "A key and its negation have different `key_identity` values and one recognised key."),
+    # The record
+    ("posture", "The record is one JSON object with exactly these members:"),
+    ("posture", "or `null` when the running code was not installed from a verified bundle."),
+    ("posture", "`null` when no binding is in force."),
+    ("posture", "The Ed25519 signature, canonical padded RFC 4648 Base64 of its 64 bytes."),
+    ("posture", "`v`, `boot_generation`, `posture_seq` and `issued_at_ms` are each written as a JSON integer token: the digit `0`, or a digit `1` to `9` followed by digits, with no sign, fraction, exponent or leading zero."),
+    ("posture", "Each is at least `1` and at most 2^53 − 1 (9007199254740991)."),
+    ("posture", "`1.0`, `1e0`, `-1`, `01`, `true` and `\"1\"` are not integers here."),
+    ("posture", "Every string member is ASCII and matches its pattern above."),
+    ("posture", "canonical form of the object: members sorted by name, no insignificant whitespace, and every number token kept exactly as written, as that contract's verifier keeps it."),
+    ("posture", "Canonical bytes never respell a number, so a record whose integer is written `1e0` or `1.0` has canonical bytes and is `malformed`, not `not_canonical`."),
+    ("posture", "**A record is published as exactly its canonical bytes,** with nothing before or after them."),
+    ("posture", "Bytes that parse to a record but are not its canonical bytes are not a record; a receiver refuses them as `not_canonical` under [Receiving](#receiving)."),
+    ("posture", "The signing input is the ASCII bytes `ori.runtime_posture.v1`, one NUL byte, then the canonical bytes of the record without its `signature` member."),
+    ("posture", "A verifier applies ed25519-key-admission/v1.md to the key and verifies under [ed25519-verification/v1.md](../ed25519-verification/v1.md); any failure is `signature_invalid`."),
+    # Receiving
+    ("posture", "judges each message in this order. The first check that fails is the answer."),
+    ("posture", "1. [Payload Size](../gateway-api/v2.md#payload-size): `payload_too_large`."),
+    ("posture", "2. [Payload Member Rule](../gateway-api/v2.md#payload-member-rule): its seven reasons."),
+    ("posture", "3. The bytes are not the canonical bytes of the object they parse to: `not_canonical`."),
+    ("posture", "4. The object is not a record: a member missing, unknown or of the wrong type, a value outside its form, `v` not `1`: `malformed`."),
+    ("posture", "5. The topic's device is not in `gateway.device_ids`: `unknown_device`."),
+    ("posture", "6. The record's `device_id` differs from the topic's device: `device_mismatch`."),
+    ("posture", "7. No posture key is pinned for the device under gateway-config/v2: `no_pinned_key`."),
+    ("posture", "8. The record's `key_identity` is not the pinned key's: `key_mismatch`."),
+    ("posture", "9. The signature fails under the pinned key: `signature_invalid`."),
+    ("posture", "10. `issued_at_ms` is more than 300000 ms before the gateway's wall clock at receipt: `stale_timestamp`; more than 300000 ms after it: `future_timestamp`."),
+    ("posture", "11. Ordering, against the **held record** for the device and the pinned key's recognised key (below):"),
+    ("posture", "- **`accepted`**: there is no held record, or the record's (`boot_generation`, `posture_seq`) is strictly greater, compared as a pair, first by `boot_generation`. The record becomes the held record."),
+    ("posture", "Except that a strictly greater pair whose `issued_at_ms` is more than 300000 ms below the held record's is **`conflict`**"),
+    ("posture", "- **`replayed`**: an equal pair with identical bytes. Nothing changes."),
+    ("posture", "- **`conflict`**: an equal pair with different bytes."),
+    ("posture", "- **`lower_tuple`**: a smaller pair."),
+    ("posture", "While the gateway cannot read its held state, a record that passes checks 1 to 10 is **`store_unavailable`** instead, and changes nothing."),
+    ("posture", "Checks 1 to 10 change no state, and a record refused at them is counted and otherwise ignored."),
+    ("posture", "For each pair of a configured device and a recognised key, the gateway holds at most one held record: its bytes, its pair, its `issued_at_ms`, the gateway's wall clock at its receipt, and the device's sticky reason, if any."),
+    ("posture", "keeps it for every recognised key it has held a record under, not only the pinned one."),
+    ("posture", "A change of pin selects which recognised key's state is read. It never resets a state: a key pinned again after another resumes from what it held, so an old record under it is still `lower_tuple`. A key and its negation share one state."),
+    ("posture", "A store the gateway cannot read, or whose contents do not parse, makes every configured device with a pinned key `unknown` with reason `store_unavailable`"),
+    # Posture state
+    ("posture", "A gateway reports one posture state for each configured device, read from the state its pinned key's recognised key selects:"),
+    ("posture", "- `no_pinned_key`: no posture key is pinned for the device;"),
+    ("posture", "- `store_unavailable`: the gateway cannot read its held state;"),
+    ("posture", "- `no_record`: no record is held under the pinned key;"),
+    ("posture", "- `lower_tuple_seen`: a record passed checks 1 to 10 and was `lower_tuple`;"),
+    ("posture", "- `conflict`: a record passed checks 1 to 10 and was `conflict`."),
+    ("posture", "`lower_tuple_seen` and `conflict` are **sticky**: each is held durably with the state, survives a gateway restart, and clears only when a record is `accepted` under the same recognised key. A record that is `replayed`, or refused at checks 1 to 10, clears nothing. A later sticky reason replaces an earlier one."),
+    ("posture", "The reasons are listed in precedence order, and the first that holds is the reason: a device with no pinned key is `no_pinned_key` whatever the store's condition, and an unreadable store hides whether a record or a sticky reason is held."),
+    ("posture", "- **`current`**: a record is held, no sticky reason is held, and its age is at most 900000 ms."),
+    ("posture", "- **`stale`**: a record is held, no sticky reason is held, and its age is more than 900000 ms or cannot be computed."),
+    ("posture", "A held record's age is its age at receipt, the gateway's wall clock at receipt minus `issued_at_ms`, taken as `0` when negative, plus the time elapsed since receipt on the gateway's monotonic clock."),
+    ("posture", "A later step of the gateway's wall clock therefore neither freshens nor stales a held record."),
+    ("posture", "A gateway's monotonic clock does not carry across its restarts, so after a restart the age of a record received before it cannot be computed: the record reads `stale` until a fresh one is accepted, and the retained copy the broker redelivers is `replayed`."),
+    # Key pinning, Carriage
+    ("posture", "Its records are `key_mismatch` until the new key is pinned."),
+    ("posture", "- `state` and, when `unknown`, `reason`, as above;"),
+    ("posture", "- when the state is `current` or `stale`, `record_b64`, the canonical padded RFC 4648 Base64 of the held record's exact bytes, and `received_at_ms`, the gateway's wall clock at its receipt."),
+    ("posture", "never carries a record under `unknown`, and never carries one record for two devices."),
+    # gateway-api/v2.md
+    ("gateway_api", "| `ori/{device_id}/runtime/posture` | Runtime -> Gateway | 4096 | One runtime-posture/v1 record, under 1024 bytes with every member at its bound. |"),
+    ("gateway_api", "| `ori/{device_id}/runtime/posture` | Runtime Posture Record |"),
+    ("gateway_api", "When several rows apply, the earliest row in the table names the reason, wherever in the payload each violation sits"),
+    ("gateway_api", "The rule judges a number by the RFC 8259 grammar alone: its range and spelling stay with the section that reads it and with `gateway-mqtt-canonical-json/v1`"),
+    ("gateway_api", "Every topic's defined members hold every key of this example, whether or not that topic's payload carries an envelope, so a variant of one is refused on every topic."),
+    ("gateway_api", "[Envelope Freshness and Replay](#envelope-freshness-and-replay) does not apply to it; runtime-posture/v1.md *Receiving* orders it instead, after [Payload Size](#payload-size) and the [Payload Member Rule](#payload-member-rule)."),
+    ("gateway_api", "`state`, one of `current`, `stale` or `unknown`; `reason` when `state` is `unknown`; and, when `state` is `current` or `stale`, `record_b64`, canonical padded RFC 4648 Base64 of the held record's exact bytes, and `received_at_ms`, the gateway's wall clock when it received it."),
+    # gateway-mqtt-canonical-json/v1.md
+    ("canonical", "A **verifier** MUST reproduce the number token exactly as it appears on the wire, and MUST NOT re-format it."),
+    ("canonical", "Keys are ordered by **Unicode scalar value** (code point), not by UTF-16 code unit."),
+    ("canonical", "Escape only `\"` and `\\`, plus C0 controls. Use the short forms `\\b`, `\\f`, `\\n`, `\\r`, `\\t`, and `\\u00xx` with lowercase hex for the remaining C0 controls."),
+    # gateway-config/v2.md
+    ("gateway_config", "- `absolute`: a value that is present is an absolute path: it begins with `/`."),
+    ("gateway_config", "Absent, or with no entry, the gateway verifies no record, and every device reads `unknown` with reason `no_pinned_key`."),
+    ("gateway_config", "Each value is `ed25519:` followed by canonical padded RFC 4648 Base64 of the device's raw 32-byte posture key."),
+    ("gateway_config", "A configuration is refused at load for the first of these it breaks, in this order, and the refusal names the rule:"),
+    ("gateway_config", "1. `unknown_device`: a key of `runtime_keys` is not one of `gateway.device_ids`;"),
+    ("gateway_config", "2. `malformed_key`: a value is not exactly `ed25519:` followed by canonical padded Base64 of 32 bytes;"),
+    ("gateway_config", "3. `inadmissible_key`: a value's key fails [`ed25519-key-admission/v1.md`](../ed25519-key-admission/v1.md);"),
+    ("gateway_config", "4. `duplicate_key`: two values are the same recognised key, as that contract's *Recognising a key* defines it, since one key identifies one device;"),
+    ("gateway_config", "The [`gateway.state_directory`](#gatewaystate_directory) load rules are judged before these, so a pin with no state directory is refused there, as `required_under_posture`."),
+    ("gateway_config", "Before any rule applies, surrounding whitespace is removed from the value, from the queue directories alike."),
+    ("gateway_config", "A value that is then empty is absent."),
+    ("gateway_config", "The rules below apply in order, whether or not authentication is enabled unless a rule says otherwise, and a configuration is refused at load for the first rule it breaks, which the refusal names:"),
+    ("gateway_config", "- `required_under_auth`: `state_directory` is required when `gateway.auth.enabled` is true."),
+    ("gateway_config", "- `required_under_posture`: `state_directory` is required when [`posture.runtime_keys`](#posture) has at least one entry, whether or not authentication is enabled, because the posture store lives there."),
+    ("gateway_config", "- `separate_from_evidence_queues`: while `evidence.enabled` is true, a present state directory is neither equal to, inside, nor containing"),
+    ("gateway_config", "Rules 1 to 3 are judged entry by entry, in the order of the keys sorted by code point, and an entry is judged against every rule from 1 to 3 before the next entry is."),
+    ("gateway_config", "A store that cannot be read or does not parse is unavailable: every configured device with a pinned key reads `unknown` with reason `store_unavailable`"),
+    ("gateway_config", "Changing a pin never resets what the gateway holds under any key"),
+    # operator-socket/v3.md
+    ("operator_socket", "A request is the UTF-8 bytes of one JSON object followed by one LF;"),
+    ("operator_socket", "The request is the bytes before the first LF, and the runtime ignores any bytes after it."),
+    ("operator_socket", "**The bound.** A request is at most 16,384 bytes, not counting its LF."),
+    ("operator_socket", "A request of exactly 16,384 bytes is parsed."),
+    ("operator_socket", "A member named twice in the request, at the top level or inside any nested object other than a revocation `document`, refuses the request `invalid_arguments`; so does a request that is not one JSON object, and a request whose `operation` is absent, is not a string, is not one of the eight operations below or `runtime_device_key`, or is named more than once."),
+    ("operator_socket", "Each operation's members are closed: a missing member, a member the operation does not accept, or a member outside its stated form is `invalid_arguments`."),
+    ("operator_socket", "text that is not JSON; a JSON string with no UTF-8 form, such as an escaped lone surrogate; and nesting deeper than 32 levels, each object or array counting one level and the request object being level 1."),
+    ("operator_socket", "It runs locally on the device, on the socket and under the framing and bound of [Requests on the socket](#requests-on-the-socket)"),
+    ("operator_socket", "**Request.** Exactly one member: `operation`, the string `runtime_device_key`."),
+    ("operator_socket", "from the kernel's peer credentials for the connection alone, root and the installed operator identity."),
+    ("operator_socket", "Any other caller, or a connection whose peer credentials the runtime cannot establish, is refused `unauthenticated`."),
+    ("operator_socket", "1. the bound: `payload_too_large`; 2. the request's form and members: `invalid_arguments`; 3. the caller: `unauthenticated`; 4. the posture key is not loaded in this run, as when evidence is disabled or its key failed to unseal or load at start: `key_unavailable`."),
+    ("operator_socket", "**Answer.** `{\"schema_version\":1,\"ok\":true,\"result\":{...}}`, whose `result` has exactly:"),
+    ("operator_socket", "- `public_key`: `ed25519:` followed by canonical padded RFC 4648 Base64 of the raw 32-byte posture key;"),
+    ("operator_socket", "- `key_identity`: that key's `key_identity` as runtime-posture/v1.md defines it, the value its records carry."),
+    # lan-app-api/v1.md
+    ("lan", "Each object has exactly `device_id`, `state` (`current`, `stale` or `unknown`), `reason` when `state` is `unknown`, and, when `state` is `current` or `stale`, `record_b64` and `received_at_ms`"),
+    # ed25519-key-admission/v1.md
+    ("admission", "1. `non_canonical`: y ≥ p, whatever bit 255 holds."),
+    ("admission", "2. `off_curve`: (y² − 1) / (d·y² + 1) has no square root modulo p, so y is the coordinate of no curve point, whatever bit 255 holds."),
+    ("admission", "3. `invalid_sign`: the recovered x is 0 and bit 255 is set."),
+    ("admission", "4. `small_order`: the decoded point A has order dividing 8, that is [8]A is the identity."),
+    ("admission", "5. `mixed_order`: the decoded point A is not of small order and [L]A is not the identity"),
+    ("admission", "MUST compare the key's identity: its 32 bytes with bit 255 cleared."),
+    # ed25519-verification/v1.md
+    ("verification", "2. `s_out_of_range`: S ≥ L. S is not reduced modulo L to make it fit."),
+    ("verification", "4. `equation`: with k the SHA-512 digest of R ‖ A ‖ M read as a little-endian integer, the encoding of [S]B − [k]A is not equal to R, byte for byte."),
+]
+
+
+def norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def section(text: str, title: str, level: int) -> str:
+    lines = text.split("\n")
+    head = "#" * level + " " + title
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == head)
+    except StopIteration:
+        raise Failure(f"text: heading {head!r} not found")
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = re.match(r"^(#+) ", lines[j])
+        if m and len(m.group(1)) <= level:
+            end = j
+            break
+    return "\n".join(lines[start + 1:end])
+
+
+def numbered(body: str) -> list[str]:
+    """The top-level numbered items of a Markdown list, continuation joined."""
+    items: list[str] = []
+    cur: list[str] | None = None
+    for ln in body.split("\n"):
+        m = re.match(r"^(\d+)\. (.*)$", ln)
+        if m:
+            if cur is not None:
+                items.append(norm(" ".join(cur)))
+            cur = [ln]
+        elif cur is not None and (ln.startswith(" ") and ln.strip()):
+            cur.append(ln)
+        elif cur is not None and not ln.strip():
+            continue
+        elif cur is not None:
+            items.append(norm(" ".join(cur)))
+            cur = None
+    if cur is not None:
+        items.append(norm(" ".join(cur)))
+    return items
+
+
+def one(pattern: str, text: str, where: str, flags: int = 0) -> re.Match:
+    m = re.search(pattern, text, flags) or (None if flags & re.M else re.search(pattern, norm(text), flags))
+    if not m:
+        raise Failure(f"text: {where}: {pattern!r} not found")
+    return m
+
+
+def load_texts() -> dict[str, str]:
+    return {k: p.read_text(encoding="utf-8") for k, p in TEXT_FILES.items()}
+
+
+def build_model(texts: dict[str, str]) -> dict:
+    flat = {k: norm(v) for k, v in texts.items()}
+    for key, sentence in PINS:
+        if norm(sentence) not in flat[key]:
+            raise Failure(f"text: pinned sentence missing from {TEXT_FILES[key].relative_to(ROOT)}: {sentence!r}")
+    m: dict = {}
+    post = texts["posture"]
+
+    # Identities
+    ident = section(post, "Identities", 2)
+    m["spki_prefix"] = bytes.fromhex(one(r"12-byte prefix `([0-9a-f]{24})`", ident, "Identities").group(1))
+
+    # The record
+    rec = section(post, "The record", 2)
+    rows = re.findall(r"^\| `([a-z_]+)` \| (.*) \|$", rec, re.M)
+    m["members"] = [r[0] for r in rows]
+    row = dict(rows)
+    m["device_re"] = one(r"matching `(\^[^`]+\$)`", row["device_id"], "device_id row").group(1)
+    rel = one(r"matching `(\^.+?\$)` and at most (\d+) characters", row["release"], "release row")
+    m["release_re"] = rel.group(1).replace("\\|", "|")
+    m["release_max"] = int(rel.group(2))
+    m["profiles"] = re.findall(r"`([a-z]+)`", row["deployment_profile"].split(":")[0])
+    m["hash_re"] = r"sha256:[0-9a-f]{64}"
+    if "`sha256:` followed by 64 lowercase hex characters" not in row["commissioned_binding"]:
+        raise Failure("text: commissioned_binding form changed")
+    m["int_max"] = int(one(r"at most 2\^53 − 1 \((\d+)\)", rec, "Integers").group(1))
+    m["int_min"] = int(one(r"Each is at least `(\d+)`", rec, "Integers").group(1))
+    m["int_members"] = re.findall(r"`([a-z_]+)`", one(r"\*\*Integers\.\*\* (.*?) are each", norm(rec), "Integers").group(1))
+    m["domain"] = one(r"signing input is the ASCII bytes `([^`]+)`, one NUL byte", rec, "Signature").group(1).encode("ascii")
+
+    # Receiving
+    recv = section(post, "Receiving", 2)
+    items = numbered(recv)
+    checks: list[tuple[int, list[str]]] = []
+    for it in items:
+        n = int(it.split(".")[0])
+        reasons = re.findall(r":\s*`([a-z_]+)`[.;]", it)
+        checks.append((n, reasons))
+    if [c[0] for c in checks] != list(range(1, 12)):
+        raise Failure(f"text: Receiving lists checks {[c[0] for c in checks]}, not 1 to 11")
+    m["check_reasons"] = {n: r for n, r in checks}
+    m["skew"] = int(one(r"more than (\d+) ms before the gateway's wall clock at receipt", items[9], "check 10").group(1))
+    if int(one(r"more than (\d+) ms after it", items[9], "check 10").group(1)) != m["skew"]:
+        raise Failure("text: the two skew bounds differ")
+    m["verdicts"] = re.findall(r"- \*\*`([a-z_]+)`\*\*:", items[10])
+    m["regression"] = int(one(r"whose `issued_at_ms` is more than (\d+) ms below the held record's", items[10], "check 11").group(1))
+    m["store_verdict"] = one(r"\*\*`([a-z_]+)`\*\* instead", items[10], "check 11").group(1)
+
+    # Posture state
+    ps = section(post, "Posture state", 2)
+    m["states"] = re.findall(r"^- \*\*`([a-z_]+)`\*\*", ps, re.M)
+    m["unknown_reasons"] = re.findall(r"^  - `([a-z_]+)`:", ps, re.M)
+    st = one(r"`([a-z_]+)` and `([a-z_]+)` are \*\*sticky\*\*", ps, "sticky")
+    m["sticky"] = [st.group(1), st.group(2)]
+    m["age"] = int(one(r"its age is at most (\d+) ms", ps, "current").group(1))
+    if int(one(r"its age is more than (\d+) ms or cannot be computed", ps, "stale").group(1)) != m["age"]:
+        raise Failure("text: current and stale age bounds differ")
+
+    # gateway-api/v2.md
+    ga = texts["gateway_api"]
+    size = section(ga, "Payload Size", 2)
+    m["size_max"] = int(one(r"^\| `ori/\{device_id\}/runtime/posture` \| Runtime -> Gateway \| (\d+) \|", size, "Payload Size", re.M).group(1))
+    m["size_claim"] = int(one(r"One runtime-posture/v1 record, under (\d+) bytes with every member at its bound", size, "Payload Size").group(1))
+    pmr = section(ga, "Payload Member Rule", 2)
+    tab = pmr.split("| Reason | Refused when |", 1)[1].split("\n\n", 1)[0]
+    m["member_rule"] = re.findall(r"^\| `([a-z_]+)` \|", tab, re.M)
+    m["member_depth"] = int(one(r"An object or array sits deeper than (\d+)", tab, "nesting").group(1))
+    if len(m["member_rule"]) != 7 or "seven" not in items[1]:
+        raise Failure("text: the Payload Member Rule does not have the seven reasons check 2 cites")
+
+    def fence_keys(body: str) -> set[str]:
+        out: set[str] = set()
+
+        def walk(v: object) -> None:
+            if isinstance(v, dict):
+                for k, x in v.items():
+                    out.add(k)
+                    walk(x)
+            elif isinstance(v, list):
+                for x in v:
+                    walk(x)
+        for blk in re.findall(r"```json\n(.*?)\n```", body, re.S):
+            walk(json.loads(blk.replace('"sha256:..."', '"x"').replace('"..."', '"x"')))
+        return out
+    prr = section(ga, "Runtime Posture Record", 2)
+    env = section(ga, "Envelope Members", 3)
+    m["record_example_keys"] = fence_keys(prr)
+    m["defined_names"] = fence_keys(prr) | fence_keys(env)
+    if m["record_example_keys"] != set(m["members"]):
+        raise Failure("text: gateway-api/v2 Runtime Posture Record example keys differ from runtime-posture/v1's members")
+    hp = norm(section(ga, "Site Health HTTP Projection", 2))
+    m["carriage"] = ["state", "reason", "record_b64", "received_at_ms"]
+    for c in m["carriage"]:
+        if f"`{c}`" not in one(r"\*\*The runtime posture record\.\*\*(.*?)A node's `posture_record`", hp, "posture_record").group(1):
+            raise Failure(f"text: posture_record no longer names {c}")
+
+    # gateway-config/v2.md
+    gc = texts["gateway_config"]
+    posture_cfg = section(gc, "`posture`", 2)
+    rules = numbered(posture_cfg.split("**Load rules.**", 1)[1])
+    m["config_rules"] = [one(r"^\d+\. `([a-z_]+)`:", r, "config rule").group(1) for r in rules]
+    m["entry_rules"] = [int(x) for x in one(r"Rules (\d+) to (\d+) are judged entry by entry", posture_cfg, "entry").groups()]
+    m["state_dir_rule"] = one(r"load rules are judged before these, so a pin with no state directory is refused there, as `([a-z_]+)`\.",
+                              norm(posture_cfg), "state directory first").group(1)
+    sdl = section(gc, "`gateway.state_directory`", 3).split("**Load rules.**", 1)[1].split("Components compare exactly", 1)[0]
+    m["state_dir_rules"] = re.findall(r"^- `([a-z_]+)`: ", sdl, re.M)
+    if m["state_dir_rule"] not in m["state_dir_rules"]:
+        raise Failure("text: the rule `## posture` cites is not a gateway.state_directory load rule")
+    m["key_prefix"] = one(r"Each value is `([a-z0-9]+:)` followed by canonical padded", posture_cfg, "value").group(1)
+
+    # operator-socket/v3.md
+    osk = texts["operator_socket"]
+    req = section(osk, "Requests on the socket", 3)
+    m["socket_bound"] = int(one(r"A request is at most ([\d,]+) bytes", req, "bound").group(1).replace(",", ""))
+    m["socket_depth"] = int(one(r"nesting deeper than (\d+) levels", req, "depth").group(1))
+    m["socket_operations"] = re.findall(r"^\| `([a-z_]+)` \| \[", req, re.M)
+    rb = section(osk, "Runtime Device Key Readback", 2)
+    m["readback_op"] = one(r"\*\*Request\.\*\* Exactly one member: `operation`, the string `([a-z_]+)`\.", rb, "request").group(1)
+    order = rb.split("**Order of refusal.**", 1)[1].split("**Answer.**", 1)[0]
+    m["readback_codes"] = [one(r": `([a-z_]+)`[.;]$", it, "readback order").group(1) for it in numbered(order)]
+    ans = rb.split("**Answer.**", 1)[1].split("A refusal is", 1)[0]
+    m["readback_result"] = re.findall(r"^- `([a-z_]+)`:", ans, re.M)
+    m["readback_peers"] = ["root", "operator"]
+    if one(r"is not one of the eight operations below or `([a-z_]+)`", req, "operations").group(1) != m["readback_op"]:
+        raise Failure("text: the socket's operation list does not admit the readback")
+    m["socket_operations"].append(m["readback_op"])
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Ed25519, from ed25519-key-admission/v1 and ed25519-verification/v1.
+# ---------------------------------------------------------------------------
+
+P = 2 ** 255 - 19
+L = 2 ** 252 + 27742317777372353535851937790883648493
+D = (-121665 * pow(121666, P - 2, P)) % P
+SQRT_M1 = pow(2, (P - 1) // 4, P)
+IDENT = (0, 1, 1, 0)
+
+
+def _add(a: tuple, b: tuple) -> tuple:
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    aa = (y1 - x1) * (y2 - x2) % P
+    bb = (y1 + x1) * (y2 + x2) % P
+    cc = 2 * D * t1 * t2 % P
+    dd = 2 * z1 * z2 % P
+    e, f, g, h = bb - aa, dd - cc, dd + cc, bb + aa
+    return (e * f % P, g * h % P, f * g % P, e * h % P)
+
+
+def _mul(k: int, pt: tuple) -> tuple:
+    acc = IDENT
+    while k:
+        if k & 1:
+            acc = _add(acc, pt)
+        pt = _add(pt, pt)
+        k >>= 1
+    return acc
+
+
+def _is_ident(pt: tuple) -> bool:
+    x, y, z, _ = pt
+    return x % P == 0 and (y - z) % P == 0
+
+
+def _encode(pt: tuple) -> bytes:
+    x, y, z, _ = pt
+    zi = pow(z, P - 2, P)
+    x, y = x * zi % P, y * zi % P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _decode(raw: bytes) -> tuple[str | None, tuple | None]:
+    """Decode under admission clauses 1 to 3; returns (clause, point)."""
+    n = int.from_bytes(raw, "little")
+    sign = n >> 255
+    y = n & ((1 << 255) - 1)
+    if y >= P:
+        return "non_canonical", None
+    x2 = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    x = pow(x2, (P + 3) // 8, P)
+    if (x * x - x2) % P:
+        x = x * SQRT_M1 % P
+    if (x * x - x2) % P:
+        return "off_curve", None
+    if x == 0 and sign:
+        return "invalid_sign", None
+    if (x & 1) != sign:
+        x = P - x
+    return None, (x, y, 1, x * y % P)
+
+
+BY = 4 * pow(5, P - 2, P) % P
+BASE = _decode(BY.to_bytes(32, "little"))[1]
+
+
+@functools.lru_cache(maxsize=None)
+def admission(raw: bytes) -> str | None:
+    """The clause that refuses a key, or None when admitted."""
+    if len(raw) != 32:
+        return "length"
+    clause, pt = _decode(raw)
+    if clause:
+        return clause
+    if _is_ident(_mul(8, pt)):
+        return "small_order"
+    if not _is_ident(_mul(L, pt)):
+        return "mixed_order"
+    return None
+
+
+def negate(raw: bytes) -> bytes:
+    return raw[:31] + bytes([raw[31] ^ 0x80])
+
+
+def recognised(raw: bytes) -> bytes:
+    return raw[:31] + bytes([raw[31] & 0x7F])
+
+
+def own_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    if admission(pub) is not None or len(sig) != 64:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= L:
+        return False
+    r = sig[:32]
+    if _decode(r)[0] is not None:
+        return False
+    a = _decode(pub)[1]
+    k = int.from_bytes(hashlib.sha512(r + pub + msg).digest(), "little")
+    neg_a = ((P - a[0]) % P, a[1], a[2], (P - a[3]) % P)
+    return _encode(_add(_mul(s, BASE), _mul(k, neg_a))) == r
+
+
+def ossl_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+_VERIFY_CACHE: dict[tuple[bytes, bytes, bytes], bool] = {}
+
+
+def verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    """ed25519-verification/v1, behind ed25519-key-admission/v1."""
+    key = (pub, msg, sig)
+    if key in _VERIFY_CACHE:
+        return _VERIFY_CACHE[key]
+    if admission(pub) is not None:
+        _VERIFY_CACHE[key] = False
+        return False
+    a, b = own_verify(pub, msg, sig), ossl_verify(pub, msg, sig)
+    if a != b:
+        raise Failure(f"verifier disagreement on a signature under {pub.hex()}: own {a}, OpenSSL {b}")
+    _VERIFY_CACHE[key] = a
+    return a
+
+
+def public_from_seed(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return _encode(_mul(a, BASE))
+
+
+def key_identity(raw: bytes, model: dict) -> str:
+    return "sha256:" + hashlib.sha256(model["spki_prefix"] + raw).hexdigest()
+
+
+def canonical_b64(s: object, n: int) -> bytes | None:
+    if not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", s) or len(s) % 4:
+        return None
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except ValueError:
+        return None
+    if len(raw) != n or base64.b64encode(raw).decode("ascii") != s:
+        return None
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# JSON: a strict reader that keeps number tokens, for the Payload Member Rule,
+# the canonical form and the socket's parse.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Num:
+    token: str
+
+
+class Grammar(Exception):
+    pass
+
+
+def fold(name: str) -> str:
+    out = []
+    for ch in name:
+        if "A" <= ch <= "Z":
+            out.append(chr(ord(ch) + 32))
+        elif ch == "ſ":
+            out.append("s")
+        elif ch == "K":
+            out.append("k")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class Reader:
+    def __init__(self, text: str, depth_bound: int, defined: set[str]):
+        self.t, self.i, self.n = text, 0, len(text)
+        self.bound, self.defined = depth_bound, defined
+        self.lone = self.deep = self.dup = self.case = False
+
+    def ws(self) -> None:
+        while self.i < self.n and self.t[self.i] in " \t\n\r":
+            self.i += 1
+
+    def value(self, depth: int) -> object:
+        if self.i >= self.n:
+            raise Grammar("end")
+        c = self.t[self.i]
+        if c in "{[" and depth > self.bound:
+            self.deep = True
+        if c == "{":
+            return self.obj(depth)
+        if c == "[":
+            return self.arr(depth)
+        if c == '"':
+            return self.string()
+        if c == "-" or c.isdigit() and c in "0123456789":
+            return self.number()
+        for lit, v in (("true", True), ("false", False), ("null", None)):
+            if self.t.startswith(lit, self.i):
+                self.i += len(lit)
+                return v
+        raise Grammar(f"unexpected {c!r}")
+
+    def obj(self, depth: int) -> dict:
+        self.i += 1
+        self.ws()
+        out: dict = {}
+        names: list[str] = []
+        if self.i < self.n and self.t[self.i] == "}":
+            self.i += 1
+            return out
+        while True:
+            self.ws()
+            if self.i >= self.n or self.t[self.i] != '"':
+                raise Grammar("name")
+            name = self.string()
+            for other in names:
+                if other == name:
+                    self.dup = True
+                elif fold(other) == fold(name):
+                    self.case = True
+            for d in self.defined:
+                if d != name and fold(d) == fold(name):
+                    self.case = True
+            names.append(name)
+            self.ws()
+            if self.i >= self.n or self.t[self.i] != ":":
+                raise Grammar("colon")
+            self.i += 1
+            self.ws()
+            out[name] = self.value(depth + 1)
+            self.ws()
+            if self.i < self.n and self.t[self.i] == ",":
+                self.i += 1
+                continue
+            if self.i < self.n and self.t[self.i] == "}":
+                self.i += 1
+                return out
+            raise Grammar("object")
+
+    def arr(self, depth: int) -> list:
+        self.i += 1
+        self.ws()
+        out: list = []
+        if self.i < self.n and self.t[self.i] == "]":
+            self.i += 1
+            return out
+        while True:
+            self.ws()
+            out.append(self.value(depth + 1))
+            self.ws()
+            if self.i < self.n and self.t[self.i] == ",":
+                self.i += 1
+                continue
+            if self.i < self.n and self.t[self.i] == "]":
+                self.i += 1
+                return out
+            raise Grammar("array")
+
+    def string(self) -> str:
+        self.i += 1
+        out: list[str] = []
+        while True:
+            if self.i >= self.n:
+                raise Grammar("string end")
+            c = self.t[self.i]
+            if c == '"':
+                self.i += 1
+                return "".join(out)
+            if ord(c) < 0x20:
+                raise Grammar("control")
+            if c != "\\":
+                out.append(c)
+                self.i += 1
+                continue
+            if self.i + 1 >= self.n:
+                raise Grammar("escape")
+            e = self.t[self.i + 1]
+            simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+            if e in simple:
+                out.append(simple[e])
+                self.i += 2
+                continue
+            if e != "u":
+                raise Grammar("escape")
+            hx = self.t[self.i + 2:self.i + 6]
+            if len(hx) < 4 or not re.fullmatch(r"[0-9A-Fa-f]{4}", hx):
+                raise Grammar("short \\u")
+            cu = int(hx, 16)
+            self.i += 6
+            if 0xD800 <= cu <= 0xDBFF:
+                nxt = self.t[self.i:self.i + 6]
+                if re.fullmatch(r"\\u[0-9A-Fa-f]{4}", nxt) and 0xDC00 <= int(nxt[2:], 16) <= 0xDFFF:
+                    lo = int(nxt[2:], 16)
+                    out.append(chr(0x10000 + ((cu - 0xD800) << 10) + (lo - 0xDC00)))
+                    self.i += 6
+                else:
+                    self.lone = True
+                    out.append(chr(cu))
+            elif 0xDC00 <= cu <= 0xDFFF:
+                self.lone = True
+                out.append(chr(cu))
+            else:
+                out.append(chr(cu))
+
+    def number(self) -> Num:
+        s = self.i
+        if self.t[self.i] == "-":
+            self.i += 1
+        if self.i >= self.n or self.t[self.i] not in "0123456789":
+            raise Grammar("number")
+        if self.t[self.i] == "0":
+            self.i += 1
+        else:
+            while self.i < self.n and self.t[self.i] in "0123456789":
+                self.i += 1
+        if self.i < self.n and self.t[self.i] == ".":
+            self.i += 1
+            if self.i >= self.n or self.t[self.i] not in "0123456789":
+                raise Grammar("fraction")
+            while self.i < self.n and self.t[self.i] in "0123456789":
+                self.i += 1
+        if self.i < self.n and self.t[self.i] in "eE":
+            self.i += 1
+            if self.i < self.n and self.t[self.i] in "+-":
+                self.i += 1
+            if self.i >= self.n or self.t[self.i] not in "0123456789":
+                raise Grammar("exponent")
+            while self.i < self.n and self.t[self.i] in "0123456789":
+                self.i += 1
+        return Num(self.t[s:self.i])
+
+
+def member_rule(raw: bytes, model: dict) -> tuple[str | None, object]:
+    """gateway-api/v2 Payload Member Rule: the earliest row that applies."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "invalid_unicode", None
+    r = Reader(text, model["member_depth"], model["defined_names"])
+    hit: set[str] = set()
+    value = None
+    try:
+        r.ws()
+        value = r.value(1)
+        end = r.i
+        r.ws()
+        if r.i < r.n:
+            hit.add("trailing_data")
+        del end
+    except Grammar:
+        hit.add("malformed_json")
+    if r.lone:
+        hit.add("invalid_unicode")
+    if r.deep:
+        hit.add("nesting_too_deep")
+    if r.dup:
+        hit.add("duplicate_member")
+    if r.case:
+        hit.add("case_variant_member")
+    if "malformed_json" not in hit and not isinstance(value, dict):
+        hit.add("not_an_object")
+    for reason in model["member_rule"]:
+        if reason in hit:
+            return reason, None
+    return None, value
+
+
+def enc_str(s: str) -> str:
+    out = ['"']
+    for ch in s:
+        o = ord(ch)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == "\\":
+            out.append("\\\\")
+        elif o < 0x20:
+            out.append({8: "\\b", 12: "\\f", 10: "\\n", 13: "\\r", 9: "\\t"}.get(o, "\\u%04x" % o))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def canon(v: object) -> str:
+    """gateway-mqtt-canonical-json/v1: sorted keys, no whitespace, number tokens kept."""
+    if isinstance(v, dict):
+        return "{" + ",".join(enc_str(k) + ":" + canon(v[k]) for k in sorted(v)) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(canon(x) for x in v) + "]"
+    if isinstance(v, str):
+        return enc_str(v)
+    if isinstance(v, Num):
+        return v.token
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if v is None:
+        return "null"
+    raise Failure(f"canon: {v!r}")
+
+
+# ---------------------------------------------------------------------------
+# The receiver: checks 1 to 10 and check 11, with switchable faults.
+# ---------------------------------------------------------------------------
+
+def int_ok(v: object, model: dict, mut: frozenset) -> bool:
+    if not isinstance(v, Num) or not re.fullmatch(r"0|[1-9][0-9]*", v.token):
+        return False
+    n = int(v.token)
+    return model["int_min"] <= n <= model["int_max"]
+
+
+def form_faults(obj: dict, model: dict, mut: frozenset) -> list[str]:
+    """The members out of form; empty when the object is a record."""
+    bad: list[str] = []
+    members = model["members"]
+    for k in obj:
+        if k not in members:
+            bad.append(f"unknown:{k}")
+    for k in members:
+        if k not in obj:
+            bad.append(f"missing:{k}")
+            continue
+        v = obj[k]
+        ok = True
+        if k in model["int_members"]:
+            ok = int_ok(v, model, mut)
+            if k == "v":
+                ok = ok and v.token == "1"
+        elif k == "device_id":
+            ok = isinstance(v, str) and v.isascii() and re.fullmatch(model["device_re"], v) is not None
+        elif k == "release":
+            ok = v is None or (isinstance(v, str) and v.isascii() and len(v) <= model["release_max"]
+                               and re.fullmatch(model["release_re"], v) is not None)
+        elif k == "deployment_profile":
+            ok = isinstance(v, str) and v in model["profiles"]
+        elif k == "commissioned_binding":
+            ok = v is None or (isinstance(v, str) and re.fullmatch(model["hash_re"], v) is not None)
+        elif k == "key_identity":
+            ok = isinstance(v, str) and re.fullmatch(model["hash_re"], v) is not None
+        elif k == "signature":
+            ok = canonical_b64(v, 64) is not None
+        else:
+            raise Failure(f"model: no form for member {k}")
+        if not ok:
+            bad.append(k)
+    return bad
+
+
+def parse_pin(value: str, model: dict) -> bytes | None:
+    if not isinstance(value, str) or not value.startswith(model["key_prefix"]):
+        return None
+    return canonical_b64(value[len(model["key_prefix"]):], 32)
+
+
+@dataclass
+class Message:
+    raw: bytes
+    topic: str
+    configured: list[str]
+    pins: dict[str, bytes]
+    wall: int
+
+
+def signing_input(obj: dict, model: dict) -> bytes:
+    body = {k: v for k, v in obj.items() if k != "signature"}
+    return model["domain"] + b"\x00" + canon(body).encode("utf-8")
+
+
+CHECK_ORDER = ["size", "members", "not_canonical", "malformed", "unknown_device",
+               "device_mismatch", "no_pinned_key", "key_mismatch", "signature_invalid", "skew"]
+
+
+def check_order(model: dict, mut: frozenset) -> list[str]:
+    reasons = model["check_reasons"]
+    by_number = {1: "size", 2: "members"}
+    for n in range(3, 11):
+        r = reasons[n]
+        by_number[n] = "skew" if r == ["stale_timestamp", "future_timestamp"] else (r[0] if len(r) == 1 else None)
+        if by_number[n] is None:
+            raise Failure(f"text: check {n} names {r}")
+    order = [by_number[n] for n in range(1, 11)]
+    for m in mut:
+        if m.startswith("swap:"):
+            a, b = m[5:].split(",")
+            i, j = order.index(a), order.index(b)
+            order[i], order[j] = order[j], order[i]
+    if "skip_not_canonical" in mut:
+        order.remove("not_canonical")
+    return order
+
+
+def judge(msg: Message, model: dict, mut: frozenset) -> tuple[list[str], dict | None]:
+    """Every check of 1 to 10 that fails, in the model's order, and the record."""
+    fails: list[str] = []
+    obj = None
+    reason = None
+    if len(msg.raw) > model["size_max"]:
+        return ["payload_too_large"], None
+    reason, obj = member_rule(msg.raw, model)
+    if reason:
+        return [reason], None
+    is_canon = canon(obj).encode("utf-8") == msg.raw
+    bad = form_faults(obj, model, mut)
+    rec = obj if not bad else None
+    pin = msg.pins.get(msg.topic)
+
+    def result(name: str) -> str | None:
+        if name in ("size", "members"):
+            return None
+        if name == "not_canonical":
+            return None if is_canon else "not_canonical"
+        if name == "malformed":
+            return "malformed" if bad else None
+        if name == "unknown_device":
+            return None if msg.topic in msg.configured else "unknown_device"
+        if rec is None:
+            return None
+        if name == "device_mismatch":
+            return "device_mismatch" if rec["device_id"] != msg.topic else None
+        if name == "no_pinned_key":
+            return None if pin is not None else "no_pinned_key"
+        if name == "key_mismatch":
+            if pin is None:
+                return None
+            if "key_check_recognised" in mut:
+                named = [k for k in msg.pins.values() if key_identity(k, model) == rec["key_identity"]]
+                named += [k for k in ALL_TEST_KEYS + [negate(t) for t in ALL_TEST_KEYS]
+                          if key_identity(k, model) == rec["key_identity"]]
+                same = any(recognised(k) == recognised(pin) for k in named)
+                return None if same else "key_mismatch"
+            return None if rec["key_identity"] == key_identity(pin, model) else "key_mismatch"
+        if name == "signature_invalid":
+            if pin is None:
+                return None
+            sig = canonical_b64(rec["signature"], 64)
+            return None if verify(pin, signing_input(rec, model), sig) else "signature_invalid"
+        if name == "skew":
+            issued = int(rec["issued_at_ms"].token)
+            bound = model["skew"]
+            past = msg.wall - issued > bound if "skew_past_inclusive" not in mut else msg.wall - issued >= bound
+            fut = issued - msg.wall > bound if "skew_future_inclusive" not in mut else issued - msg.wall >= bound
+            if past:
+                return "stale_timestamp"
+            if fut:
+                return "future_timestamp"
+            return None
+        raise Failure(f"model: unknown check {name}")
+
+    for name in check_order(model, mut):
+        r = result(name)
+        if r:
+            fails.append(r)
+    return fails, (rec if not fails else rec)
+
+
+ALL_TEST_KEYS: list[bytes] = []
+
+
+@dataclass
+class Held:
+    raw: bytes
+    pair: tuple[int, int]
+    issued: int
+    recv_wall: int
+    recv_mono: int
+    run: int
+    sticky: str | None = None
+
+
+@dataclass
+class Gateway:
+    configured: list[str]
+    pins: dict[str, bytes]
+    store_readable: bool
+    run: int = 0
+    store: dict = field(default_factory=dict)
+
+    def slot(self, device: str, mut: frozenset) -> tuple | None:
+        pin = self.pins.get(device)
+        if pin is None:
+            return None
+        return (device, pin if "state_by_encoding" in mut else recognised(pin))
+
+
+def report(gw: Gateway, device: str, mono: int, wall: int, model: dict, mut: frozenset) -> dict:
+    h = gw.store.get(gw.slot(device, mut)) if gw.store_readable and device in gw.pins else None
+    holds = {
+        # Each reason's own condition; which one is the reason is the text's
+        # list order alone ("the first that holds is the reason").
+        "no_pinned_key": device not in gw.pins,
+        "no_record": h is None,
+        "store_unavailable": not gw.store_readable,
+        "lower_tuple_seen": h is not None and h.sticky == "lower_tuple_seen",
+        "conflict": h is not None and h.sticky == "conflict",
+    }
+    if "store_reads_no_record" in mut and not gw.store_readable:
+        holds["store_unavailable"], holds["no_record"] = False, True
+    order = list(model["unknown_reasons"])
+    if "store_over_pin" in mut:
+        order.remove("store_unavailable")
+        order.insert(0, "store_unavailable")
+    if "record_over_store" in mut:
+        i, j = order.index("store_unavailable"), order.index("no_record")
+        order[i], order[j] = order[j], order[i]
+    for r in order:
+        if holds[r]:
+            out = {"state": "unknown", "reason": r}
+            if "carry_under_unknown" in mut and h is not None:
+                out["record_b64"] = base64.b64encode(h.raw).decode()
+            return out
+    if h.sticky:
+        out = {"state": "unknown", "reason": h.sticky}
+        if "carry_under_unknown" in mut:
+            out["record_b64"] = base64.b64encode(h.raw).decode()
+        return out
+    computable = h.run == gw.run or "mono_across_restart" in mut
+    state = "stale"
+    if computable:
+        receipt = h.recv_wall - h.issued
+        if "age_not_floored" not in mut:
+            receipt = max(0, receipt)
+        if "age_no_receipt" in mut:
+            receipt = 0
+        elapsed = (wall - h.recv_wall) if "age_wall_clock" in mut else (mono - h.recv_mono)
+        if elapsed < 0 and "age_wall_clock" not in mut:
+            raise Failure("corpus: the monotonic clock goes back within a run")
+        age = receipt + elapsed
+        current = age <= model["age"] if "age_edge_exclusive" not in mut else age < model["age"]
+        state = "current" if current else "stale"
+        report.ages.append((age, state))
+    received = h.issued if "received_is_issued" in mut else h.recv_wall
+    return {"state": state, "record_b64": base64.b64encode(h.raw).decode(), "received_at_ms": received}
+
+
+report.ages = []  # type: ignore[attr-defined]
+
+
+def set_sticky(h: Held, reason: str, mut: frozenset) -> None:
+    if "sticky_first_kept" in mut and h.sticky:
+        return
+    h.sticky = reason
+
+
+def receive(gw: Gateway, msg: Message, mono: int, model: dict, mut: frozenset, notes: list) -> str:
+    fails, rec = judge(msg, model, mut)
+    if "store_before_checks" in mut and not gw.store_readable:
+        return model["store_verdict"]
+    if fails:
+        if "refusal_clears_sticky" in mut:
+            k = gw.slot(msg.topic, mut)
+            if k in gw.store:
+                gw.store[k].sticky = None
+        return fails[0]
+    if not gw.store_readable and "no_store_check" not in mut:
+        return model["store_verdict"]
+    key = gw.slot(msg.topic, mut)
+    pair = (int(rec["boot_generation"].token), int(rec["posture_seq"].token))
+    if "pair_seq_first" in mut:
+        pair = (pair[1], pair[0])
+    issued = int(rec["issued_at_ms"].token)
+    h = gw.store.get(key)
+    new = Held(msg.raw, pair, issued, msg.wall, mono, gw.run)
+    if h is None:
+        gw.store[key] = new
+        return "accepted"
+    if pair > h.pair:
+        regress = h.issued - issued
+        notes.append(("regression", regress))
+        bound = model["regression"]
+        conflict = regress > bound if "regression_inclusive" not in mut else regress >= bound
+        if conflict and "no_regression_conflict" not in mut:
+            set_sticky(h, "conflict", mut)
+            return "conflict"
+        gw.store[key] = new
+        return "accepted"
+    if pair == h.pair:
+        if msg.raw == h.raw or "equal_pair_replayed" in mut:
+            if "replay_refreshes" in mut:
+                h.recv_mono, h.run = mono, gw.run
+            if "replay_clears_sticky" in mut:
+                h.sticky = None
+            return "replayed"
+        if "conflict_not_sticky" not in mut:
+            set_sticky(h, "conflict", mut)
+        return "conflict"
+    if "lower_not_sticky" not in mut:
+        set_sticky(h, "lower_tuple_seen", mut)
+    return "lower_tuple"
+
+
+# ---------------------------------------------------------------------------
+# gateway-config/v2 posture load rules, operator-socket/v3 readback.
+# ---------------------------------------------------------------------------
+
+def load_config(case: dict, model: dict, mut: frozenset) -> str | None:
+    rules = list(model["config_rules"])
+    lo, hi = model["entry_rules"]
+    entry_rules = rules[lo - 1:hi]
+    for m in mut:
+        if m.startswith("cfg_drop:") and m[9:] in rules:
+            r = m[9:]
+            if r in entry_rules:
+                entry_rules.remove(r)
+            rules.remove(r)
+        if m.startswith("cfg_swap_entry:"):
+            a, b = m[15:].split(",")
+            i, j = entry_rules.index(a), entry_rules.index(b)
+            entry_rules[i], entry_rules[j] = entry_rules[j], entry_rules[i]
+    keys = case["runtime_keys"]
+    names = list(keys) if "cfg_given_order" in mut else sorted(keys)
+    device_ids = case["device_ids"]
+
+    def entry_fault(dev: str, rule: str) -> bool:
+        val = keys[dev]
+        raw = parse_pin(val, model)
+        if rule == "unknown_device":
+            return dev not in device_ids
+        if rule == "malformed_key":
+            return raw is None
+        if rule == "inadmissible_key":
+            return raw is not None and admission(raw) is not None
+        raise Failure(f"model: {rule} is not an entry rule")
+
+    def dup() -> bool:
+        seen = set()
+        for dev in names:
+            raw = parse_pin(keys[dev], model)
+            if raw is None:
+                continue
+            ident = raw if "cfg_dup_by_encoding" in mut else recognised(raw)
+            if ident in seen:
+                return True
+            seen.add(ident)
+        return False
+
+    def global_fault(rule: str) -> bool:
+        if rule == "duplicate_key":
+            return dup()
+        raise Failure(f"model: {rule} is not a global rule")
+
+    tail = [r for r in rules if r not in model["config_rules"][lo - 1:hi]]
+    sd = case["state_directory"]
+    sd = sd.strip() if isinstance(sd, str) else sd
+    if sd == "":
+        sd = None
+
+    def state_dir_fault() -> str | None:
+        # gateway.state_directory, in the text's order. The corpus note states
+        # gateway.auth and evidence disabled.
+        tests = {
+            "required_under_auth": lambda: False,
+            "required_under_posture": lambda: bool(keys) and sd is None,
+            "absolute": lambda: sd is not None and not sd.startswith("/"),
+            "separate_from_evidence_queues": lambda: False,
+        }
+        for r in model["state_dir_rules"]:
+            if f"cfg_drop:{r}" in mut:
+                continue
+            if r not in tests:
+                raise Failure(f"model: no test for gateway.state_directory rule {r}")
+            if tests[r]():
+                return r
+        return None
+    if "cfg_state_dir_last" not in mut:
+        r = state_dir_fault()
+        if r:
+            return r
+    if "cfg_global_first" in mut:
+        for r in tail:
+            if global_fault(r):
+                return r
+    if "cfg_rule_by_rule" in mut:
+        for r in entry_rules:
+            for dev in names:
+                if entry_fault(dev, r):
+                    return r
+    else:
+        for dev in names:
+            for r in entry_rules:
+                if entry_fault(dev, r):
+                    return r
+    for r in tail:
+        if global_fault(r):
+            return r
+    if "cfg_state_dir_last" in mut:
+        return state_dir_fault()
+    return None
+
+
+def readback(case: dict, model: dict, mut: frozenset) -> dict:
+    key = parse_pin(case["posture_key"], model)
+    if key is None or admission(key) is not None:
+        raise Failure(f"readback.{case['name']}: posture_key is not an admitted key")
+    raw = case["request"].encode("utf-8")
+    if b"\n" in raw:
+        raw = raw.split(b"\n", 1)[0]
+    codes = list(model["readback_codes"])
+    for m in mut:
+        if m.startswith("rb_swap:"):
+            a, b = m[8:].split(",")
+            i, j = codes.index(a), codes.index(b)
+            codes[i], codes[j] = codes[j], codes[i]
+        if m.startswith("rb_drop:"):
+            codes.remove(m[8:])
+
+    def form_ok() -> bool:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        r = Reader(text, model["socket_depth"], set())
+        try:
+            r.ws()
+            v = r.value(1)
+            r.ws()
+            if r.i < r.n:
+                return False
+        except Grammar:
+            return False
+        if r.lone or r.deep or r.dup or not isinstance(v, dict):
+            return False
+        if not isinstance(v.get("operation"), str) or v["operation"] not in model["socket_operations"]:
+            return False
+        return set(v) == {"operation"} and v["operation"] == model["readback_op"]
+
+    tests = {
+        "payload_too_large": lambda: len(raw) > model["socket_bound"],
+        "invalid_arguments": lambda: not form_ok(),
+        "unauthenticated": lambda: case["peer"] not in model["readback_peers"],
+        "key_unavailable": lambda: not case["key_loaded"],
+    }
+    for code in codes:
+        if tests[code]():
+            return {"schema_version": 1, "ok": False, "error": {"code": code}}
+    pub = model["key_prefix"] + base64.b64encode(key).decode()
+    return {"schema_version": 1, "ok": True, "result": {"device_id": case["device_id"], "public_key": pub,
+                                   "key_identity": key_identity(key, model)}}
+
+
+# ---------------------------------------------------------------------------
+# The corpus check.
+# ---------------------------------------------------------------------------
+
+def check(corpus: dict, model: dict, mut: frozenset = frozenset(), first: bool = False) -> list[str]:
+    errs: list[str] = []
+
+    def bad(msg: str) -> None:
+        errs.append(msg)
+        if first:
+            raise Failure(msg)
+
+    try:
+        _check(corpus, model, mut, bad)
+    except Failure as e:
+        if not errs or errs[-1] != str(e):
+            errs.append(str(e))
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as e:
+        errs.append(f"corpus: shape: {type(e).__name__}: {e}")
+    return errs
+
+
+def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> None:
+    if corpus.get("contract") != "runtime-posture/v1":
+        bad("corpus: contract is not runtime-posture/v1")
+    # Keys
+    keys: dict[str, bytes] = {}
+    for label, entry in corpus["test_keys"].items():
+        seed = hashlib.sha256(f"ori runtime-posture/v1 posture {label} test key".encode()).digest()
+        pub = public_from_seed(seed)
+        if parse_pin(entry["public_key"], model) != pub:
+            bad(f"test_keys.{label}: public_key is not the key of its disclosed seed")
+        if entry["key_identity"] != key_identity(pub, model):
+            bad(f"test_keys.{label}: key_identity is not SHA-256 of its SPKI DER")
+        if admission(pub) is not None:
+            bad(f"test_keys.{label}: refused by admission")
+        keys[label] = pub
+        if "ori runtime-posture/v1 <label> test key" not in corpus["note"]["keys"]:
+            bad("corpus: the seed note changed")
+    ALL_TEST_KEYS[:] = list(keys.values())
+    if len(keys) < 2 or recognised(keys["A"]) == recognised(keys["B"]):
+        bad("test_keys: two distinct recognised keys are needed")
+
+    # Text self-consistency: a record with every member at its bound.
+    maxrec = {
+        "v": Num("1"), "device_id": "d" * 128, "release": "9" * (model["release_max"] - 9) + ".0.0-rc.1",
+        "deployment_profile": max(model["profiles"], key=len), "commissioned_binding": "sha256:" + "0" * 64,
+        "key_identity": "sha256:" + "0" * 64, "boot_generation": Num(str(model["int_max"])),
+        "posture_seq": Num(str(model["int_max"])), "issued_at_ms": Num(str(model["int_max"])),
+        "signature": base64.b64encode(bytes(64)).decode(),
+    }
+    if form_faults(maxrec, model, frozenset()):
+        bad("model: the maximal record is not a record")
+    maxlen = len(canon(maxrec).encode())
+    if not maxlen < model["size_claim"] <= model["size_max"]:
+        bad(f"text: the maximal record is {maxlen} bytes, not under {model['size_claim']}")
+
+    # Record cases
+    seen_verdicts: set[str] = set()
+    skew_points: set[tuple[str, int]] = set()
+    precedence: set[tuple[str, str]] = set()
+    malformed_members: set[str] = set()
+    bound_pass: set[str] = set()
+    for c in corpus["records"]:
+        where = f"records.{c['name']}"
+        raw = c["record"].encode("utf-8")
+        pins = {}
+        for dev, val in c["pinned_keys"].items():
+            pk = parse_pin(val, model)
+            if pk is None or admission(pk) is not None:
+                bad(f"{where}: pinned key for {dev} would not load")
+                continue
+            pins[dev] = pk
+        msg = Message(raw, c["topic_device"], c["configured_devices"], pins, c["gateway_wall_ms"])
+        fails, rec = judge(msg, model, mut)
+        if fails and fails[0] in model["member_rule"] + ["payload_too_large"]:
+            bad(f"{where}: refused at check 1 or 2 ({fails[0]}), which the record corpus does not hold")
+            continue
+        got = fails[0] if fails else "pass"
+        if got != c["expected"]:
+            bad(f"{where}: verdict {got}, corpus says {c['expected']}")
+        seen_verdicts.add(got)
+        if len(fails) >= 2:
+            precedence.add((fails[0], fails[1]))
+        if ("precedence" in c["name"] or "_over_" in c["name"]) and len(fails) < 2:
+            bad(f"{where}: a precedence case fails only one check: {fails}")
+        status, obj = member_rule(raw, model)
+        if obj is not None:
+            ff = form_faults(obj, model, frozenset())
+            if got == "malformed":
+                if len(ff) == 1:
+                    malformed_members.add(ff[0].split(":")[0] if ":" in ff[0] else ff[0])
+            if not ff and isinstance(obj.get("issued_at_ms"), Num):
+                delta = c["gateway_wall_ms"] - int(obj["issued_at_ms"].token)
+                if not fails or fails == ["stale_timestamp"] or fails == ["future_timestamp"]:
+                    skew_points.add((got, delta))
+            if got == "pass":
+                if len(obj["device_id"]) == 128:
+                    bound_pass.add("device_id")
+                if isinstance(obj["release"], str) and len(obj["release"]) == model["release_max"]:
+                    bound_pass.add("release")
+                for k in ("boot_generation", "posture_seq", "issued_at_ms"):
+                    if int(obj[k].token) == model["int_max"]:
+                        bound_pass.add(k)
+                if obj["release"] is None:
+                    bound_pass.add("release_null")
+                if obj["commissioned_binding"] is None:
+                    bound_pass.add("binding_null")
+            # Declared constructions of signature refusals.
+            if not ff and got in ("signature_invalid", "key_mismatch") and not mut:
+                sig = canonical_b64(obj["signature"], 64)
+                si = signing_input(obj, model)
+                if c["name"].endswith("other_key") and not verify(keys["B"], si, sig):
+                    bad(f"{where}: declared signed by key B, but B's signature does not verify")
+                if c["name"].endswith("no_domain"):
+                    plain = canon({k: v for k, v in obj.items() if k != "signature"}).encode()
+                    if not verify(keys["A"], plain, sig):
+                        bad(f"{where}: declared signed without the domain prefix, but it does not verify so")
+                if c["name"] == "key_mismatch" and not verify(keys["B"], si, sig):
+                    bad(f"{where}: declared signed by key B, but it does not verify under B")
+                if "negated" in c["name"]:
+                    neg = negate(keys["A"])
+                    if admission(neg) is not None or obj["key_identity"] != key_identity(neg, model) or not verify(neg, si, sig):
+                        bad(f"{where}: declared signed under A's negation and naming it, but it is not")
+                if c["name"].endswith("flipped") and (verify(keys["A"], si, sig) or verify(keys["B"], si, sig)):
+                    bad(f"{where}: declared corrupted, but it verifies")
+            if got == "pass" and not mut:
+                named = [k for k in keys.values() if key_identity(k, model) == obj["key_identity"]]
+                if not named:
+                    bad(f"{where}: a passing record names no test key")
+
+    def need(cond: bool, what: str) -> None:
+        if not cond:
+            bad(f"coverage: {what}")
+
+    record_reasons = ["pass"] + [r for n in range(3, 11) for r in model["check_reasons"][n]]
+    for r in record_reasons:
+        need(r in seen_verdicts, f"no record case gives {r}")
+    sk = model["skew"]
+    for pt in (("pass", sk), ("pass", -sk), ("stale_timestamp", sk + 1), ("future_timestamp", -sk - 1)):
+        need(pt in skew_points, f"no record case at the skew edge {pt}")
+    order = check_order(model, frozenset())
+    reasons_in_order = []
+    for name in order[2:]:
+        reasons_in_order.append(["stale_timestamp", "future_timestamp"] if name == "skew" else [name])
+    # Every adjacent pair of checks 3 to 10 must be exercised in precedence,
+    # except where the later check cannot be judged once the earlier one fails.
+    unjudgeable = {("no_pinned_key", "key_mismatch")}
+    for i in range(len(reasons_in_order) - 1):
+        a, b = reasons_in_order[i], reasons_in_order[i + 1]
+        if (a[0], b[0]) in unjudgeable:
+            continue
+        need(any((x, y) in precedence for x in a for y in b), f"no record case puts {a[0]} ahead of {b[0]}")
+    for k in model["members"]:
+        need(k in malformed_members, f"no malformed case with {k} alone out of form")
+    for k in ("device_id", "release", "boot_generation", "posture_seq", "release_null", "binding_null"):
+        need(k in bound_pass, f"no passing record with {k} at its bound")
+
+    # Sequences
+    verdicts_seen: set[str] = set()
+    states_seen: set[tuple] = set()
+    edges: dict[str, bool] = {}
+    for s in corpus["sequences"]:
+        where = f"sequences.{s['name']}"
+        if len(s["configured_devices"]) != 1:
+            bad(f"{where}: a sequence's state is one device's; this one configures {len(s['configured_devices'])}")
+            continue
+        device = s["configured_devices"][0]
+        pins = {d: parse_pin(v, model) for d, v in s["pinned_keys"].items()}
+        gw = Gateway(list(s["configured_devices"]), pins, s["store_readable"])
+        prev_wall_for_skew = None
+        del prev_wall_for_skew
+        sticky_held_on_refusal = False
+        for n, e in enumerate(s["events"]):
+            ew = f"{where}.events[{n}]"
+            report.ages = []
+            notes: list = []
+            got: dict = {}
+            if e["event"] == "receive":
+                before = report(gw, device, e["mono_ms"], e["wall_ms"], model, frozenset())
+                msg = Message(e["record"].encode("utf-8"), e["topic_device"], gw.configured, gw.pins, e["wall_ms"])
+                v = receive(gw, msg, e["mono_ms"], model, mut, notes)
+                got["verdict"] = v
+                verdicts_seen.add(v)
+                if v in [r for n2 in range(3, 11) for r in model["check_reasons"][n2]] and before.get("reason") in model["sticky"]:
+                    sticky_held_on_refusal = True
+                if not gw.store_readable and v in [r for n2 in range(3, 11) for r in model["check_reasons"][n2]]:
+                    edges["refusal_store_unreadable"] = True
+                after_reason = report(gw, device, e["mono_ms"], e["wall_ms"], model, frozenset()).get("reason")
+                if before.get("reason") in model["sticky"] and after_reason in model["sticky"] and after_reason != before.get("reason"):
+                    edges["sticky_replaced"] = True
+                if v == "replayed" and before.get("reason") in model["sticky"]:
+                    edges["replay_with_sticky"] = True
+                if v in [r for n2 in range(3, 11) for r in model["check_reasons"][n2]]:
+                    edges["refusal_in_sequence"] = True
+                for kind, val in notes:
+                    if kind == "regression":
+                        edges[f"regression:{val}:{v}"] = True
+            elif e["event"] == "restart":
+                gw.run += 1
+                if "pinned_keys" in e:
+                    newpins = {d: parse_pin(v, model) for d, v in e["pinned_keys"].items()}
+                    for d, k in newpins.items():
+                        old = gw.pins.get(d)
+                        if old is not None and k != old and recognised(k) == recognised(old):
+                            edges["repin_negation"] = True
+                        if old is not None and k != old:
+                            edges["repin"] = True
+                    if "repin_resets" in mut and newpins != gw.pins:
+                        gw.store.clear()
+                    gw.pins = newpins
+                if "sticky_lost_on_restart" in mut:
+                    for h in gw.store.values():
+                        h.sticky = None
+                edges["restart"] = True
+            elif e["event"] != "observe":
+                bad(f"{ew}: unknown event {e['event']!r}")
+                continue
+            if device not in gw.pins and not gw.store_readable:
+                edges["no_pin_store_unreadable"] = True
+            st = report(gw, device, e["mono_ms"], e["wall_ms"], model, mut)
+            for age, state in report.ages:
+                edges[f"age:{age - model['age']}:{state}"] = True
+            if e["event"] == "restart" and st["state"] == "stale":
+                edges["stale_after_restart"] = True
+            if e["event"] == "restart" and st.get("reason") in model["sticky"]:
+                edges["sticky_after_restart"] = True
+            got.update(st)
+            states_seen.add((st["state"], st.get("reason")))
+            if got != e["expected"]:
+                bad(f"{ew}: got {got}, corpus says {e['expected']}")
+        if sticky_held_on_refusal:
+            edges["refusal_with_sticky"] = True
+    for v in model["verdicts"] + [model["store_verdict"]]:
+        need(v in verdicts_seen, f"no sequence receive gives {v}")
+    for st in model["states"]:
+        if st != "unknown":
+            need((st, None) in states_seen, f"no sequence reaches {st}")
+    for r in model["unknown_reasons"]:
+        need(("unknown", r) in states_seen, f"no sequence reaches unknown({r})")
+    rb = model["regression"]
+    need(edges.get(f"regression:{rb}:accepted", False), f"no higher record exactly {rb} ms below the held one, accepted")
+    need(edges.get(f"regression:{rb + 1}:conflict", False), f"no higher record {rb + 1} ms below the held one, conflict")
+    need(edges.get("age:0:current", False), f"no observation at age exactly {model['age']} ms, current")
+    need(edges.get("age:1:stale", False), f"no observation at age {model['age'] + 1} ms, stale")
+    for k, what in (("stale_after_restart", "a held record stale after a restart"),
+                    ("sticky_after_restart", "a sticky reason across a restart"),
+                    ("replay_with_sticky", "a replay while a sticky reason is held"),
+                    ("refusal_in_sequence", "a refusal at checks 3 to 10 within a sequence"),
+                    ("refusal_with_sticky", "a refusal at checks 3 to 10 while a sticky reason is held"),
+                    ("repin", "a pin changed across a restart"),
+                    ("sticky_replaced", "a later sticky reason replacing an earlier one"),
+                    ("refusal_store_unreadable", "a refusal at checks 3 to 10 while the store is unreadable"),
+                    ("no_pin_store_unreadable", "a device with no pin while the store is unreadable, which reads no_pinned_key"),
+                    ("repin_negation", "a pin changed to the negation of the held key, which shares its state")):
+        need(edges.get(k, False), f"no sequence with {what}")
+
+    # Config
+    if "with gateway.auth and evidence disabled" not in corpus["note"]["config"]:
+        bad("corpus: the config note no longer states gateway.auth and evidence disabled, which the loader assumes")
+    rules_seen: set = set()
+    for c in corpus["config"]:
+        where = f"config.{c['name']}"
+        sd = c["state_directory"]
+        if sd is not None and not isinstance(sd, str):
+            bad(f"{where}: state_directory is not a string")
+        got = load_config(c, model, mut)
+        want = None if c["valid"] else c.get("rule")
+        if c["valid"] and "rule" in c:
+            bad(f"{where}: a valid case names a rule")
+        if got != want:
+            bad(f"{where}: loader says {got or 'valid'}, corpus says {want or 'valid'}")
+        rules_seen.add(got)
+        if not mut:
+            # Order evidence: what each other rule order would have named.
+            for alt in ("cfg_rule_by_rule", "cfg_given_order", "cfg_global_first", "cfg_state_dir_last"):
+                if load_config(c, model, frozenset([alt])) != got:
+                    edges[f"cfg_order:{alt}"] = True
+    for r in [None, model["state_dir_rule"]] + model["config_rules"]:
+        need(r in rules_seen, f"no config case gives {r or 'valid'}")
+    for alt, what in (("cfg_rule_by_rule", "entry-by-entry judging (an earlier entry's later rule before a later entry's earlier rule)"),
+                      ("cfg_given_order", "code point order of entries differing from the order given"),
+                      ("cfg_global_first", "rules 1 to 3 before rule 4"),
+                      ("cfg_state_dir_last", "the gateway.state_directory rules before the posture rules")):
+        if not mut:
+            need(edges.get(f"cfg_order:{alt}", False), f"no config case distinguishes {what}")
+
+    # Readback
+    codes_seen: set = set()
+    peers_ok: set = set()
+    rb_pairs: set = set()
+    for c in corpus["readback"]:
+        where = f"readback.{c['name']}"
+        got = readback(c, model, mut)
+        want = copy.deepcopy(c["expected"])
+        if isinstance(want.get("error"), dict):
+            want["error"].pop("detail", None)
+        if got != want:
+            bad(f"{where}: server says {got}, corpus says {c['expected']}")
+        if got["ok"]:
+            peers_ok.add(c["peer"])
+        else:
+            codes_seen.add(got["error"]["code"])
+        if not mut:
+            fails = [code for code in model["readback_codes"]
+                     if not readback(c, model, frozenset(f"rb_drop:{x}" for x in model["readback_codes"] if x != code))["ok"]]
+            for i in range(len(fails) - 1):
+                rb_pairs.add((fails[i], fails[i + 1]))
+    for code in model["readback_codes"]:
+        need(code in codes_seen, f"no readback case gives {code}")
+    for p in model["readback_peers"]:
+        need(p in peers_ok, f"no readback answered to {p}")
+    rc = model["readback_codes"]
+    if not mut:
+        for i in range(len(rc) - 1):
+            need((rc[i], rc[i + 1]) in rb_pairs, f"no readback case puts {rc[i]} ahead of {rc[i + 1]}")
+
+
+# ---------------------------------------------------------------------------
+# Mutations
+# ---------------------------------------------------------------------------
+
+RECEIVER_MUTANTS = [
+    "swap:not_canonical,malformed",
+    "swap:malformed,unknown_device",
+    "swap:unknown_device,device_mismatch",
+    "swap:device_mismatch,no_pinned_key",
+    "swap:device_mismatch,key_mismatch",
+    "swap:key_mismatch,signature_invalid",
+    "swap:signature_invalid,skew",
+    "skip_not_canonical",
+    "skew_past_inclusive",
+    "skew_future_inclusive",
+    "age_no_receipt",
+    "age_wall_clock",
+    "age_not_floored",
+    "age_edge_exclusive",
+    "mono_across_restart",
+    "replay_refreshes",
+    "replay_clears_sticky",
+    "refusal_clears_sticky",
+    "sticky_lost_on_restart",
+    "repin_resets",
+    "state_by_encoding",
+    "key_check_recognised",
+    "no_regression_conflict",
+    "regression_inclusive",
+    "pair_seq_first",
+    "lower_not_sticky",
+    "conflict_not_sticky",
+    "equal_pair_replayed",
+    "no_store_check",
+    "store_before_checks",
+    "store_reads_no_record",
+    "carry_under_unknown",
+    "received_is_issued",
+    "sticky_first_kept",
+    "store_over_pin",
+    "record_over_store",
+]
+
+CONFIG_MUTANTS = [
+    "cfg_drop:unknown_device", "cfg_drop:malformed_key", "cfg_drop:inadmissible_key",
+    "cfg_drop:duplicate_key", "cfg_drop:required_under_posture", "cfg_state_dir_last",
+    "cfg_swap_entry:unknown_device,malformed_key",
+    "cfg_rule_by_rule", "cfg_given_order", "cfg_global_first",
+    "cfg_dup_by_encoding",
+]
+
+READBACK_MUTANTS = [
+    "rb_swap:payload_too_large,invalid_arguments",
+    "rb_swap:invalid_arguments,unauthenticated",
+    "rb_swap:unauthenticated,key_unavailable",
+    "rb_drop:payload_too_large", "rb_drop:invalid_arguments",
+    "rb_drop:unauthenticated", "rb_drop:key_unavailable",
+]
+
+
+def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
+    out: list[tuple[str, dict]] = []
+    reasons = ["pass"] + [r for n in range(3, 11) for r in model["check_reasons"][n]]
+    for i, c in enumerate(corpus["records"]):
+        x = copy.deepcopy(corpus)
+        alt = "malformed" if c["expected"] == "pass" else "pass"
+        x["records"][i]["expected"] = alt
+        out.append((f"records.{c['name']}: expected {alt}", x))
+        x = copy.deepcopy(corpus)
+        alt = reasons[(reasons.index(c["expected"]) + 1) % len(reasons)]
+        x["records"][i]["expected"] = alt
+        out.append((f"records.{c['name']}: expected {alt}", x))
+    verdicts = model["verdicts"] + [model["store_verdict"], "key_mismatch"]
+    for si, s in enumerate(corpus["sequences"]):
+        for ei, e in enumerate(s["events"]):
+            ex = e["expected"]
+            for fld in list(ex):
+                x = copy.deepcopy(corpus)
+                tgt = x["sequences"][si]["events"][ei]["expected"]
+                v = tgt[fld]
+                if fld == "verdict":
+                    tgt[fld] = verdicts[(verdicts.index(v) + 1) % len(verdicts)] if v in verdicts else "accepted"
+                elif fld == "state":
+                    tgt[fld] = {"current": "stale", "stale": "current", "unknown": "current"}[v]
+                elif fld == "reason":
+                    rs = model["unknown_reasons"]
+                    tgt[fld] = rs[(rs.index(v) + 1) % len(rs)]
+                elif fld == "record_b64":
+                    raw = bytearray(base64.b64decode(v))
+                    raw[-2] ^= 1
+                    tgt[fld] = base64.b64encode(bytes(raw)).decode()
+                elif fld == "received_at_ms":
+                    tgt[fld] = v + 1
+                out.append((f"sequences.{s['name']}[{ei}].{fld} changed", x))
+                if fld in ("record_b64", "received_at_ms", "reason"):
+                    x = copy.deepcopy(corpus)
+                    del x["sequences"][si]["events"][ei]["expected"][fld]
+                    out.append((f"sequences.{s['name']}[{ei}].{fld} removed", x))
+            if ex.get("state") == "unknown":
+                x = copy.deepcopy(corpus)
+                x["sequences"][si]["events"][ei]["expected"]["record_b64"] = "AAAA"
+                out.append((f"sequences.{s['name']}[{ei}]: a record carried under unknown", x))
+    rules = [model["state_dir_rule"]] + model["config_rules"]
+    for i, c in enumerate(corpus["config"]):
+        x = copy.deepcopy(corpus)
+        if c["valid"]:
+            x["config"][i]["valid"] = False
+            x["config"][i]["rule"] = rules[0]
+        else:
+            x["config"][i]["rule"] = rules[(rules.index(c["rule"]) + 1) % len(rules)]
+        out.append((f"config.{c['name']}: verdict changed", x))
+        if not c["valid"]:
+            x = copy.deepcopy(corpus)
+            x["config"][i]["valid"] = True
+            del x["config"][i]["rule"]
+            out.append((f"config.{c['name']}: made valid", x))
+    codes = model["readback_codes"]
+    for i, c in enumerate(corpus["readback"]):
+        x = copy.deepcopy(corpus)
+        ex = x["readback"][i]["expected"]
+        if ex["ok"]:
+            for fld in list(ex["result"]):
+                y = copy.deepcopy(x)
+                y["readback"][i]["expected"]["result"][fld] += "x"
+                out.append((f"readback.{c['name']}: result.{fld} changed", y))
+            x["readback"][i]["expected"] = {"schema_version": 1, "ok": False, "error": {"code": codes[-1]}}
+        else:
+            ex["error"]["code"] = codes[(codes.index(ex["error"]["code"]) + 1) % len(codes)]
+        y = copy.deepcopy(corpus)
+        y["readback"][i]["expected"]["schema_version"] = 2
+        out.append((f"readback.{c['name']}: schema_version changed", y))
+        out.append((f"readback.{c['name']}: answer changed", x))
+    for label in corpus["test_keys"]:
+        x = copy.deepcopy(corpus)
+        ki = x["test_keys"][label]["key_identity"]
+        x["test_keys"][label]["key_identity"] = ki[:-1] + ("0" if ki[-1] != "0" else "1")
+        out.append((f"test_keys.{label}.key_identity changed", x))
+    return out
+
+
+def text_mutants(texts: dict[str, str]) -> list[tuple[str, dict[str, str]]]:
+    out = []
+    for key, sentence in PINS:
+        words = sentence.split()
+        t = dict(texts)
+        flat = norm(t[key])
+        target = norm(sentence)
+        # Cut the sentence's last word, in the document's own wrapping.
+        pattern = r"\s+".join(re.escape(w) for w in words)
+        new, n = re.subn(pattern, lambda _m: " ".join(words[:-1]) + " XX", t[key], count=1)
+        if n != 1 or target not in flat:
+            out.append((f"text: pin not locatable: {sentence[:50]}", None))
+            continue
+        t[key] = new
+        out.append((f"text: {key}: {sentence[:60]}… cut", t))
+    # Reorder two of the receiver's checks in the text.
+    t = dict(texts)
+    t["posture"] = t["posture"].replace("`device_mismatch`.", "`@@`.").replace(
+        "`key_mismatch`.", "`device_mismatch`.").replace("`@@`.", "`key_mismatch`.")
+    out.append(("text: checks 6 and 8 swapped in Receiving", t))
+    t = dict(texts)
+    t["gateway_config"] = t["gateway_config"].replace("1. `unknown_device`:", "1. `malformed_key`:@").replace(
+        "2. `malformed_key`:", "2. `unknown_device`:").replace("1. `malformed_key`:@", "1. `malformed_key`:")
+    out.append(("text: config rules 1 and 2 swapped", t))
+    t = dict(texts)
+    t["posture"] = re.sub(r"its\s+age\s+is\s+at\s+most\s+900000\s+ms", "its age is at most 900001 ms", t["posture"])
+    out.append(("text: age bound changed", t))
+    t = dict(texts)
+    t["posture"] = re.sub(r"`issued_at_ms`\s+is\s+more\s+than\s+300000\s+ms\s+below", "`issued_at_ms` is more than 300001 ms below", t["posture"])
+    out.append(("text: regression bound changed", t))
+    t = dict(texts)
+    t["gateway_api"] = t["gateway_api"].replace("| Runtime -> Gateway | 4096 |", "| Runtime -> Gateway | 644 |")
+    out.append(("text: payload size bound changed", t))
+    for name, t in out:
+        if t is not None and t == texts:
+            raise Failure(f"mutations: {name} did not change the text")
+    return out
+
+
+def run_mutations(corpus: dict, model: dict, texts: dict[str, str]) -> int:
+    """A mutant is refused when it adds a failure the unmutated run lacks."""
+    survivors: list[str] = []
+    killed = 0
+    total = 0
+    baseline = set(check(corpus, model))
+    for m in RECEIVER_MUTANTS + CONFIG_MUTANTS + READBACK_MUTANTS:
+        total += 1
+        errs = set(check(corpus, model, frozenset([m]))) - baseline
+        if [e for e in errs if not e.startswith("coverage:")]:
+            killed += 1
+        else:
+            survivors.append(f"model mutant {m}")
+    for name, x in corpus_mutants(corpus, model):
+        total += 1
+        if set(check(x, model)) - baseline:
+            killed += 1
+        else:
+            survivors.append(f"corpus mutant {name}")
+    for name, t in text_mutants(texts):
+        total += 1
+        if t is None:
+            survivors.append(name)
+            continue
+        try:
+            mm = build_model(t)
+            ok = not (set(check(corpus, mm)) - baseline)
+        except Failure:
+            ok = False
+        if ok:
+            survivors.append(name)
+        else:
+            killed += 1
+    for s in survivors:
+        print(f"SURVIVED: {s}", file=sys.stderr)
+    if survivors:
+        print(f"check-runtime-posture-vectors-v1 --mutations: {len(survivors)} of {total} mutants survived", file=sys.stderr)
+        return 1
+    print(f"check-runtime-posture-vectors-v1 --mutations: all {total} mutants refused")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if args not in ([], ["--mutations"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        texts = load_texts()
+        model = build_model(texts)
+        corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    except Failure as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    errs = check(corpus, model)
+    if errs:
+        for e in errs:
+            print(f"FAIL: {e}", file=sys.stderr)
+        print(f"check-runtime-posture-vectors-v1: {len(errs)} failures", file=sys.stderr)
+        if args != ["--mutations"]:
+            return 1
+    else:
+        n_events = sum(len(s["events"]) for s in corpus["sequences"])
+        print(f"check-runtime-posture-vectors-v1: {len(corpus['records'])} records, "
+              f"{len(corpus['sequences'])} sequences ({n_events} events), {len(corpus['config'])} config, "
+              f"{len(corpus['readback'])} readback cases hold against the text; {len(PINS)} sentences pinned")
+    if args == ["--mutations"]:
+        if errs:
+            print("check-runtime-posture-vectors-v1 --mutations: the unmutated corpus fails; mutants still run", file=sys.stderr)
+        rc = run_mutations(corpus, model, texts)
+        return 1 if errs else rc
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

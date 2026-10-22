@@ -527,6 +527,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-health | v4 | `draft` | `amendable` | — |
 | runtime-mobile | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-mobile | v2 | `draft` | `frozen` | claiming-merge, runtime `1f7fe6c`, 2026-09-16; audit complete |
+| runtime-posture | v1 | `draft` | `amendable` | — |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
 | runtime-telemetry | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-telemetry | v2 | `draft` | `frozen` | shipment, runtime `f87be13`, 2026-09-16; audit pending |
