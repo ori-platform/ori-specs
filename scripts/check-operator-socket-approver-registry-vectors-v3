@@ -185,15 +185,17 @@ HELD: dict[str, tuple[str, ...]] = {
         "The registry is **locked** when it is absent, corrupt or cannot be read; a locked "
         "registry is not initialized, and an operation that needs an initialized registry "
         "refuses it `registry_unavailable`.",
-        "A signed change of the verified `device.site_id` locks registry mutation, as "
-        "[tier-c-approvers/v1.md](../tier-c-approvers/v1.md) states: every registry operation on "
-        "an initialized registry whose site binding differs from the verified `device.site_id`, "
-        "the binding readback included, is refused `site_binding_mismatch` at the row its "
-        "section gives.",
+        "A change of the runtime's device identity or of the verified `device.site_id` locks "
+        "registry mutation, as [tier-c-approvers/v1.md](../tier-c-approvers/v1.md) states: every "
+        "registry operation on an initialized registry whose device binding differs from the "
+        "runtime's device identity is refused `device_binding_mismatch`, and one whose site "
+        "binding differs from the verified `device.site_id` is refused `site_binding_mismatch`, "
+        "each at the row its section gives, the binding readback included.",
+        "When both differ, `device_binding_mismatch` is the answer.",
         "Rows marked *defence in depth* below can fail only in a state the earlier checks or the "
         "runtime's own minting prevent: a registry revision change since the challenge, which "
         "`challenge_stale` refuses first, or a collision of runtime-minted IDs.",
-        "A locked registry has no site binding.",
+        "A locked registry has neither binding.",
         "A refusal changes no credential, tombstone, registry revision, proposal or pending "
         "phone operation.",
         "The one state a refusal may change is a challenge's used marker, as [Challenges "
@@ -271,7 +273,7 @@ HELD: dict[str, tuple[str, ...]] = {
     "Recover": (
         "After the checks of [Challenges presented](#challenges-presented):",
         "On success the runtime commits an empty initialized registry under the challenge's "
-        "prospective epoch and the verified site, with the effects "
+        "prospective epoch, the runtime's device identity and the verified site, with the effects "
         "[tier-c-approvers/v1.md](../tier-c-approvers/v1.md) gives recovery, and answers with "
         "exactly `status` (`recovered`) and `registry_revision` (`1`).",
         "In the same transaction it clears every challenge it holds, every phone authorisation it "
@@ -401,6 +403,20 @@ HELD_APPROVERS = (
     "An enrolment that names an existing approver must be authorised by one of that "
     "approver's own active credentials; operator-socket/v3 names the refusal.",
     "Duplicate and tombstone checks compare the number alone, across `sms` and `whatsapp`.",
+    # The device binding: what the header holds, when it is corrupt, what a change of
+    # the runtime's device identity does, and that it refuses a phone candidate first.
+    "The durable header contains `initialized`, the registry's `device_id`, `site_id` and "
+    "`identity_epoch` bindings,",
+    "A header whose `device_id` is absent or does not match `^[A-Za-z0-9._-]{1,64}$` is "
+    "corrupt, so the registry is locked and only recovery can initialize it again.",
+    "a runtime whose device identity differs from the registry's `device_id` (a store "
+    "restarted under another `device.id` among them), each lock registry mutation and Tier C "
+    "admission, and close open proposals to their safe default.",
+    "Nothing the registry holds is inherited under the new identity.",
+    "A locked registry and a device or site binding mismatch refuse such a candidate first, "
+    "under their own codes.",
+    "requires an authenticated runtime-local operator request before committing "
+    "`initialized = true` with the device, site and epoch bindings.",
 )
 # The three signed preimages; the domain strings are parsed from these.
 DOMAIN_SENTENCES = {
@@ -1320,6 +1336,27 @@ def site_differs(st: State) -> bool:
     return st.reg is not None and st.reg["site_id"] != st.ctx["verified_site_id"]
 
 
+def device_differs(st: State) -> bool:
+    """"every registry operation on an initialized registry whose device binding differs
+    from the runtime's device identity is refused `device_binding_mismatch`"; "A locked
+    registry has neither binding." """
+    if st.reg is None:
+        return "device_when_locked" in st.D
+    return st.reg["device_id"] != st.ctx["device_id"]
+
+
+def device_row(table: str) -> Callable[[State], bool]:
+    """The device binding row of one table; `device_unchecked` drops it everywhere and
+    `device_unchecked:<table>` in that table alone."""
+    def p_device_differs(st: State) -> bool:
+        if "device_unchecked" in st.D or f"device_unchecked:{table}" in st.D:
+            return False
+        if table == B and "binding_device_from_runtime" in st.D:
+            return False
+        return device_differs(st)
+    return p_device_differs
+
+
 def ch_op(st: State) -> str:
     return st.req["challenge_operation"]
 
@@ -1814,6 +1851,7 @@ def p_unknown_target(st):
 C, CP, R_, LS, E, RV, B = ("Challenge", "Challenges presented", "Recover", "Local seed", "Enrol",
                            "Revoke", "Binding")
 SITE = "The registry's site binding differs from the verified `device.site_id`."
+DEVICE = "The registry's device binding differs from the runtime's device identity."
 LOCKED = "The registry is locked."
 STALE = "The registry's revision or identity epoch differs from the challenge's."
 DID = " Defence in depth."
@@ -1831,6 +1869,7 @@ ROWS: dict[str, list[tuple[str, str, Callable[[State], bool]]]] = {
     C: [
         ("lan_key_required", "`challenge_operation` is `local_seed` and the candidate's `channel` "
          "is not `lan_ed25519`.", p_lan_key_required),
+        ("device_binding_mismatch", DEVICE, device_row(C)),
         ("site_binding_mismatch", SITE, p_site_differs),
         ("recovery_not_available", "`challenge_operation` is `recover` and the registry is "
          "initialized.", p_recovery_not_available_challenge),
@@ -1854,6 +1893,7 @@ ROWS: dict[str, list[tuple[str, str, Callable[[State], bool]]]] = {
          "operation, on either phone channel.", p_phone_pending_challenge),
     ],
     CP: [
+        ("device_binding_mismatch", DEVICE, device_row(CP)),
         ("site_binding_mismatch", SITE, p_site_differs),
         ("challenge_reused", "The runtime holds the challenge as used (already presented).", p_reused),
         ("challenge_unavailable", "The runtime holds no challenge with this ID, pending, used or "
@@ -1934,6 +1974,7 @@ ROWS: dict[str, list[tuple[str, str, Callable[[State], bool]]]] = {
         ("wrong_authority", "`signing_key` is recognised as an anchor of another class.",
          needing(p_wrong_authority, "doc")),
         ("registry_unavailable", LOCKED, p_locked),
+        ("device_binding_mismatch", DEVICE, device_row(RV)),
         ("site_binding_mismatch", SITE, p_site_differs),
         ("binding_mismatch", "The document's `device_id` differs from the runtime's device "
          "identity, or its `site_id` or `identity_epoch` from the registry's.",
@@ -1948,6 +1989,7 @@ ROWS: dict[str, list[tuple[str, str, Callable[[State], bool]]]] = {
     ],
     B: [
         ("registry_unavailable", LOCKED, p_locked),
+        ("device_binding_mismatch", DEVICE, device_row(B)),
         ("site_binding_mismatch", SITE, p_site_differs),
     ],
 }
@@ -1964,6 +2006,7 @@ PRED = {(name, code, cell): fn for name, rows in ROWS.items() for code, cell, fn
 # last_external_revision).
 NEEDS: dict[tuple[str, str, int], dict[str, str]] = {
     (C, "lan_key_required", 0): {"op": "local_seed", "cand": "sms|whatsapp"},
+    (C, "device_binding_mismatch", 0): {"reg": "held"},
     (C, "site_binding_mismatch", 0): {"reg": "held"},
     (C, "recovery_not_available", 0): {"op": "recover", "reg": "held"},
     (C, "registry_unavailable", 0): {"op": "local_seed|enrol", "reg": "locked"},
@@ -1975,6 +2018,7 @@ NEEDS: dict[tuple[str, str, int], dict[str, str]] = {
     (C, "value_tombstoned", 0): {"op": "local_seed|enrol", "reg": "held"},
     (C, "duplicate_value", 0): {"op": "local_seed|enrol", "reg": "held"},
     (C, "phone_pending_for_value", 0): {"op": "local_seed|enrol", "cand": "sms|whatsapp"},
+    (CP, "device_binding_mismatch", 0): {"reg": "held"},
     (CP, "site_binding_mismatch", 0): {"reg": "held"},
     (CP, "challenge_reused", 0): {"held": "used"},
     (CP, "challenge_unavailable", 0): {"held": "none"},
@@ -2010,12 +2054,14 @@ NEEDS: dict[tuple[str, str, int], dict[str, str]] = {
     (RV, "superseded_signer", 0): {"doc": "ok", "signer": "previous"},
     (RV, "wrong_authority", 0): {"doc": "ok", "signer": "other_class"},
     (RV, "registry_unavailable", 0): {"reg": "locked"},
+    (RV, "device_binding_mismatch", 0): {"reg": "held"},
     (RV, "site_binding_mismatch", 0): {"reg": "held"},
     (RV, "binding_mismatch", 0): {"doc": "ok", "reg": "held"},
     (RV, "revision_regressed", 0): {"doc": "ok", "reg": "held", "rev": "below"},
     (RV, "revision_conflict", 0): {"doc": "ok", "reg": "held", "rev": "equal"},
     (RV, "unknown_target", 0): {"doc": "ok", "reg": "held", "rev": "below|above"},
     (B, "registry_unavailable", 0): {"reg": "locked"},
+    (B, "device_binding_mismatch", 0): {"reg": "held"},
     (B, "site_binding_mismatch", 0): {"reg": "held"},
 }
 
@@ -2293,7 +2339,9 @@ def e_challenge(st: State) -> dict:
 
 def e_recover(st: State) -> dict:
     ch = st.challenge()
+    device = None if "recover_device_unbound" in st.D else st.ctx["device_id"]
     st.world["registry"] = {
+        "device_id": device,
         "site_id": st.ctx["verified_site_id"], "identity_epoch": ch["identity_epoch"],
         "registry_revision": 1, "last_external_revision": 0,
         "last_external_document_sha256": None, "credential_sequence": 0, "credentials": [],
@@ -2354,7 +2402,12 @@ def e_revoke(st: State) -> dict:
 
 
 def e_binding(st: State) -> dict:
-    return {"device_id": st.ctx["device_id"], "site_id": st.reg["site_id"],
+    # "the registry's current `device_id`, `site_id`, `identity_epoch` and
+    # `registry_revision`": the registry's own device binding, which equals the
+    # runtime's identity only because device_binding_mismatch refused otherwise.
+    device = st.ctx["device_id"] if "binding_device_from_runtime" in st.D else \
+        st.reg["device_id"]
+    return {"device_id": device, "site_id": st.reg["site_id"],
             "identity_epoch": st.reg["identity_epoch"],
             "registry_revision": st.reg["registry_revision"]}
 
@@ -2427,8 +2480,10 @@ def state_law(case: dict, out: dict) -> None:
         law(nreg is not None and nreg["registry_revision"] == 1 and nreg["credentials"] == [] and
             nreg["tombstoned_credentials"] == [] and nreg["tombstoned_approvers"] == [] and
             nreg["tombstoned_values"] == [] and nreg["last_external_revision"] == 0 and
-            nreg["site_id"] == case["context"]["verified_site_id"],
-            "recovery commits an empty initialized registry at revision 1 under the verified site")
+            nreg["site_id"] == case["context"]["verified_site_id"] and
+            nreg["device_id"] == case["context"]["device_id"],
+            "recovery commits an empty initialized registry at revision 1 under the runtime's "
+            "device identity and the verified site")
         return
     law(canon(post["challenges"]) == canon(challenges_with_used(cid)),
         "a success consumes exactly its challenge")
@@ -2447,7 +2502,7 @@ def state_law(case: dict, out: dict) -> None:
             nreg["registry_revision"] == preg["registry_revision"] + 1 == result["registry_revision"],
             "the new credential takes the next sequence and the revision increments once")
         for k in ("tombstoned_credentials", "tombstoned_approvers", "tombstoned_values",
-                  "identity_epoch", "site_id", "last_external_revision",
+                  "identity_epoch", "device_id", "site_id", "last_external_revision",
                   "last_external_document_sha256"):
             law(canon(nreg[k]) == canon(preg[k]), f"a credential addition changed {k}")
         return
@@ -2472,7 +2527,8 @@ def state_law(case: dict, out: dict) -> None:
     law(nreg["registry_revision"] == preg["registry_revision"] + 1 and
         nreg["last_external_revision"] == doc["revision"] and
         nreg["credential_sequence"] == preg["credential_sequence"] and
-        nreg["identity_epoch"] == preg["identity_epoch"] and nreg["site_id"] == preg["site_id"],
+        nreg["identity_epoch"] == preg["identity_epoch"] and nreg["site_id"] == preg["site_id"]
+        and nreg["device_id"] == preg["device_id"],
         "revocation increments the revision once and records the external revision")
 
 
@@ -2486,7 +2542,8 @@ FABRICATED = {"challenge": {"v": 1, "challenge_id": "/////////////////////w==", 
 
 def _registry(world: dict) -> dict:
     if world["registry"] is None:
-        world["registry"] = {"site_id": "x", "identity_epoch": "/////////////////////w==",
+        world["registry"] = {"device_id": "x", "site_id": "x",
+                             "identity_epoch": "/////////////////////w==",
                              "registry_revision": 1, "last_external_revision": 0,
                              "last_external_document_sha256": None, "credential_sequence": 0,
                              "credentials": [], "tombstoned_credentials": [],
@@ -2515,6 +2572,14 @@ def _epoch(world: dict, out: dict) -> None:
     reg = _registry(world)
     if reg:
         reg["identity_epoch"] = "AAAAAAAAAAAAAAAAAAAAAA=="
+
+
+def _rebind(key: str) -> Callable[[dict, dict], None]:
+    def write(world: dict, out: dict) -> None:
+        reg = _registry(world)
+        if reg:
+            reg[key] = reg[key] + "-rebound"
+    return write
 
 
 def _used(world: dict, out: dict) -> None:
@@ -2546,6 +2611,8 @@ INJECT: dict[str, Callable[[dict, dict], None]] = {
     "approver tombstoned": _append("tombstoned_approvers", "x"),
     "value tombstoned": _append("tombstoned_values", "+19999999999"),
     "identity epoch": _epoch,
+    "device binding": _rebind("device_id"),
+    "site binding": _rebind("site_id"),
     "challenge created": lambda w, o: w["challenges"].append(copy.deepcopy(FABRICATED)),
     "challenge marked used": _used,
     "used marker cleared": _unused,
@@ -2569,7 +2636,7 @@ NOTE_KEYS = {"corpus", "request", "terminated", "signatures", "expected", "expec
              "keys"} | \
     {f"context.{k}" for k in CONTEXT_KEYS}
 CASE_KEYS = {"name", "note", "context", "request", "request_bytes", "terminated", "expected"}
-REGISTRY_KEYS = {"site_id", "identity_epoch", "registry_revision", "last_external_revision",
+REGISTRY_KEYS = {"device_id", "site_id", "identity_epoch", "registry_revision", "last_external_revision",
                  "last_external_document_sha256", "credential_sequence", "credentials",
                  "tombstoned_credentials", "tombstoned_approvers", "tombstoned_values"}
 CREDENTIAL_KEYS = {"approver_id", "credential_id", "channel", "value", "sequence"}
@@ -2616,7 +2683,8 @@ CHANGES_NOTE = (
     "challenge_added:<challenge_id> (a pending challenge with its deadline); "
     "code_sent:<challenge_id> (a possession code sent to the challenge's phone candidate); "
     "used:<challenge_id> (the challenge marked used); registry_created:<identity_epoch> (an "
-    "empty initialized registry under that epoch and the verified site: revision 1, last "
+    "empty initialized registry under that epoch, the context's device_id and the verified "
+    "site: revision 1, last "
     "external revision 0, credential sequence 0, no credentials or tombstones); "
     "challenges_cleared, phone_authorizations_cleared and pending_phone_cleared (every held "
     "challenge, received phone authorization and pending phone operation removed); "
@@ -2663,7 +2731,8 @@ SWEEP_SENTENCE = (
     "sms challenge) each x presented candidate kind (lan, sms, whatsapp), a presented "
     "kind other than the challenge's being decided at candidate_changed unless an earlier "
     "row fires; challenge_unavailable over the presented candidate kind alone, no "
-    "challenge being held, and site_binding_mismatch also with no challenge held, over "
+    "challenge being held, and device_binding_mismatch and site_binding_mismatch also with "
+    "no challenge held, over "
     "recover and the presented kind for local_seed and enrol; an expired sms challenge "
     "sitting between the 60-second challenge window and the 10-minute possession window; "
     "ch (Challenge) for an enrolment over candidate kind (lan, sms) x request approver "
@@ -2715,11 +2784,13 @@ def sweep_claims(text: dict) -> dict[tuple, tuple[set[str], set[str], str | None
         claims[(row, "op")] = ({"recover", "local_seed", "enrol"},) * 2 + (None,)
         for op in ("recover", "local_seed", "enrol"):
             # challenge_unavailable: no challenge held, the presented kind alone;
-            # site_binding_mismatch: the operation's own challenge and none held.
+            # device_binding_mismatch and site_binding_mismatch: the operation's own
+            # challenge and none held.
+            bindings = ("device_binding_mismatch", "site_binding_mismatch")
             kinds = {"none"} if row[1] == "challenge_unavailable" else \
-                own[op] | {"none"} if row[1] == "site_binding_mismatch" else own[op]
+                own[op] | {"none"} if row[1] in bindings else own[op]
             domain = own[op] | {"none"}
-            if op != "recover" or row[1] in ("challenge_unavailable", "site_binding_mismatch"):
+            if op != "recover" or row[1] == "challenge_unavailable" or row[1] in bindings:
                 claims[(row, "kind", op)] = (kinds, domain, op)
             if op != "recover":
                 claims[(row, "pres", op)] = ({"lan", "sms", "whatsapp"},) * 2 + (op,)
@@ -2834,8 +2905,9 @@ def changes_of(out: dict) -> list[str]:
                            ("last_external_revision", "last_external_revision")):
             if nreg[key] != preg[key]:
                 tokens.append(f"{token}:{nreg[key]}")
-        if nreg["identity_epoch"] != preg["identity_epoch"]:
-            tokens.append(f"identity_epoch:{nreg['identity_epoch']}")
+        for key in ("identity_epoch", "device_id", "site_id"):
+            if nreg[key] != preg[key]:
+                tokens.append(f"{key}:{nreg[key]}")
     elif preg is not None:
         tokens.append("registry_dropped")
     if post["phone_authorizations"] and canon(post["phone_authorizations"]) != canon(
@@ -2865,6 +2937,11 @@ def check_context(name: str, ctx: dict) -> None:
     reg = ctx["registry"]
     if reg is not None:
         need(isinstance(reg, dict) and set(reg) == REGISTRY_KEYS, f"{name}: registry keys")
+        # "A header whose `device_id` is absent or does not match `^[A-Za-z0-9._-]{1,64}$`
+        # is corrupt, so the registry is locked": such a registry is `null`, never held.
+        need(is_id(reg["device_id"]), f"{name}: not a valid context: a registry whose device_id "
+             "is absent or malformed is corrupt, so locked, and is null")
+        need(is_id(reg["site_id"]), f"{name}: registry site_id")
         need(canon_b64(reg["identity_epoch"], 16) is not None, f"{name}: registry epoch")
         for k in ("registry_revision", "last_external_revision", "credential_sequence"):
             need(type(reg[k]) is int and reg[k] >= 0, f"{name}: registry {k}")
@@ -3307,6 +3384,12 @@ def coverage(T: dict, corpus: dict, outcomes: list) -> None:
     exists(lambda c, g: g["where"] == ("step", "site") and ctx(c)["registry"] is not None and
            ctx(c)["registry"]["site_id"] != ctx(c)["verified_site_id"] and g["presents"],
            "no verified site decided before site_binding_mismatch")
+    exists(lambda c, g: g["where"] == ("step", "site") and ctx(c)["registry"] is not None and
+           ctx(c)["registry"]["device_id"] != ctx(c)["device_id"] and g["presents"],
+           "no verified site decided before device_binding_mismatch")
+    exists(lambda c, g: g.get("code") == "registry_busy" and ctx(c)["registry"] is not None and
+           ctx(c)["registry"]["device_id"] != ctx(c)["device_id"],
+           "serialisation decided before device_binding_mismatch")
     exists(lambda c, g: g.get("code") == "registry_busy" and g.get("presents") and
            g.get("consumes_challenge") is False, "registry_busy consuming no challenge")
     exists(lambda c, g: g.get("code") == "unauthenticated" and op_of(c) in PRESENTING,
@@ -3717,6 +3800,137 @@ def _call_one(i: int) -> Any:
     return _ONE(i)
 
 
+def move_row_after(text: str, table: str, code: str, after: str) -> str:
+    """The text with `code`'s row of `table` moved to just after `after`'s row."""
+    lines = text.split("\n")
+    start = lines.index(f"### {table}")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].startswith("#"))
+    at = {re.match(r"\| `([a-z_]+)`", lines[i]).group(1): i for i in range(start, end)
+          if re.fullmatch(r"\| `[a-z_]+` \| .+ \|", lines[i])}
+    need(code in at and after in at, f"mutation setup: {table} has no {code} or {after} row")
+    row = lines.pop(at[code])
+    lines.insert(at[after] - (1 if at[after] > at[code] else 0) + 1, row)
+    return "\n".join(lines)
+
+
+def refusal(expected: str, *given: str | None) -> Callable[[str], bool]:
+    """A failure that is a case expected `expected` and answered one of `given` (None:
+    accepted; no `given`: any other answer)."""
+    def shown(code: str | None) -> str:
+        return '{"ok": true' if code is None else f'{{"ok": false, "code": "{code}"}}'
+    head = f'expected {{"ok": false, "code": "{expected}"}}, the text gives '
+    return lambda message: head in message and (
+        not given or any(head + shown(code) in message for code in given))
+
+
+def answered(given: str) -> Callable[[str], bool]:
+    """A failure that is a case the text answers otherwise answered `given`."""
+    return lambda message: f'the text gives {{"ok": false, "code": "{given}"}}' in message
+
+
+DB = "device_binding_mismatch"
+# The device binding's mutants, each with the failure it must be refused by: a case
+# the text answers device_binding_mismatch answered otherwise, or a case the text
+# answers otherwise answered device_binding_mismatch, or the recovery state law.
+DEVICE_DEFECTS: tuple[tuple[str, Callable[[str], bool]], ...] = (
+    ("device_unchecked", refusal(DB)),
+    ("device_unchecked:Challenge", refusal(DB)),
+    ("device_unchecked:Challenges presented", refusal(DB)),
+    # revoke comparing the document's device_id with the runtime's instead of refusing
+    # first: the document names the registry's device, or the runtime's and the
+    # revocation proceeds
+    ("device_unchecked:Revoke", refusal(DB, "binding_mismatch", "site_binding_mismatch",
+                                        "revision_conflict", "revision_regressed", None)),
+    ("device_unchecked:Binding", refusal(DB, None, "site_binding_mismatch")),
+    # the binding readback answering the runtime's device instead of refusing
+    ("binding_device_from_runtime", refusal(DB, None, "site_binding_mismatch")),
+    # a locked registry treated as bound to another device
+    ("device_when_locked", answered(DB)),
+    ("recover_device_unbound", lambda m: "under the runtime's device identity" in m),
+)
+# The device row of a table moved to just after another row: a case the text
+# answers device_binding_mismatch must then be answered by a row it overtook.
+DEVICE_MOVES = (
+    ("Challenge", "site_binding_mismatch"),
+    ("Challenge", "recovery_not_available"),
+    ("Challenge", "channel_unauthenticated"),
+    ("Challenge", "active_authorizer_exists"),
+    ("Challenges presented", "site_binding_mismatch"),
+    ("Challenges presented", "challenge_reused"),
+    ("Revoke", "site_binding_mismatch"),
+    ("Revoke", "binding_mismatch"),
+    ("Revoke", "revision_conflict"),
+    ("Binding", "site_binding_mismatch"),
+)
+# registry_unavailable moved after the device row where it now precedes it: the rows
+# can never fail together, since a locked registry has neither binding, so no case can
+# show the move and it must change no answer.
+DEVICE_MOVES_INHERENT = (("Revoke", "registry_unavailable"), ("Binding", "registry_unavailable"))
+
+
+def overtaken(text: str, name: str, after: str) -> tuple[str, ...]:
+    """The codes the device row passes when moved to just after `after`."""
+    codes = [code for code, _ in table(subsections(text)[name], "| `error.code` | Refused when |",
+                                       name)]
+    return tuple(codes[codes.index(DB) + 1:codes.index(after) + 1])
+
+
+def device_mutants(text: str, approvers: str, corpus: dict) -> list[tuple[str, Callable[[], str]]]:
+    out: list[tuple[str, Callable[[], str]]] = []
+
+    def judged(t: str, d: frozenset, reason: Callable[[str], bool]) -> Callable[[], str]:
+        def run() -> str:
+            try:
+                check(t, approvers, corpus, d, announce=False)
+            except Failure as exc:
+                return "refused" if reason(str(exc)) else \
+                    f"error: refused for another reason: {exc}"
+            return "accepted"
+        return run
+
+    for defect, reason in DEVICE_DEFECTS:
+        out.append((f"device defect: {defect}", judged(text, frozenset({defect}), reason)))
+    for table_name, after in DEVICE_MOVES:
+        out.append((f"device row after {after} in {table_name}",
+                    judged(move_row_after(text, table_name, DB, after), frozenset(),
+                           refusal(DB, *overtaken(text, table_name, after)))))
+
+    def inherent(t: str, label: str) -> Callable[[], str]:
+        def run() -> str:
+            try:
+                check(t, approvers, corpus, announce=False)
+            except Failure as exc:
+                return f"error: '{label}' should change no answer but does: {exc}"
+            return "inherent"
+        return run
+    for table_name, row in DEVICE_MOVES_INHERENT:
+        label = f"{row} after the device row in {table_name}"
+        out.append((label, inherent(move_row_after(text, table_name, row, DB), label)))
+    # A registry held with a malformed device_id: a corrupt header, so locked, never held.
+    held = next(i for i, c in enumerate(corpus["cases"]) if c["context"]["registry"])
+
+    def corpus_judged(c: dict, reason: Callable[[str], bool]) -> Callable[[], str]:
+        return lambda: _judge(text, approvers, c, reason)
+    for bad in ("", "edge 1", "x" * 65, None):
+        m = fork(corpus, held)
+        m["cases"][held]["context"]["registry"]["device_id"] = bad
+        out.append((f"device_id {bad!r:.10} held as initialized",
+                    corpus_judged(m, lambda msg: "corrupt, so locked" in msg)))
+    m = fork(corpus, held)
+    del m["cases"][held]["context"]["registry"]["device_id"]
+    out.append(("device_id absent from a held registry",
+                corpus_judged(m, lambda msg: "registry keys" in msg)))
+    return out
+
+
+def _judge(text: str, approvers: str, corpus: dict, reason: Callable[[str], bool]) -> str:
+    try:
+        check(text, approvers, corpus, announce=False)
+    except Failure as exc:
+        return "refused" if reason(str(exc)) else f"error: refused for another reason: {exc}"
+    return "accepted"
+
+
 def mutations(text: str, approvers: str, corpus: dict) -> None:
     """Every mutant, listed first, then run on the fork pool. Each returns
     "refused", "accepted", "inherent" (a reordering that changes no answer) or
@@ -3899,6 +4113,9 @@ def mutations(text: str, approvers: str, corpus: dict) -> None:
                          ("" if cases else " (no case is decided there)"),
                          cases_mutant(cases, inject=(field, place))))
 
+    for label, run in device_mutants(text, approvers, corpus):
+        jobs.append(("device", label, run))
+
     results = _in_order(len(jobs), lambda i: jobs[i][2]())
     errors = [f"{jobs[i][1]}: {r[7:]}" for i, r in enumerate(results) if r.startswith("error:")]
     need(not errors, "; ".join(errors))
@@ -3912,9 +4129,11 @@ def mutations(text: str, approvers: str, corpus: dict) -> None:
         for label in survivors:
             print(f"  accepted: {label}", file=sys.stderr)
         raise SystemExit(1)
+    device = sum(1 for (family, _, _), r in zip(jobs, results)
+                 if family == "device" and r == "refused")
     print(f"operator-socket/v3 approver registry: {refused} mutations refused, {writes} of them "
-          f"forbidden writes ({inherent} reorderings of rows that never fail together change no "
-          "answer)")
+          f"forbidden writes and {device} device-binding mutants refused for their own reason "
+          f"({inherent} reorderings of rows that never fail together change no answer)")
 
 
 def explain(text: str, approvers: str, corpus: dict) -> None:
