@@ -69,5 +69,5 @@ handset delivery remains unknown without a separate receipt contract.
    bytes or validation. Keep HIL and live-provider proof explicitly pending.
 
 Related: [ori-specs #393](https://github.com/ori-platform/ori-specs/issues/393),
-[ori-energy #92](https://github.com/ori-platform/ori-energy/issues/92), and
+ori-energy #92 (private repository), and
 [ori-runtime #528](https://github.com/ori-platform/ori-runtime/issues/528).
