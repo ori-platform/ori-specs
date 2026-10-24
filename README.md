@@ -14,6 +14,7 @@ below are checked against those records.
 | --- | --- | --- | --- | --- |
 | Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | `draft` | none recorded | `amendable` |
 | Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | `draft` | none recorded | `amendable` |
+| Customer alerts | [customer-alerts/v1.md](customer-alerts/v1.md) | `draft` | none recorded | `amendable` |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | `draft` | runtime `shipped` in v0.9.0-beta.1, `partial` at assessed implementation snapshot `eee40d3` (7 missing requirements); current `d2aba48` unassessed, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `complete` |
 | CLI commands | [cli-commands/v2.md](cli-commands/v2.md) | `draft` | none recorded | `amendable` |
 | Operator Socket | [operator-socket/v1.md](operator-socket/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, claimed, `non-conforming` at assessed implementation snapshot `4078762` (1 divergence); current `a0380b7` unassessed, cli (runtime) `shipped` in v2.5.0-rc.12, claimed, `non-conforming` at assessed implementation snapshot `4078762` (1 divergence); current `a0380b7` unassessed, installer (runtime) `shipped` in v2.5.0-rc.12, `partial` at assessed implementation snapshot `25e0d9c` (1 missing requirement); current `a0380b7` unassessed | `frozen` (2026-09-29), audit `complete` |
