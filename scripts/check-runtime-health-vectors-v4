@@ -167,6 +167,7 @@ V4_SECTIONS = (
     ('## Health Payload > ### `firmware_controller_profiles` object', True),
     ('## Health Payload > ### `skill_hooks` object', True),
     ('## Health Payload > ### `telemetry_export` object', False),
+    ('## Health Payload > ### `mqtt_ingress` object', True),
     ('## Health Payload > ### Diagnostics', True),
     ('## Remote Health Projection', True),
     ('## Consumers', True),
@@ -404,6 +405,12 @@ PREDICATES: dict[str, tuple[str, Callable[[dict, dict], bool]]] = {
         ("`firmware_liveness.loop` is not `stopped_cleanly`, and `consecutive_tick_failures > "
          "0`."),
         lambda s, m: (fl := _live(s, m)) is not None and fl["consecutive_tick_failures"] > 0),
+    # Not a liveness condition: it does not read `loop`, so a clean stop does not clear it,
+    # and it does not raise the umbrella.
+    "firmware_signing_domains_undeclared": (
+        "`firmware_liveness.undeclared_device_ids` is non-empty.",
+        lambda s, m: (fl := (_live(s, m) if m["undeclared_reads_loop"] else _fl(s))) is not None
+        and len(fl["undeclared_device_ids"]) > 0),
     "decision_record_lost": (
         ("Some `action_log_records.loss_incidents[]` entry has `kind: \"decision_record_lost\"` "
          "and `acknowledged: false`."),
@@ -535,6 +542,7 @@ BLOCK_SECTIONS = {
     "firmware_controller_profiles": "## Health Payload > ### `firmware_controller_profiles` object",
     "telemetry_export": "## Health Payload > ### `telemetry_export` object",
     "skill_hooks": "## Health Payload > ### `skill_hooks` object",
+    "mqtt_ingress": "## Health Payload > ### `mqtt_ingress` object",
     "safety_zones": "## Health Payload > ### `safety_zones[]` object",
 }
 STATELESS = ("sensors", "last_alert_timestamps", "safety_zones")
@@ -546,7 +554,8 @@ SECTION_FLAGS = {"attestation summary": "attestation_summary_available",
 READ_MEMBERS = {
     "firmware_liveness": ("loop", "started_age_ms", "expiry_window_ms", "supervised_devices",
                           "supported_device_capacity", "consecutive_tick_failures",
-                          "last_successful_tick_age_ms", "expiring_device_ids", "degraded"),
+                          "last_successful_tick_age_ms", "expiring_device_ids",
+                          "undeclared_device_ids", "degraded"),
     "action_log_records": ("pending", "oldest_pending_age_ms", "ceiling", "lost", "stall_bound_ms",
                            "decision_records_lost", "loss_incidents"),
     "evidence.action_records": ("pending", "outcome_unknown", "dispatch_unproven", "lost",
@@ -622,7 +631,7 @@ def _inline(text: str) -> dict | None:
 def _row(types: set[str], present: str, int_values: bool = False,
          tie: tuple[bool, str] | None = None, sub: dict | None = None) -> dict:
     return {"types": types, "present": present, "int_values": int_values, "tie": tie,
-            "sub": sub, "set": False}
+            "sub": sub, "set": False, "map": False}
 
 
 def sequence_ok(m: dict, field: str, row: dict, v: Any) -> bool:
@@ -685,12 +694,18 @@ def _schema_rows(header: list[str], rows: list[list[str]], body: str) -> dict:
     return out
 
 
-def _attach(schema: dict, field: str, sub: dict) -> bool:
+def _attach(schema: dict, field: str, sub: dict, is_map: bool = False) -> bool:
+    """Attach `sub` to the member `field`. With `is_map`, the table describes each value
+    of an object whose member names are data (a table introduced as "Each `x` value:"),
+    so `sub` holds for every value and the names are not its members."""
     for name, row in schema.items():
         if name == field and row["sub"] is None and row["types"] & {"object", "object[]"}:
+            if is_map and row["types"] != {"object"}:
+                return False
             row["sub"] = sub
+            row["map"] = is_map
             return True
-    return any(row["sub"] is not None and _attach(row["sub"], field, sub)
+    return any(row["sub"] is not None and _attach(row["sub"], field, sub, is_map)
                for row in schema.values())
 
 
@@ -704,8 +719,9 @@ def section_schema(body: str, name: str) -> dict:
     schema = _schema_rows(header, rows, body)
     for label, header, rows in found[1:]:
         named = re.search(r"`(\w+)(?:\[\])?`", label)
+        is_map = re.fullmatch(r"Each `\w+` value:", label) is not None
         if named is None or not _attach(schema, named.group(1),
-                                        _schema_rows(header, rows, body)):
+                                        _schema_rows(header, rows, body), is_map):
             raise Failure(f"{name}: a table after {label!r} attaches to no member")
     return schema
 
@@ -1076,6 +1092,24 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
             or count.group(2) != m["heartbeat_only"] \
             or len({int(count.group(i)) for i in (3, 4, 5)} | {len(m["vocabulary"]) - 1}) != 1:
         raise Failure("the gateway's stated token counts disagree with its table")
+    room = re.search(r"The bound of (\d+) admits every such combination and leaves (no room: a "
+                     r"further token changes the bound|room for one addition without a change "
+                     r"to the bound);",
+                     flat(gw["## Runtime Node Heartbeat Payload > ### `degradation_reasons`"]))
+    spare = len(m["vocabulary"]) - 1
+    if room is None or int(room.group(1)) != spare + (0 if room.group(2).startswith("no") else 1):
+        raise Failure(f"the gateway's stated bound and its room disagree with the {spare} tokens "
+                      "a heartbeat can name beside each other")
+    m["room_bound"] = int(room.group(1))
+    # The topics mqtt_ingress may name: the Gateway -> Runtime rows of Payload Size, which
+    # GATEWAY_SECTIONS does not own, read from the section's own table.
+    size = re.search(r"^## Payload Size\n(.*?)^## ", texts["gw"], re.MULTILINE | re.DOTALL)
+    if size is None:
+        raise Failure("gateway-api/v2.md has no Payload Size section")
+    m["ingress_topics"] = re.findall(r"^\| `(ori/[^`]+)` \| Gateway -> Runtime \| \d+ \|",
+                                     size.group(1), re.MULTILINE)
+    if not m["ingress_topics"] or len(set(m["ingress_topics"])) != len(m["ingress_topics"]):
+        raise Failure("Payload Size lists no Gateway -> Runtime topic, or one twice")
 
     t_rows = table(v4["## Heartbeat Mapping"], ["Step", "Check", "Failure"])
     m["t_steps"] = [(step, unquote(fail)) for step, _, fail in t_rows]
@@ -1190,7 +1224,8 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     m["projection_copied"] = re.findall(r"`(\w+)`", copied)
     blocks = next(k for k, v in rows.items() if v == (
         "The snapshot's block, with only its present members that this version's tables list, "
-        "nested ones included, except `commissioning.last_verdict`, which is projected as "
+        "nested ones included, and every member of a map such as `mqtt_ingress.families`, "
+        "whose names are data, except `commissioning.last_verdict`, which is projected as "
         "`{binding_seq, at_ms}`."))
     ucb = rows.get("`unknown_critical_blocks`", "")
     if sorted(re.findall(r"`([a-z_]+)`", ucb.split("from ", 1)[-1])) != sorted(
@@ -1294,6 +1329,9 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     m["trip_deadline_max"] = 60000
     m["trip_deadline"] = 10000
     m["clean_stop_exempt"] = True
+    m["undeclared_reads_loop"] = False
+    m["projected_device_lists"] = ()
+    m["uncounted_device_lists"] = ()
     m["ack_clears"] = True
     m["zone_sensor_path"] = True
     m["trip_needs_active"] = True
@@ -1685,8 +1723,9 @@ PROJECTION_ROWS = {
         "`incident_sender_limit`, with `sender_count` and `locked_out_sender_count` (both `int`) in "
         "place of `senders`."),
     "firmware_liveness": (
-        "`state`; when `available`, every listed member except `expiring_device_ids`, with "
-        "`expiring_device_count` (`int`) in its place."),
+        "`state`; when `available`, every listed member except `expiring_device_ids` and "
+        "`undeclared_device_ids`, with `expiring_device_count` and `undeclared_device_count` "
+        "(both `int`) in their places."),
     "firmware_reading_age": (
         "`state`; when `available`, `signing_runtime`, with `device_count` and "
         "`unbounded_device_count` (both `int`) in place of `devices`."),
@@ -1702,10 +1741,17 @@ def _listed(v: Any, schema: dict | None) -> Any:
     if schema is None:
         return copy.deepcopy(v)
     if isinstance(v, dict):
-        return {k: _listed(x, schema[k]["sub"]) for k, x in v.items() if k in schema}
+        return {k: _listed_row(x, schema[k]) for k, x in v.items() if k in schema}
     if isinstance(v, list):
         return [_listed(x, schema) for x in v]
     return copy.deepcopy(v)
+
+
+def _listed_row(v: Any, row: dict) -> Any:
+    """A member's value under its row: a map keeps every name and lists each value."""
+    if row["map"] and isinstance(v, dict):
+        return {k: _listed(x, row["sub"]) for k, x in v.items()}
+    return _listed(v, row["sub"])
 
 
 def projection(m: dict, snap: dict, runtime_device: str | None = None) -> dict:
@@ -1748,9 +1794,14 @@ def projection(m: dict, snap: dict, runtime_device: str | None = None) -> dict:
     fl = snap["firmware_liveness"]
     p = {"state": fl["state"]}
     if fl["state"] == "available":
+        counted = {"expiring_device_ids": "expiring_device_count",
+                   "undeclared_device_ids": "undeclared_device_count"}
         p.update({k: copy.deepcopy(fl[k]) for k in m["schema"]["firmware_liveness"]
-                  if k not in ("state", "expiring_device_ids") and k in fl})
-        p["expiring_device_count"] = len(fl["expiring_device_ids"])
+                  if k != "state" and k in fl
+                  and (k not in counted or k in m["projected_device_lists"])})
+        for k, count in counted.items():
+            if k in fl and count not in m["uncounted_device_lists"]:
+                p[count] = len(fl[k])
     out["firmware_liveness"] = p
     ra = snap["firmware_reading_age"]
     p = {"state": ra["state"]}
@@ -1819,6 +1870,7 @@ def local_strings(snap: dict) -> set[str]:
     rc = snap["remote_command_lockout"]
     walk([x.get("from_number") for x in rc.get("senders", [])])
     walk(snap["firmware_liveness"].get("expiring_device_ids", []))
+    walk(snap["firmware_liveness"].get("undeclared_device_ids", []))
     walk([d.get("device_id") for d in snap["firmware_reading_age"].get("devices", [])])
     cp = snap["firmware_controller_profiles"]
     walk([d.get("file") for d in cp.get("documents_refused", [])])
@@ -1947,7 +1999,11 @@ def _members(v: Any, row: dict) -> list[tuple[str, Any, dict]]:
     out: list[tuple[str, Any, dict]] = []
     if sub is None:
         return out
-    if isinstance(v, dict):
+    if row["map"]:
+        if isinstance(v, dict):
+            out += [(f".*.{k}", x[k], r) for x in v.values() if isinstance(x, dict)
+                    for k, r in sub.items() if k in x]
+    elif isinstance(v, dict):
         out += [(f".{k}", v[k], r) for k, r in sub.items() if k in v]
     elif isinstance(v, list):
         out += [(f"[].{k}", x[k], r) for x in v if isinstance(x, dict)
@@ -2028,6 +2084,9 @@ def types_ok(m: dict, health: dict) -> bool:
                 return all(walk(v[k], r, f"{path}.{k}") for k, r in m["bound"].items() if k in v)
         if not in_vocab(path, v):
             return False
+        if m["check_types"] and row["map"] and isinstance(v, dict) and not all(
+                isinstance(x, dict) for x in v.values()):
+            return False
         return all(walk(x, r, path + suffix) for suffix, x, r in _members(v, row))
 
     top = _top_rows(m)
@@ -2048,8 +2107,11 @@ def entries_ok(m: dict, v: Any, row: dict, path: str) -> bool:
     sub = row["sub"]
     if sub is None:
         return True
-    objs = [v] if isinstance(v, dict) else [x for x in v if isinstance(x, dict)] \
-        if isinstance(v, list) else []
+    if row["map"]:
+        objs = [x for x in v.values() if isinstance(x, dict)] if isinstance(v, dict) else []
+    else:
+        objs = [v] if isinstance(v, dict) else [x for x in v if isinstance(x, dict)] \
+            if isinstance(v, list) else []
     for o in objs:
         want = {k for k, r in sub.items() if r["present"] == "always"
                 or r["present"] == o.get("state")}
@@ -2120,7 +2182,11 @@ CONSISTENCY = (
     (("each `loss_incidents[]` entry's `acknowledged_at_ms` is `null` exactly when "
       "`acknowledged` is `false`;"), "ack_pairing"),
     (("`loss_incidents` is ordered by `incident_id` in byte order, without a repeated "
-      "`incident_id`."), "incident_order"),
+      "`incident_id`;"), "incident_order"),
+    (("no device ID is in both `firmware_liveness.undeclared_device_ids` and "
+      "`expiring_device_ids`;"), "undeclared_not_expiring"),
+    (("each member name of `mqtt_ingress.families` is the topic of a `Gateway -> Runtime` row "
+      "of gateway-api/v2 Payload Size."), "ingress_families"),
 )
 
 
@@ -2175,6 +2241,17 @@ def consistency_faults(m: dict, h: dict) -> list[str]:
             keys = [x.encode() for x in ids]
             if keys != sorted(set(keys)):
                 bad.append("incident_order")
+    fl = h.get("firmware_liveness")
+    if "undeclared_not_expiring" in on and isinstance(fl, dict):
+        both_sets = [fl.get(k) for k in ("undeclared_device_ids", "expiring_device_ids")]
+        if all(isinstance(x, list) for x in both_sets) and {
+                str(x) for x in both_sets[0]} & {str(x) for x in both_sets[1]}:
+            bad.append("undeclared_not_expiring")
+    mi = h.get("mqtt_ingress")
+    families = mi.get("families") if isinstance(mi, dict) else None
+    if "ingress_families" in on and isinstance(families, dict) and any(
+            name not in m["ingress_topics"] for name in families):
+        bad.append("ingress_families")
     return bad
 
 
@@ -2735,6 +2812,18 @@ def coverage(corpus: dict, m: dict,
          available(fl(s)) and fl(s)["loop"] == "stopped_cleanly" and fl(s)["expiring_device_ids"]
          and fl(s)["supervised_devices"] > fl(s)["supported_device_capacity"]
          and fl(s)["consecutive_tick_failures"] > 0)
+    # The signing-domains condition reads no `loop`, and its devices are never expiring.
+    some("an undeclared device after a clean stop, still named", lambda s, _:
+         av(s, "firmware_liveness") and fl(s)["loop"] == "stopped_cleanly"
+         and fl(s).get("undeclared_device_ids")
+         and "firmware_signing_domains_undeclared" in holding(m, s))
+    some("an undeclared device beside an expiring one", lambda s, _: av(s, "firmware_liveness")
+         and fl(s).get("undeclared_device_ids") and fl(s).get("expiring_device_ids")
+         and fl(s)["loop"] != "stopped_cleanly")
+    some("an undeclared device beside a trip refused before signing", lambda s, _:
+         av(s, "firmware_liveness") and fl(s).get("undeclared_device_ids") and any(
+             z["trip_state"] == "tripped" and z["command_status"] == "driver_refused"
+             and z["activation"] == "active" for z in zones(s)))
     some("supervised equal to capacity", lambda s, _: av(s, "firmware_liveness")
          and fl(s)["supervised_devices"] == fl(s)["supported_device_capacity"])
     some("supervised one over capacity", lambda s, _: av(s, "firmware_liveness")
@@ -2852,6 +2941,8 @@ def coverage(corpus: dict, m: dict,
     for label, test in (
             ("senders", lambda x: x["remote_command_lockout"].get("senders")),
             ("expiring devices", lambda x: x["firmware_liveness"].get("expiring_device_ids")),
+            ("undeclared devices", lambda x: x["firmware_liveness"].get("undeclared_device_ids")),
+            ("ingress families", lambda x: (x.get("mqtt_ingress") or {}).get("families")),
             ("reading-age devices", lambda x: x["firmware_reading_age"].get("devices")),
             ("refused documents", lambda x: x["firmware_controller_profiles"].get(
                 "documents_refused")),
@@ -3022,6 +3113,39 @@ def coverage(corpus: dict, m: dict,
             *((f"the application-storage fault raised while evidence is {st}",
                lambda t, st=st: _fault_raised_in(t, st)) for st in m["fault_off_states"])):
         if not any(test(t) and failures(t)[:1] == [S_SHAPE] for _, t in resp):
+            gaps.append(f"response: {label}")
+    # The new members, each served whole: accepted where well formed, and a fault in each
+    # refused at the check that owns it.
+    def health_of(text: str) -> dict:
+        doc = _doc(text)
+        return plain(doc["health"]) if isinstance(doc, dict) and isinstance(
+            doc.get("health"), dict) else {}
+
+    def ingress(text: str) -> dict:
+        mi = health_of(text).get("mqtt_ingress")
+        return mi if isinstance(mi, dict) else {}
+
+    def undeclared_ids(text: str) -> list:
+        fl_ = health_of(text).get("firmware_liveness")
+        ids = fl_.get("undeclared_device_ids") if isinstance(fl_, dict) else None
+        return ids if isinstance(ids, list) else []
+
+    for label, step, test in (
+            ("an available mqtt_ingress with families accepted", None, lambda t: ingress(t).get(
+                "state") == "available" and ingress(t).get("families")),
+            ("families while mqtt_ingress is disabled", S_SHAPE, lambda t: ingress(t).get(
+                "state") == "disabled" and "families" in ingress(t)),
+            ("a families count that is not an int", S_INT, lambda t: any(
+                isinstance(v, dict) and any(type(x) is not int for x in v.values())
+                for v in (ingress(t).get("families") or {}).values())),
+            ("a families count below zero", S_INT, lambda t: any(
+                isinstance(v, dict) and any(type(x) is int and x < 0 for x in v.values())
+                for v in (ingress(t).get("families") or {}).values())),
+            ("an undeclared device accepted, naming its condition", None, lambda t:
+                undeclared_ids(t) and "firmware_signing_domains_undeclared" in (
+                    health_of(t).get("degradation_reasons") or []))):
+        want = [] if step is None else [step]
+        if not any(test(t) and independent(m, f) == want and f[:1] == want for f, t in resp):
             gaps.append(f"response: {label}")
     if not any(v == verdict_of("elements are unique") and listed(h) != sorted(
             listed(h), key=lambda t: str(t).encode()) for v, h in gws):
@@ -3721,6 +3845,174 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             run(corpus_bytes, mutated, coverage_model=model, coverage_cache=coverage_cache)
         return go
 
+    def pc(c: dict, name: str) -> dict:
+        return named(c, "projection_cases", name)
+
+    def sc(c: dict, name: str) -> dict:
+        return named(c, "snapshot_cases", name)
+
+    def families(snap: dict) -> dict:
+        return snap["mqtt_ingress"]["families"]
+
+    def rename_family(c: dict, old: str, new: str) -> None:
+        fam = families(pc(c, "every_local_only_member")["snapshot"])
+        fam[new] = fam.pop(old)
+        fam_out = families(pc(c, "every_local_only_member")["expected"])
+        fam_out[new] = fam_out.pop(old)
+
+    def parsed_mutant(doc: str, old: str, new: str) -> Callable[[], None]:
+        """The text change fed to the model's parser past the held-sentence guard, so the
+        parser's own refusal is shown, not only the guard's."""
+        def go() -> None:
+            texts = contract_texts()
+            if old not in texts[doc]:
+                raise AssertionError(f"mutant target missing: {old!r}")
+            texts[doc] = texts[doc].replace(old, new, 1)
+            guard = globals()["check_text"]
+            globals()["check_text"] = lambda _texts: None
+            try:
+                mutated = contract_model(texts)
+            finally:
+                globals()["check_text"] = guard
+            run(corpus_bytes, mutated)
+        return go
+
+    def both(reason: str, edit: tuple[str, str, str]) -> Callable[[], None]:
+        """A text change refused twice: by the held-sentence guard, and, past it, by the
+        parser for `reason`."""
+        doc = edit[0]
+        where = {"v4": "sentence changed in v4", "gw": "sentence changed in gw"}[doc]
+        guarded, parsed = because(where, text_mutant(*edit)), because(reason, parsed_mutant(*edit))
+
+        def go() -> None:
+            refused = []
+            for mutant in (guarded, parsed):
+                try:
+                    mutant()
+                except Failure as failure:
+                    refused.append(str(failure).splitlines()[0])
+            if len(refused) == 2:
+                raise Failure(" | ".join(refused))
+        return go
+
+    # The signing-domains condition, its set and its projection, and mqtt_ingress.
+    undeclared = "firmware_signing_domains_undeclared"
+    cases += [
+        ("signing domains: the token read as a liveness condition", because(
+            "firmware_liveness.degraded is not the umbrella", model_mutant(
+                umbrella_of=[*model["umbrella_of"], undeclared]))),
+        ("signing domains: the condition cleared by a clean stop", because(
+            "snapshot undeclared_while_stopped_cleanly:", model_mutant(undeclared_reads_loop=True))),
+        ("signing domains: the condition dropped", because(
+            f"snapshot alone_{undeclared}:", model_mutant(pred={undeclared: never}))),
+        ("signing domains: the device list projected", because(
+            "projection every_local_only_member:", model_mutant(
+                projected_device_lists=("undeclared_device_ids",)))),
+        ("signing domains: the device count not projected", because(
+            "projection every_local_only_member:", model_mutant(
+                uncounted_device_lists=("undeclared_device_count",)))),
+        ("text: the token liveness-prefixed", both(
+            "no model for condition 'firmware_liveness_signing_domains_undeclared'", (
+                "v4", f"| `{undeclared}` | `degraded` |",
+                "| `firmware_liveness_signing_domains_undeclared` | `degraded` |"))),
+        ("text: the condition reads the loop", both(
+            f"no model for condition '{undeclared}'", (
+                "v4", "| `firmware_liveness.undeclared_device_ids` is non-empty. |",
+                ("| `firmware_liveness.loop` is not `stopped_cleanly`, and "
+                 "`undeclared_device_ids` is non-empty. |")))),
+        ("text: the token critical in runtime-health", both(
+            f"gateway-api/v2 gives {undeclared} severity degraded", (
+                "v4", f"| `{undeclared}` | `degraded` |", f"| `{undeclared}` | `critical` |"))),
+        ("text: the token critical in the gateway table", both(
+            f"gateway-api/v2 gives {undeclared} severity critical", (
+                "gw", f"| `{undeclared}` | `degraded` |", f"| `{undeclared}` | `critical` |"))),
+        ("text: the token dropped from the gateway table", both(
+            f"gateway-api/v2 gives {undeclared} severity missing", (
+                "gw", f"| `{undeclared}` | `degraded` | A device's", "| `x` | `degraded` | A"))),
+        ("text: the gateway count left at 32 tokens", both(
+            "the gateway's stated token counts disagree with its table", (
+                "gw", "The vocabulary holds 33 tokens.", "The vocabulary holds 32 tokens."))),
+        ("text: the old room for one addition restored", both(
+            "the gateway's stated bound and its room disagree", (
+                "gw", "leaves no room: a further token\nchanges the bound;",
+                "leaves room for one addition\nwithout a change to the bound;"))),
+        ("text: the device list projected", both(
+            "the projection row for firmware_liveness changed", (
+                "v4", ("every listed member except `expiring_device_ids` and "
+                       "`undeclared_device_ids`, with `expiring_device_count` and "
+                       "`undeclared_device_count` (both `int`) in their places."),
+                ("every listed member except `expiring_device_ids`, with "
+                 "`expiring_device_count` (`int`) in its place.")))),
+        ("text: mqtt_ingress not projected", both(
+            "payload members neither projected nor listed as local: {'mqtt_ingress'}",
+            ("v4", "`skill_hooks`, `telemetry_export`, `mqtt_ingress` | The snapshot's",
+             "`skill_hooks`, `telemetry_export` | The snapshot's"))),
+        ("text: member_refused dropped from the families value", because(
+            "sentence changed in v4 ## Health Payload > ### `mqtt_ingress` object", text_mutant(
+                "v4", ("| `member_refused` | `int` | Payloads refused under the Payload "
+                       "Member Rule. |\n"), ""))),
+        ("text: the family rule dropped", both(
+            "the consistency rules changed", (
+                "v4", ("- each member name of `mqtt_ingress.families` is the topic of a\n  "
+                       "`Gateway -> Runtime` row of gateway-api/v2 Payload Size.\n"), ""))),
+        ("text: map members no longer projected whole", because(
+            "sentence changed in v4 ## Remote Health Projection", text_mutant(
+                "v4", " and every member of a map such as `mqtt_ingress.families`, whose names "
+                "are data,", ""))),
+        ("text: the disjointness rule dropped", both(
+            "the consistency rules changed", (
+                "v4", ("- no device ID is in both `firmware_liveness.undeclared_device_ids` "
+                       "and\n  `expiring_device_ids`;\n"), ""))),
+        ("text: evidence/inbound turned Runtime -> Gateway in Payload Size", because(
+            "projection every_local_only_member:", text_mutant(
+                "gw", "| `ori/{device_id}/evidence/inbound` | Gateway -> Runtime |",
+                "| `ori/{device_id}/evidence/inbound` | Runtime -> Gateway |"))),
+        ("corpus: a family renamed to a runtime-to-gateway topic", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: rename_family(
+                c, "ori/gateway/health", "ori/{device_id}/runtime/heartbeat")))),
+        ("corpus: a family renamed to a concrete device topic", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: rename_family(
+                c, "ori/{device_id}/export/request", "ori/site-a-edge-01/export/request")))),
+        ("corpus: a families value without member_refused", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: [
+                v.pop("member_refused") for x in ("snapshot", "expected")
+                for v in families(pc(c, "every_local_only_member")[x]).values()]))),
+        ("corpus: a families count a string", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: [
+                families(pc(c, "every_local_only_member")[x])["ori/gateway/health"].update(
+                    volume_dropped="0") for x in ("snapshot", "expected")]))),
+        ("corpus: the projection carries the undeclared list", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: pc(
+                c, "every_local_only_member")["expected"]["firmware_liveness"].update(
+                    undeclared_device_ids=["ori-fw-1d2e3f40"])))),
+        ("corpus: the projection without the undeclared count", because(
+            "projection every_local_only_member:", corpus_mutant(lambda c: pc(
+                c, "every_local_only_member")["expected"]["firmware_liveness"].pop(
+                    "undeclared_device_count")))),
+        ("corpus: a snapshot without its undeclared set", because(
+            "condition members missing: ['undeclared_device_ids']", corpus_mutant(lambda c: sc(
+                c, f"alone_{undeclared}")["snapshot"]["firmware_liveness"].pop(
+                    "undeclared_device_ids")))),
+        ("corpus: an undeclared set with a duplicate", because(
+            "firmware_liveness.undeclared_device_ids: not a set", corpus_mutant(lambda c: sc(
+                c, f"alone_{undeclared}")["snapshot"]["firmware_liveness"].update(
+                    undeclared_device_ids=["ori-fw-7c9f2b3a", "ori-fw-7c9f2b3a"])))),
+        ("corpus: an undeclared set out of byte order", because(
+            "firmware_liveness.undeclared_device_ids: not a set", corpus_mutant(lambda c: sc(
+                c, f"alone_{undeclared}")["snapshot"]["firmware_liveness"].update(
+                    undeclared_device_ids=["ori-fw-b", "ori-fw-a"])))),
+        ("corpus: an undeclared device also expiring", because(
+            "consistency rule undeclared_not_expiring", corpus_mutant(lambda c: sc(
+                c, "undeclared_beside_device_expired")["snapshot"]["firmware_liveness"].update(
+                    expiring_device_ids=["ori-fw-7c9f2b3a"])))),
+        ("corpus: the umbrella beside the token alone", because(
+            f"snapshot alone_{undeclared}:", corpus_mutant(lambda c: sc(
+                c, f"alone_{undeclared}")["expected"].update(degradation_reasons=[
+                    "firmware_liveness_degraded", undeclared])))),
+        ("corpus: the token critical alone", because(
+            f"snapshot alone_{undeclared}:", corpus_mutant(lambda c: sc(
+                c, f"alone_{undeclared}")["expected"].update(status="critical", critical=True)))),
+    ]
     cases += [
         ("age: the record-time term dropped (A2)", because(
             "awaiting courier_clock_ahead:", model_mutant(age_steps=without("A2")))),
@@ -4132,6 +4424,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `firmware_controller_profiles` | `object` | |',
             '| `skill_hooks` | `object` | |',
             '| `telemetry_export` | `object` | |',
+            '| `mqtt_ingress` | `object` | |',
             '| `diagnostics` | `object` | See [Diagnostics](#diagnostics). |',
         ),
         '## Health Payload > ### `sensors[]` object': (
@@ -4635,6 +4928,28 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'protection coverage.'),
             ('A gateway projection MUST NOT aggregate `protection_claim` across nodes so '
              'as to render an `unavailable` pair as covered.'),
+            ("A protective trip attempt made through a firmware command that the runtime refuses "
+             "before signing, for any reason, is reported as the driver's refusal: for such an "
+             "attempt the driver is the runtime's firmware command path, and nothing was "
+             "commanded."),
+            ('That covers a device whose accepted manifest does not carry `runtime_key_domains`, '
+             'under firmware-commands/v2 [Unresolved '
+             'Commands](../firmware-commands/v2.md#unresolved-commands), as well as a device the '
+             'runtime does not hold as approved or whose manifest grants the action no authority.'),
+            ('Its `command_status` is `driver_refused`, so `safety_zone_trip_unresolved` holds '
+             'from that attempt, not from a deadline, with `safety_zone_active_unprotected` as '
+             'for any unresolved trip, and, for a device without the domains, '
+             '`firmware_signing_domains_undeclared` names why.'),
+            ('That is distinct from a delivery failure, which leaves the effect unverified until '
+             'the deadline.'),
+            ('The attempts go on as safety-profile/v1 requires, each refused the same way, and '
+             'health reporting never delays one.'),
+            ('A pair whose protective outcome is a `runtime_commanded` action of a device in '
+             '`firmware_liveness.undeclared_device_ids` has an actuator backend that is not '
+             'drivable, so from the moment the device enters the set, before any trip, its '
+             '`protection_claim` is never `protected`: it is `unavailable` while the pair is '
+             "under qualification, as v3's table decides first, and `unprotected` otherwise, so "
+             'that `safety_zone_active_unprotected` holds while the pair is `active`.'),
         ),
         '## Health Payload > ### `community_skills` object': (
             'States:',
@@ -4663,10 +4978,11 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('The firmware liveness scheduler, which publishes signed liveness to every '
              'supervised device.'),
             'States:',
-            ('`disabled` (no command egress: this runtime is the liveness authority for '
-             'no device), `starting` (configured, and the loop has not started), '
-             "`unavailable` (the scheduler's state could not be read, or the loop had not started when the startup deadline passed), "
-             '`available` (the loop has started and its state was read).'),
+            ("`disabled` (no command egress: this runtime is the liveness authority for no "
+             "device), `starting` (configured, and the loop has not started), `unavailable` (the "
+             "scheduler's state could not be read, or the loop had not started when the startup "
+             "deadline passed, or the device manifests it holds could not be listed), `available`"
+             " (the loop has started, and its state and the held manifests were read)."),
             '| Field | Type | Present | Notes |',
             '| `state` | `string` | always | |',
             ('| `loop` | `string` | available | `running`, `stopped_cleanly` (ended by an '
@@ -4678,20 +4994,39 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| `expiry_window_ms` | `int` | available | The device expiry window of '
              '[firmware-commands/v2.md](../firmware-commands/v2.md), `60000`.'),
             'An elapsed time equal to it is expired. |',
-            '| `supervised_devices` | `int` | available | |',
+            ('| `supervised_devices` | `int` | available | Devices the scheduler publishes '
+             'liveness to: never one in `undeclared_device_ids`. |'),
             '| `supported_device_capacity` | `int` | available | |',
             '| `worst_case_device_latency_ms` | `int` | available | |',
             '| `consecutive_tick_failures` | `int` | available | |',
             ('| `last_successful_tick_age_ms` | `int \\| null` | available | `null` when '
              'no tick has succeeded since the loop started. |'),
-            ('| `expiring_device_ids` | `string[]` | available | A set: supervised '
-             'devices whose last successful publication is at least `expiry_window_ms` old.'),
+            ('| `expiring_device_ids` | `string[]` | available | A set: supervised devices whose '
+             'last successful publication is at least `expiry_window_ms` old, never one in '
+             '`undeclared_device_ids`.'),
+            'Local only; never projected. |',
+            ('| `undeclared_device_ids` | `string[]` | available | A set: devices whose accepted '
+             'manifest the runtime holds and that does not carry `runtime_key_domains`, '
+             'supervised or not.'),
             'Local only; never projected. |',
             ('| `degraded` | `bool` | available | `true` exactly when one of the five '
              'liveness conditions holds. |'),
             ('No liveness condition holds while `loop` is `stopped_cleanly`: an orderly '
              'shutdown owes no device further liveness, including one whose window '
              'expired during the stop.'),
+            ('**Devices that do not declare the signing domains.** For a device in '
+             '`undeclared_device_ids` the runtime signs no command and no liveness message, and '
+             'its `runtime_commanded` actions are unavailable, under firmware-telemetry/v2 '
+             '[Runtime Key Domains](../firmware-telemetry/v2.md#runtime-key-domains).'),
+            ('The set holds such a device from the moment the runtime accepts its manifest, or, '
+             'for a manifest held before the runtime adopted that section, from its first start, '
+             'and until it accepts one that carries the member.'),
+            ('It is not a liveness condition: the scheduler sends such a device nothing, so the '
+             'device is never in `expiring_device_ids` and never counts toward '
+             '`firmware_liveness_device_expired`, though the device itself reports the runtime '
+             'unreachable once its expiry window lapses.'),
+            ('A runtime that cannot list the manifests it holds reports the block `unavailable`, '
+             'never an empty set.'),
         ),
         '## Health Payload > ### `firmware_reading_age` object': (
             ('Per device, how long ago its latest accepted reading was polled, at most, '
@@ -4787,6 +5122,40 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| `optional_unavailable` | `int` | available | Loaded skills running '
              'without hooks they declared optional. |'),
         ),
+        '## Health Payload > ### `mqtt_ingress` object': (
+            ('What the runtime refused of the gateway-to-runtime messages it receives under '
+             'gateway-api/v2 [Payload Size](../gateway-api/v2.md#payload-size), [Payload '
+             'Volume](../gateway-api/v2.md#payload-volume) and the [Payload Member '
+             'Rule](../gateway-api/v2.md#payload-member-rule).'),
+            'States:',
+            '`disabled` (the runtime has no gateway MQTT connection configured), `available`.',
+            ('The counts are held in the process, so they are always readable, and the block '
+             'takes no other state.'),
+            '| Field | Type | Present | Notes |',
+            '| `state` | `string` | always | |',
+            ('| `families` | `object` | available | One member per topic family the runtime '
+             'receives and bounds, named by its topic as Payload Size names a family, with the '
+             '`{device_id}` segment left as written.'),
+            'A family whose route the runtime has not built is not a member. |',
+            'Each `families` value:',
+            '| Field | Type | Notes |',
+            '| `payload_too_large` | `int` | Payloads refused for size. |',
+            ("| `volume_dropped` | `int` | Messages dropped under Payload Volume: beyond the "
+             "family's rate bound, or beyond the work it holds in flight."),
+            ('A message left unread for the broker to redeliver is not dropped and is not '
+             'counted. |'),
+            '| `member_refused` | `int` | Payloads refused under the Payload Member Rule. |',
+            'Each count is since the runtime process started.',
+            ('A count is a number and nothing else: no payload content, device identifier, or '
+             'topic beyond its family.'),
+            ("`mqtt_ingress` contributes no condition, and a non-zero count does not by itself "
+             "degrade health: an authenticated gateway sending refused traffic is made visible "
+             "here, and judging it is the reader's."),
+            ("The block is the runtime's counterpart of the gateway's `mqtt_ingress` posture "
+             "under gateway-api/v2, with two differences: it holds only the families whose routes"
+             " the runtime has built, under `families` beside its `state`, and it counts Payload "
+             "Member Rule refusals, which the gateway's posture does not."),
+        ),
         '## Health Payload > ### Diagnostics': (
             '`diagnostics` is an object, always present, possibly empty.',
             'It is the only place a producer may report uncontracted local state.',
@@ -4814,13 +5183,14 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `projection` | `runtime-health/v4/remote`. |',
             "| `device_id` | The snapshot's: the node's routing identity. |",
             "| `uptime_s`, `status`, `critical`, `degradation_reasons` | The snapshot's. |",
-            ('| `capability_posture`, `sensors`, `device_policy`, `alert_outbox`, '
-             '`gateway_broker_posture`, `state_store_encryption`, `evidence`, '
-             '`action_log_records`, `commissioning`, `safety_registry`, `safety_zones`, '
-             '`community_skills`, `config_authority`, `skill_hooks`, `telemetry_export` | '
-             "The snapshot's block, with only its present members that this version's "
-             'tables list, nested ones included, except `commissioning.last_verdict`, '
-             'which is projected as `{binding_seq, at_ms}`. |'),
+            ("| `capability_posture`, `sensors`, `device_policy`, `alert_outbox`, "
+             "`gateway_broker_posture`, `state_store_encryption`, `evidence`, "
+             "`action_log_records`, `commissioning`, `safety_registry`, `safety_zones`, "
+             "`community_skills`, `config_authority`, `skill_hooks`, `telemetry_export`, "
+             "`mqtt_ingress` | The snapshot's block, with only its present members that this "
+             "version's tables list, nested ones included, and every member of a map such as "
+             "`mqtt_ingress.families`, whose names are data, except `commissioning.last_verdict`,"
+             " which is projected as `{binding_seq, at_ms}`. |"),
             ('| `unknown_critical_blocks` | `string[]`, a set: the names of the '
              'critical-capable blocks that are `unavailable`, from `safety_registry`, '
              '`alert_outbox`, `action_log_records`, `skill_hooks`, `firmware_liveness`.'),
@@ -4831,8 +5201,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              '`enforcement_enabled`, `risk_window_ms`, `stale_after_ms` and '
              '`incident_sender_limit`, with `sender_count` and `locked_out_sender_count` '
              '(both `int`) in place of `senders`. |'),
-            ('| `firmware_liveness` | `state`; when `available`, every listed member '
-             'except `expiring_device_ids`, with `expiring_device_count` (`int`) in its place. |'),
+            ('| `firmware_liveness` | `state`; when `available`, every listed member except '
+             '`expiring_device_ids` and `undeclared_device_ids`, with `expiring_device_count` and'
+             ' `undeclared_device_count` (both `int`) in their places. |'),
             ('| `firmware_reading_age` | `state`; when `available`, `signing_runtime`, '
              'with `device_count` and `unbounded_device_count` (both `int`) in place of '
              '`devices`. |'),
@@ -4843,9 +5214,10 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             'Never projected:',
             ('`contract_version`, `health_socket_path`, `diagnostics`, '
              '`last_alert_timestamps.by_trigger`, `remote_command_lockout.senders`, '
-             '`firmware_liveness.expiring_device_ids`, `firmware_reading_age.devices`, '
-             '`firmware_controller_profiles.documents_refused` and `alarm_channels`, and '
-             '`commissioning.last_verdict.stage` and `.reason`, which are free text.'),
+             '`firmware_liveness.expiring_device_ids` and `.undeclared_device_ids`, '
+             '`firmware_reading_age.devices`, `firmware_controller_profiles.documents_refused` '
+             'and `alarm_channels`, and `commissioning.last_verdict.stage` and `.reason`, which '
+             'are free text.'),
             ('Every string the projection carries is an identifier, a hash, or a value '
              'from a closed vocabulary; prose never leaves the socket.'),
             "The projection follows this contract's representation rules.",
@@ -4878,6 +5250,15 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'gateway refuse its heartbeats, turning an additive change into a loss of '
              'health reporting.'),
             "Every consumer of the gateway's site projection gains `critical`.",
+            ('**`firmware_signing_domains_undeclared` is adopted gateway first.** A gateway '
+             'refuses a heartbeat naming a token outside its vocabulary (gateway-api/v2 '
+             '`degradation_reasons`), so a runtime names this token only once the gateways it '
+             'reports to accept it.'),
+            ('Until then a runtime may serve `undeclared_device_ids` and '
+             '`undeclared_device_count` without the token.'),
+            ('Its snapshot then fails snapshot checks 9 and 10 for that condition alone, so it is'
+             ' a partial implementation of this version, and its `status` can read `ok` while the'
+             ' count is non-zero.'),
         ),
         '## Severity': (
         ),
@@ -4906,6 +5287,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'is not `stopped_cleanly`, and `supervised_devices > supported_device_capacity`. |'),
             ('| `firmware_liveness_tick_failures` | `degraded` | `firmware_liveness.loop` '
              'is not `stopped_cleanly`, and `consecutive_tick_failures > 0`. |'),
+            ('| `firmware_signing_domains_undeclared` | `degraded` | '
+             '`firmware_liveness.undeclared_device_ids` is non-empty. |'),
             ('| `decision_record_lost` | `critical` | Some '
              '`action_log_records.loss_incidents[]` entry has `kind:'),
             '"decision_record_lost"` and `acknowledged: false`. |',
@@ -4992,6 +5375,16 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'critical condition that also holds.'),
             ("None of this says a physical protection failed: the firmware backstop's "
              'state is not reported here.'),
+            '`firmware_signing_domains_undeclared` is degraded, and not a liveness condition.',
+            ('The signing domains are adopted runtime first and then device by device, so a '
+             'runtime that has adopted reports it for every device that has not, for as long as '
+             'the rollout takes; a critical token would report every such site critical '
+             'throughout.'),
+            ('What it reports is a capability the device does not have, not one that is failing: '
+             'the runtime knew of the gap when it accepted the manifest, before any command was '
+             'needed.'),
+            ('A trip that needs the missing capability is critical through '
+             '`safety_zone_trip_unresolved`, from the attempt the runtime refuses.'),
             ('A `disabled` subsystem contributes nothing, because it has no obligation, '
              'and neither does one that does not apply to the device.'),
             ('A subsystem whose conditions decide severity and is still initialising is '
@@ -5248,8 +5641,12 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'every `decision_record_lost` incident;'),
             ("each `loss_incidents[]` entry's `acknowledged_at_ms` is `null` exactly when "
              '`acknowledged` is `false`;'),
-            ('`loss_incidents` is ordered by `incident_id` in byte order, without a '
-             'repeated `incident_id`.'),
+            ('`loss_incidents` is ordered by `incident_id` in byte order, without a repeated '
+             '`incident_id`;'),
+            ('no device ID is in both `firmware_liveness.undeclared_device_ids` and '
+             '`expiring_device_ids`;'),
+            ('each member name of `mqtt_ingress.families` is the topic of a `Gateway -> Runtime` '
+             'row of gateway-api/v2 Payload Size.'),
         ),
         '## Conformance > ### Behavioural checks': (
             ("Each row is driven through the runtime's real snapshot builder or its socket, "
@@ -5324,6 +5721,35 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'condition. |'),
             ('| Another alert unconfirmed past `overdue_bound_ms`; a large backlog of young '
              'alerts | `alert_delivery_overdue`; then nothing. |'),
+            ('| A manifest accepted without `runtime_key_domains`; a start over such a manifest '
+             'held before the runtime adopted; then a manifest that carries it | '
+             '`undeclared_device_ids` names the device from the acceptance, and from the start '
+             'with no republication, `firmware_signing_domains_undeclared`, `degraded`, and the '
+             'device never in `expiring_device_ids`; then the device leaves the set and the '
+             'condition no longer holds. |'),
+            '| The held manifests cannot be listed | `firmware_liveness.state:',
+            ('"unavailable"`, `subsystem_state_unknown_critical`, `critical`; never an empty '
+             '`undeclared_device_ids`. |'),
+            ('| A protective trip attempt through a firmware command to a device in '
+             '`undeclared_device_ids` | Refused before signing, no `cmd_seq` consumed, '
+             '`command_status:'),
+            ('"driver_refused"`, `safety_zone_trip_unresolved`, `safety_zone_active_unprotected` '
+             'and `firmware_signing_domains_undeclared`, `critical`, from that attempt; the '
+             'attempts go on. |'),
+            ('| A protective trip attempt through a firmware command refused before signing for '
+             'another reason: a device not held as approved, or a manifest that grants the action'
+             ' no authority | `command_status:'),
+            ('"driver_refused"`, `safety_zone_trip_unresolved`, `critical`, from that attempt, '
+             'not from the deadline. |'),
+            ('| An active pair not under qualification whose protective outcome is a '
+             '`runtime_commanded` action of a '
+             'device in `undeclared_device_ids`, before any trip | `protection_claim:'),
+            ('"unprotected"`, `safety_zone_active_unprotected` and '
+             '`firmware_signing_domains_undeclared`, `degraded`. |'),
+            ("| Payloads over a family's maximum, past its rate bound, past its in-flight bound, "
+             "refused under the Payload Member Rule, and left unread for redelivery | Each "
+             "counted under its family as `payload_too_large`, `volume_dropped`, "
+             "`volume_dropped`, `member_refused`, and not at all; no condition. |"),
             ('| A lost decision record, then a restart | `decision_record_lost`, '
              '`critical`, before and after the restart, the same `incident_id`, '
              '`decision_records_lost` unchanged. |'),
@@ -5549,6 +5975,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'failing while supervision is still inside its window. |'),
             ('| `firmware_liveness_tick_stale` | `critical` | No liveness tick has '
              'succeeded within the expiry window. |'),
+            ("| `firmware_signing_domains_undeclared` | `degraded` | A device's accepted manifest"
+             " does not declare the signing domains, so the runtime signs no command or liveness "
+             "message for it and its runtime-commanded actions are unavailable. |"),
             ("| `safety_zone_activation_refused` | `degraded` | An eligible zone's "
              'profile was refused at activation, so the zone is not protected. |'),
             ('| `safety_zone_active_unprotected` | `degraded` | A zone the device has '
@@ -5606,18 +6035,17 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'inconsistently.'),
             ('Tokens are unique, in byte order, and number at most **32** — an exact '
              'bound rather than "bounded", so conformance is checkable without judgement.'),
-            'The vocabulary holds 32 tokens.',
+            'The vocabulary holds 33 tokens.',
             ('A conforming heartbeat names either `health_snapshot_invalid` alone, or a '
-             'combination of the other 31.'),
-            ('Not all 31 can hold at once, because a block that names '
+             'combination of the other 32.'),
+            ('Not all 32 can hold at once, because a block that names '
              '`subsystem_state_unknown_critical` cannot also name its own conditions, but the '
-             'bound admits all 31 together.'),
+             'bound admits all 32 together.'),
             ('A conforming runtime never emits `firmware_liveness_degraded` alone, '
              'because its local triple check refuses that snapshot (runtime-health/v4 '
              'step T4), though a receiver accepts it.'),
-            ('The bound of 32 admits every such combination and leaves room for one addition '
-             'without a change to the bound; step 9 refuses `health_snapshot_invalid` beside any '
-             'other token.'),
+            ('The bound of 32 admits every such combination and leaves no room: a further token '
+             'changes the bound; step 9 refuses `health_snapshot_invalid` beside any other token.'),
             ('**Validation order is normative.** It applies after authentication and '
              'generic JSON syntax parsing, but **before typed decoding or normalisation** '
              '— otherwise a typed decoder would already have rejected the array-type and '

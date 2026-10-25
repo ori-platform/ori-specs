@@ -42,6 +42,7 @@ SEVERITY = {
     "firmware_liveness_stopped": C,
     "firmware_liveness_tick_failures": D,
     "firmware_liveness_tick_stale": C,
+    "firmware_signing_domains_undeclared": D,
     "safety_zone_active_unprotected": D,
     "sensor_measurement_degraded": D,
     "sensor_unconnected": D,
@@ -112,6 +113,9 @@ def holding(v: dict) -> list[str]:
             out.append("firmware_liveness_over_capacity")
         if fl["consecutive_tick_failures"] > 0:
             out.append("firmware_liveness_tick_failures")
+    if avail(fl) and fl["undeclared_device_ids"]:
+        # Not a liveness condition, so it holds whatever the loop's state.
+        out.append("firmware_signing_domains_undeclared")
     al = v["action_log_records"]
     if avail(al):
         open_kinds = {i["kind"] for i in al["loss_incidents"] if not i["acknowledged"]}
@@ -215,7 +219,7 @@ def baseline() -> dict:
             "expiry_window_ms": 60000, "supervised_devices": 2,
             "supported_device_capacity": 16, "consecutive_tick_failures": 0,
             "last_successful_tick_age_ms": 1000, "expiring_device_ids": [],
-            "degraded": False},
+            "undeclared_device_ids": [], "degraded": False},
         "action_log_records": {
             "state": "available", "pending": 0, "oldest_pending_age_ms": None,
             "ceiling": 1000, "lost": 0, "stall_bound_ms": 30000,
@@ -298,6 +302,7 @@ SINGLE = {
     "firmware_liveness_tick_stale": [((FL, "last_successful_tick_age_ms"), 60000)],
     "firmware_liveness_device_expired": [((FL, "expiring_device_ids"), ["ori-fw-7c9f2b3a"])],
     "firmware_liveness_over_capacity": [((FL, "supervised_devices"), 17)],
+    "firmware_signing_domains_undeclared": [((FL, "undeclared_device_ids"), ["ori-fw-1d2e3f40"])],
     "firmware_liveness_tick_failures": [((FL, "consecutive_tick_failures"), 1)],
     "decision_record_lost": losses(incident("decision_record_lost")),
     "action_log_records_lost": losses(incident("action_record_lost", iid="inc-0002")),
@@ -387,6 +392,19 @@ def snapshot_specs() -> list[tuple[str, list, str]]:
         ("stopped_with_stale_tick", [((FL, "loop"), "stopped_unexpectedly"),
                                      ((FL, "last_successful_tick_age_ms"), 120000)],
          "a dead loop past the window is both stopped and stale"),
+        ("undeclared_while_stopped_cleanly", [((FL, "loop"), "stopped_cleanly"),
+                                              ((FL, "undeclared_device_ids"), ["ori-fw-7c9f2b3a"])],
+         "devices without the signing domains are named after an orderly stop too"),
+        ("undeclared_beside_device_expired", [((FL, "undeclared_device_ids"), ["ori-fw-7c9f2b3a"]),
+                                              ((FL, "expiring_device_ids"), ["ori-fw-00000000"])],
+         "the undeclared device is not the expiring one; critical, and the undeclared token is "
+         "no liveness condition"),
+        ("undeclared_beside_trip_refused", [((FL, "undeclared_device_ids"), ["ori-fw-7c9f2b3a"]),
+                                            *TRIPPED,
+                                            (("safety_zones", 0, "command_status"), "driver_refused"),
+                                            (("safety_zones", 0, "protection_claim"), "unprotected")],
+         "a trip attempt refused before signing is driver_refused, critical at once, and leaves "
+         "the pair unprotected"),
         ("capacity_equal", [((FL, "supervised_devices"), 16)],
          "supervised equal to capacity is not over it"),
         ("over_capacity_and_tick_failures", [((FL, "supervised_devices"), 17),
@@ -624,7 +642,8 @@ def snapshot_specs() -> list[tuple[str, list, str]]:
         {"zone_id": "zone-b", "profile_id": "profile-a", "activation": "unit_mismatch",
          "trip_state": "inactive", "command_status": "none", "effect_verified": "unknown",
          "trip_age_ms": None, "protection_claim": "unprotected"}]))
-    s.append(("every_condition", every, "every condition at once: twenty-nine tokens"))
+    s.append(("every_condition", every,
+              f"every condition at once: {len(fold(holding(view(*every)))['degradation_reasons'])} tokens"))
     return s
 
 
@@ -1238,6 +1257,7 @@ def full_health() -> dict:
         "firmware_controller_profiles": {"state": "disabled"},
         "skill_hooks": {"state": "disabled"},
         "telemetry_export": {"state": "disabled"},
+        "mqtt_ingress": {"state": "disabled"},
         "diagnostics": {},
     }
 
@@ -1258,6 +1278,22 @@ def edited(path: tuple, value) -> dict:
     else:
         node[path[-1]] = value
     return h
+
+
+def ingress_block(family: str = "ori/{device_id}/export/request", count=14) -> dict:
+    return {"state": "available", "families": {
+        "ori/gateway/health": {"payload_too_large": 0, "volume_dropped": 0, "member_refused": 0},
+        family: {"payload_too_large": 1, "volume_dropped": count, "member_refused": 2}}}
+
+
+def liveness_block(undeclared: list[str], expiring: list[str] | None = None) -> dict:
+    return {
+        "state": "available", "loop": "running", "started_age_ms": 600000, "interval_ms": 15000,
+        "per_device_timeout_ms": 5000, "max_concurrent": 8, "expiry_window_ms": 60000,
+        "supervised_devices": 2, "supported_device_capacity": 16,
+        "worst_case_device_latency_ms": 5000, "consecutive_tick_failures": 0,
+        "last_successful_tick_age_ms": 1000, "expiring_device_ids": expiring or [],
+        "undeclared_device_ids": undeclared, "degraded": bool(expiring)}
 
 
 def zone_entry(trip_age_ms) -> dict:
@@ -1491,6 +1527,30 @@ def response_cases() -> list[dict]:
         ("encryption_unavailable", envelope_text(edited(
             ("state_store_encryption",), {"state": "unavailable", "available": False})),
          "accept", "decides no severity"),
+        ("ingress_available", envelope_text(edited(("mqtt_ingress",), ingress_block())),
+         "accept", "refusal counts decide no severity, however large"),
+        ("ingress_family_not_gateway_to_runtime", envelope_text(edited(
+            ("mqtt_ingress",), ingress_block("ori/{device_id}/runtime/heartbeat"))),
+         "shape_invalid", "a family the runtime publishes, not one it receives"),
+        ("ingress_families_while_disabled", envelope_text(edited(
+            ("mqtt_ingress",), {"state": "disabled", "families": {}})),
+         "shape_invalid", "a disabled block carries only state"),
+        ("ingress_count_string", envelope_text(edited(
+            ("mqtt_ingress",), ingress_block(count="3"))),
+         "integer_invalid", "a count is an integer"),
+        ("ingress_count_negative", envelope_text(edited(
+            ("mqtt_ingress",), ingress_block(count=-1))),
+         "integer_invalid", "a count is at least 0"),
+        ("undeclared_device", envelope_text(served(
+            [(("firmware_liveness",), liveness_block(undeclared=["ori-fw-1d2e3f40"]))],
+            "degraded", ["firmware_signing_domains_undeclared"])),
+         "accept", "a device without the signing domains, named and degraded"),
+        ("undeclared_and_expiring", envelope_text(served(
+            [(("firmware_liveness",), liveness_block(undeclared=["ori-fw-1d2e3f40"],
+                                                     expiring=["ori-fw-1d2e3f40"]))],
+            "critical", ["firmware_liveness_degraded", "firmware_liveness_device_expired",
+                         "firmware_signing_domains_undeclared"])),
+         "shape_invalid", "a device without the signing domains is never expiring"),
         ("disabled_block_with_member", envelope_text(edited(("firmware_liveness", "loop"),
                                                             "running")),
          "shape_invalid", "a disabled block carries only state"),
@@ -1647,6 +1707,7 @@ def evidence_available() -> dict:
 
 PHONE = "+2348000000000"
 SUBORDINATE = "ori-fw-7c9f2b3a"
+UNDECLARED = "ori-fw-1d2e3f40"
 
 
 def rich_health() -> dict:
@@ -1672,7 +1733,13 @@ def rich_health() -> dict:
         "supervised_devices": 2, "supported_device_capacity": 16,
         "worst_case_device_latency_ms": 5000, "consecutive_tick_failures": 0,
         "last_successful_tick_age_ms": 1000, "expiring_device_ids": [SUBORDINATE],
-        "degraded": True}
+        "undeclared_device_ids": [UNDECLARED], "degraded": True}
+    h["mqtt_ingress"] = {"state": "available", "families": {
+        "ori/gateway/health": {"payload_too_large": 0, "volume_dropped": 0, "member_refused": 0},
+        "ori/{device_id}/evidence/inbound": {"payload_too_large": 2, "volume_dropped": 0,
+                                             "member_refused": 1},
+        "ori/{device_id}/export/request": {"payload_too_large": 0, "volume_dropped": 14,
+                                           "member_refused": 0}}}
     h["firmware_reading_age"] = {"state": "available", "signing_runtime": True, "devices": [
         {"device_id": "ori-fw-00000000",
          "latest_reading": {"key_epoch_id": "epoch-1", "boot_id": 3, "seq": 88},
@@ -1764,9 +1831,11 @@ def project(h: dict) -> dict:
             1 for s in lock["senders"] if s["locked_out"])
     fl = h["firmware_liveness"]
     out["firmware_liveness"] = {k: copy_value(v) for k, v in fl.items()
-                                if k != "expiring_device_ids"}
+                                if k not in ("expiring_device_ids", "undeclared_device_ids")}
     if fl["state"] == "available":
         out["firmware_liveness"]["expiring_device_count"] = len(fl["expiring_device_ids"])
+        out["firmware_liveness"]["undeclared_device_count"] = len(fl["undeclared_device_ids"])
+    out["mqtt_ingress"] = copy_value(h["mqtt_ingress"])
     ra = h["firmware_reading_age"]
     out["firmware_reading_age"] = keep(ra, ["state", "signing_runtime"])
     if ra["state"] == "available":
@@ -1787,7 +1856,7 @@ def project(h: dict) -> dict:
 
 def projection_cases() -> list[dict]:
     rich = rich_health()
-    local = [PHONE, "+2348000000001", "signature_invalid", SUBORDINATE, "ori-fw-00000000", "/var/lib/ori", "TimeoutError",
+    local = [PHONE, "+2348000000001", "signature_invalid", SUBORDINATE, UNDECLARED, "ori-fw-00000000", "/var/lib/ori", "TimeoutError",
              "/run/ori/health.sock", "dangerous_overcurrent", "broken-profile.json"]
     cases = [("whole_healthy", full_health(), "every block as a healthy runtime serves it"),
              ("every_local_only_member", rich,
