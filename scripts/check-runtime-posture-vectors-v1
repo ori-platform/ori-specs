@@ -95,7 +95,8 @@ PINS: list[tuple[str, str]] = [
     ("posture", "`v`, `boot_generation`, `posture_seq` and `issued_at_ms` are each written as a JSON integer token: the digit `0`, or a digit `1` to `9` followed by digits, with no sign, fraction, exponent or leading zero."),
     ("posture", "Each is at least `1` and at most 2^53 − 1 (9007199254740991)."),
     ("posture", "`1.0`, `1e0`, `-1`, `01`, `true` and `\"1\"` are not integers here."),
-    ("posture", "Every string member is ASCII and matches its pattern above."),
+    ("posture", "Every string member, and every string in `alert_classes`, is ASCII and matches its pattern above."),
+    ("posture", "Like every member, it grants nothing: no consumer enables, withholds or sends anything because of it."),
     ("posture", "canonical form of the object: members sorted by name, no insignificant whitespace, and every number token kept exactly as written, as that contract's verifier keeps it."),
     ("posture", "Canonical bytes never respell a number, so a record whose integer is written `1e0` or `1.0` has canonical bytes and is `malformed`, not `not_canonical`."),
     ("posture", "**A record is published as exactly its canonical bytes,** with nothing before or after them."),
@@ -329,6 +330,11 @@ def build_model(texts: dict[str, str]) -> dict:
     m["release_max"] = int(rel.group(2))
     m["profiles"] = re.findall(r"`([a-z]+)`", row["deployment_profile"].split(":")[0])
     m["hash_re"] = r"sha256:[0-9a-f]{64}"
+    ac = one(r"a JSON array of at most (\d+) strings, each matching `\^(.+?)\$`, in strictly ascending byte order",
+             row["alert_classes"], "alert_classes row")
+    m["classes_max"] = int(ac.group(1))
+    m["class_re"] = ac.group(2)
+    m["class_len"] = int(one(r"\{0,(\d+)\}$", m["class_re"], "alert_classes pattern").group(1)) + 1
     if "`sha256:` followed by 64 lowercase hex characters" not in row["commissioned_binding"]:
         raise Failure("text: commissioned_binding form changed")
     m["int_max"] = int(one(r"at most 2\^53 − 1 \((\d+)\)", rec, "Integers").group(1))
@@ -992,6 +998,10 @@ def form_faults(obj: dict, model: dict, mut: frozenset) -> list[str]:
             ok = v is None or (isinstance(v, str) and re.fullmatch(model["hash_re"], v) is not None)
         elif k == "key_identity":
             ok = isinstance(v, str) and re.fullmatch(model["hash_re"], v) is not None
+        elif k == "alert_classes":
+            ok = (isinstance(v, list) and ("classes_no_count_bound" in mut or len(v) <= model["classes_max"])
+                  and all(isinstance(c, str) and c.isascii() and re.fullmatch(model["class_re"], c) for c in v)
+                  and ("classes_any_order" in mut or all(a.encode() < b.encode() for a, b in zip(v, v[1:]))))
         elif k == "signature":
             ok = canonical_b64(v, 64) is not None
         else:
@@ -1576,6 +1586,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         "v": Num("1"), "device_id": "d" * 128, "release": "9" * (model["release_max"] - 9) + ".0.0-rc.1",
         "deployment_profile": max(model["profiles"], key=len), "commissioned_binding": "sha256:" + "0" * 64,
         "key_identity": "sha256:" + "0" * 64, "boot_generation": Num(str(model["int_max"])),
+        "alert_classes": [f"{i:0{model['class_len']}d}".replace("0", "a", 1) for i in range(model["classes_max"])],
         "posture_seq": Num(str(model["int_max"])), "issued_at_ms": Num(str(model["int_max"])),
         "signature": base64.b64encode(bytes(64)).decode(),
     }
@@ -1648,6 +1659,11 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     bound_pass.add("release_null")
                 if obj["commissioned_binding"] is None:
                     bound_pass.add("binding_null")
+                cl = obj["alert_classes"]
+                if not cl:
+                    bound_pass.add("alert_classes_empty")
+                if len(cl) == model["classes_max"] and all(len(c) == model["class_len"] for c in cl):
+                    bound_pass.add("alert_classes")
             # Declared constructions of signature refusals.
             if not ff and got in ("signature_invalid", "key_mismatch") and not mut:
                 sig = canonical_b64(obj["signature"], 64)
@@ -1708,7 +1724,8 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                     ("release_rc_zero", "a release candidate rc.0"),
                     ("s_not_reduced", "a signature whose S is not below L but whose S - L verifies")):
         need(k in rec_edges, f"no record case with {what}")
-    for k in ("device_id", "release", "boot_generation", "posture_seq", "release_null", "binding_null"):
+    for k in ("device_id", "release", "boot_generation", "posture_seq", "release_null", "binding_null",
+              "alert_classes", "alert_classes_empty"):
         need(k in bound_pass, f"no passing record with {k} at its bound")
 
     # Sequences
@@ -2088,6 +2105,8 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
 # ---------------------------------------------------------------------------
 
 RECEIVER_MUTANTS = [
+    "classes_any_order",
+    "classes_no_count_bound",
     "swap:not_canonical,malformed",
     "swap:malformed,unknown_device",
     "swap:unknown_device,device_mismatch",

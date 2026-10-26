@@ -43,8 +43,11 @@ INADMISSIBLE = bytes.fromhex("01" + "00" * 31)  # ed25519-key-admission/v1 vecto
 DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 RELEASE_RE = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?")
 HASH_RE = re.compile(r"sha256:[0-9a-f]{64}")
-MEMBERS = {"v", "device_id", "release", "deployment_profile", "commissioned_binding", "key_identity",
-           "boot_generation", "posture_seq", "issued_at_ms", "signature"}
+CLASS_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MAX_CLASSES = 10
+CLASSES = ["unusual_consumption_spike"]
+MEMBERS = {"v", "device_id", "release", "deployment_profile", "commissioned_binding", "alert_classes",
+           "key_identity", "boot_generation", "posture_seq", "issued_at_ms", "signature"}
 
 
 def key(label: str) -> Ed25519PrivateKey:
@@ -183,9 +186,11 @@ PUB_NEG_A = NEG_A.public()
 
 def record(signer: object = KEY_A, *, boot: int = 1, seq: int = 1, issued: int = 1_787_000_000_000,
            device: str = DEVICE, release: object = "2.5.1", profile: str = "production",
-           binding: object = BINDING, key_identity: str | None = None, **override: object) -> dict:
+           binding: object = BINDING, classes: object = None, key_identity: str | None = None,
+           **override: object) -> dict:
     obj = {"v": 1, "device_id": device, "release": release, "deployment_profile": profile,
-           "commissioned_binding": binding, "key_identity": key_identity or identity(raw(signer)),
+           "commissioned_binding": binding, "alert_classes": list(CLASSES) if classes is None else classes,
+           "key_identity": key_identity or identity(raw(signer)),
            "boot_generation": boot, "posture_seq": seq, "issued_at_ms": issued}
     obj.update({k: v for k, v in override.items() if k != "signature"})
     obj["signature"] = b64(signer.sign(DOMAIN + canonical(obj)))
@@ -213,6 +218,14 @@ def canonical_b64(s: object, n: int) -> bool:
     return len(d) == n and b64(d) == s
 
 
+def classes_ok(v: object) -> bool:
+    if not isinstance(v, list) or len(v) > MAX_CLASSES:
+        return False
+    if not all(isinstance(c, str) and CLASS_RE.fullmatch(c) for c in v):
+        return False
+    return all(a.encode() < b.encode() for a, b in zip(v, v[1:]))
+
+
 def schema_ok(o: dict) -> bool:
     if set(o) != MEMBERS:
         return False
@@ -223,6 +236,7 @@ def schema_ok(o: dict) -> bool:
             and o["deployment_profile"] in ("development", "staging", "production")
             and (o["commissioned_binding"] is None
                  or (isinstance(o["commissioned_binding"], str) and HASH_RE.fullmatch(o["commissioned_binding"])))
+            and classes_ok(o["alert_classes"])
             and isinstance(o["key_identity"], str) and HASH_RE.fullmatch(o["key_identity"]) is not None
             and all(is_int(o[m]) for m in ("boot_generation", "posture_seq", "issued_at_ms"))
             and canonical_b64(o["signature"], 64))
@@ -359,8 +373,13 @@ GOOD = record()
 rcase("valid", "A record that passes every check up to ordering.", text(GOOD))
 rcase("valid_nulls", "release and commissioned_binding may be null.", text(record(release=None, binding=None)))
 rcase("valid_rc_release", "A release candidate's SemVer.", text(record(release="2.5.1-rc.13")))
+BOUND_CLASSES = ["c" * 31 + str(i) for i in range(MAX_CLASSES)]
+rcase("valid_no_alert_classes", "A release that binds no alert class.", text(record(classes=[])))
+rcase("valid_undefined_alert_class", "A class name device-policy/v2 does not define is carried unchanged.",
+      text(record(classes=["later_class", "unusual_consumption_spike"])))
 rcase("valid_bounds", "Every bounded member at its largest value.",
-      text(record(device="d" * 128, release="9" * 55 + ".0.0-rc.1", boot=MAX_INT, seq=MAX_INT, issued=WALL)),
+      text(record(device="d" * 128, release="9" * 55 + ".0.0-rc.1", boot=MAX_INT, seq=MAX_INT, issued=WALL,
+                  classes=BOUND_CLASSES)),
       topic="d" * 128, devices=("d" * 128,), pins={"d" * 128: PUB_A})
 rcase("not_canonical_whitespace", "A space after a colon.", text(GOOD).replace('"v":1', '"v": 1'))
 assert list(GOOD) != sorted(GOOD)
@@ -384,6 +403,18 @@ for name, note, obj in (
     ("malformed_release_long", "release of 65 characters.", {**GOOD, "release": "1" * 61 + ".0.0"}),
     ("malformed_release_beta", "Only -rc.N pre-releases.", {**GOOD, "release": "2.5.1-beta.1"}),
     ("malformed_profile", "deployment_profile outside its set.", {**GOOD, "deployment_profile": "prod"}),
+    ("malformed_alert_classes_null", "alert_classes is null.", {**GOOD, "alert_classes": None}),
+    ("malformed_alert_classes_string", "alert_classes is a string, not an array.",
+     {**GOOD, "alert_classes": "unusual_consumption_spike"}),
+    ("malformed_alert_classes_entry_type", "An entry that is not a string.", {**GOOD, "alert_classes": [1]}),
+    ("malformed_alert_classes_upper", "An entry outside the pattern.", {**GOOD, "alert_classes": ["Grid_power"]}),
+    ("malformed_alert_classes_long", "An entry of 33 characters.", {**GOOD, "alert_classes": ["c" * 33]}),
+    ("malformed_alert_classes_many", "11 entries.",
+     {**GOOD, "alert_classes": ["c" * 30 + f"{i:02d}" for i in range(MAX_CLASSES + 1)]}),
+    ("malformed_alert_classes_duplicate", "One name twice.",
+     {**GOOD, "alert_classes": ["unusual_consumption_spike", "unusual_consumption_spike"]}),
+    ("malformed_alert_classes_unsorted", "Names out of ascending order.",
+     {**GOOD, "alert_classes": ["unusual_consumption_spike", "grid_power_restored"]}),
     ("malformed_binding_upper", "commissioned_binding in upper-case hex.",
      {**GOOD, "commissioned_binding": BINDING.upper().replace("SHA256", "sha256")}),
     ("malformed_key_identity", "key_identity of 63 hex characters.", {**GOOD, "key_identity": GOOD["key_identity"][:-1]}),
