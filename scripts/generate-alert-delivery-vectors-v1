@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import pathlib
 import re
@@ -456,7 +457,7 @@ def check_enrolments(enrolments: list) -> None:
     for es in by_device.values():
         es = sorted(es, key=lambda e: e["revision"])
         assert len({e["revision"] for e in es}) == len(es) and es[0]["lineage"] == "begins"
-        for a, b in zip(es, es[1:]):
+        for a, b in itertools.pairwise(es):
             assert a["owner"] == b["owner"] or b["lineage"] == "begins", "another owner always begins a lineage"
 
 
@@ -468,6 +469,12 @@ def fixture(device: str = DEVICE, *, enrol: tuple = ("runtime",), forwarder: str
     return {"topic_device": device, "configured_devices": [device], "forwarder": forwarder,
             "forwarding_registry": registry if registry is not None else {FORWARDER: [perm(device)]},
             "enrolments": enrolments}
+
+
+# A store reset begins lineage 2 under rotated; a move to site-b does too, to another owner.
+RESET = fixture(enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins")])
+MOVED = fixture(registry={FORWARDER: [perm(DEVICE)], OTHER_FORWARDER: [perm(DEVICE, "site-b")]},
+                enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins", "site-b")])
 
 
 # --- records -----------------------------------------------------------------------------------------
@@ -992,9 +999,6 @@ def obs(alert: str, attempt: str, aseq: int, oseq: int, prior: object, outcome: 
 AL1, AL2 = "alert-0000000001", "alert-0000000002"
 AT1, AT2, AT3 = "attempt-00000001", "attempt-00000002", "attempt-00000003"
 BOTH = fixture(enrol=("runtime", "rotated"))  # rotated continues runtime's lineage, a rotation
-RESET = fixture(enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins")])
-MOVED = fixture(registry={FORWARDER: [perm(DEVICE)], OTHER_FORWARDER: [perm(DEVICE, "site-b")]},
-                enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins", "site-b")])
 
 rseq("duplicate", "The same record twice: stored, then duplicate.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
@@ -1512,35 +1516,44 @@ def build() -> dict:
                      "key_identity. Test keys only."),
             "records": ("Each record case is one message, `record` its exact bytes, on the alert-delivery topic of "
                         "`topic_device`. `expected_gateway` is `pass` or the reason of checks 3 to 6 of Carriage "
-                        "and custody, for a gateway whose gateway.device_ids is `configured_devices`. "
-                        "`expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check 1 being "
-                        "carriage checks 3 and 4: the receiver receives no topic, reads neither `topic_device` "
-                        "nor `configured_devices`, and judges forwarding permission against the record's own "
-                        "device_id. Checks 1 and 2 of carriage, and the receiver's own payload bound, "
-                        "are not exercised. The receiver's authenticated registry is `forwarding_registry`, each "
-                        "forwarder mapped to the devices it may forward for; the record arrives from `forwarder`, "
-                        "and check 2 (not_owned) fails when the record's device_id is not in the forwarder's "
-                        "list. `enrolments` is the receiver's enrolment registry: each a device, a test key by "
-                        "name and the purpose; check 3 (key_not_enrolled) fails unless an enrolment for the "
-                        "record's device_id has the record's key_identity, and check 4 verifies under that "
+                        "and custody, for a gateway whose gateway.device_ids is `configured_devices`; check 4 "
+                        "is unsupported_version for a v that is a JSON integer token (an optional minus, no "
+                        "fraction or exponent) other than 1, and otherwise malformed for a record outside its "
+                        "form. `expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check "
+                        "1 being carriage checks 3 and 4: the receiver receives no topic and reads neither "
+                        "`topic_device` nor `configured_devices`. Checks 1 and 2 of carriage, and the "
+                        "receiver's own payload bound, are not exercised. `enrolments` is the receiver's "
+                        "enrolment registry: each a device, a test key by name, the purpose, the owner (site or "
+                        "tenant), the enrolment revision, and `lineage`, whether it `begins` a lineage or "
+                        "`continues` the lineage of the device's previous revision; an enrolment to another "
+                        "owner always begins one. The record's key's enrolment is the one for its device_id, "
+                        "purpose alert_delivery_report, and key_identity. `forwarding_registry` maps each "
+                        "forwarder to the (device_id, owner) pairs it may forward for, and the record arrives "
+                        "from `forwarder`. Check 2 (not_owned) fails unless the forwarder may forward for the "
+                        "record's device_id on behalf of the owner its key's enrolment names or, when the key "
+                        "has no enrolment, for the device_id on behalf of any owner. Check 3 "
+                        "(key_not_enrolled) fails when the key has no enrolment, and check 4 verifies under the "
                         "enrolment's key. `pass` at the receiver means the record goes on to check 6."),
             "receiver_sequences": ("Each sequence is records in arrival order to one receiver with "
-                                   "`forwarder`, `forwarding_registry` and `enrolments` as in `records`. `expected` is the verdict: "
-                                   "a refusal of checks 1 to 5, which changes nothing, or check 6's: `stored`, "
-                                   "`duplicate`, `conflict` or `lower_count`, in that order. Bytes identical to a "
-                                   "record held as stored or as conflict are duplicate; every other judgement is "
-                                   "against `stored` records only. A tally with the count of a stored one and "
-                                   "other bytes is conflict even when a greater count is stored. An observation's identity is (device_id, "
-                                   "delivery_attempt_id, observation_seq), and every consistency rule holds within "
-                                   "one device_id whatever key signs; a tally's identity is its tally key, its "
-                                   "epoch and its count. `expected_reading` is Reading a notice over the `stored` "
-                                   "records, for each device_id and alert_id: per channel the latest attempt state "
-                                   "and ever accepted, and accepted on some channel; `settled` is false for every "
-                                   "notice a record held as conflict names, and every one the record it conflicted "
-                                   "with names. `expected_tallies` lists, per device, epoch (the key_identity) "
-                                   "and tally key, the greatest-count snapshot of those it keeps, every stored "
-                                   "snapshot being kept, `settled` as for a "
-                                   "notice; a key not listed is unknown."),
+                                   "`forwarder`, `forwarding_registry` and `enrolments` as in `records`. A "
+                                   "record's lineage is that of its key's enrolment: a device's lineages are "
+                                   "numbered from 1, by revision, each enrolment that begins one starting the "
+                                   "next. `expected` is the verdict: a refusal of checks 1 to 5, which changes "
+                                   "nothing, or check 6's: `stored`, `duplicate`, `conflict` or `lower_count`, in "
+                                   "that order. Bytes identical to a record held as stored or as conflict are "
+                                   "duplicate; every other judgement is against `stored` records only. A tally "
+                                   "with the count of a stored one and other bytes is conflict even when a "
+                                   "greater count is stored. An observation's identity is (device_id, "
+                                   "delivery_attempt_id, observation_seq), and every consistency rule, attempt_seq "
+                                   "uniqueness among them, holds within one device_id and one lineage whatever key "
+                                   "of it signs; a tally's identity is its tally key, its epoch and its count. "
+                                   "`expected_reading` is Reading a notice over the `stored` records, for each "
+                                   "device_id, lineage and alert_id: per channel the latest attempt state and ever "
+                                   "accepted, and accepted on some channel; `settled` is false for every notice a "
+                                   "record held as conflict names, and every one the record it conflicted with "
+                                   "names. `expected_tallies` lists, per device, epoch (the key_identity) and "
+                                   "tally key, the greatest-count snapshot of those it keeps, every stored "
+                                   "snapshot being kept, `settled` as for a notice; a key not listed is unknown."),
             "carriage_sequences": ("Each sequence is messages in arrival order to one gateway with "
                                    "`configured_devices` and alert_delivery.max_records_per_device, custody "
                                    "readable and writable, and nothing retired from custody. `expected` is the "

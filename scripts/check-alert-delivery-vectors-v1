@@ -151,7 +151,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "| `record_digest` | `sha256:` and the lowercase hexadecimal SHA-256 of the record's exact bytes. |"),
     ("ad", "A queue holding `max_records_per_device` records for the device is `queue_full`."),
     ("ad", "A held digest is `replayed` even when the queue is full."),
-    ("ad", "`queue_full`, `store_unavailable` and `unsupported_version` describe the gateway's state, not the record's, so they are **retryable**"),
+    ("ad", "`queue_full` and `store_unavailable` describe the gateway's state, and `unsupported_version` the versions the gateway takes, never a fault in the record, so all three are **retryable**"),
     ("ad", "and, when the record's key is enrolled, on behalf of the owner its enrolment names, as the receiver's own authenticated registry holds it: never as any label in the record or the request says, and never as the device's current owner. Otherwise `not_owned`. A record whose key is not enrolled for the device passes this check on the device alone, and check 3 refuses it."),
     # Verifying
     ("ad", "A record refused at checks 2 to 4 is the forwarder's or the network's, never the runtime's, and changes nothing the receiver holds."),
@@ -482,7 +482,7 @@ def build_model(texts: dict[str, str]) -> dict:
     if ack_rows["reason"] != '`""` when `queued`; otherwise the refusing check\'s reason.':
         raise Failure(f"text: acknowledgement reason row changed: {ack_rows['reason']!r}")
     m["ack_outcomes"] = (ga.group(1), ga.group(2), ga.group(3), m["gw_queue_full"], m["gw_store_unavailable"])
-    gr = one(r"`(\w+)`, `(\w+)` and `(\w+)` describe the gateway's state, not the record's, so they are \*\*retryable\*\*", cc, "retryable")
+    gr = one(r"`(\w+)` and `(\w+)` describe the gateway's state, and `(\w+)` the versions the gateway takes, never a fault in the record, so all three are \*\*retryable\*\*", cc, "retryable")
     if set(gr.groups()) != {m["gw_queue_full"], m["gw_store_unavailable"], m["gw_unsupported"]}:
         raise Failure(f"text: the retryable set changed: {gr.groups()}")
     m["ack_unanswered_check"] = int(one(r"A message refused at check (\d) is not acknowledged", cc, "ack").group(1))
@@ -1163,14 +1163,17 @@ def gateway_faults(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> tuple[l
         checks[0], checks[1] = checks[1], checks[0]
     if "gw_swap_4_6" in mut:
         checks[1], checks[3] = checks[3], checks[1]
-    skip: set = set()
     for n, c in checks:
-        if f"gw_drop_{n}" in mut or n in skip:
+        if f"gw_drop_{n}" in mut:
+            continue
+        if n == 4 and model["gw_unsupported"] in f:
+            # check 4 names one reason; a second fault behind unsupported_version
+            # is any form fault other than v's own
+            if form_faults(obj, model, mut | {"skip_form:v"}):
+                f.append(model["gw_reason"][4])
             continue
         if c():
             f.append(model["gw_unsupported"] if n == 40 else model["gw_reason"][n])
-            if n == 40:
-                skip.add(4)  # "Otherwise": check 4 names one reason
     return f, obj
 
 
@@ -1179,14 +1182,24 @@ def receiver_faults(raw: bytes, obj: dict, ctx: Ctx, model: dict, mut: frozenset
     enrolled key that verified the record when it passed checks 3 and 4."""
     f: list[str] = []
     dev, ki = obj.get("device_id"), obj.get("key_identity")
-    owned = isinstance(dev, str) and dev in ctx.registry.get(ctx.forwarder, [])
+    pubs = [en for en in ctx.enrolments
+            if (en[0] == dev or "enrol_any_device" in mut)
+            and (en[2] == model["enrol_purpose"] or "enrol_any_purpose_rx" in mut)]
+    match = [en for en in pubs if key_identity_of(en[1], model) == ki
+             or ("enrol_by_recognised" in mut and ki in ctx.keyring and recognised(ctx.keyring[ki]) == recognised(en[1]))]
+    pairs = ctx.registry.get(ctx.forwarder, [])
+    if match and "owner_ignored" not in mut:
+        owner = match[0][3]
+        if "owner_current" in mut:
+            mine = [en for en in ctx.enrolments if en[0] == dev]
+            owner = max(mine, key=lambda en: en[5])[3]
+        owned = (dev, owner) in pairs
+    else:
+        owned = isinstance(dev, str) and any(d == dev for d, _ in pairs)
     if not owned and "rx_drop:2" not in mut:
         f.append(model["rx_reasons"][2][0])
-    pubs = [pub for d, pub, purpose in ctx.enrolments
-            if (d == dev or "enrol_any_device" in mut)
-            and (purpose == model["enrol_purpose"] or "enrol_any_purpose_rx" in mut)]
-    match = [pub for pub in pubs if key_identity_of(pub, model) == ki
-             or ("enrol_by_recognised" in mut and ki in ctx.keyring and recognised(ctx.keyring[ki]) == recognised(pub))]
+    lineage = (dev, match[0][4]) if match else None
+    match = [en[1] for en in match]
     bound = bool(match)
     # Check 4 is judged under the enrolled key the record names; for a record
     # already refused at check 3 it is judged under the test key the record
@@ -1208,7 +1221,7 @@ def receiver_faults(raw: bytes, obj: dict, ctx: Ctx, model: dict, mut: frozenset
             f.append(name)
     if "rx_drop:5" not in mut:
         f += rule5_faults(obj, model, mut)
-    return f, (pub if bound else None)
+    return f, ((pub, lineage) if bound else None)
 
 
 def sig_ok(obj: dict, pub: bytes | None, model: dict, mut: frozenset) -> bool:
@@ -1245,7 +1258,7 @@ class Receiver:
         self.unsettled_alerts: set[tuple] = set()
         self.unsettled_tallies: set[tuple] = set()
 
-    def judge(self, raw: bytes, obj: dict, epoch: bytes, model: dict, mut: frozenset) -> str:
+    def judge(self, raw: bytes, obj: dict, epoch: bytes, model: dict, mut: frozenset, lineage: tuple = ()) -> str:
         dup, conflict, lower = model["rx6"]
         # A record held as conflict is never the earlier record a later one is
         # judged against, for duplicate as for the rest.
@@ -1254,27 +1267,30 @@ class Receiver:
             return dup
         pool = [k for k in self.kept if k[3] != conflict or "conflicts_in_pool" in mut]
         if obj["kind"] == model["kind_submission"]:
-            other = self._submission(raw, obj, epoch, pool, model, mut)
+            other = self._submission(raw, obj, epoch, pool, model, mut, lineage)
             if other is not None:
-                self.unsettled_alerts.add((obj["device_id"], obj["alert_id"]))
-                self.unsettled_alerts.add((other[1]["device_id"], other[1]["alert_id"]))
+                self.unsettled_alerts.add((lineage, obj["alert_id"]))
+                self.unsettled_alerts.add((other[4], other[1]["alert_id"]))
                 v = conflict
             else:
                 v = model["stored"]
         else:
             v = self._tally(raw, obj, epoch, model, mut) or model["stored"]
         if v not in (lower, dup):
-            self.kept.append((raw, obj, epoch, v))
+            self.kept.append((raw, obj, epoch, v, lineage))
         return v
 
-    def _submission(self, raw, obj, epoch, pool, model, mut):
-        """The kept record this one conflicts with, or None."""
+    def _submission(self, raw, obj, epoch, pool, model, mut, lineage=()):
+        """The kept record this one conflicts with, or None. Every rule,
+        identity included, holds within one device and one lineage."""
         seq = int(obj["observation_seq"].text)
         scope = model["consistency_scope"]
         ident = model["obs_identity"]
         for k in pool:
-            r, o, e, _ = k
+            r, o, e, _, lin = k
             if o["kind"] != model["kind_submission"]:
+                continue
+            if lin != lineage and "lineage_ignored" not in mut:
                 continue
             # The identity rule is judged on the identity the text names, before
             # and apart from the consistency rules' device scope.
@@ -1338,12 +1354,16 @@ class Receiver:
         """Reading a notice, per device_id and alert_id, from the records held
         as stored; a notice with a record held as conflict is unsettled."""
         per: dict[tuple, list] = {}
-        for _, o, e, v in self.kept:
+        for _, o, e, v, lin in self.kept:
             if o["kind"] != model["kind_submission"]:
                 continue
             if v != model["stored"] and "reading_with_conflicts" not in mut:
                 continue
-            key = (o["device_id"], o["alert_id"]) if "reading_per_epoch" not in mut else (e, o["alert_id"])
+            if "reading_per_epoch" in mut:
+                lin = (o["device_id"], e)
+            elif "lineage_ignored" in mut:
+                lin = (o["device_id"], 1)
+            key = (lin, o["alert_id"])
             per.setdefault(key, []).append(o)
         out = []
         for (d, a), obs in per.items():
@@ -1366,7 +1386,7 @@ class Receiver:
             some = any(c["ever_accepted"] for c in chans.values())
             if "some_channel_sms_only" in mut:
                 some = chans.get("sms", {}).get("ever_accepted", False)
-            out.append({"device_id": d, "alert_id": a, "channels": chans, "accepted_on_some_channel": some,
+            out.append({"device_id": d[0], "lineage": d[1], "alert_id": a, "channels": chans, "accepted_on_some_channel": some,
                         "settled": (d, a) not in self.unsettled_alerts or "settled_always" in mut})
         return out
 
@@ -1811,16 +1831,42 @@ def keys_of(corpus: dict, model: dict, bad: Callable[[str], None]) -> dict[str, 
     return out
 
 
-def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str], None], where: str) -> Ctx:
+def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str], None], where: str,
+            mut: frozenset = frozenset()) -> Ctx:
+    """The receiver's registries. Each enrolment names a device, a key, a
+    purpose, an owner, a revision strictly increasing for the device, and
+    whether it begins a lineage or continues the previous revision's; an
+    enrolment to another owner always begins one. A device's lineages are
+    numbered from 1 in revision order."""
     enrol = []
+    by_dev: dict = {}
     for e in case.get("enrolments", []):
         if e.get("key") not in keys:
             bad(f"{where}: enrolment names unknown key {e.get('key')!r}")
             continue
-        enrol.append((e.get("device_id"), keys[e["key"]], e.get("purpose")))
+        if e.get("lineage") not in ("begins", "continues") or not isinstance(e.get("revision"), int) \
+                or isinstance(e.get("revision"), bool) or not isinstance(e.get("owner"), str):
+            bad(f"{where}: enrolment {e.get('key')} lacks an owner, a revision or a lineage")
+            continue
+        by_dev.setdefault(e.get("device_id"), []).append(e)
+    for dev, es in by_dev.items():
+        revs = [e["revision"] for e in es]
+        if len(set(revs)) != len(revs):
+            bad(f"{where}: two enrolments of {dev} share a revision")
+        n, prev = 0, None
+        for e in sorted(es, key=lambda e: e["revision"]):
+            begins = prev is None or e["lineage"] == "begins" or (e["owner"] != prev["owner"] and "lineage_owner_ignored" not in mut)
+            if prev is None and e["lineage"] == "continues":
+                bad(f"{where}: {dev}'s first enrolment continues no lineage")
+            n += 1 if begins else 0
+            enrol.append((dev, keys[e["key"]], e.get("purpose"), e["owner"], n, e["revision"]))
+            prev = e
     ring = {key_identity_of(p, model): p for p in keys.values()}
+    reg = {}
+    for fwd, pairs in (case.get("forwarding_registry") or {}).items():
+        reg[fwd] = [(pp.get("device_id"), pp.get("owner")) for pp in pairs]
     return Ctx(case.get("configured_devices", []), case.get("topic_device", ""), case.get("forwarder", ""),
-               case.get("forwarding_registry", {}), enrol, ring)
+               reg, enrol, ring)
 
 
 def judge_record(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> dict:
@@ -1856,7 +1902,8 @@ def judge_record(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> dict:
     if not rx1 and rx:
         out["rx"] = rx[0]
     if not rx1 and not rx and pub is not None:
-        out["epoch"] = recognised(pub)
+        out["epoch"] = recognised(pub[0])
+        out["lineage"] = pub[1]
     return out
 
 
