@@ -22,7 +22,8 @@ below are checked against those records.
 | Commissioned safety binding | [commissioned-safety-binding/v1.md](commissioned-safety-binding/v1.md) | `draft` | producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed`, consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `complete` |
 | Commissioned safety binding | [commissioned-safety-binding/v2.md](commissioned-safety-binding/v2.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.11, `unassessed`, producer (cli) `implemented-unreleased`, `unassessed`, verifier (cli) `implemented-unreleased`, `unassessed` | `frozen` (2026-09-23), audit `complete` |
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | `draft` | none recorded | `amendable` |
-| Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
+| Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `complete` |
+| Device policy | [device-policy/v2.md](device-policy/v2.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, `unassessed` | `frozen` (2026-07-24), audit `complete` |
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `pending` |
 | Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `pending` |
 | Event schema | [events/v2.md](events/v2.md) | `draft` | none recorded | `amendable` |
