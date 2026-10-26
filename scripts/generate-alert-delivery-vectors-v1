@@ -42,6 +42,7 @@ POSTURE_DOMAIN = b"ori.runtime_posture.v1\x00"
 SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 MAX_INT = 2**53 - 1
 RECORD_TOPIC_BOUND = 1024
+RECORD_PAYLOAD_MAX = 4096  # gateway-api/v2 Payload Size for the record topic, and the receiver's own bound
 DEVICE = "site-a-edge-01"
 OTHER_DEVICE = "site-a-edge-02"
 FORWARDER = "gateway-site-a"
@@ -354,7 +355,9 @@ def shape(obj: object) -> str | None:
 
 
 def gateway_stateless(data: str, topic: str, configured: list) -> str | None:
-    """Checks 3 to 6 of Carriage and custody; checks 1 and 2 are gateway-api/v2's corpora's."""
+    """Checks 1 (Payload Size only) and 3 to 6 of Carriage and custody; volume and check 2 are gateway-api/v2's."""
+    if len(data.encode("utf-8")) > RECORD_PAYLOAD_MAX:
+        return "payload_too_large"
     obj = parse(data)
     if canonical(obj) != data.encode("utf-8"):
         return "not_canonical"
@@ -396,7 +399,10 @@ def verify(pub: bytes, sig_b64: str, message: bytes) -> bool:
 
 
 def receiver_stateless(data: str, ctx: dict) -> str | None:
-    """Checks 1 to 5 of Verifying. Check 1 is carriage checks 3 and 4: a receiver receives no topic."""
+    """Checks 1 to 5 of Verifying. Check 1 is the receiver's own 4096-byte bound, then carriage checks 3 and 4
+    (check 2, the Payload Member Rule, is gateway-api/v2's corpora's): a receiver receives no topic."""
+    if len(data.encode("utf-8")) > RECORD_PAYLOAD_MAX:
+        return "payload_too_large"
     obj = parse(data)
     if canonical(obj) != data.encode("utf-8"):
         return "not_canonical"
@@ -601,6 +607,16 @@ gw("not_canonical_escape", "A value with a character written as an escape that c
    text(GOOD).replace('"sms"', '"\\u0073ms"'), "not_canonical")
 gw("not_canonical_tally", "A tally with a space before its first member.", "{ " + text(TGOOD)[1:], "not_canonical")
 
+# Payload bound: 4096 bytes at the gateway (gateway-api/v2 Payload Size) and at the receiver (its own bound).
+# Every member is bounded and a canonical record is under 1024 bytes, so only insignificant whitespace can
+# carry a body past 4096: a body at the bound is judged further, and is not_canonical.
+_PAD = text(GOOD)
+gw("payload_at_bound", "A genuine record padded with spaces after its first brace to exactly 4096 bytes: within "
+   "the bound, then not_canonical.", "{" + " " * (RECORD_PAYLOAD_MAX - len(_PAD)) + _PAD[1:], "not_canonical")
+gw("payload_too_large", "The same record padded to 4097 bytes: payload_too_large, at the gateway under check 1 "
+   "and at the receiver under its own 4096-byte bound, before canonical form is judged.",
+   "{" + " " * (RECORD_PAYLOAD_MAX + 1 - len(_PAD)) + _PAD[1:], "payload_too_large")
+
 # Gateway check 4: malformed. Each is signed over its own content, so its form is its only defect.
 for name, note, rec in (
     ("kind_unknown", "kind is receipt, neither kind.", submission(kind="receipt")),
@@ -713,7 +729,8 @@ rx_only("not_owned_unregistered_forwarder", "A genuine tally forwarded by a gate
 
 # Receiver check 2 follows the owner the record key's enrolment names, never the device's current owner.
 rx_only("not_owned_moved_device", "The device moved from site-a to site-b: runtime is enrolled to site-a (revision "
-        "1), rotated to site-b (revision 2, a new lineage). A record of runtime's, the old owner's key, forwarded "
+        "1); the test key named rotated, made by the act that began the move's new lineage, not by a rotation, is "
+        "enrolled to site-b (revision 2). A record of runtime's, the old owner's key, forwarded "
         "by gateway-site-b, which is permitted for the device on behalf of site-b only, is not_owned.",
         GOOD, "not_owned", {**MOVED, "forwarder": OTHER_FORWARDER})
 ok("moved_device_old_owner_gateway", "The same record of runtime's forwarded by gateway-site-a, permitted for the "
@@ -1230,7 +1247,7 @@ LINEAGES = ("begins", "continues")
 
 
 def enrol_verdict(challenge: str, signature: str, device: str, pub: bytes, nonce: str, consumed: bool,
-                  recorded: str, owner_change: bool) -> str | None:
+                  recorded: str, owner_change: bool, first: bool) -> str | None:
     o = parse(challenge)
     if (canonical(o) != challenge.encode("utf-8") or not isinstance(o, dict) or set(o) != ENROL_MEMBERS
             or integer(o["v"]) != 1 or not word(o["purpose"], (PURPOSE,)) or not string(o["nonce"], NONCE_RE)
@@ -1245,6 +1262,8 @@ def enrol_verdict(challenge: str, signature: str, device: str, pub: bytes, nonce
         return "key_mismatch"
     if not b64_ok(signature, 64) or not verify(pub, signature, ENROL_DOMAIN + challenge.encode("utf-8")):
         return "signature_invalid"
+    if first:
+        return None  # a device's first enrolment is recorded as beginning a lineage, whatever was signed
     if o["lineage"] != recorded or (o["lineage"] == "continues" and owner_change):
         return "lineage_mismatch"
     return None
@@ -1267,17 +1286,19 @@ DROP = object()
 def ecase(name: str, note: str, chal: object, expected: str, *, signer: object = RUNTIME,
           enrolling: object = RUNTIME, device: str = DEVICE, nonce: str = NONCE, consumed: bool = False,
           domain: bytes = ENROL_DOMAIN, signature: str | None = None, recorded: str = "begins",
-          owner_change: bool = False) -> None:
+          owner_change: bool = False, first: bool = False) -> None:
+    if first:
+        assert recorded == "begins" and not owner_change, "a first enrolment has no key before it"
     data = chal if isinstance(chal, str) else text(chal)
     sig = signature if signature is not None else b64(signer.sign(domain + data.encode("utf-8")))
     pub = enrolling.pub if hasattr(enrolling, "pub") else enrolling
-    v = enrol_verdict(data, sig, device, pub, nonce, consumed, recorded, owner_change) or "pass"
+    v = enrol_verdict(data, sig, device, pub, nonce, consumed, recorded, owner_change, first) or "pass"
     if v != expected:
         raise AssertionError(f"enrolment {name}: computed {v}, declared {expected}")
     ENROL_CASES.append({"name": name, "note": note, "enrolling_device_id": device,
                         "enrolling_public_key": "ed25519:" + b64(pub), "enrolling_key_identity": identity(pub),
                         "issued_nonce": nonce, "nonce_consumed": consumed, "recorded_lineage": recorded,
-                        "owner_change": owner_change, "challenge": data,
+                        "first_enrolment": first, "owner_change": owner_change, "challenge": data,
                         "challenge_b64": b64(data.encode("utf-8")),
                         "signing_input_hex": (ENROL_DOMAIN + data.encode("utf-8")).hex(), "signature": sig,
                         "expected": v})
@@ -1288,6 +1309,11 @@ ecase("valid_nonce_64", "A 64-character nonce.", challenge(nonce=NONCE64), "pass
 ecase("valid_rotated", "rotated's proof for site-a-edge-01 after a rotation: lineage continues, as the "
       "commissioning act records it, to the same owner.", challenge(ROTATED, lineage="continues"), "pass",
       signer=ROTATED, enrolling=ROTATED, recorded="continues")
+ecase("valid_first_begins", "runtime's first enrolment for the device, signed begins.", challenge(), "pass",
+      first=True)
+ecase("valid_first_signed_continues", "runtime's first enrolment for the device, signed continues: with no key "
+      "before it, the receiver records it as beginning a lineage whichever value was signed, so it passes.",
+      challenge(lineage="continues"), "pass", first=True)
 ecase("valid_reset", "rotated's proof after a reset: lineage begins, as recorded.", challenge(ROTATED), "pass",
       signer=ROTATED, enrolling=ROTATED)
 ecase("valid_moved", "rotated's proof for an enrolment to another owner: lineage begins, as recorded.",
@@ -1557,16 +1583,18 @@ def build() -> dict:
             "keys": ("Ed25519 private keys are SHA-256 of 'ori alert-delivery/v1 <name> test key', for names "
                      "runtime, other and rotated. runtime_negated is runtime's negation, -A, which runtime's "
                      "holder signs under with -a: it has no seed, one recognised key with runtime, and its own "
-                     "key_identity. Test keys only."),
+                     "key_identity. The name rotated is a label only: each fixture's enrolment says whether that "
+                     "key continues a lineage or begins one. Test keys only."),
             "records": ("Each record case is one message, `record` its exact bytes, on the alert-delivery topic of "
-                        "`topic_device`. `expected_gateway` is `pass` or the reason of checks 3 to 6 of Carriage "
-                        "and custody, for a gateway whose gateway.device_ids is `configured_devices`; check 4 "
+                        "`topic_device`. `expected_gateway` is `pass` or the reason of checks 1 to 6 of Carriage "
+                        "and custody, check 1 being Payload Size alone, 4096 bytes, for a gateway whose gateway.device_ids is `configured_devices`; check 4 "
                         "is unsupported_version for a v within the integer rule of Records (1 to 2^53 - 1, no "
                         "sign, fraction or exponent) other than 1, and otherwise malformed for a record outside "
                         "its form. `expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check "
-                        "1 being carriage checks 3 and 4: the receiver receives no topic and reads neither "
-                        "`topic_device` nor `configured_devices`. Checks 1 and 2 of carriage, and the "
-                        "receiver's own payload bound, are not exercised. `enrolments` is the receiver's "
+                        "1 being its own 4096-byte bound (payload_too_large), then carriage checks 3 and 4: the "
+                        "receiver receives no topic and reads neither `topic_device` nor `configured_devices`. "
+                        "Payload Volume and the Payload Member Rule (check 2) are gateway-api/v2's corpora's, "
+                        "and are not exercised. `enrolments` is the receiver's "
                         "enrolment registry: each a device, a test key by name, the purpose, the owner (site or "
                         "tenant), the enrolment revision, `revoked` (a revoked key is not enrolled), and `lineage`, whether it `begins` a lineage or "
                         "`continues` the lineage of the device's previous revision; an enrolment to another "
@@ -1610,7 +1638,9 @@ def build() -> dict:
             "enrolment": ("Each case is one enrolment proof judged by a receiver enrolling "
                           "`enrolling_public_key` for `enrolling_device_id`, having issued `issued_nonce`, "
                           "consumed already when `nonce_consumed`, whose commissioning act records `recorded_lineage` "
-                          "for the enrolment; `owner_change` is true for an enrolment to another owner than the "
+                          "for the enrolment. `first_enrolment` is true for the device's first enrolment at the "
+                          "receiver, which has no key before it and is recorded as beginning a lineage whichever "
+                          "value was signed; otherwise it is a later revision. `owner_change` is true for an enrolment to another owner than the "
                           "key before it, which always begins a lineage. `challenge` is the challenge's bytes as "
                           "signed, `challenge_b64` the same bytes as operator-socket/v3 answers them, "
                           "`signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
