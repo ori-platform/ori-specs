@@ -434,7 +434,8 @@ def enrolment_of(obj: dict, enrolments: list, *, revoked_too: bool = False) -> d
 def derive_lineages(enrolments: list) -> dict:
     """Each enrolment's lineage, numbered per device from 1, derived in revision order from its signed origin.
 
-    An origin that is a key held enrolled for the device to the same owner joins that key's lineage; any other
+    An origin equal to the key_identity or the recorded origin of a key held enrolled for the device to the same
+    owner joins that key's lineage; any other
     origin, the key itself, a key never enrolled, a key enrolled only for another purpose, or (in a registry
     check 6 would never let arise) a key held to another owner, begins a lineage of its own at the receiver.
     """
@@ -446,7 +447,7 @@ def derive_lineages(enrolments: list) -> dict:
         held: list = []
         n = 0
         for e in sorted(es, key=lambda e: e["revision"]):
-            joined = [h for h in held if identity(KEYS[h["key"]].pub) == e["lineage_origin"]
+            joined = [h for h in held if e["lineage_origin"] in (identity(KEYS[h["key"]].pub), h["lineage_origin"])
                       and h["owner"] == e["owner"]]
             if joined:
                 out[id(e)] = out[id(joined[0])]
@@ -484,7 +485,7 @@ def check_enrolments(enrolments: list, other_owner_origin: bool = False) -> None
         es = sorted(es, key=lambda e: e["revision"])
         for i, e in enumerate(es):
             crossed = [h for h in es[:i] if h["purpose"] == PURPOSE and h["owner"] != e["owner"]
-                       and identity(KEYS[h["key"]].pub) == e["lineage_origin"]]
+                       and e["lineage_origin"] in (identity(KEYS[h["key"]].pub), h["lineage_origin"])]
             assert other_owner_origin or not crossed, "refused at enrolment as lineage_mismatch"
     derive_lineages(enrolments)
 
@@ -1215,6 +1216,13 @@ rseq("origin_other_owner_begins", "Defence in depth. runtime is enrolled to site
      fixture(registry={FORWARDER: [perm(DEVICE), perm(DEVICE, "site-b")]},
              enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "runtime", owner="site-b")],
              other_owner_origin=True))
+CHAIN = fixture(enrolments=[enr(DEVICE, "runtime", 1, "other"), enr(DEVICE, "rotated", 2, "other")])
+rseq("lineage_by_recorded_origin", "other began a lineage and was never enrolled; runtime (origin other) and then "
+     "rotated (origin other) are enrolled. rotated's origin equals runtime's recorded origin, so both are lineage "
+     "1: runtime's unconfirmed attempt observed later under rotated is the same attempt, stored, and another "
+     "attempt reusing attempt_seq 1 under rotated is conflict.",
+     [obs(AL1, AT1, 1, 1, None, "unconfirmed"), obs(AL1, AT1, 1, 2, "unconfirmed", "accepted", signer=ROTATED),
+      obs(AL2, AT2, 1, 1, None, "accepted", signer=ROTATED)], CHAIN)
 rseq("origin_never_enrolled", "runtime began a lineage and rotated to rotated before either was enrolled; only "
      "rotated is enrolled, naming runtime as its origin. runtime's record is key_not_enrolled, and rotated begins "
      "a lineage of its own at the receiver, lineage 1.",
@@ -1313,10 +1321,11 @@ def enrol_verdict(challenge: str, signature: str, device: str, pub: bytes, nonce
         return "key_mismatch", None
     if not b64_ok(signature, 64) or not verify(pub, signature, ENROL_DOMAIN + challenge.encode("utf-8")):
         return "signature_invalid", None
-    named = [h for h in held if h["device_id"] == device and h["key_identity"] == o["lineage_origin"]]
+    named = [h for h in held if h["device_id"] == device
+             and o["lineage_origin"] in (h["key_identity"], h["lineage_origin"])]
     if any(h["owner"] != owner for h in named):
         return "lineage_mismatch", None
-    return None, (o["lineage_origin"] if named else None)
+    return None, (named[0]["key_identity"] if named else None)
 
 
 NONCE = hashlib.sha256(b"ori alert-delivery/v1 test nonce").hexdigest()[:32]
@@ -1334,9 +1343,12 @@ def challenge(signer: object = RUNTIME, origin: object = None, **over: object) -
 DROP = object()
 
 
-def held(key: object, device: str = DEVICE, owner: str = "site-a", revoked: bool = False) -> dict:
-    """A key the receiver holds enrolled; a revoked key is still held, for lineage origins as for check 2."""
-    return {"device_id": device, "key_identity": identity(key.pub), "owner": owner, "revoked": revoked}
+def held(key: object, device: str = DEVICE, owner: str = "site-a", revoked: bool = False,
+         origin: object = None) -> dict:
+    """A key the receiver holds enrolled, with the lineage_origin its proof signed (itself when None); a revoked
+    key is still held, for lineage origins as for check 2."""
+    return {"device_id": device, "key_identity": identity(key.pub), "lineage_origin": identity((origin or key).pub),
+            "owner": owner, "revoked": revoked}
 
 
 def ecase(name: str, note: str, chal: object, expected: str, *, signer: object = RUNTIME,
@@ -1370,6 +1382,16 @@ ecase("valid_revoked_origin", "rotated names runtime as its origin; runtime is e
       "since revoked. A revoked key is still held, so rotated joins runtime's lineage.",
       challenge(ROTATED, RUNTIME), "pass", signer=ROTATED, enrolling=ROTATED,
       held_enrolments=(held(RUNTIME, revoked=True),))
+ecase("valid_joins_by_recorded_origin", "other began a lineage and was never enrolled; runtime, its rotation, is "
+      "held with recorded origin other; rotated, a later rotation, names other too. Its origin equals runtime's "
+      "recorded origin, so rotated joins runtime's lineage though the key that began it was never enrolled.",
+      challenge(ROTATED, OTHER), "pass", signer=ROTATED, enrolling=ROTATED,
+      held_enrolments=(held(RUNTIME, origin=OTHER),))
+ecase("lineage_mismatch_by_recorded_origin", "other began a lineage and was never enrolled; site-a enrolled "
+      "runtime, origin other; rotated, origin other, is now enrolled to site-b. Its origin equals the recorded "
+      "origin of a key held to another owner: a move without the act.", challenge(ROTATED, OTHER),
+      "lineage_mismatch", signer=ROTATED, enrolling=ROTATED, owner="site-b",
+      held_enrolments=(held(RUNTIME, origin=OTHER),))
 ecase("valid_reset", "rotated's proof after a reset, runtime enrolled: rotated names itself, so begins a "
       "lineage of its own.", challenge(ROTATED), "pass", signer=ROTATED, enrolling=ROTATED,
       held_enrolments=(held(RUNTIME),))
@@ -1678,9 +1700,10 @@ def build() -> dict:
             "receiver_sequences": ("Each sequence is records in arrival order to one receiver with "
                                    "`forwarder`, `forwarding_registry` and `enrolments` as in `records`. A "
                                    "record's lineage is that of its key's enrolment, derived in revision order "
-                                   "from its lineage_origin: an origin that is a key enrolled earlier for the "
-                                   "device to the same owner joins that key's lineage; any other origin, the key "
-                                   "itself or a key never enrolled, begins a new one. A device's lineages are "
+                                   "from its lineage_origin: an origin equal to the key_identity or the "
+                                   "recorded lineage_origin of a key enrolled earlier for report signing for the "
+                                   "device to the same owner joins that key's lineage; any other origin begins a "
+                                   "new one. A device's lineages are "
                                    "numbered from 1 in the order they begin. `expected` is the verdict: a refusal of checks 1 to 5, which changes "
                                    "nothing, or check 6's: `stored`, `duplicate`, `conflict` or `lower_count`, in "
                                    "that order. Bytes identical to a record held as stored or as conflict are "
@@ -1708,11 +1731,13 @@ def build() -> dict:
             "enrolment": ("Each case is one enrolment proof judged by a receiver enrolling "
                           "`enrolling_public_key` for `enrolling_device_id`, having issued `issued_nonce`, "
                           "consumed already when `nonce_consumed`, to `enrolling_owner`. `held_enrolments` lists the "
-                          "keys the receiver already holds enrolled, each a device, key_identity, owner and whether it "
-                          "is revoked; a revoked key is still held. Check "
-                          "6 (lineage_mismatch) fails when lineage_origin names a held key for this device to "
-                          "another owner. After a pass, `expected_lineage_joins` is the key_identity of the held "
-                          "key, for this device and owner, whose lineage the key joins, or null when it begins a "
+                          "keys the receiver already holds enrolled, each a device, key_identity, the lineage_origin "
+                          "its proof signed and recorded, owner, and whether it is revoked; a revoked key is still "
+                          "held. Check "
+                          "6 (lineage_mismatch) fails when lineage_origin equals the key_identity or the recorded "
+                          "origin of a held key for this device to another owner. After a pass, `expected_lineage_joins` is the key_identity of the "
+                          "first held key, for this device and owner, whose key_identity or recorded origin equals "
+                          "the origin, and whose lineage the key joins, or null when it begins a "
                           "lineage of its own. `challenge` is the challenge's bytes as "
                           "signed, `challenge_b64` the same bytes as operator-socket/v3 answers them, "
                           "`signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
