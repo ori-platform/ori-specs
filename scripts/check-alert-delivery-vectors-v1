@@ -154,6 +154,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "the receiver keeps both and presents neither as settled."),
     ("ad", "A record is never refused for its age"),
     # Key trust
+    ("ad", "The key it replaces is **retired**: the receiver keeps verifying records under it, which can arrive long after the rotation, and presents them as that key's epoch."),
     ("ad", "The receiver issues a nonce: 16 to 32 random bytes, written as 32 to 64 lowercase hexadecimal characters, an even number, matching `^(?:[0-9a-f]{2}){16,32}$`, and never issued twice."),
     ("ad", "The runtime signs, under its report key, the ASCII bytes `ori.report_key_enrolment.v1`, one NUL byte, then the canonical bytes, as [Records](#records) defines them, of exactly this object:"),
     ("ad", "`device_id` and `key_identity` are the runtime's own, and `purpose` is the constant `alert_delivery_report`."),
@@ -169,7 +170,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "gateway-config/v2 `alert_delivery` load-rule cases, one for each rule and accepted cases."),
     # gateway-config/v2.md
     ("gateway_config", "Surrounding whitespace, every character with the Unicode `White_Space` property, is removed from `queue_directory` before these rules apply, and the gateway uses the trimmed path."),
-    ("gateway_config", "A configuration with `enabled` true is refused at load for the first of these it breaks, in this order, and the refusal names the rule:"),
+    ("gateway_config", "A configuration is refused at load for the first of these it breaks, in this order, and the refusal names the rule. Each rule applies only while `enabled` is true, except as rule 1 says:"),
     ("gateway_config", "Take custody of alert-delivery records. Disabled, the other keys are not validated."),
     ("gateway_config", "The records the queue holds for one device; a record beyond it is refused `queue_full`."),
     ("gateway_config", "Before any rule applies, surrounding whitespace is removed from the value, from the queue directories alike. Whitespace here is every character with the Unicode `White_Space` property. A value that is then empty is absent."),
@@ -542,17 +543,28 @@ def build_model(texts: dict[str, str]) -> dict:
     m["cfg_range"] = (int(g.group(1)), int(g.group(2)))
     m["cfg_enabled_default"] = ticks(keys["enabled"][2])[0]
     items = numbered(gc)
-    if len(items) != 4:
-        raise Failure(f"text: alert_delivery lists {len(items)} load rules")
     m["cfg_rules"] = [re.match(r"`(\w+)`:", it).group(1) for it in items]
     m["cfg_items"] = items
-    g = one(r"not an integer from (\d+) to (\d+)", items[3], "range rule")
+    kinds = (("type", "`enabled` is not a boolean, `queue_directory` is not a string, or `max_records_per_device` is not an integer, each by the type the configuration document itself gives the value. A loader never coerces one"),
+             ("required", "`queue_directory` is absent or empty"),
+             ("absolute", "it does not begin with `/`"),
+             ("separate", "the state directory, `evidence.queue_directory` or `evidence.return_queue_directory`"),
+             ("range", "is not from "))
+    m["cfg_order"] = []
+    for name, it in zip(m["cfg_rules"], items):
+        ks = [k for k, want in kinds if want in it]
+        if len(ks) != 1:
+            raise Failure(f"text: config rule not recognised: {it!r}")
+        m["cfg_order"].append((name, ks[0]))
+    if sorted(k for _, k in m["cfg_order"]) != sorted(k for k, _ in kinds):
+        raise Failure(f"text: config rules changed: {m['cfg_order']}")
+    rng = items[[k for _, k in m["cfg_order"]].index("range")]
+    g = one(r"is not from (\d+) to (\d+)", rng, "range rule")
     if (int(g.group(1)), int(g.group(2))) != m["cfg_range"]:
         raise Failure("text: the range rule and the table disagree")
-    for want, it in (("absent or empty", items[0]), ("does not begin with `/`", items[1]),
-                     ("the state directory, `evidence.queue_directory` or `evidence.return_queue_directory`", items[2])):
-        if want not in it:
-            raise Failure(f"text: config rule changed: {it!r}")
+    typ = items[[k for _, k in m["cfg_order"]].index("type")]
+    if "`enabled` is judged whenever the section is present; the other two only when `enabled` is true" not in typ:
+        raise Failure("text: the type rule's scope changed")
 
     # gateway-api/v2 payload size
     g = one(r"\| `ori/\{device_id\}/runtime/alert-delivery` \| Runtime -> Gateway \| (\d+) \|", texts["gateway_api"], "payload size")
@@ -1474,60 +1486,71 @@ def related(a: list[str], b: list[str], mut: frozenset) -> bool:
 def load_alert_delivery(cfg: dict, model: dict, mut: frozenset) -> str | None:
     """cfg: {"alert_delivery": {...}, "state_directory": ..., "evidence": {...}};
     returns the refused rule or None."""
-    r_req, r_abs, r_sep, r_range = model["cfg_rules"]
-    ad = cfg.get("alert_delivery") or {}
-    if ad.get("enabled") is not True and "validate_disabled" not in mut:
+    names = {k: n for n, k in model["cfg_order"]}
+    ad = cfg.get("alert_delivery")
+    if not isinstance(ad, dict):
+        return None
+    coerce = "num_as_str_config" in mut
+
+    def is_int(v: object) -> bool:
+        if isinstance(v, bool):
+            return False
+        return isinstance(v, int) or ("range_float_ok" in mut and isinstance(v, float) and v == int(v))
+
+    en = ad.get("enabled", False)
+    if "enabled" in ad and not isinstance(en, bool) and "type_enabled_unchecked" not in mut:
+        return names["type"]
+    if en is not True and "validate_disabled" not in mut:
         return None
     qd = ad.get("queue_directory")
-    if "num_as_str_config" in mut and isinstance(qd, (int, float)) and not isinstance(qd, bool):
+    if coerce and isinstance(qd, (int, float)) and not isinstance(qd, bool):
         qd = str(qd)
-    qd = ws_trim(qd, mut) if isinstance(qd, str) else qd
-    rules: list[tuple[str, Callable[[], bool]]] = []
-    rules.append((r_req, lambda: not isinstance(qd, str) or qd == ""))
-    rules.append((r_abs, lambda: not qd.startswith("/")))
+    mr = ad.get("max_records_per_device", model["cfg_default_max"])
+
+    def typ() -> bool:
+        return ("queue_directory" in ad and not isinstance(qd, str)) or \
+            ("max_records_per_device" in ad and not is_int(mr))
+
+    tq = ws_trim(qd, mut) if isinstance(qd, str) else None
 
     def sep() -> bool:
-        others = []
-        sd = cfg.get("state_directory")
-        others.append(sd)
+        others = [cfg.get("state_directory")]
         ev = cfg.get("evidence") or {}
-        # An evidence queue directory counts only while evidence.enabled is
-        # true, as separate_from_evidence_queues decides it (see the report:
-        # rule 3's "for each of those that is configured" is read this way).
+        # The state directory counts when present after trimming; the evidence
+        # queue directories count while evidence.enabled is true.
         if "sep_evidence_always" in mut or ev.get("enabled") is True:
             others += [ev.get("queue_directory"), ev.get("return_queue_directory")]
         if "sep_no_state_dir" in mut:
             others = others[1:]
-        mine = clean(qd, mut)
+        mine = clean(tq, mut)
         for o in others:
             if not isinstance(o, str):
                 continue
             o = ws_trim(o, mut)
-            if o == "":
-                continue
-            if related(mine, clean(o, mut), mut):
+            if o and related(mine, clean(o, mut), mut):
                 return True
         return False
 
-    rules.append((r_sep, sep))
-
     def rng() -> bool:
         lo, hi = model["cfg_range"]
-        if "max_records_per_device" not in ad:
+        if not is_int(mr):
             return False
-        v = ad["max_records_per_device"]
-        if isinstance(v, bool) or not isinstance(v, int):
-            return not ("range_float_ok" in mut and isinstance(v, float) and v == int(v))
-        return not (lo - (1 if "range_zero_ok" in mut else 0) <= v <= hi + (1 if "range_high_ok" in mut else 0))
+        return not (lo - (1 if "range_zero_ok" in mut else 0) <= mr <= hi + (1 if "range_high_ok" in mut else 0))
 
-    rules.append((r_range, rng))
+    tests = {"type": typ, "required": lambda: not tq, "absolute": lambda: not tq.startswith("/"),
+             "separate": sep, "range": rng}
+    order = [k for _, k in model["cfg_order"]]
     if "cfg_swap_2_3" in mut:
-        rules[1], rules[2] = rules[2], rules[1]
-    for name, c in rules:
-        if f"cfg_drop:{name}" in mut:
+        i, j = order.index("absolute"), order.index("separate")
+        order[i], order[j] = order[j], order[i]
+    if "cfg_type_last" in mut:
+        order.remove("type")
+        order.append("type")
+    for k in order:
+        if f"cfg_drop:{names[k]}" in mut:
             continue
-        if c():
-            return name
+        if tests[k]():
+            return names[k]
     return None
 
 
@@ -1675,9 +1698,12 @@ TEXT_EDITS: list[tuple[str, str, str, str, bool]] = [
     ("enrolment nonce range", "ad", "written as 32 to 64 lowercase", "written as 32 to 66 lowercase", False),
     ("enrolment purpose renamed", "ad", "`purpose` is the\nconstant `alert_delivery_report`.", "`purpose` is the\nconstant `alert_delivery_reports`.", False),
     ("enrolment prefix changed", "ad", "`ori.report_key_enrolment.v1`, one NUL byte, then the canonical bytes, as", "`ori.report_key_enrolment.v2`, one NUL byte, then the canonical bytes, as", False),
-    ("config rules 1 and 2 swapped", "gateway_config", "1. `queue_directory_required`: `queue_directory` is absent or empty;\n2. `queue_directory_absolute`: it does not begin with `/`;", "1. `queue_directory_absolute`: it does not begin with `/`;\n2. `queue_directory_required`: `queue_directory` is absent or empty;", False),
-    ("config rule 3 and 4 names swapped", "gateway_config", "3. `queue_directory_separate`:", "3. `max_records_per_device_range`:", False),
-    ("config range upper bound", "gateway_config", r"not\s+an\s+integer\s+from\s+1\s+to\s+65536", "not an integer from 1 to 65535", True),
+    ("config rules 2 and 3 swapped", "gateway_config", "2. `queue_directory_required`: `queue_directory` is absent or empty;\n3. `queue_directory_absolute`: it does not begin with `/`;", "2. `queue_directory_absolute`: it does not begin with `/`;\n3. `queue_directory_required`: `queue_directory` is absent or empty;", False),
+    ("config rule 4 and 5 names swapped", "gateway_config", "4. `queue_directory_separate`:", "4. `max_records_per_device_range`:", False),
+    ("config type rule renamed", "gateway_config", "1. `type_mismatch`:", "1. `wrong_type`:", False),
+    ("config type rule moved last", "gateway_config", r"1\. `type_mismatch`:(.*?)\n2\. `queue_directory_required`", "1. `queue_directory_required`", True),
+    ("config type rule: enabled judged only when true", "gateway_config", "`enabled` is judged whenever the section is present; the other\n   two only when `enabled` is true;", "each only when `enabled` is true;", False),
+    ("config range upper bound", "gateway_config", r"not\s+from\s+1\s+to\s+65536", "not from 1 to 65535", True),
     ("config table range", "gateway_config", "| 1 to 65536. The records", "| 1 to 65535. The records", False),
     ("payload size bound", "gateway_api", "| `ori/{device_id}/runtime/alert-delivery` | Runtime -> Gateway | 4096 |", "| `ori/{device_id}/runtime/alert-delivery` | Runtime -> Gateway | 812 |", False),
     ("SPKI prefix changed", "posture", "the 12-byte prefix `302a300506032b6570032100`", "the 12-byte prefix `302a300506032b6570032200`", False),
@@ -2193,7 +2219,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         cov["cfg"].add(r or ("enabled" if case["alert_delivery"].get("enabled") is True else "disabled"))
         ad = case["alert_delivery"]
         if r is None and ad.get("enabled") is True:
-            eq = ws_trim(ad["queue_directory"], mut)
+            eq = ws_trim(ad["queue_directory"], mut) if isinstance(ad["queue_directory"], str) else ad["queue_directory"]
             em = ad.get("max_records_per_device", model["cfg_default_max"])
             if case.get("effective_queue_directory") != eq or case.get("effective_max_records_per_device") != em:
                 bad(f"{where}: in force {eq!r}, {em}; corpus says {case.get('effective_queue_directory')!r}, {case.get('effective_max_records_per_device')}")
@@ -2279,7 +2305,7 @@ JUDGE_MUTANTS = [
     # config
     "num_as_str_config", "validate_disabled", "trim_python_strip", "no_trim", "no_dotdot", "fold_case", "prefix_by_string",
     "no_containing", "sep_evidence_always", "sep_no_state_dir", "range_float_ok", "range_zero_ok", "range_high_ok",
-    "cfg_swap_2_3", "cfg_drop:queue_directory_required", "cfg_drop:queue_directory_absolute",
+    "cfg_swap_2_3", "cfg_type_last", "type_enabled_unchecked", "cfg_drop:type_mismatch", "cfg_drop:queue_directory_required", "cfg_drop:queue_directory_absolute",
     "cfg_drop:queue_directory_separate", "cfg_drop:max_records_per_device_range",
 ]
 
@@ -2340,6 +2366,30 @@ def corpus_mutants(corpus: dict) -> list[tuple[str, dict]]:
            lambda x, i=i: x["enrolment"][i].__setitem__("expected", "pass" if x["enrolment"][i]["expected"] != "pass" else "nonce_mismatch"))
     for i, c in enumerate(corpus.get("config", [])):
         mk(f"config.{c['name']}: verdict flipped", lambda x, i=i: x["config"][i].__setitem__("valid", not x["config"][i]["valid"]))
+    # The closed schema: an unknown member at every level the checker reads.
+    def first(x, *path):
+        for key in path:
+            try:
+                x = x[key]
+            except (KeyError, IndexError, TypeError):
+                return None
+        return x if isinstance(x, dict) else None
+
+    places = [(), ("note",), ("test_keys", "runtime"), ("records", 0), ("records", 0, "enrolments", 0),
+              ("receiver_sequences", 0), ("receiver_sequences", 0, "records", 0), ("receiver_sequences", 0, "enrolments", 0),
+              ("receiver_sequences", 0, "expected_reading", 0), ("receiver_sequences", 0, "expected_reading", 0, "channels", "sms"),
+              ("carriage_sequences", 0), ("carriage_sequences", 0, "events", 0), ("carriage_sequences", 0, "events", 0, "expected_ack"),
+              ("enrolment", 0), ("config", 0), ("config", 0, "alert_delivery"), ("config", 0, "evidence")]
+    for path in places:
+        def add(x, path=path):
+            t = first(x, *path) if path else x
+            t["unchecked_extra"] = 1
+        if (first(corpus, *path) if path else corpus) is not None:
+            mk(f"schema: unknown member at {'.'.join(map(str, path)) or 'root'}", add)
+    tal = next((i for i, s in enumerate(corpus.get("receiver_sequences", [])) if s.get("expected_tallies")), None)
+    if tal is not None:
+        mk("schema: unknown member in an expected tally",
+           lambda x: x["receiver_sequences"][tal]["expected_tallies"][0].__setitem__("unchecked_extra", 1))
     for name in list(corpus.get("test_keys", {})):
         def flipkey(x, name=name):
             k = x["test_keys"][name]
