@@ -150,7 +150,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "| `reason` | `\"\"` when `queued`; otherwise the refusing check's reason. |"),
     ("ad", "| `record_digest` | `sha256:` and the lowercase hexadecimal SHA-256 of the record's exact bytes. |"),
     ("ad", "A queue holding `max_records_per_device` records for the device is `queue_full`."),
-    ("ad", "A digest already held is `replayed` even when the queue is full."),
+    ("ad", "A held digest is `replayed` even when the queue is full."),
     ("ad", "`queue_full`, `store_unavailable` and `unsupported_version` describe the gateway's state, not the record's, so they are **retryable**"),
     ("ad", "and, when the record's key is enrolled, on behalf of the owner its enrolment names, as the receiver's own authenticated registry holds it: never as any label in the record or the request says, and never as the device's current owner. Otherwise `not_owned`. A record whose key is not enrolled for the device passes this check on the device alone, and check 3 refuses it."),
     # Verifying
@@ -463,12 +463,28 @@ def build_model(texts: dict[str, str]) -> dict:
         gw.append((i, it, reasons))
     m["gw_checks"] = gw
     m["gw_reason"] = {3: gw[2][2][-1], 4: gw[3][2][-1], 5: gw[4][2][-1], 6: gw[5][2][-1]}
-    if not re.search(r"`outcome` one of the values \*Submission observation\* lists", items[3]):
-        raise Failure("text: check 4's outcome clause changed")
-    g7 = [t for t in gw[6][2]]
-    m["gw_replayed"] = g7[0]
-    m["gw_store_unavailable"] = g7[-1]
-    m["ack_outcomes"] = one(r"`outcome` is `(\w+)` for a commit or a `(\w+)` record, and `(\w+)` otherwise, with `reason` the check's reason, `(\w+)` or `(\w+)`", cc, "ack").groups()
+    g4 = re.fullmatch(r"`v` is a JSON integer other than `(\d+)`: `(\w+)`\. Otherwise, not a record of either kind, with every member present, of its type and within its form: `(\w+)`\.", items[3])
+    if not g4 or int(g4.group(1)) != m["v"]:
+        raise Failure(f"text: carriage check 4 changed: {items[3]!r}")
+    m["gw_unsupported"], m["gw_reason"][4] = g4.group(2), g4.group(3)
+    g7 = re.search(r"a digest already held is `(\w+)`, and changes nothing\. A queue holding `max_records_per_device` records for the device is `(\w+)`\..*a record that passes checks 1 to 6 is `(\w+)`", items[6])
+    if not g7:
+        raise Failure(f"text: carriage check 7 changed: {items[6]!r}")
+    m["gw_replayed"], m["gw_queue_full"], m["gw_store_unavailable"] = g7.groups()
+    if "A held digest is `replayed` even when the queue is full." not in items[6]:
+        raise Failure("text: check 7 no longer replays before the bound")
+    ack_rows = {ticks(r[0])[0]: r[1] for r in table(cc, "Member")}
+    if sorted(ack_rows) != ["acknowledged_at_ms", "device_id", "outcome", "reason", "record_digest"]:
+        raise Failure(f"text: acknowledgement members changed: {sorted(ack_rows)}")
+    ga = re.fullmatch(r"`(\w+)` for a commit or a `(\w+)` record; `(\w+)` otherwise\.", ack_rows["outcome"])
+    if not ga or ga.group(2) != m["gw_replayed"]:
+        raise Failure(f"text: acknowledgement outcome row changed: {ack_rows['outcome']!r}")
+    if ack_rows["reason"] != '`""` when `queued`; otherwise the refusing check\'s reason.':
+        raise Failure(f"text: acknowledgement reason row changed: {ack_rows['reason']!r}")
+    m["ack_outcomes"] = (ga.group(1), ga.group(2), ga.group(3), m["gw_queue_full"], m["gw_store_unavailable"])
+    gr = one(r"`(\w+)`, `(\w+)` and `(\w+)` describe the gateway's state, not the record's, so they are \*\*retryable\*\*", cc, "retryable")
+    if set(gr.groups()) != {m["gw_queue_full"], m["gw_store_unavailable"], m["gw_unsupported"]}:
+        raise Failure(f"text: the retryable set changed: {gr.groups()}")
     m["ack_unanswered_check"] = int(one(r"A message refused at check (\d) is not acknowledged", cc, "ack").group(1))
     m["ack_from"] = tuple(int(x) for x in one(r"or a refusal at checks (\d) to (\d) for a configured device", cc, "ack").groups())
 
@@ -517,7 +533,10 @@ def build_model(texts: dict[str, str]) -> dict:
     g = one(r"\*\*Every observation of one `delivery_attempt_id`\*\* carries the same ((?:`\w+`, )*`\w+` and `\w+`)\.", con, "consistency")
     m["attempt_fields"] = ticks(g.group(1))
     m["obs_identity"] = [x.strip() for x in one(r"An observation's identity is `\(([\w, ]+)\)`", con, "identity").group(1).split(",")]
-    m["consistency_scope"] = one(r"Every rule here holds within one `(\w+)`, whatever key signs each record", con, "scope").group(1)
+    m["consistency_scope"] = one(r"Every rule here holds within one `(\w+)` and one \[lineage\]\(#lineage\), whatever key of that lineage signs each record", con, "scope").group(1)
+    lin = section(ad, "Lineage", 3)
+    one(r"The rules of \[Consistency across records\]\(#consistency-across-records\), the uniqueness of `attempt_seq`, and \[Reading a notice\]\(#reading-a-notice\) hold within one lineage\.", lin, "lineage")
+    one(r"an enrolment to another owner always begins one", lin, "lineage")
 
     # Enrolment proof
     kt = section(ad, "Key trust", 2)
@@ -1127,8 +1146,15 @@ def gateway_faults(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> tuple[l
     why, obj = parse_payload(raw)
     if why:
         return [why], None
+    def unsupported() -> bool:
+        v = obj.get("v")
+        if "unsupported_as_malformed" in mut or not isinstance(v, Tok):
+            return False
+        return re.fullmatch(r"-?(0|[1-9][0-9]*)", v.text) is not None and v.text != str(model["v"])
+
     checks: list[tuple[int, Callable[[], bool]]] = [
         (3, lambda: canon_bytes(obj) != raw),
+        (40, unsupported),
         (4, lambda: bool(form_faults(obj, model, mut))),
         (5, lambda: ctx.topic_device not in ctx.configured),
         (6, lambda: obj.get("device_id") != ctx.topic_device),
@@ -1137,11 +1163,14 @@ def gateway_faults(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> tuple[l
         checks[0], checks[1] = checks[1], checks[0]
     if "gw_swap_4_6" in mut:
         checks[1], checks[3] = checks[3], checks[1]
+    skip: set = set()
     for n, c in checks:
-        if f"gw_drop_{n}" in mut:
+        if f"gw_drop_{n}" in mut or n in skip:
             continue
         if c():
-            f.append(model["gw_reason"][n])
+            f.append(model["gw_unsupported"] if n == 40 else model["gw_reason"][n])
+            if n == 40:
+                skip.add(4)  # "Otherwise": check 4 names one reason
     return f, obj
 
 
@@ -1368,7 +1397,7 @@ class Custody:
         elif "replay_by_identity" in mut and obj is not None and any(identity_of(o, model) == identity_of(obj, model) for o in self._objs(topic_device)):
             verdict = model["gw_replayed"]
         elif len(q) >= self.max + (1 if "queue_off_by_one" in mut else 0):
-            verdict = "queue_full"
+            verdict = model["gw_queue_full"]
         else:
             q.append(digest)
             self._held.setdefault(topic_device, []).append(obj)
@@ -1382,6 +1411,7 @@ class Custody:
         q_out, replayed, refused, qf, su = model["ack_outcomes"]
         lo, hi = model["ack_from"]
         reasons_acked = [model["gw_reason"][n] for n in range(lo, hi) if n in model["gw_reason"] and n != model["ack_unanswered_check"]]
+        reasons_acked.append(model["gw_unsupported"])
         if "ack_unknown_device" in mut:
             reasons_acked.append(model["gw_reason"][5])
         if verdict in ("queued", replayed):
@@ -1806,7 +1836,7 @@ def judge_record(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> dict:
     if gw:
         out["gw"] = gw[0]
     lo, hi = model["rx_check1"]
-    rx1_reasons = {model["gw_reason"][n] for n in range(3, hi + 1) if n in model["gw_reason"]}
+    rx1_reasons = {model["gw_reason"][n] for n in range(3, hi + 1) if n in model["gw_reason"]} | {model["gw_unsupported"]}
     if "rx_checks_device_ids" in mut:
         rx1_reasons |= {model["gw_reason"][5], model["gw_reason"][6]}
     if "rx_checks_topic" in mut:
@@ -2008,7 +2038,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
     cov: dict[str, set] = {k: set() for k in (
         "gw_alone", "rx_alone", "outcomes", "rows", "details", "kinds", "delivered", "bound",
         "rx6", "rules", "seq_shapes", "carriage", "enrol_alone", "enrol_pass", "cfg")}
-    every_reason_gw = [model["gw_reason"][n] for n in (3, 4, 5, 6)]
+    every_reason_gw = [model["gw_reason"][n] for n in (3, 4, 5, 6)] + [model["gw_unsupported"]]
     every_reason_rx = model["rx_reasons"][2] + model["rx_reasons"][3] + model["rx_reasons"][4] + model["rx5"]
 
 
@@ -2166,7 +2196,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
             if ack != ev.get("expected_ack"):
                 bad(f"{where}[{i}]: acknowledgement {ack}, corpus says {ev.get('expected_ack')}")
             cov["carriage"].add(v)
-            if v == "queue_full" and len(cu.queue.get(ev["topic_device"], [])) == seq["max_records_per_device"]:
+            if v == model["gw_queue_full"] and len(cu.queue.get(ev["topic_device"], [])) == seq["max_records_per_device"]:
                 cov["carriage"].add("queue_full_at_bound")
         same_id: dict[tuple, set] = {}
         for dev, objs in cu._held.items():
@@ -2282,7 +2312,7 @@ JUDGE_MUTANTS = [
     "gw_drop_3", "gw_drop_4", "gw_drop_6", "gw_swap_3_4", "gw_swap_4_6",
     # check 4 loosened, one form at a time
     "members_extra_ok", "int_bool_ok", "int_spelling_ok", "int_no_max", "int_no_min", "v_any",
-    "num_as_str_record", "dollar_pattern", "obs_seq_4", "outcome_open", "sig_form_loose", "prior_open", "detail_open",
+    "unsupported_as_malformed", "num_as_str_record", "dollar_pattern", "obs_seq_4", "outcome_open", "sig_form_loose", "prior_open", "detail_open",
     "loose_pattern:device_id", "loose_pattern:alert_id", "loose_pattern:delivery_attempt_id",
     "loose_pattern:class", "loose_pattern:month", "loose_pattern:key_identity",
     "skip_form:v", "skip_form:device_id", "skip_form:key_identity", "skip_form:alert_id",

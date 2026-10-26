@@ -345,13 +345,25 @@ def form_ok(o: object) -> bool:
             and int_in(o["count"], 1, MAX_INT))
 
 
+def json_integer(v: object) -> bool:
+    """A JSON integer token: an optional minus, then 0 or a digit 1 to 9 and digits; no fraction or exponent."""
+    return isinstance(v, Raw) and re.fullmatch(r"-?(0|[1-9][0-9]*)", v) is not None
+
+
+def shape(obj: object) -> str | None:
+    """Check 4 of Carriage and custody: unsupported_version for a JSON integer v other than 1, else form."""
+    if isinstance(obj, dict) and json_integer(obj.get("v")) and obj["v"] != "1":
+        return "unsupported_version"
+    return None if form_ok(obj) else "malformed"
+
+
 def gateway_stateless(data: str, topic: str, configured: list) -> str | None:
     """Checks 3 to 6 of Carriage and custody; checks 1 and 2 are gateway-api/v2's corpora's."""
     obj = parse(data)
     if canonical(obj) != data.encode("utf-8"):
         return "not_canonical"
-    if not form_ok(obj):
-        return "malformed"
+    if shape(obj) is not None:
+        return shape(obj)
     if topic not in configured:
         return "unknown_device"
     if obj["device_id"] != topic:
@@ -392,26 +404,70 @@ def receiver_stateless(data: str, ctx: dict) -> str | None:
     obj = parse(data)
     if canonical(obj) != data.encode("utf-8"):
         return "not_canonical"
-    if not form_ok(obj):
-        return "malformed"
-    if obj["device_id"] not in ctx["forwarding_registry"].get(ctx["forwarder"], []):
-        return "not_owned"
-    enrolled = [e for e in ctx["enrolments"]
-                if e["device_id"] == obj["device_id"] and e["purpose"] == PURPOSE
-                and identity(KEYS[e["key"]].pub) == obj["key_identity"]]
-    if not enrolled:
+    if shape(obj) is not None:
+        return shape(obj)
+    enrolled = enrolment_of(obj, ctx["enrolments"])
+    permitted = ctx["forwarding_registry"].get(ctx["forwarder"], [])
+    if not any(p["device_id"] == obj["device_id"] and (enrolled is None or p["owner"] == enrolled["owner"])
+               for p in permitted):
+        return "not_owned"  # the owner the key's enrolment names, or, with no enrolment, the device alone
+    if enrolled is None:
         return "key_not_enrolled"
     unsigned = {k: v for k, v in obj.items() if k != "signature"}
-    if not verify(KEYS[enrolled[0]["key"]].pub, obj["signature"], DOMAIN + canonical(unsigned)):
+    if not verify(KEYS[enrolled["key"]].pub, obj["signature"], DOMAIN + canonical(unsigned)):
         return "signature_invalid"
     return rules_verdict(obj)
 
 
+def enrolment_of(obj: dict, enrolments: list) -> dict | None:
+    """The enrolment of the record's key for its device, for report signing, or None."""
+    for e in enrolments:
+        if (e["device_id"] == obj["device_id"] and e["purpose"] == PURPOSE
+                and identity(KEYS[e["key"]].pub) == obj["key_identity"]):
+            return e
+    return None
+
+
+def lineage_of(enrolment: dict, enrolments: list) -> int:
+    """1 for a device's first lineage; each enrolment that begins a lineage, by revision, starts the next."""
+    mine = sorted((e for e in enrolments if e["device_id"] == enrolment["device_id"]), key=lambda e: e["revision"])
+    n = 0
+    for e in mine:
+        n += e["lineage"] == "begins"
+        if e is enrolment:
+            return n
+    raise KeyError(enrolment["key"])
+
+
+def enr(device: str, key: str, revision: int = 1, lineage: str = "begins", owner: str = "site-a",
+        purpose: str = PURPOSE) -> dict:
+    return {"device_id": device, "key": key, "purpose": purpose, "owner": owner, "revision": revision,
+            "lineage": lineage}
+
+
+def perm(device: str, owner: str = "site-a") -> dict:
+    return {"device_id": device, "owner": owner}
+
+
+def check_enrolments(enrolments: list) -> None:
+    by_device: dict = {}
+    for e in enrolments:
+        by_device.setdefault(e["device_id"], []).append(e)
+    for es in by_device.values():
+        es = sorted(es, key=lambda e: e["revision"])
+        assert len({e["revision"] for e in es}) == len(es) and es[0]["lineage"] == "begins"
+        for a, b in zip(es, es[1:]):
+            assert a["owner"] == b["owner"] or b["lineage"] == "begins", "another owner always begins a lineage"
+
+
 def fixture(device: str = DEVICE, *, enrol: tuple = ("runtime",), forwarder: str = FORWARDER,
-            registry: dict | None = None) -> dict:
+            registry: dict | None = None, enrolments: list | None = None) -> dict:
+    enrolments = enrolments if enrolments is not None else [
+        enr(device, k, i + 1, "begins" if i == 0 else "continues") for i, k in enumerate(enrol)]
+    check_enrolments(enrolments)
     return {"topic_device": device, "configured_devices": [device], "forwarder": forwarder,
-            "forwarding_registry": registry if registry is not None else {FORWARDER: [device]},
-            "enrolments": [{"device_id": device, "key": k, "purpose": PURPOSE} for k in enrol]}
+            "forwarding_registry": registry if registry is not None else {FORWARDER: [perm(device)]},
+            "enrolments": enrolments}
 
 
 # --- records -----------------------------------------------------------------------------------------
@@ -546,9 +602,10 @@ for name, note, rec in (
     ("submission_member_extra", "A submission with a count member.", submission(count=1)),
     ("tally_member_missing", "A tally without month.", tally(drop=("month",))),
     ("tally_notice_member", "A tally with a notice member: a tally has none.", tally(notice="optional")),
-    ("v_2", "v is 2.", submission(v=2)),
     ("v_true", "v is true.", submission(v=True)),
-    ("v_string", "v is \"1\".", submission(v="1")),
+    ("v_string", "v is \"1\", a string, not a JSON integer.", submission(v="1")),
+    ("v_fraction", "v written 1.0, not a JSON integer.", submission(v=Raw("1.0"))),
+    ("v_exponent", "v written 2e0, not a JSON integer.", submission(v=Raw("2e0"))),
     ("integer_fraction", "attempt_seq written 41.0.", submission(attempt_seq=Raw("41.0"))),
     ("integer_exponent", ("attempt_seq written 41e0: the token is kept as written, so the bytes are canonical "
                           "and the value is no integer."), submission(attempt_seq=Raw("41e0"))),
@@ -637,15 +694,30 @@ rcase("device_mismatch_gateway_only", "A record naming site-a-edge-02, on site-a
       "forwarder is permitted for site-a-edge-02 and runtime is enrolled for it: device_mismatch at the gateway; "
       "the receiver, judging permission against the record's own device_id, passes it.",
       submission(device_id=OTHER_DEVICE), "device_mismatch", "pass",
-      {**fixture(), "forwarding_registry": {FORWARDER: [DEVICE, OTHER_DEVICE]},
-       "enrolments": [{"device_id": OTHER_DEVICE, "key": "runtime", "purpose": PURPOSE}]})
+      fixture(registry={FORWARDER: [perm(DEVICE), perm(OTHER_DEVICE)]}, enrolments=[enr(OTHER_DEVICE, "runtime")]))
 
 # Receiver check 2: not_owned. The receiver's registry permits gateway-site-b for another device only.
-NOT_OWNED = fixture(forwarder=OTHER_FORWARDER, registry={FORWARDER: [DEVICE], OTHER_FORWARDER: ["site-b-edge-01"]})
+NOT_OWNED = fixture(forwarder=OTHER_FORWARDER,
+                    registry={FORWARDER: [perm(DEVICE)], OTHER_FORWARDER: [perm("site-b-edge-01", "site-b")]})
 rx_only("not_owned", "A genuine record forwarded by gateway-site-b, which the receiver's registry permits to "
         "forward for site-b-edge-01 only.", GOOD, "not_owned", NOT_OWNED)
 rx_only("not_owned_unregistered_forwarder", "A genuine tally forwarded by a gateway the registry does not hold.",
         TGOOD, "not_owned", fixture(forwarder=OTHER_FORWARDER))
+
+# Receiver check 2 follows the owner the record key's enrolment names, never the device's current owner.
+rx_only("not_owned_moved_device", "The device moved from site-a to site-b: runtime is enrolled to site-a (revision "
+        "1), rotated to site-b (revision 2, a new lineage). A record of runtime's, the old owner's key, forwarded "
+        "by gateway-site-b, which is permitted for the device on behalf of site-b only, is not_owned.",
+        GOOD, "not_owned", {**MOVED, "forwarder": OTHER_FORWARDER})
+ok("moved_device_old_owner_gateway", "The same record of runtime's forwarded by gateway-site-a, permitted for the "
+   "device on behalf of site-a, the owner its key's enrolment names.", GOOD, MOVED)
+ok("moved_device_new_owner", "A record of rotated's, the new owner's key, forwarded by gateway-site-b.",
+   submission(ROTATED), {**MOVED, "forwarder": OTHER_FORWARDER})
+rx_only("not_owned_moved_device_new_key_old_gateway", "rotated's record forwarded by gateway-site-a, which may "
+        "forward for site-a only: not_owned.", submission(ROTATED), "not_owned", MOVED)
+rx_only("key_not_enrolled_passes_check_2", "A record of other, not enrolled for the device, forwarded by "
+        "gateway-site-b, permitted for the device on behalf of site-b: check 2 passes on the device alone, and "
+        "check 3 refuses it.", submission(OTHER), "key_not_enrolled", {**MOVED, "forwarder": OTHER_FORWARDER})
 
 # Receiver check 3: key_not_enrolled.
 rx_only("key_not_enrolled_other", "Signed by key other, which the record names; only runtime is enrolled.",
@@ -656,10 +728,10 @@ rx_only("key_not_enrolled_negation", "Signed under runtime's negation and naming
         "different key_identity, and enrolment binds the exact key.", submission(NEGATED), "key_not_enrolled")
 rx_only("key_not_enrolled_wrong_purpose", "runtime is enrolled for site-a-edge-01, but for the purpose "
         "runtime_posture, not alert_delivery_report.", GOOD, "key_not_enrolled",
-        {**fixture(), "enrolments": [{"device_id": DEVICE, "key": "runtime", "purpose": "runtime_posture"}]})
+        fixture(enrolments=[enr(DEVICE, "runtime", purpose="runtime_posture")]))
 rx_only("key_not_enrolled_other_device", "runtime is enrolled for site-a-edge-01 only; the record is "
         "site-a-edge-02's, configured and permitted.", submission(device_id=OTHER_DEVICE), "key_not_enrolled",
-        {**fixture(OTHER_DEVICE), "enrolments": [{"device_id": DEVICE, "key": "runtime", "purpose": PURPOSE}]})
+        fixture(OTHER_DEVICE, enrolments=[enr(DEVICE, "runtime")]))
 
 # Receiver check 4: signature_invalid.
 _FLIP = b64(bytes([_SIG[0] ^ 1]) + _SIG[1:])
@@ -732,10 +804,29 @@ for name, note, kw in (
     rx_only("detail_refused_" + name, note, submission(**kw), "detail_refused")
 
 # Precedence: two rules broken on purpose; the note names the check that wins.
-gw("precedence_not_canonical_over_malformed", "Not canonical and v 2: check 3 wins, not_canonical.",
+gw("precedence_not_canonical_over_malformed", "Not canonical and notice null: check 3 wins, not_canonical.",
+   text(submission(notice=None)).replace('"v":1', '"v": 1'), "not_canonical")
+gw("precedence_not_canonical_over_unsupported_version", "Not canonical and v 2: check 3 wins, not_canonical.",
    text(submission(v=2)).replace('"v":2', '"v": 2'), "not_canonical")
-gw("precedence_malformed_over_device_mismatch", "Another device's record with v 2: check 4 wins, malformed.",
-   submission(device_id=OTHER_DEVICE, v=2), "malformed")
+gw("precedence_malformed_over_device_mismatch", "Another device's record with notice null: check 4 wins, "
+   "malformed.", submission(device_id=OTHER_DEVICE, notice=None), "malformed")
+gw("precedence_unsupported_version_over_malformed", "v 2 and no detail member: unsupported_version is judged "
+   "first within check 4.", submission(v=2, drop=("detail",)), "unsupported_version")
+gw("precedence_unsupported_version_over_kind", "v 2 and kind receipt: unsupported_version first.",
+   submission(v=2, kind="receipt"), "unsupported_version")
+rcase("precedence_unsupported_version_over_device_mismatch", "Another device's record with v 2: check 4 wins at "
+      "the gateway, and at the receiver through its check 1.", submission(device_id=OTHER_DEVICE, v=2),
+      "unsupported_version", "unsupported_version")
+
+# Gateway check 4: unsupported_version, a JSON integer v other than 1.
+gw("unsupported_version_2", "v is 2, a later version.", submission(v=2), "unsupported_version")
+gw("unsupported_version_tally", "A tally with v 2.", tally(v=2), "unsupported_version")
+gw("unsupported_version_0", "v is 0: a JSON integer other than 1, so unsupported_version, though no member is "
+   "ever 0.", submission(v=0), "unsupported_version")
+gw("unsupported_version_negative", "v is -1: a JSON integer token, with its sign, other than 1.",
+   submission(v=-1), "unsupported_version")
+gw("unsupported_version_over_bound", "v is 2^53, a JSON integer beyond every integer member's bound.",
+   submission(v=MAX_INT + 1), "unsupported_version")
 rcase("precedence_not_owned_over_key_other_device", "Another device's record, on site-a-edge-01's topic, signed by "
       "other: device_mismatch at the gateway; at the receiver check 2 wins over key_not_enrolled, not_owned.",
       submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch", "not_owned")
@@ -806,12 +897,13 @@ class Receiver:
         self.ctx = ctx
         self.kept: list[dict] = []  # {"data", "obj", "verdict", "hit"}
 
-    def check6(self, data: str, o: dict) -> tuple[str, list]:
+    def check6(self, data: str, o: dict, lineage: int) -> tuple[str, list]:
         if any(k["data"] == data for k in self.kept):  # identical to a record held as stored or as conflict
             return "duplicate", []
         stored = [k for k in self.kept if k["verdict"] == "stored"]  # never judged against a conflict record
         if o["kind"] == "submission":
-            hit = [k for k in stored if k["obj"]["kind"] == "submission" and breaks(k["obj"], o)]
+            hit = [k for k in stored if k["obj"]["kind"] == "submission" and k["lineage"] == lineage
+                   and breaks(k["obj"], o)]  # consistency holds within one device and one lineage
             return ("conflict", hit) if hit else ("stored", [])
         same = [k for k in stored if k["obj"]["kind"] == "withheld_tally" and tally_key(k["obj"]) == tally_key(o)]
         hit = [k for k in same if integer(k["obj"]["count"]) == integer(o["count"])]
@@ -826,25 +918,29 @@ class Receiver:
         if reason is not None:
             return reason
         o = parse(data)
-        verdict, hit = self.check6(data, o)
+        lineage = lineage_of(enrolment_of(o, self.ctx["enrolments"]), self.ctx["enrolments"])
+        verdict, hit = self.check6(data, o, lineage)
         if verdict in ("stored", "conflict"):
-            self.kept.append({"data": data, "obj": o, "verdict": verdict, "hit": hit})
+            self.kept.append({"data": data, "obj": o, "verdict": verdict, "hit": hit, "lineage": lineage})
         return verdict
 
     def reading(self) -> tuple[list, list]:
-        stored = [k["obj"] for k in self.kept if k["verdict"] == "stored"]
         unsettled = set()
         for k in self.kept:
             if k["verdict"] == "conflict":
                 for r in [k] + k["hit"]:  # neither side of a conflict is presented as settled
                     o = r["obj"]
-                    unsettled.add((o["device_id"], o["alert_id"]) if o["kind"] == "submission" else tally_key(o))
+                    unsettled.add((o["device_id"], r["lineage"], o["alert_id"]) if o["kind"] == "submission"
+                                  else tally_key(o))
         alerts: dict = {}
-        for o in stored:
-            if o["kind"] == "submission":
-                alerts.setdefault((o["device_id"], o["alert_id"]), {}).setdefault(o["channel"], []).append(o)
+        for k in self.kept:
+            o = k["obj"]
+            if k["verdict"] == "stored" and o["kind"] == "submission":
+                alerts.setdefault((o["device_id"], k["lineage"], o["alert_id"]), {}).setdefault(
+                    o["channel"], []).append(o)
+        stored = [k["obj"] for k in self.kept if k["verdict"] == "stored"]
         reading = []
-        for (dev, aid), chans in sorted(alerts.items()):
+        for (dev, lin, aid), chans in sorted(alerts.items()):
             out = {}
             for ch, obs_ in sorted(chans.items()):
                 top = max(integer(x["attempt_seq"]) for x in obs_)
@@ -852,9 +948,9 @@ class Receiver:
                            key=lambda x: integer(x["observation_seq"]))
                 out[ch] = {"latest_attempt_state": last["outcome"],
                            "ever_accepted": any(x["outcome"] == "accepted" for x in obs_)}
-            reading.append({"device_id": dev, "alert_id": aid, "channels": out,
+            reading.append({"device_id": dev, "lineage": lin, "alert_id": aid, "channels": out,
                             "accepted_on_some_channel": any(c["ever_accepted"] for c in out.values()),
-                            "settled": (dev, aid) not in unsettled})
+                            "settled": (dev, lin, aid) not in unsettled})
         tallies: dict = {}
         for o in stored:
             if o["kind"] == "withheld_tally":
@@ -895,7 +991,10 @@ def obs(alert: str, attempt: str, aseq: int, oseq: int, prior: object, outcome: 
 
 AL1, AL2 = "alert-0000000001", "alert-0000000002"
 AT1, AT2, AT3 = "attempt-00000001", "attempt-00000002", "attempt-00000003"
-BOTH = fixture(enrol=("runtime", "rotated"))
+BOTH = fixture(enrol=("runtime", "rotated"))  # rotated continues runtime's lineage, a rotation
+RESET = fixture(enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins")])
+MOVED = fixture(registry={FORWARDER: [perm(DEVICE)], OTHER_FORWARDER: [perm(DEVICE, "site-b")]},
+                enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "begins", "site-b")])
 
 rseq("duplicate", "The same record twice: stored, then duplicate.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
@@ -934,9 +1033,8 @@ rseq("attempt_seq_across_keys", "attempt_seq 7 under runtime and again under rot
      "signs. Conflict.",
      [obs(AL1, AT1, 7, 1, None, "accepted"),
       obs(AL2, AT2, 7, 1, None, "failed", "provider_refused", signer=ROTATED)], BOTH)
-TWO_DEVICES = {"forwarder": FORWARDER, "forwarding_registry": {FORWARDER: [DEVICE, OTHER_DEVICE]},
-               "enrolments": [{"device_id": DEVICE, "key": "runtime", "purpose": PURPOSE},
-                              {"device_id": OTHER_DEVICE, "key": "other", "purpose": PURPOSE}]}
+TWO_DEVICES = fixture(registry={FORWARDER: [perm(DEVICE), perm(OTHER_DEVICE)]},
+                      enrolments=[enr(DEVICE, "runtime"), enr(OTHER_DEVICE, "other")])
 rseq("consistency_per_device", "Two devices, each with its own enrolled key, reuse one delivery_attempt_id, "
      "attempt_seq and alert_id with another notice and channel: every rule holds within one device_id, so "
      "both are stored and each device reads apart.",
@@ -971,8 +1069,9 @@ rseq("gap_stored", "seq 2 of an attempt with no seq 1: the receiver does not hol
 rseq("accepted_then_reported_failure", "An accepted attempt later failed by the provider: both observations "
      "stored; latest failed, ever accepted true.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed", "provider_reported_failure")])
-rseq("unconfirmed_accepted_reported_failure", "Every step of the longest path: unconfirmed, accepted, failed "
-     "with provider_reported_failure.",
+rseq("unconfirmed_accepted_reported_failure", "Rows 1, 2 and 3: an unconfirmed attempt, then a provider report "
+     "naming a message identifier for it, a failure, recorded as accepted and then failed with "
+     "provider_reported_failure.",
      [_U, obs(AL1, AT1, 1, 2, "unconfirmed", "accepted"),
       obs(AL1, AT1, 1, 3, "accepted", "failed", "provider_reported_failure")])
 rseq("unconfirmed_never_resolved", "An unconfirmed attempt never resolved stays unconfirmed.",
@@ -1025,6 +1124,18 @@ rseq("tally_two_epochs", "runtime's snapshot 5, then rotated's snapshot 2 of the
      "in its own epoch.",
      [tally(count=5), tally(ROTATED, count=2, issued_at_ms=T0 + 80_000), tally(count=4, issued_at_ms=T0 + 90_000)],
      BOTH)
+rseq("reset_new_lineage", "runtime enrolled (lineage 1), then rotated enrolled as a reset that begins lineage "
+     "2: attempt_seq restarts at 1, so attempt_seq 1, delivery_attempt_id and alert_id reused under rotated for "
+     "another notice are no conflict; both are stored, and the notices are read apart, one per lineage.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"),
+      obs(AL1, AT1, 1, 1, None, "failed", "provider_refused", signer=ROTATED, notice="tier_d",
+          **{"class": None})], RESET)
+rseq("restore_same_lineage", "rotated continues runtime's lineage, a rotation, but the store was restored without "
+     "the act that begins a new lineage: attempt_seq 1 reused under rotated for another attempt is a conflict, "
+     "and both notices are unsettled.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL2, AT2, 1, 1, None, "accepted", signer=ROTATED)], BOTH)
+rseq("restore_same_key", "One key, a restored store: attempt_seq 1 reused for another attempt is a conflict.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL2, AT2, 1, 1, None, "failed", "provider_refused")])
 rseq("notice_across_rotation", "One alert_id's attempts under runtime then, after a rotation, rotated: one "
      "device, so one notice, read across both keys; latest is attempt_seq 2's.",
      [obs(AL1, AT1, 1, 1, None, "failed", "provider_refused"),
@@ -1078,9 +1189,11 @@ carriage("queue_full", "max_records_per_device 2: two records queued, the third 
           (DEVICE, obs(AL1, AT3, 3, 1, None, "accepted")),
           (OTHER_DEVICE, obs(AL1, AT1, 1, 1, None, "accepted", signer=OTHER, device_id=OTHER_DEVICE))],
          devices=(DEVICE, OTHER_DEVICE), max_per_device=2)
-carriage("refusals", "Refusals at checks 3, 4 and 6 are acknowledged refused with their reason; a record on an "
+carriage("refusals", "Refusals at checks 3, 4 (unsupported_version and malformed) and 6 are acknowledged "
+         "refused with their reason; a record on an "
          "unconfigured device's topic is unknown_device and not acknowledged; none takes a place in the queue.",
-         [(DEVICE, text(GENUINE) + "\n"), (DEVICE, submission(v=2)), (DEVICE, submission(device_id=OTHER_DEVICE)),
+         [(DEVICE, text(GENUINE) + "\n"), (DEVICE, submission(v=2)), (DEVICE, submission(notice=None)),
+          (DEVICE, submission(device_id=OTHER_DEVICE)),
           (OTHER_DEVICE, submission(device_id=OTHER_DEVICE)), (DEVICE, GENUINE)], max_per_device=1)
 carriage("unverified_carried", "Records the receiver would refuse at checks 2 to 5 are carried: an unenrolled "
          "key, a corrupted signature and a refused transition are each queued.",
