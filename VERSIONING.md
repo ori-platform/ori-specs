@@ -481,7 +481,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | commissioned-safety-binding | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit complete |
 | commissioned-safety-binding | v2 | `draft` | `frozen` | shipment, runtime `332754b`, 2026-09-23; audit complete |
 | device-configuration | v1 | `draft` | `amendable` | — |
-| device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
+| device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
+| device-policy | v2 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit complete |
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
 | ed25519-key-admission | v1 | `draft` | `amendable` | — |
 | ed25519-verification | v1 | `draft` | `amendable` | — |
