@@ -92,8 +92,9 @@ PINS: list[tuple[str, str]] = [
     ("ad", "- **A rotation continues it.** A new report key from a rotation of the evidence device key signs the lineage's later records, including later observations of attempts claimed under the key before it."),
     ("ad", "Every report key's enrolment proof names its **lineage origin**: the `key_identity` of the key that began its lineage, which is its own when the key itself began one."),
     ("ad", "An enrolment to another owner never continues a lineage."),
-    ("ad", "The receiver records each enrolled key's signed `lineage_origin`. Once the proof passes, it derives the key's lineage. When `lineage_origin` is the `key_identity`, or the recorded origin, of a key it holds enrolled for this device to the same owner, the key joins that key's lineage, so two keys of one lineage join each other even when the key that began it was never enrolled."),
-    ("ad", "6. `lineage_origin` is the `key_identity`, or the recorded lineage origin, of a key the receiver holds enrolled for this device to another owner than this enrolment's: `lineage_mismatch`."),
+    ("ad", "The receiver records each enrolled key's signed `lineage_origin`. Once the proof passes, it derives the key's lineage. When `lineage_origin` is the `key_identity`, or the recorded origin, of a key it holds enrolled for this device to the same owner, the key joins that key's lineage, since check 6 has refused a match under any other device or owner, so two keys of one lineage join each other even when the key that began it was never enrolled."),
+    ("ad", "6. `lineage_origin` is the `key_identity`, or the recorded lineage origin, of a key the receiver holds enrolled for another device, or to another owner than this enrolment's: `lineage_mismatch`. Origins are matched across every device, since a `key_identity` names one key."),
+    ("ad", "7. The key being enrolled is already held enrolled for another device, or to another owner than this enrolment's: `key_already_enrolled`."),
     ("ad", "A notice whose attempts span lineages, as one pending across a reset does, is presented per lineage, never combined."),
     ("ad", "for report signing, under [Key trust](#key-trust): otherwise `key_not_enrolled`. A key so enrolled and since revoked: `key_revoked`."),
     ("ad", "The rules of [Consistency across records](#consistency-across-records), the uniqueness of `attempt_seq`, and [Reading a notice](#reading-a-notice) hold within one lineage."),
@@ -566,16 +567,18 @@ def build_model(texts: dict[str, str]) -> dict:
     if json.loads(blk.group(1))["purpose"] != m["enrol_purpose"]:
         raise Failure("text: enrolment example purpose differs from the constant")
     items = numbered(pr)
-    if len(items) != 6:
+    if len(items) != 7:
         raise Failure(f"text: the enrolment proof lists {len(items)} refusals")
     if "lineage_origin" not in m["enrol_members"]:
         raise Failure("text: the challenge no longer carries lineage_origin")
     if "or `lineage_origin` not a `key_identity`" not in items[0]:
         raise Failure(f"text: enrolment check 1 changed: {items[0]!r}")
     one(r"`lineage_origin` is the `key_identity` of the key that began the key's lineage: its own, when the key was made at the store's first commissioning or by the act that begins a lineage; and the origin of the key it replaced, when it was made by a rotation", pr, "origin")
-    if not re.fullmatch(r"`lineage_origin` is the `key_identity`, or the recorded lineage origin, of a key the receiver holds enrolled for this device to another owner than this enrolment's: `\w+`\. A move begins a new lineage, so its keys name themselves; one that names the earlier owner's lineage was moved without that act\.", items[5]):
+    if not re.fullmatch(r"`lineage_origin` is the `key_identity`, or the recorded lineage origin, of a key the receiver holds enrolled for another device, or to another owner than this enrolment's: `\w+`\. Origins are matched across every device, since a `key_identity` names one key\. A move, and a change of `device_id`, each begin a new lineage, so their keys name themselves; one that names another device's or the earlier owner's lineage was changed without that act\.", items[5]):
         raise Failure(f"text: enrolment check 6 changed: {items[5]!r}")
-    m["enrol_order"] = [ticks(it)[-1] for it in items]
+    if not re.fullmatch(r"The key being enrolled is already held enrolled for another device, or to another owner than this enrolment's: `\w+`\.", items[6]):
+        raise Failure(f"text: enrolment check 7 changed: {items[6]!r}")
+    m["enrol_order"] = [re.search(r":\s+`(\w+)`\.", it).group(1) for it in items]
     m["enrol_items"] = items
 
     # Config load rules (gateway-config/v2 alert_delivery)
@@ -1488,7 +1491,7 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
     """The enrolment proof's failing checks in order, and, for a pass, the
     held key whose lineage the key joins (None when it begins its own)."""
     held = held or []
-    r_malformed, r_nonce, r_device, r_key, r_sig, r_lineage = model["enrol_order"]
+    r_malformed, r_nonce, r_device, r_key, r_sig, r_lineage, r_already = model["enrol_order"]
     f: list[str] = []
     why, obj = parse_payload(challenge)
     malformed = why is not None
@@ -1517,10 +1520,18 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
 
     def of_lineage(h: dict) -> bool:
         # the origin is the held key's key_identity or its recorded origin
-        return h["key_identity"] == origin or (h["lineage_origin"] == origin and "origin_by_identity_only" not in mut)
+        return h["key_identity"] == origin or (h.get("lineage_origin") == origin and "origin_by_identity_only" not in mut)
 
-    on_device = [h for h in held if (h["device_id"] == device or "origin_any_device" in mut) and of_lineage(h)]
-    other_owner = any(h["owner"] != owner for h in on_device) and "origin_other_owner_ok" not in mut
+    # Origins are matched across every device; a match under another device, or
+    # to another owner, is lineage_mismatch.
+    matched = [h for h in held if of_lineage(h) and (h["device_id"] == device or "origin_device_scoped" not in mut)]
+    other_owner = any(h["owner"] != owner and "origin_other_owner_ok" not in mut
+                      or h["device_id"] != device and "origin_other_device_ok" not in mut for h in matched)
+    mine = key_identity_of(pub, model)
+    already = any(h["key_identity"] == mine and (h["device_id"] != device and "already_owner_only" not in mut
+                                                  or h["owner"] != owner and "already_device_only" not in mut)
+                  for h in held)
+    on_device = [h for h in matched if h["device_id"] == device]
     tests = [
         (r_nonce, obj.get("nonce") != issued_nonce or (consumed and "enrol_reuse_ok" not in mut)),
         (r_device, obj.get("device_id") != device),
@@ -1528,7 +1539,10 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
         (r_sig, sig is None or not ed_verify(pub, model["enrol_prefix"] + challenge, sig) if "enrol_no_prefix" not in mut
          else not ed_verify(pub, challenge, sig or b"")),
         (r_lineage, other_owner),
+        (r_already, already),
     ]
+    if "enrol_swap_6_7" in mut:
+        tests[4], tests[5] = tests[5], tests[4]
     if "enrol_lineage_before_signature" in mut:
         tests[3], tests[4] = tests[4], tests[3]
     if "enrol_swap_2_3" in mut:
@@ -1906,7 +1920,9 @@ def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str]
             continue
         if not isinstance(e.get("revoked"), bool):
             bad(f"{where}: enrolment {e.get('key')} revoked is not a boolean")
-        if not full(model["key_identity_re"], e.get("lineage_origin"), frozenset(), "key_identity") \
+        report = e.get("purpose") == model["enrol_purpose"]
+        if not (full(model["key_identity_re"], e.get("lineage_origin"), frozenset(), "key_identity") if report
+                else "lineage_origin" not in e) \
                 or not isinstance(e.get("revision"), int) or isinstance(e.get("revision"), bool) \
                 or not isinstance(e.get("owner"), str):
             bad(f"{where}: enrolment {e.get('key')} lacks an owner, a revision or a lineage origin")
@@ -1921,7 +1937,7 @@ def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str]
         prev = None
         for e in sorted(es, key=lambda e: e["revision"]):
             ki = key_identity_of(keys[e["key"]], model)
-            origin = e["lineage_origin"]
+            origin = e.get("lineage_origin")
             # held keys whose key_identity or recorded origin is this origin
             held = next((v for k2, v in lineage_of.items()
                          if k2 == origin or (v[2] == origin and "origin_by_identity_only" not in mut)), None)
@@ -1934,6 +1950,8 @@ def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str]
                 joins, ln = True, held[1]
             else:
                 joins, ln = False, None
+            if e.get("purpose") != model["enrol_purpose"] and "origin_any_purpose" not in mut:
+                joins, ln = True, None  # no lineage: not enrolled for report signing
             if not joins:
                 n += 1
                 ln = n
@@ -2380,13 +2398,17 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
             bad(f"{where}: signature is not canonical Base64 of 64 bytes")
         held = case["held_enrolments"]
         for h in held:
+            report = h.get("purpose") == model["enrol_purpose"]
             if not (isinstance(h.get("device_id"), str) and isinstance(h.get("owner"), str)
-                    and isinstance(h.get("revoked"), bool)
-                    and full(model["key_identity_re"], h.get("lineage_origin"), frozenset(), "key_identity")
+                    and isinstance(h.get("revoked"), bool) and isinstance(h.get("purpose"), str)
+                    and (full(model["key_identity_re"], h.get("lineage_origin"), frozenset(), "key_identity")
+                         if report else "lineage_origin" not in h)
                     and full(model["key_identity_re"], h.get("key_identity"), frozenset(), "key_identity")):
                 bad(f"{where}: a held enrolment outside its form")
         # A revoked key is still held: revocation ends its trust, not its place in a lineage.
-        held_now = [h for h in held if not (h["revoked"] and "revoked_not_held" in mut)]
+        # A key enrolled only for another purpose is not held.
+        held_now = [h for h in held if not (h["revoked"] and "revoked_not_held" in mut)
+                    and (h["purpose"] == model["enrol_purpose"] or "held_any_purpose" in mut)]
         f, joins = enrol_faults(ch, sig, case["issued_nonce"], case["nonce_consumed"], case["enrolling_device_id"], pub, model, mut,
                                 case["enrolling_owner"], held_now)
         if not f and joins != case["expected_lineage_joins"]:
@@ -2507,7 +2529,8 @@ JUDGE_MUTANTS = [
     # enrolment
     "enrol_noncanonical_ok", "enrol_extra_ok", "enrol_any_purpose", "enrol_nonce_form_any", "enrol_drop_1",
     "enrol_reuse_ok", "enrol_nonce_odd_ok", "enrol_drop:lineage_mismatch", "origin_other_owner_ok",
-    "origin_any_device", "lineage_join_any_origin", "enrol_lineage_before_signature", "enrol_origin_form_any", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
+    "origin_device_scoped", "origin_other_device_ok", "enrol_drop:key_already_enrolled", "already_owner_only",
+    "already_device_only", "enrol_swap_6_7", "held_any_purpose", "lineage_join_any_origin", "enrol_lineage_before_signature", "enrol_origin_form_any", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
     "enrol_drop:nonce_mismatch", "enrol_drop:device_mismatch", "enrol_drop:key_mismatch", "enrol_drop:signature_invalid",
     "loose_pattern:nonce", "num_as_str_enrol",
     # config
