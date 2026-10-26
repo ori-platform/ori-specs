@@ -1,0 +1,1357 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate alert-delivery/v1 vectors.
+
+Writes alert-delivery/vectors/alert-delivery-v1.json: signed records as exact
+bytes, each with the verdict a gateway gives it at checks 3, 4 and 6 of
+Carriage and custody and the verdict a receiver gives it at checks 1 to 5 of
+Verifying; receiver sequences, each record with its check 6 verdict and, after
+the last, the reading of Reading a notice and the tallies held; carriage
+sequences with the gateway's custody verdict and acknowledgement; enrolment
+proofs with their challenge bytes, signing input, signature and verdict; and
+the gateway-config/v2 alert_delivery load rules. Keys are SHA-256 of a
+published label and are test keys only.
+
+Usage: generate-alert-delivery-vectors-v1 [--check]
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import pathlib
+import re
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "alert-delivery" / "vectors" / "alert-delivery-v1.json"
+
+DOMAIN = b"ori.alert_delivery.v1\x00"
+ENROL_DOMAIN = b"ori.report_key_enrolment.v1\x00"
+POSTURE_DOMAIN = b"ori.runtime_posture.v1\x00"
+SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+MAX_INT = 2**53 - 1
+RECORD_TOPIC_BOUND = 1024
+DEVICE = "site-a-edge-01"
+OTHER_DEVICE = "site-a-edge-02"
+FORWARDER = "gateway-site-a"
+OTHER_FORWARDER = "gateway-site-b"
+PURPOSE = "alert_delivery_report"
+T0 = 1_787_000_000_000
+
+DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+ID_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+CLASS_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
+KEY_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+NONCE_RE = re.compile(r"[0-9a-f]{32,64}")
+NOTICES = ("optional", "tier_d", "protection_degraded")
+MANDATORY = ("tier_d", "protection_degraded")
+CHANNELS = ("sms", "whatsapp")
+OUTCOMES = ("accepted", "failed", "unconfirmed")
+DETAILS = {"accepted": (), "failed": ("provider_refused", "provider_reported_failure", "not_submitted"),
+           "unconfirmed": ("timeout_after_submit", "response_unreadable")}
+ALL_DETAILS = tuple(d for v in DETAILS.values() for d in v)
+REASONS = ("disabled", "capped")
+SUBMISSION = {"v", "kind", "device_id", "key_identity", "alert_id", "notice", "class", "channel",
+              "delivery_attempt_id", "attempt_seq", "attempted_at_ms", "observation_seq", "prior_outcome",
+              "outcome", "detail", "issued_at_ms", "signature"}
+TALLY = {"v", "kind", "device_id", "key_identity", "channel", "class", "reason", "month", "count",
+         "issued_at_ms", "signature"}
+# Observations of one attempt: (observation_seq, prior_outcome) -> permitted outcomes. Row 3's further
+# condition, that the second observation followed an unconfirmed, follows from row 2 and consistency.
+TRANSITIONS = {(1, None): {"accepted", "failed", "unconfirmed"}, (2, "unconfirmed"): {"accepted", "failed"},
+               (2, "accepted"): {"failed"}, (3, "accepted"): {"failed"}}
+# Unicode White_Space.
+WHITE_SPACE = set("\t\n\x0b\x0c\r \x85\xa0     　") | {chr(c) for c in range(0x2000, 0x200B)}
+
+
+# --- keys -------------------------------------------------------------------------------------------
+def seed(name: str) -> bytes:
+    return hashlib.sha256(f"ori alert-delivery/v1 {name} test key".encode("ascii")).digest()
+
+
+def b64(b: bytes) -> str:
+    return base64.b64encode(b).decode("ascii")
+
+
+def identity(pub: bytes) -> str:
+    return "sha256:" + hashlib.sha256(SPKI_PREFIX + pub).hexdigest()
+
+
+def recognised(pub: bytes) -> bytes:
+    return pub[:31] + bytes([pub[31] & 0x7F])
+
+
+class Signer:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.key = Ed25519PrivateKey.from_private_bytes(seed(name))
+        self.pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+    def sign(self, message: bytes) -> bytes:
+        return self.key.sign(message)
+
+
+# Edwards25519 arithmetic: to sign under a key's negation, to recognise keys, and for key admission.
+FIELD = 2**255 - 19
+ORDER = 2**252 + 27742317777372353535851937790883648493
+D = -121665 * pow(121666, FIELD - 2, FIELD) % FIELD
+IDENT = (0, 1, 1, 0)
+
+
+def padd(a: tuple, b: tuple) -> tuple:
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    k1 = (y1 - x1) * (y2 - x2) % FIELD
+    k2 = (y1 + x1) * (y2 + x2) % FIELD
+    k3 = 2 * D * t1 * t2 % FIELD
+    k4 = 2 * z1 * z2 % FIELD
+    e, f, g, h = k2 - k1, k4 - k3, k4 + k3, k2 + k1
+    return (e * f % FIELD, g * h % FIELD, f * g % FIELD, e * h % FIELD)
+
+
+def pmul(n: int, p: tuple) -> tuple:
+    acc = IDENT
+    while n:
+        if n & 1:
+            acc = padd(acc, p)
+        p = padd(p, p)
+        n >>= 1
+    return acc
+
+
+def penc(p: tuple) -> bytes:
+    x, y, z, _ = p
+    inv = pow(z, FIELD - 2, FIELD)
+    x, y = x * inv % FIELD, y * inv % FIELD
+    return (y | (x & 1) << 255).to_bytes(32, "little")
+
+
+def pdec(raw: bytes) -> tuple | str:
+    """A point, or the ed25519-key-admission/v1 decoding clause that refuses the encoding."""
+    v = int.from_bytes(raw, "little")
+    sign, y = v >> 255, v & ((1 << 255) - 1)
+    if y >= FIELD:
+        return "non_canonical"
+    xx = (y * y - 1) * pow(D * y * y + 1, FIELD - 2, FIELD) % FIELD
+    x = pow(xx, (FIELD + 3) // 8, FIELD)
+    if (x * x - xx) % FIELD:
+        x = x * pow(2, (FIELD - 1) // 4, FIELD) % FIELD
+    if (x * x - xx) % FIELD:
+        return "off_curve"
+    if x == 0 and sign:
+        return "invalid_sign"
+    if x & 1 != sign:
+        x = FIELD - x
+    return (x, y, 1, x * y % FIELD)
+
+
+def is_identity(p: tuple) -> bool:
+    x, y, z, _ = p
+    return x % FIELD == 0 and (y - z) % FIELD == 0
+
+
+def admission(raw: bytes) -> str | None:
+    p = pdec(raw)
+    if isinstance(p, str):
+        return p
+    if is_identity(pmul(8, p)):
+        return "small_order"
+    if not is_identity(pmul(ORDER, p)):
+        return "mixed_order"
+    return None
+
+
+BASE = pdec((4 * pow(5, FIELD - 2, FIELD) % FIELD).to_bytes(32, "little"))
+
+
+class Negated:
+    """Signs as the holder of a key does under that key's negation: with -a under -A."""
+
+    def __init__(self, of: Signer) -> None:
+        self.name = of.name + "_negated"
+        self.of = of
+        self.pub = of.pub[:31] + bytes([of.pub[31] ^ 0x80])
+
+    def sign(self, message: bytes) -> bytes:
+        h = hashlib.sha512(seed(self.of.name)).digest()
+        a = int.from_bytes(h[:32], "little") & ((1 << 254) - 8) | (1 << 254)
+        r = int.from_bytes(hashlib.sha512(h[32:] + message).digest(), "little") % ORDER
+        big_r = penc(pmul(r, BASE))
+        k = int.from_bytes(hashlib.sha512(big_r + self.pub + message).digest(), "little") % ORDER
+        sig = big_r + ((r + k * (ORDER - a % ORDER)) % ORDER).to_bytes(32, "little")
+        Ed25519PublicKey.from_public_bytes(self.pub).verify(sig, message)
+        return sig
+
+
+RUNTIME, OTHER, ROTATED = Signer("runtime"), Signer("other"), Signer("rotated")
+NEGATED = Negated(RUNTIME)
+SMALL_ORDER = bytes.fromhex("01" + "00" * 31)  # the identity: ed25519-key-admission/v1 small_order
+KEYS = {s.name: s for s in (RUNTIME, OTHER, ROTATED, NEGATED)}
+assert len({recognised(s.pub) for s in (RUNTIME, OTHER, ROTATED)}) == 3
+assert recognised(NEGATED.pub) == recognised(RUNTIME.pub) and admission(NEGATED.pub) is None
+assert admission(SMALL_ORDER) == "small_order" and all(admission(s.pub) is None for s in KEYS.values())
+
+
+# --- canonical bytes ---------------------------------------------------------------------------------
+class Raw(str):
+    """A JSON number token kept exactly as written."""
+
+
+def emit(value: object) -> str:
+    if isinstance(value, Raw):
+        return str(value)
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + emit(value[k]) for k in sorted(value)) + "}"
+    if isinstance(value, list):
+        return "[" + ",".join(emit(v) for v in value) + "]"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    raise TypeError(value)
+
+
+def canonical(obj: dict) -> bytes:
+    return emit(obj).encode("utf-8")
+
+
+def text(obj: dict) -> str:
+    return canonical(obj).decode("utf-8")
+
+
+def parse(data: str) -> object:
+    def pairs(items: list) -> dict:
+        if len({k for k, _ in items}) != len(items):
+            raise ValueError("a member named twice is the Payload Member Rule's, outside this corpus")
+        return dict(items)
+    return json.loads(data, parse_int=Raw, parse_float=Raw, object_pairs_hook=pairs)
+
+
+def integer(v: object) -> int | None:
+    if isinstance(v, Raw) and re.fullmatch(r"0|[1-9][0-9]*", v):
+        return int(v)
+    return None
+
+
+def digest(data: str) -> str:
+    return "sha256:" + hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def sign_obj(obj: dict, signer: object, domain: bytes = DOMAIN) -> str:
+    unsigned = {k: v for k, v in obj.items() if k != "signature"}
+    return b64(signer.sign(domain + canonical(unsigned)))
+
+
+# --- record builders ---------------------------------------------------------------------------------
+def submission(signer: object = RUNTIME, *, drop: tuple = (), domain: bytes = DOMAIN, **over: object) -> dict:
+    obj = {"v": 1, "kind": "submission", "device_id": DEVICE, "key_identity": identity(signer.pub),
+           "alert_id": "q3Jx0bS6lVb8nT2aXw9e1g", "notice": "optional", "class": "grid_power_restored",
+           "channel": "sms", "delivery_attempt_id": "Zt4Qm8yK2cR7vP1nL0sW5a", "attempt_seq": 41,
+           "attempted_at_ms": T0 + 500, "observation_seq": 1, "prior_outcome": None, "outcome": "accepted",
+           "detail": None, "issued_at_ms": T0 + 1000}
+    obj.update({k: v for k, v in over.items() if k != "signature"})
+    for k in drop:
+        del obj[k]
+    obj["signature"] = sign_obj(obj, signer, domain)
+    if "signature" in over:
+        obj["signature"] = over["signature"]
+    return obj
+
+
+def tally(signer: object = RUNTIME, *, drop: tuple = (), domain: bytes = DOMAIN, **over: object) -> dict:
+    obj = {"v": 1, "kind": "withheld_tally", "device_id": DEVICE, "key_identity": identity(signer.pub),
+           "channel": "sms", "class": "grid_power_restored", "reason": "disabled", "month": "2026-08",
+           "count": 3, "issued_at_ms": T0 + 2000}
+    obj.update({k: v for k, v in over.items() if k != "signature"})
+    for k in drop:
+        del obj[k]
+    obj["signature"] = sign_obj(obj, signer, domain)
+    if "signature" in over:
+        obj["signature"] = over["signature"]
+    return obj
+
+
+# --- judgement: gateway checks 3 to 6, receiver checks 1 to 6 -----------------------------------------
+def b64_ok(s: object, n: int) -> bool:
+    if not isinstance(s, str):
+        return False
+    try:
+        d = base64.b64decode(s, validate=True)
+    except ValueError:
+        return False
+    return len(d) == n and b64(d) == s
+
+
+def string(v: object, pattern: re.Pattern) -> bool:
+    return isinstance(v, str) and v.isascii() and pattern.fullmatch(v) is not None
+
+
+def int_in(v: object, lo: int, hi: int) -> bool:
+    n = integer(v)
+    return n is not None and lo <= n <= hi
+
+
+def class_ok(v: object) -> bool:
+    return v is None or string(v, CLASS_RE)
+
+
+def form_ok(o: object) -> bool:
+    """Gateway check 4: a record of either kind, every member present, of its type and within its own form.
+
+    A member's form is its own type, pattern, bounds and vocabulary. Rules that relate two members, the
+    observation table, the detail table and the class rules, are check 5's of Verifying.
+    """
+    if not isinstance(o, dict) or o.get("kind") not in ("submission", "withheld_tally"):
+        return False
+    common = (integer(o.get("v")) == 1 and string(o.get("device_id"), DEVICE_RE)
+              and string(o.get("key_identity"), KEY_ID_RE) and o.get("channel") in CHANNELS
+              and class_ok(o.get("class")) and int_in(o.get("issued_at_ms"), 0, MAX_INT)
+              and b64_ok(o.get("signature"), 64))
+    if o["kind"] == "submission":
+        return (set(o) == SUBMISSION and common and string(o["alert_id"], ID_RE)
+                and o["notice"] in NOTICES and string(o["delivery_attempt_id"], ID_RE)
+                and int_in(o["attempt_seq"], 1, MAX_INT) and int_in(o["attempted_at_ms"], 0, MAX_INT)
+                and int_in(o["observation_seq"], 1, 3)
+                and (o["prior_outcome"] is None or o["prior_outcome"] in OUTCOMES)
+                and o["outcome"] in OUTCOMES
+                and (o["detail"] is None or o["detail"] in ALL_DETAILS))
+    return (set(o) == TALLY and common and o["reason"] in REASONS and string(o["month"], MONTH_RE)
+            and int_in(o["count"], 1, MAX_INT))
+
+
+def gateway_stateless(data: str, topic: str, configured: list) -> str | None:
+    """Checks 3 to 6 of Carriage and custody; checks 1 and 2 are gateway-api/v2's corpora's."""
+    obj = parse(data)
+    if canonical(obj) != data.encode("utf-8"):
+        return "not_canonical"
+    if not form_ok(obj):
+        return "malformed"
+    if topic not in configured:
+        return "unknown_device"
+    if obj["device_id"] != topic:
+        return "device_mismatch"
+    return None
+
+
+def rules_verdict(o: dict) -> str | None:
+    """Check 5 of Verifying, in the order it lists its reasons."""
+    if o["kind"] == "submission":
+        if o["outcome"] not in OUTCOMES:
+            return "outcome_refused"  # unreachable: check 4 refuses it first
+        seq = integer(o["observation_seq"])
+        if o["outcome"] not in TRANSITIONS.get((seq, o["prior_outcome"]), set()):
+            return "transition_refused"
+        if o["notice"] in MANDATORY and o["class"] is not None:
+            return "class_refused"
+        if o["detail"] is not None and (o["detail"] not in DETAILS[o["outcome"]] or (
+                o["detail"] == "provider_reported_failure" and o["prior_outcome"] != "accepted")):
+            return "detail_refused"
+        return None
+    if o["reason"] == "disabled" and o["class"] is None:
+        return "class_refused"
+    return None
+
+
+def verify(pub: bytes, sig_b64: str, message: bytes) -> bool:
+    if admission(pub) is not None:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(base64.b64decode(sig_b64), message)
+    except InvalidSignature:
+        return False
+    return True
+
+
+def receiver_stateless(data: str, ctx: dict) -> str | None:
+    """Checks 1 to 5 of Verifying."""
+    reason = gateway_stateless(data, ctx["topic_device"], ctx["configured_devices"])
+    if reason is not None:
+        return reason
+    obj = parse(data)
+    if obj["device_id"] not in ctx["forwarding_registry"].get(ctx["forwarder"], []):
+        return "not_owned"
+    enrolled = [e for e in ctx["enrolments"]
+                if e["device_id"] == obj["device_id"] and identity(KEYS[e["key"]].pub) == obj["key_identity"]]
+    if not enrolled:
+        return "key_not_enrolled"
+    unsigned = {k: v for k, v in obj.items() if k != "signature"}
+    if not verify(KEYS[enrolled[0]["key"]].pub, obj["signature"], DOMAIN + canonical(unsigned)):
+        return "signature_invalid"
+    return rules_verdict(obj)
+
+
+def fixture(device: str = DEVICE, *, enrol: tuple = ("runtime",), forwarder: str = FORWARDER,
+            registry: dict | None = None) -> dict:
+    return {"topic_device": device, "configured_devices": [device], "forwarder": forwarder,
+            "forwarding_registry": registry if registry is not None else {FORWARDER: [device]},
+            "enrolments": [{"device_id": device, "key": k, "purpose": PURPOSE} for k in enrol]}
+
+
+# --- records -----------------------------------------------------------------------------------------
+RECORD_CASES: list[dict] = []
+
+
+def rcase(name: str, note: str, rec: object, gateway: str, receiver: str, ctx: dict | None = None) -> None:
+    data = rec if isinstance(rec, str) else text(rec)
+    ctx = ctx or fixture()
+    g = gateway_stateless(data, ctx["topic_device"], ctx["configured_devices"]) or "pass"
+    r = receiver_stateless(data, ctx) or "pass"
+    if (g, r) != (gateway, receiver):
+        raise AssertionError(f"{name}: computed gateway {g}, receiver {r}; declared {gateway}, {receiver}")
+    if any(c["name"] == name for c in RECORD_CASES):
+        raise AssertionError(f"duplicate case name {name}")
+    RECORD_CASES.append({"name": name, "note": note, "record": data, **ctx,
+                         "expected_gateway": g, "expected_receiver": r})
+
+
+def ok(name: str, note: str, rec: object, ctx: dict | None = None) -> None:
+    rcase(name, note, rec, "pass", "pass", ctx)
+
+
+def gw(name: str, note: str, rec: object, reason: str, ctx: dict | None = None) -> None:
+    rcase(name, note, rec, reason, reason, ctx)
+
+
+def rx_only(name: str, note: str, rec: object, reason: str, ctx: dict | None = None) -> None:
+    rcase(name, note, rec, "pass", reason, ctx)
+
+
+GOOD = submission()
+TGOOD = tally()
+
+# Accepted: every row of the observation table, every detail code, every outcome, both kinds.
+ok("row1_accepted", "Observation table row 1: seq 1, prior null, accepted; detail null, the only detail "
+   "accepted permits.", GOOD)
+ok("row1_failed_provider_refused", "Row 1, failed, detail provider_refused.",
+   submission(outcome="failed", detail="provider_refused"))
+ok("row1_failed_not_submitted", "Row 1, failed, detail not_submitted.",
+   submission(outcome="failed", detail="not_submitted"))
+ok("row1_failed_null", "Row 1, failed, detail null.", submission(outcome="failed"))
+ok("row1_unconfirmed_timeout", "Row 1, unconfirmed, detail timeout_after_submit.",
+   submission(outcome="unconfirmed", detail="timeout_after_submit"))
+ok("row1_unconfirmed_unreadable", "Row 1, unconfirmed, detail response_unreadable.",
+   submission(outcome="unconfirmed", detail="response_unreadable"))
+ok("row1_unconfirmed_null", "Row 1, unconfirmed, detail null.", submission(outcome="unconfirmed"))
+ok("row2_unconfirmed_to_accepted", "Row 2: seq 2, prior unconfirmed, accepted.",
+   submission(observation_seq=2, prior_outcome="unconfirmed", outcome="accepted", issued_at_ms=T0 + 3000))
+ok("row2_unconfirmed_to_failed", "Row 2: seq 2, prior unconfirmed, failed, detail provider_refused.",
+   submission(observation_seq=2, prior_outcome="unconfirmed", outcome="failed", detail="provider_refused",
+              issued_at_ms=T0 + 3000))
+ok("row3_accepted_to_failed_reported", "Row 3: seq 2, prior accepted, failed, detail "
+   "provider_reported_failure, which only a prior accepted permits.",
+   submission(observation_seq=2, prior_outcome="accepted", outcome="failed",
+              detail="provider_reported_failure", issued_at_ms=T0 + 3000))
+ok("row3_accepted_to_failed_null", "Row 3: seq 2, prior accepted, failed, detail null.",
+   submission(observation_seq=2, prior_outcome="accepted", outcome="failed", issued_at_ms=T0 + 3000))
+ok("row4_seq3_accepted_to_failed", "Row 4: seq 3, prior accepted, failed, detail provider_reported_failure. "
+   "From the record alone the receiver cannot see the second observation; that it followed an unconfirmed is "
+   "judged across records, by Consistency.",
+   submission(observation_seq=3, prior_outcome="accepted", outcome="failed",
+              detail="provider_reported_failure", issued_at_ms=T0 + 4000))
+ok("notice_tier_d", "A tier_d notice, class null.", submission(notice="tier_d", **{"class": None}))
+ok("notice_protection_degraded", "A protection_degraded notice, class null.",
+   submission(notice="protection_degraded", **{"class": None}))
+ok("optional_class_null", "An optional notice with no class.", submission(**{"class": None}))
+ok("class_unknown_carried", "A class name matching the pattern that device-policy/v2 does not define is carried, "
+   "not refused.", submission(**{"class": "later_class"}))
+ok("class_one_character", "A class name of one character.", submission(**{"class": "a"}))
+ok("channel_whatsapp", "The whatsapp channel.", submission(channel="whatsapp"))
+ok("ids_at_lower_bound", "alert_id and delivery_attempt_id of 16 characters, using - and _.",
+   submission(alert_id="a-b_c-d_e-f_g-h_", delivery_attempt_id="Z_Y-X_W-V_U-T_S-"))
+ok("signing_times_zero", "attempted_at_ms 0 and issued_at_ms 0: the text bounds every integer from 0, and only "
+   "attempt_seq, observation_seq, count and v further.", submission(attempted_at_ms=0, issued_at_ms=0))
+ok("tally_disabled", "A disabled tally with a class.", TGOOD)
+ok("tally_capped_class", "A capped tally with a class.", tally(reason="capped"))
+ok("tally_capped_null", "A capped tally with class null.", tally(reason="capped", **{"class": None}))
+ok("tally_whatsapp", "A tally on whatsapp, December.", tally(channel="whatsapp", month="2026-12"))
+ok("tally_unknown_class", "A tally whose class device-policy/v2 does not define is carried.",
+   tally(**{"class": "later_class"}))
+ok("tally_count_one", "The least count.", tally(count=1))
+
+# Every member at its bound. Combinations that the rules forbid cannot all be at their longest at once,
+# so each kind takes the longest combination the rules permit.
+BOUND_DEVICE = "d" * 128
+BOUND_CLASS = "c" * 32
+BOUND_SUB = submission(device_id=BOUND_DEVICE, alert_id="A" * 64, delivery_attempt_id="Z" * 64,
+                       notice="optional", channel="whatsapp", attempt_seq=MAX_INT, attempted_at_ms=MAX_INT,
+                       observation_seq=3, prior_outcome="accepted", outcome="failed",
+                       detail="provider_reported_failure", issued_at_ms=MAX_INT, **{"class": BOUND_CLASS})
+BOUND_TALLY = tally(device_id=BOUND_DEVICE, channel="whatsapp", reason="disabled", month="2026-12",
+                    count=MAX_INT, issued_at_ms=MAX_INT, **{"class": BOUND_CLASS})
+for _b in (BOUND_SUB, BOUND_TALLY):
+    assert len(canonical(_b)) < RECORD_TOPIC_BOUND, len(canonical(_b))
+ok("bound_submission", f"Every member at its bound, {len(canonical(BOUND_SUB))} bytes: device_id of 128, ids of "
+   "64, class of 32, whatsapp, every free integer 9007199254740991, observation_seq at its largest 3, and the "
+   "longest permitted outcome, prior_outcome and detail together (failed after accepted, "
+   "provider_reported_failure). notice is optional, the longest notice a class may accompany.",
+   BOUND_SUB, fixture(BOUND_DEVICE))
+ok("bound_tally", f"Every member at its bound, {len(canonical(BOUND_TALLY))} bytes: device_id of 128, class of 32, "
+   "whatsapp, disabled, count and issued_at_ms 9007199254740991.", BOUND_TALLY, fixture(BOUND_DEVICE))
+ok("bound_submission_mandatory", "The longest mandatory notice, protection_degraded, with every other member "
+   "as bound_submission permits it: class null.",
+   submission(device_id=BOUND_DEVICE, alert_id="A" * 64, delivery_attempt_id="Z" * 64,
+              notice="protection_degraded", channel="whatsapp", attempt_seq=MAX_INT, attempted_at_ms=MAX_INT,
+              observation_seq=3, prior_outcome="accepted", outcome="failed",
+              detail="provider_reported_failure", issued_at_ms=MAX_INT, **{"class": None}),
+   fixture(BOUND_DEVICE))
+
+# Gateway check 3: not_canonical.
+gw("not_canonical_whitespace", "A space after a colon; refused for not_canonical alone.",
+   text(GOOD).replace('"v":1', '"v": 1'), "not_canonical")
+gw("not_canonical_order", "Members in insertion order, not sorted.", json.dumps(GOOD, separators=(",", ":")),
+   "not_canonical")
+gw("not_canonical_trailing_lf", "A line feed after the object.", text(GOOD) + "\n", "not_canonical")
+gw("not_canonical_escape", "A value with a character written as an escape that canonical form writes literally.",
+   text(GOOD).replace('"sms"', '"\\u0073ms"'), "not_canonical")
+gw("not_canonical_tally", "A tally with a space before its first member.", "{ " + text(TGOOD)[1:], "not_canonical")
+
+# Gateway check 4: malformed. Each is signed over its own content, so its form is its only defect.
+for name, note, rec in (
+    ("kind_unknown", "kind is receipt, neither kind.", submission(kind="receipt")),
+    ("kind_swapped", "A submission's members under kind withheld_tally.", submission(kind="withheld_tally")),
+    ("submission_member_missing", "No detail member.", submission(drop=("detail",))),
+    ("submission_member_extra", "A submission with a count member.", submission(count=1)),
+    ("tally_member_missing", "A tally without month.", tally(drop=("month",))),
+    ("tally_notice_member", "A tally with a notice member: a tally has none.", tally(notice="optional")),
+    ("v_2", "v is 2.", submission(v=2)),
+    ("v_true", "v is true.", submission(v=True)),
+    ("v_string", "v is \"1\".", submission(v="1")),
+    ("integer_fraction", "attempt_seq written 41.0.", submission(attempt_seq=Raw("41.0"))),
+    ("integer_exponent", ("attempt_seq written 41e0: the token is kept as written, so the bytes are canonical "
+                          "and the value is no integer."), submission(attempt_seq=Raw("41e0"))),
+    ("integer_negative", "attempted_at_ms is -1.", submission(attempted_at_ms=-1)),
+    ("integer_over", "issued_at_ms is 2^53.", submission(issued_at_ms=MAX_INT + 1)),
+    ("attempt_seq_zero", "attempt_seq is 0; it is at least 1.", submission(attempt_seq=0)),
+    ("observation_seq_zero", "observation_seq is 0.", submission(observation_seq=0)),
+    ("observation_seq_four", "observation_seq is 4, outside 1 to 3.",
+     submission(observation_seq=4, prior_outcome="accepted", outcome="failed")),
+    ("count_zero", "A tally count of 0; it is at least 1.", tally(count=0)),
+    ("count_over", "A tally count of 2^53.", tally(count=MAX_INT + 1)),
+    ("count_string", "A tally count of \"3\".", tally(count="3")),
+    ("device_empty", "An empty device_id.", submission(device_id="")),
+    ("device_long", "device_id of 129 characters.", submission(device_id="d" * 129)),
+    ("device_space", "device_id with a space.", submission(device_id="site a")),
+    ("device_non_ascii", "device_id with a literal e-acute: canonical, and not ASCII.",
+     submission(device_id="site-é")),
+    ("alert_id_short", "alert_id of 15 characters.", submission(alert_id="a" * 15)),
+    ("alert_id_long", "alert_id of 65 characters.", submission(alert_id="a" * 65)),
+    ("alert_id_dot", "alert_id with a dot, which device_id permits and an id does not.",
+     submission(alert_id="q3Jx0bS6lVb8nT2a.w9e1g")),
+    ("attempt_id_short", "delivery_attempt_id of 15 characters.", submission(delivery_attempt_id="Z" * 15)),
+    ("attempt_id_plus", "delivery_attempt_id with a +.", submission(delivery_attempt_id="Zt4Qm8yK2cR7vP1n+0sW5a")),
+    ("notice_unknown", "notice is mandatory, not in the vocabulary.", submission(notice="mandatory")),
+    ("notice_null", "notice is null.", submission(notice=None)),
+    ("class_upper", "class with an upper-case letter.", submission(**{"class": "Grid_power"})),
+    ("class_leading_digit", "class beginning with a digit.", submission(**{"class": "1grid"})),
+    ("class_long", "class of 33 characters.", submission(**{"class": "c" * 33})),
+    ("class_empty", "class is the empty string.", submission(**{"class": ""})),
+    ("class_number", "class is a number.", submission(**{"class": 1})),
+    ("tally_class_hyphen", "A tally class with a hyphen.", tally(**{"class": "grid-power"})),
+    ("channel_unknown", "channel is email.", submission(channel="email")),
+    ("channel_upper", "channel is SMS.", submission(channel="SMS")),
+    ("outcome_unknown", "outcome is sent, not in the table.", submission(outcome="sent")),
+    ("outcome_null", "outcome is null.", submission(outcome=None)),
+    ("prior_outcome_unknown", "prior_outcome is delivered, outside the outcome vocabulary.",
+     submission(observation_seq=2, prior_outcome="delivered", outcome="failed")),
+    ("detail_unknown", "detail is rate_limited, no detail code.", submission(outcome="failed", detail="rate_limited")),
+    ("detail_free_text", "detail is a provider's error string.",
+     submission(outcome="failed", detail="Error 21610: unsubscribed recipient")),
+    ("reason_unknown", "A tally reason of muted.", tally(reason="muted")),
+    ("month_13", "month 2026-13.", tally(month="2026-13")),
+    ("month_00", "month 2026-00.", tally(month="2026-00")),
+    ("month_one_digit", "month 2026-8.", tally(month="2026-8")),
+    ("month_with_day", "month 2026-08-01.", tally(month="2026-08-01")),
+    ("key_identity_upper", "key_identity in upper-case hex.",
+     submission(key_identity=identity(RUNTIME.pub).upper().replace("SHA256", "sha256"))),
+    ("key_identity_short", "key_identity of 63 hex characters.", submission(key_identity=identity(RUNTIME.pub)[:-1])),
+):
+    gw("malformed_" + name, note, rec, "malformed")
+_SIG = base64.b64decode(GOOD["signature"])
+gw("malformed_signature_short", "A signature of 63 bytes.", {**GOOD, "signature": b64(_SIG[:63])}, "malformed")
+gw("malformed_signature_pad_bits", "Base64 with nonzero pad bits.", {**GOOD, "signature": GOOD["signature"][:-3] + "B=="},
+   "malformed")
+gw("malformed_signature_unpadded", "Base64 without its padding.", {**GOOD, "signature": GOOD["signature"].rstrip("=")},
+   "malformed")
+gw("delivered_refused", "outcome delivered, which is reserved. Check 4 of Carriage and custody refuses an outcome "
+   "outside Submission observation's list as malformed, and the receiver's check 1 applies it, so it is malformed "
+   "at both, before check 5 could name outcome_refused.",
+   submission(observation_seq=2, prior_outcome="accepted", outcome="delivered"), "malformed")
+
+# Gateway check 6: device_mismatch.
+gw("device_mismatch", "A well-formed record naming site-a-edge-02, on site-a-edge-01's topic.",
+   submission(device_id=OTHER_DEVICE), "device_mismatch")
+gw("device_mismatch_tally", "A tally naming site-a-edge-02, on site-a-edge-01's topic.",
+   tally(device_id=OTHER_DEVICE), "device_mismatch")
+
+# Receiver check 2: not_owned. The receiver's registry permits gateway-site-b for another device only.
+NOT_OWNED = fixture(forwarder=OTHER_FORWARDER, registry={FORWARDER: [DEVICE], OTHER_FORWARDER: ["site-b-edge-01"]})
+rx_only("not_owned", "A genuine record forwarded by gateway-site-b, which the receiver's registry permits to "
+        "forward for site-b-edge-01 only.", GOOD, "not_owned", NOT_OWNED)
+rx_only("not_owned_unregistered_forwarder", "A genuine tally forwarded by a gateway the registry does not hold.",
+        TGOOD, "not_owned", fixture(forwarder=OTHER_FORWARDER))
+
+# Receiver check 3: key_not_enrolled.
+rx_only("key_not_enrolled_other", "Signed by key other, which the record names; only runtime is enrolled.",
+        submission(OTHER), "key_not_enrolled")
+rx_only("key_not_enrolled_rotated", "A tally signed by key rotated, not enrolled in this fixture.",
+        tally(ROTATED), "key_not_enrolled")
+rx_only("key_not_enrolled_negation", "Signed under runtime's negation and naming it: one recognised key, a "
+        "different key_identity, and enrolment binds the exact key.", submission(NEGATED), "key_not_enrolled")
+rx_only("key_not_enrolled_other_device", "runtime is enrolled for site-a-edge-01 only; the record is "
+        "site-a-edge-02's, configured and permitted.", submission(device_id=OTHER_DEVICE), "key_not_enrolled",
+        {**fixture(OTHER_DEVICE), "enrolments": [{"device_id": DEVICE, "key": "runtime", "purpose": PURPOSE}]})
+
+# Receiver check 4: signature_invalid.
+_FLIP = b64(bytes([_SIG[0] ^ 1]) + _SIG[1:])
+_S_PLUS_L = (int.from_bytes(_SIG[32:], "little") + ORDER).to_bytes(32, "little")
+rx_only("signature_invalid_flipped", "The first signature byte flipped.", {**GOOD, "signature": _FLIP},
+        "signature_invalid")
+rx_only("signature_invalid_other_key", "Signed by key other while naming runtime.",
+        submission(OTHER, key_identity=identity(RUNTIME.pub)), "signature_invalid")
+rx_only("signature_invalid_no_domain", "Signed over the canonical bytes without the domain prefix.",
+        submission(domain=b""), "signature_invalid")
+rx_only("signature_invalid_posture_domain", "Signed under the runtime-posture/v1 prefix.",
+        submission(domain=POSTURE_DOMAIN), "signature_invalid")
+rx_only("signature_invalid_enrolment_domain", "Signed under the enrolment proof's prefix.",
+        tally(domain=ENROL_DOMAIN), "signature_invalid")
+rx_only("signature_invalid_s_not_reduced", "S plus the group order, which ed25519-verification/v1 refuses.",
+        {**GOOD, "signature": b64(_SIG[:32] + _S_PLUS_L)}, "signature_invalid")
+rx_only("signature_invalid_member_changed", "A valid record with outcome changed after signing.",
+        {**submission(outcome="unconfirmed"), "outcome": "accepted"}, "signature_invalid")
+rx_only("signature_invalid_other_kind", "A tally carrying a submission's signature.",
+        {**TGOOD, "signature": GOOD["signature"]}, "signature_invalid")
+
+# Receiver check 5: transition_refused, class_refused, detail_refused.
+for name, note, kw in (
+    ("seq1_prior_accepted", "seq 1 with prior accepted.", {"prior_outcome": "accepted", "outcome": "failed"}),
+    ("seq1_prior_unconfirmed", "seq 1 with prior unconfirmed.", {"prior_outcome": "unconfirmed", "outcome": "accepted"}),
+    ("seq2_prior_null", "seq 2 with prior null.", {"observation_seq": 2, "outcome": "accepted"}),
+    ("seq2_prior_failed", "seq 2 after failed: failed ends an attempt.",
+     {"observation_seq": 2, "prior_outcome": "failed", "outcome": "failed"}),
+    ("seq2_unconfirmed_to_unconfirmed", "seq 2 unconfirmed after unconfirmed.",
+     {"observation_seq": 2, "prior_outcome": "unconfirmed", "outcome": "unconfirmed"}),
+    ("seq2_accepted_to_accepted", "seq 2 accepted after accepted.",
+     {"observation_seq": 2, "prior_outcome": "accepted", "outcome": "accepted"}),
+    ("seq2_accepted_to_unconfirmed", "seq 2 unconfirmed after accepted.",
+     {"observation_seq": 2, "prior_outcome": "accepted", "outcome": "unconfirmed"}),
+    ("seq3_prior_unconfirmed", "seq 3 after unconfirmed.",
+     {"observation_seq": 3, "prior_outcome": "unconfirmed", "outcome": "failed"}),
+    ("seq3_prior_failed", "seq 3 after failed.", {"observation_seq": 3, "prior_outcome": "failed", "outcome": "failed"}),
+    ("seq3_prior_null", "seq 3 with prior null.", {"observation_seq": 3, "outcome": "failed"}),
+    ("seq3_accepted_to_accepted", "seq 3 accepted after accepted.",
+     {"observation_seq": 3, "prior_outcome": "accepted", "outcome": "accepted"}),
+):
+    rx_only("transition_refused_" + name, note, submission(**kw), "transition_refused")
+rx_only("class_refused_tier_d", "A tier_d notice with a class.", submission(notice="tier_d"), "class_refused")
+rx_only("class_refused_protection_degraded", "A protection_degraded notice with a class.",
+        submission(notice="protection_degraded"), "class_refused")
+rx_only("class_refused_disabled_null", "A disabled tally with class null: only a class can be switched off.",
+        tally(**{"class": None}), "class_refused")
+for name, note, kw in (
+    ("accepted_provider_refused", "accepted permits only null.", {"detail": "provider_refused"}),
+    ("accepted_timeout", "accepted with timeout_after_submit.", {"detail": "timeout_after_submit"}),
+    ("accepted_not_submitted", "accepted with not_submitted.", {"detail": "not_submitted"}),
+    ("failed_timeout", "failed with an unconfirmed code.", {"outcome": "failed", "detail": "timeout_after_submit"}),
+    ("failed_unreadable", "failed with response_unreadable.", {"outcome": "failed", "detail": "response_unreadable"}),
+    ("unconfirmed_not_submitted", "unconfirmed with a failed code.", {"outcome": "unconfirmed", "detail": "not_submitted"}),
+    ("unconfirmed_provider_refused", "unconfirmed with provider_refused.",
+     {"outcome": "unconfirmed", "detail": "provider_refused"}),
+    ("unconfirmed_reported_failure", "unconfirmed with provider_reported_failure.",
+     {"outcome": "unconfirmed", "detail": "provider_reported_failure"}),
+    ("reported_failure_first", "provider_reported_failure at seq 1, prior null.",
+     {"outcome": "failed", "detail": "provider_reported_failure"}),
+    ("reported_failure_after_unconfirmed", "provider_reported_failure after unconfirmed, not accepted.",
+     {"observation_seq": 2, "prior_outcome": "unconfirmed", "outcome": "failed", "detail": "provider_reported_failure"}),
+):
+    rx_only("detail_refused_" + name, note, submission(**kw), "detail_refused")
+
+# Precedence: two rules broken on purpose; the note names the check that wins.
+gw("precedence_not_canonical_over_malformed", "Not canonical and v 2: check 3 wins, not_canonical.",
+   text(submission(v=2)).replace('"v":2', '"v": 2'), "not_canonical")
+gw("precedence_malformed_over_device_mismatch", "Another device's record with v 2: check 4 wins, malformed.",
+   submission(device_id=OTHER_DEVICE, v=2), "malformed")
+gw("precedence_device_mismatch_over_key", "Another device's record signed by other: check 6 of carriage, in the "
+   "receiver's check 1, wins over key_not_enrolled.", submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch")
+rx_only("precedence_not_owned_over_key", "An unpermitted forwarder and an unenrolled key: check 2 wins, not_owned.",
+        submission(OTHER), "not_owned", NOT_OWNED)
+rx_only("precedence_key_over_signature", "An unenrolled key named and a zero signature: check 3 wins, "
+        "key_not_enrolled.", {**submission(OTHER), "signature": b64(b"\x00" * 64)}, "key_not_enrolled")
+rx_only("precedence_signature_over_transition", "A refused transition with a corrupted signature: check 4 wins, "
+        "signature_invalid.", {**submission(prior_outcome="accepted", outcome="failed"), "signature": _FLIP},
+        "signature_invalid")
+rx_only("precedence_signature_over_class", "A disabled null-class tally with the domain omitted: check 4 wins.",
+        tally(domain=b"", **{"class": None}), "signature_invalid")
+rx_only("precedence_transition_over_class", "seq 1 with prior accepted on a tier_d notice with a class: check 5 "
+        "lists transition_refused before class_refused, and this corpus takes that order.",
+        submission(notice="tier_d", prior_outcome="accepted", outcome="failed"), "transition_refused")
+rx_only("precedence_class_over_detail", "A tier_d notice with a class, accepted with provider_refused: "
+        "class_refused before detail_refused, in check 5's listed order.",
+        submission(notice="tier_d", detail="provider_refused"), "class_refused")
+rx_only("precedence_transition_over_detail", "seq 2 after failed, with timeout_after_submit on failed: "
+        "transition_refused before detail_refused, in check 5's listed order.",
+        submission(observation_seq=2, prior_outcome="failed", outcome="failed", detail="timeout_after_submit"),
+        "transition_refused")
+
+
+# --- receiver sequences (check 6) --------------------------------------------------------------------
+def epoch_of(key_identity: str) -> bytes:
+    for s in KEYS.values():
+        if identity(s.pub) == key_identity:
+            return recognised(s.pub)
+    raise KeyError(key_identity)
+
+
+def breaks(h: dict, o: dict) -> bool:
+    """Whether o, against the held observation h, is different bytes under h's identity or breaks Consistency."""
+    same_attempt = h["delivery_attempt_id"] == o["delivery_attempt_id"]
+    hs, os_ = integer(h["observation_seq"]), integer(o["observation_seq"])
+    if same_attempt and hs == os_:
+        return True  # different bytes under a held identity
+    if same_attempt and any(h[m] != o[m] for m in ("device_id", "key_identity", "alert_id", "notice", "class",
+                                                     "channel", "attempt_seq", "attempted_at_ms")):
+        return True
+    if h["alert_id"] == o["alert_id"] and (h["notice"], h["class"]) != (o["notice"], o["class"]):
+        return True
+    if (not same_attempt and h["attempt_seq"] == o["attempt_seq"]
+            and epoch_of(h["key_identity"]) == epoch_of(o["key_identity"])):
+        return True
+    if same_attempt and hs == os_ - 1:
+        return h["outcome"] != o["prior_outcome"]
+    if same_attempt and hs == os_ + 1:
+        return h["prior_outcome"] != o["outcome"]
+    return False
+
+
+class Receiver:
+    def __init__(self, ctx: dict, conflicts_count: bool) -> None:
+        self.ctx = ctx
+        self.kept: list[dict] = []  # {"data", "obj", "verdict"}
+        self.conflicts_count = conflicts_count  # whether a record kept as conflict is judged against
+
+    def judged_against(self) -> list[dict]:
+        return [k for k in self.kept if self.conflicts_count or k["verdict"] == "held"]
+
+    def check6(self, data: str, o: dict) -> tuple[str, list]:
+        against = self.judged_against()
+        if any(k["data"] == data for k in self.kept):
+            return "duplicate", []
+        hit: list = []
+        if o["kind"] == "submission":
+            hit = [k for k in against if k["obj"]["kind"] == "submission" and breaks(k["obj"], o)]
+            return ("conflict", hit) if hit else ("held", [])
+        tkey = (o["channel"], o["class"], o["reason"], o["month"], epoch_of(o["key_identity"]))
+        same = [k for k in against if k["obj"]["kind"] == "withheld_tally"
+                and (k["obj"]["channel"], k["obj"]["class"], k["obj"]["reason"], k["obj"]["month"],
+                     epoch_of(k["obj"]["key_identity"])) == tkey]
+        hit = [k for k in same if integer(k["obj"]["count"]) == integer(o["count"])]
+        if hit:
+            return "conflict", hit
+        if same and integer(o["count"]) < max(integer(k["obj"]["count"]) for k in same):
+            return "lower_count", []
+        return "held", []
+
+    def receive(self, data: str) -> str:
+        reason = receiver_stateless(data, self.ctx)
+        if reason is not None:
+            return reason
+        o = parse(data)
+        verdict, hit = self.check6(data, o)
+        if verdict in ("held", "conflict"):
+            self.kept.append({"data": data, "obj": o, "verdict": verdict, "hit": hit})
+        return verdict
+
+    def reading(self) -> tuple[list, list]:
+        held = [k["obj"] for k in self.kept if k["verdict"] == "held"]
+        unsettled = set()
+        for k in self.kept:
+            if k["verdict"] == "conflict":
+                for r in [k] + k["hit"]:
+                    o = r["obj"]
+                    if o["kind"] == "submission":
+                        unsettled.add((o["key_identity"], o["alert_id"]))
+                    else:
+                        unsettled.add((o["key_identity"], o["channel"], o["class"], o["reason"], o["month"]))
+        alerts: dict = {}
+        for o in held:
+            if o["kind"] != "submission":
+                continue
+            alerts.setdefault((o["key_identity"], o["alert_id"]), {}).setdefault(o["channel"], []).append(o)
+        reading = []
+        for (kid, aid), chans in sorted(alerts.items()):
+            out = {}
+            for ch, obs in sorted(chans.items()):
+                top = max(integer(x["attempt_seq"]) for x in obs)
+                last = max((x for x in obs if integer(x["attempt_seq"]) == top),
+                           key=lambda x: integer(x["observation_seq"]))
+                out[ch] = {"latest_attempt_state": last["outcome"],
+                           "ever_accepted": any(x["outcome"] == "accepted" for x in obs)}
+            reading.append({"epoch": kid, "alert_id": aid, "channels": out,
+                            "accepted_on_some_channel": any(c["ever_accepted"] for c in out.values()),
+                            "settled": (kid, aid) not in unsettled})
+        tallies: dict = {}
+        for o in held:
+            if o["kind"] != "withheld_tally":
+                continue
+            tk = (o["key_identity"], o["channel"], o["class"] or "", o["reason"], o["month"])
+            if tk not in tallies or integer(o["count"]) > integer(tallies[tk]["count"]):
+                tallies[tk] = o
+        held_tallies = [{"epoch": o["key_identity"], "channel": o["channel"], "class": o["class"],
+                         "reason": o["reason"], "month": o["month"], "count": integer(o["count"]),
+                         "record_digest": digest(text(o)),
+                         "settled": (o["key_identity"], o["channel"], o["class"], o["reason"], o["month"])
+                         not in unsettled}
+                        for _, o in sorted(tallies.items())]
+        return reading, held_tallies
+
+
+RECEIVER_SEQUENCES: list[dict] = []
+
+
+def rseq(name: str, note: str, recs: list, ctx: dict | None = None) -> None:
+    ctx = ctx or fixture()
+    datas = [r if isinstance(r, str) else text(r) for r in recs]
+    runs = []
+    for conflicts_count in (True, False):
+        rcv = Receiver(ctx, conflicts_count)
+        verdicts = [rcv.receive(d) for d in datas]
+        runs.append((verdicts, rcv.reading()))
+    if runs[0] != runs[1]:
+        raise AssertionError(f"{name} depends on whether a conflict record is judged against")
+    verdicts, (reading, tallies) = runs[0]
+    RECEIVER_SEQUENCES.append({"name": name, "note": note, **ctx,
+                               "records": [{"record": d, "expected": v} for d, v in zip(datas, verdicts)],
+                               "expected_reading": reading, "expected_tallies": tallies})
+
+
+def obs(alert: str, attempt: str, aseq: int, oseq: int, prior: object, outcome: str, detail: object = None,
+        *, signer: object = RUNTIME, channel: str = "sms", issued: int | None = None, **over: object) -> dict:
+    members = {"alert_id": alert, "delivery_attempt_id": attempt, "attempt_seq": aseq,
+               "attempted_at_ms": T0 + aseq * 10_000, "observation_seq": oseq, "prior_outcome": prior,
+               "outcome": outcome, "detail": detail, "channel": channel,
+               "issued_at_ms": issued if issued is not None else T0 + aseq * 10_000 + oseq * 1000}
+    return submission(signer, **{**members, **over})
+
+
+AL1, AL2 = "alert-0000000001", "alert-0000000002"
+AT1, AT2, AT3 = "attempt-00000001", "attempt-00000002", "attempt-00000003"
+BOTH = fixture(enrol=("runtime", "rotated"))
+
+rseq("duplicate", "The same record twice: held, then duplicate.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
+rseq("conflict_one_identity", "Two records of one observation identity, different bytes (another "
+     "issued_at_ms): the later is conflict, both are kept, and the notice is not settled.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted", issued=T0 + 99_999)])
+rseq("conflict_one_identity_outcome", "One identity, accepted then failed: the later is conflict.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "failed", "provider_refused")])
+_U = obs(AL1, AT1, 1, 1, None, "unconfirmed")
+for member, value in (("alert_id", AL2), ("notice", "tier_d"), ("class", "later_class"), ("channel", "whatsapp"),
+                      ("attempt_seq", 2), ("attempted_at_ms", T0 + 1)):
+    base = obs(AL1, AT1, 1, 1, None, "unconfirmed", **({"class": None} if member == "notice" else {}))
+    later = obs(AL1, AT1, 1, 2, "unconfirmed", "accepted", issued=base["issued_at_ms"] + 1000,
+                **{"class": base["class"], "attempt_seq": base["attempt_seq"],
+                   "attempted_at_ms": base["attempted_at_ms"], member: value})
+    rseq(f"consistency_attempt_{member}", f"Consistency, one delivery_attempt_id: its second observation carries "
+         f"another {member}, every other member and the path as rule 4 requires. Conflict."
+         + (" One attempt has one alert_id, so the alert_id rule is broken too, to the same verdict."
+            if member in ("notice", "class") else ""), [base, later])
+rseq("consistency_attempt_key_identity", "Consistency, one delivery_attempt_id: its second observation is signed "
+     "by rotated, also enrolled, so key_identity differs. The rule names key_identity, so an observation identity "
+     "is compared across epochs. Conflict.",
+     [_U, obs(AL1, AT1, 1, 2, "unconfirmed", "accepted", signer=ROTATED)], BOTH)
+rseq("consistency_alert_notice", "Consistency, one alert_id: a second attempt carries notice tier_d (class "
+     "null) where the first carried optional (class null). Conflict.",
+     [obs(AL1, AT1, 1, 1, None, "failed", **{"class": None}),
+      obs(AL1, AT2, 2, 1, None, "accepted", notice="tier_d", **{"class": None})])
+rseq("consistency_alert_class", "Consistency, one alert_id: a second attempt carries class null where the first "
+     "carried grid_power_restored. Conflict.",
+     [obs(AL1, AT1, 1, 1, None, "failed"), obs(AL1, AT2, 2, 1, None, "accepted", **{"class": None})])
+rseq("consistency_attempt_seq", "Consistency, one attempt_seq names one delivery_attempt_id in an epoch: two "
+     "attempts of different notices share attempt_seq 7. Conflict.",
+     [obs(AL1, AT1, 7, 1, None, "accepted"), obs(AL2, AT2, 7, 1, None, "accepted")])
+rseq("attempt_seq_across_epochs", "attempt_seq 7 under runtime and under rotated, both enrolled: compared within "
+     "an epoch only, so both are held, and each epoch reads apart.",
+     [obs(AL1, AT1, 7, 1, None, "accepted"), obs(AL2, AT2, 7, 1, None, "failed", "provider_refused",
+                                                  signer=ROTATED)], BOTH)
+rseq("consistency_prior_outcome", "Consistency, prior_outcome: seq 1 is unconfirmed, then seq 2 says its prior "
+     "was accepted (a row the table permits on its own). Conflict.",
+     [_U, obs(AL1, AT1, 1, 2, "accepted", "failed", "provider_reported_failure")])
+rseq("consistency_prior_outcome_reverse", "Consistency, prior_outcome, arriving out of order: seq 2 (prior "
+     "unconfirmed) is held without seq 1, which the receiver cannot judge; then seq 1 arrives as failed, which "
+     "breaks the rule against the held seq 2. The later, seq 1, is conflict.",
+     [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted"), obs(AL1, AT1, 1, 1, None, "failed")])
+rseq("consistency_prior_outcome_seq3", "Consistency, prior_outcome at seq 3: seq 1 accepted, seq 2 failed after "
+     "accepted, then seq 3 says its prior was accepted, but seq 2's outcome was failed. Conflict.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed"),
+      obs(AL1, AT1, 1, 3, "accepted", "failed", "provider_reported_failure")])
+rseq("gap_held", "seq 2 of an attempt held with no seq 1: the receiver does not hold the earlier and accepts it; "
+     "the reading is a lower bound.", [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted")])
+rseq("accepted_then_reported_failure", "An accepted attempt later failed by the provider: both observations "
+     "held; latest failed, ever accepted true.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed", "provider_reported_failure")])
+rseq("unconfirmed_accepted_reported_failure", "Every step of the longest path: unconfirmed, accepted, failed "
+     "with provider_reported_failure.",
+     [_U, obs(AL1, AT1, 1, 2, "unconfirmed", "accepted"),
+      obs(AL1, AT1, 1, 3, "accepted", "failed", "provider_reported_failure")])
+rseq("unconfirmed_never_resolved", "An unconfirmed attempt never resolved stays unconfirmed.",
+     [obs(AL1, AT1, 1, 1, None, "unconfirmed", "timeout_after_submit")])
+rseq("failed_retry_after_accepted", "Attempt 1 accepted, a retry (attempt 2, same alert and channel) failed: "
+     "latest failed, ever accepted still true.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT2, 2, 1, None, "failed", "provider_refused")])
+rseq("attempts_out_of_order", "The retry (attempt_seq 2, accepted) arrives before attempt_seq 1 (failed): "
+     "latest is attempt_seq 2's, whatever the arrival order.",
+     [obs(AL1, AT2, 2, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "failed", "provider_refused")])
+rseq("failover_other_channel", "sms failed, then a failover attempt on whatsapp accepted: each channel reads "
+     "apart, and accepted on some channel is true.",
+     [obs(AL1, AT1, 1, 1, None, "failed", "provider_refused"),
+      obs(AL1, AT2, 2, 1, None, "accepted", channel="whatsapp")])
+rseq("failover_both_failed", "sms unconfirmed then whatsapp failed: accepted on no channel.",
+     [obs(AL1, AT1, 1, 1, None, "unconfirmed"),
+      obs(AL1, AT2, 2, 1, None, "failed", "not_submitted", channel="whatsapp")])
+rseq("refused_records_change_nothing", "A forged record of one identity (signed by other while naming runtime), "
+     "then the genuine one: the forgery is signature_invalid and changes nothing, so the genuine record is held, "
+     "not conflict.",
+     [obs(AL1, AT1, 1, 1, None, "failed", signer=OTHER, key_identity=identity(RUNTIME.pub)),
+      obs(AL1, AT1, 1, 1, None, "accepted")])
+rseq("check5_refusal_changes_nothing", "A record refused at check 5 (tier_d with a class) changes nothing; a "
+     "consistent record of the same identity is then held.",
+     [obs(AL1, AT1, 1, 1, None, "accepted", notice="tier_d"),
+      obs(AL1, AT1, 1, 1, None, "accepted", notice="tier_d", **{"class": None})])
+rseq("tally_rising", "Snapshots 3 then 7 of one tally key: both held, the tally held is 7.",
+     [tally(count=3), tally(count=7, issued_at_ms=T0 + 70_000)])
+rseq("tally_lower_count", "Snapshot 5, then 3 under the same key: lower_count, the tally held stays 5.",
+     [tally(count=5), tally(count=3, issued_at_ms=T0 + 70_000)])
+rseq("tally_duplicate", "One snapshot twice: duplicate.", [tally(count=5), tally(count=5)])
+rseq("tally_conflict", "Two snapshots of one key and count, different bytes: conflict, and the tally is not "
+     "settled.", [tally(count=5), tally(count=5, issued_at_ms=T0 + 70_000)])
+rseq("tally_keys_apart", "Same channel, class and month, reasons disabled and capped, and the same reason on two "
+     "channels and two months: four keys, each held alone.",
+     [tally(count=4), tally(reason="capped", count=2), tally(channel="whatsapp", count=1),
+      tally(month="2026-07", count=9)])
+rseq("tally_two_epochs", "runtime's snapshot 5, then rotated's snapshot 2 of the same tally key: a new epoch "
+     "starts again, so 2 is not lower_count, and both are held and listed apart. Then runtime's 4 is lower_count "
+     "in its own epoch.",
+     [tally(count=5), tally(ROTATED, count=2, issued_at_ms=T0 + 80_000), tally(count=4, issued_at_ms=T0 + 90_000)],
+     BOTH)
+rseq("notice_two_epochs", "One alert_id's attempts under runtime then rotated: each epoch reads apart.",
+     [obs(AL1, AT1, 1, 1, None, "failed", "provider_refused"),
+      obs(AL1, AT2, 1, 1, None, "accepted", signer=ROTATED)], BOTH)
+
+
+# --- carriage sequences ------------------------------------------------------------------------------
+CARRIAGE_SEQUENCES: list[dict] = []
+
+
+def carriage(name: str, note: str, events: list, *, devices: tuple = (DEVICE,), max_per_device: int = 4096) -> None:
+    queues: dict[str, list] = {d: [] for d in devices}
+    out = []
+    for topic, rec in events:
+        data = rec if isinstance(rec, str) else text(rec)
+        reason = gateway_stateless(data, topic, list(devices))
+        ack = None
+        if reason is None:
+            if digest(data) in queues[topic]:
+                verdict = "replayed"
+            elif len(queues[topic]) >= max_per_device:
+                verdict = "queue_full"
+            else:
+                queues[topic].append(digest(data))
+                verdict = "queued"
+        else:
+            verdict = reason
+        if verdict != "unknown_device":
+            queued = verdict in ("queued", "replayed")
+            ack = {"device_id": topic, "outcome": "queued" if queued else "refused",
+                   "reason": "" if queued else verdict, "record_digest": digest(data)}
+        out.append({"topic_device": topic, "message": data, "expected": verdict, "expected_ack": ack})
+    CARRIAGE_SEQUENCES.append({"name": name, "note": note, "configured_devices": list(devices),
+                               "max_records_per_device": max_per_device, "events": out})
+
+
+FORGED = obs(AL1, AT1, 1, 1, None, "failed", signer=OTHER, key_identity=identity(RUNTIME.pub))
+GENUINE = obs(AL1, AT1, 1, 1, None, "accepted")
+carriage("queued_then_replayed", "A record is queued; its retransmission, the same bytes, is replayed and "
+         "acknowledged queued.", [(DEVICE, GENUINE), (DEVICE, GENUINE)])
+carriage("one_identity_both_queued", "A forged record of one observation identity arrives first, then the "
+         "runtime's: different digests, both queued. The gateway verifies nothing.",
+         [(DEVICE, FORGED), (DEVICE, GENUINE), (DEVICE, GENUINE)])
+carriage("one_tally_key_both_queued", "Two snapshots of one tally key and count with different bytes: both queued.",
+         [(DEVICE, tally(count=5)), (DEVICE, tally(count=5, issued_at_ms=T0 + 70_000))])
+carriage("queue_full", "max_records_per_device 2: two records queued, the third queue_full and refused "
+         "retryably; a held record's retransmission is still replayed at a full queue; the third again "
+         "queue_full; another device's record is queued in its own share.",
+         [(DEVICE, obs(AL1, AT1, 1, 1, None, "accepted")), (DEVICE, obs(AL1, AT2, 2, 1, None, "accepted")),
+          (DEVICE, obs(AL1, AT3, 3, 1, None, "accepted")), (DEVICE, obs(AL1, AT1, 1, 1, None, "accepted")),
+          (DEVICE, obs(AL1, AT3, 3, 1, None, "accepted")),
+          (OTHER_DEVICE, obs(AL1, AT1, 1, 1, None, "accepted", signer=OTHER, device_id=OTHER_DEVICE))],
+         devices=(DEVICE, OTHER_DEVICE), max_per_device=2)
+carriage("refusals", "Refusals at checks 3, 4 and 6 are acknowledged refused with their reason; a record on an "
+         "unconfigured device's topic is unknown_device and not acknowledged; none takes a place in the queue.",
+         [(DEVICE, text(GENUINE) + "\n"), (DEVICE, submission(v=2)), (DEVICE, submission(device_id=OTHER_DEVICE)),
+          (OTHER_DEVICE, submission(device_id=OTHER_DEVICE)), (DEVICE, GENUINE)], max_per_device=1)
+carriage("unverified_carried", "Records the receiver would refuse at checks 2 to 5 are carried: an unenrolled "
+         "key, a corrupted signature and a refused transition are each queued.",
+         [(DEVICE, submission(OTHER)), (DEVICE, {**GOOD, "signature": _FLIP}),
+          (DEVICE, submission(prior_outcome="accepted", outcome="failed"))])
+
+
+# --- enrolment ---------------------------------------------------------------------------------------
+ENROL_CASES: list[dict] = []
+ENROL_MEMBERS = {"device_id", "key_identity", "nonce", "purpose", "v"}
+
+
+def enrol_verdict(challenge: str, signature: str, device: str, pub: bytes, nonce: str, consumed: bool) -> str | None:
+    o = parse(challenge)
+    if (canonical(o) != challenge.encode("utf-8") or not isinstance(o, dict) or set(o) != ENROL_MEMBERS
+            or integer(o["v"]) != 1 or o["purpose"] != PURPOSE or not string(o["nonce"], NONCE_RE)
+            or not string(o["device_id"], DEVICE_RE) or not string(o["key_identity"], KEY_ID_RE)):
+        return "challenge_malformed"
+    if o["nonce"] != nonce or consumed:
+        return "nonce_mismatch"
+    if o["device_id"] != device:
+        return "device_mismatch"
+    if o["key_identity"] != identity(pub):
+        return "key_mismatch"
+    if not b64_ok(signature, 64) or not verify(pub, signature, ENROL_DOMAIN + challenge.encode("utf-8")):
+        return "signature_invalid"
+    return None
+
+
+NONCE = hashlib.sha256(b"ori alert-delivery/v1 test nonce").hexdigest()[:32]
+NONCE64 = hashlib.sha256(b"ori alert-delivery/v1 test nonce 64").hexdigest()
+
+
+def challenge(signer: object = RUNTIME, **over: object) -> dict:
+    obj = {"device_id": DEVICE, "key_identity": identity(signer.pub), "nonce": NONCE, "purpose": PURPOSE, "v": 1}
+    obj.update(over)
+    return {k: v for k, v in obj.items() if v is not DROP}
+
+
+DROP = object()
+
+
+def ecase(name: str, note: str, chal: object, expected: str, *, signer: object = RUNTIME,
+          enrolling: object = RUNTIME, device: str = DEVICE, nonce: str = NONCE, consumed: bool = False,
+          domain: bytes = ENROL_DOMAIN, signature: str | None = None) -> None:
+    data = chal if isinstance(chal, str) else text(chal)
+    sig = signature if signature is not None else b64(signer.sign(domain + data.encode("utf-8")))
+    pub = enrolling.pub if hasattr(enrolling, "pub") else enrolling
+    v = enrol_verdict(data, sig, device, pub, nonce, consumed) or "pass"
+    if v != expected:
+        raise AssertionError(f"enrolment {name}: computed {v}, declared {expected}")
+    ENROL_CASES.append({"name": name, "note": note, "enrolling_device_id": device,
+                        "enrolling_public_key": "ed25519:" + b64(pub), "enrolling_key_identity": identity(pub),
+                        "issued_nonce": nonce, "nonce_consumed": consumed, "challenge": data,
+                        "signing_input_hex": (ENROL_DOMAIN + data.encode("utf-8")).hex(), "signature": sig,
+                        "expected": v})
+
+
+ecase("valid", "runtime's proof for site-a-edge-01 under a 32-character nonce.", challenge(), "pass")
+ecase("valid_nonce_64", "A 64-character nonce.", challenge(nonce=NONCE64), "pass", nonce=NONCE64)
+ecase("valid_rotated", "rotated's proof for site-a-edge-01, as at a replacement.", challenge(ROTATED), "pass",
+      signer=ROTATED, enrolling=ROTATED)
+for name, note, chal in (
+    ("member_missing", "No purpose member.", challenge(purpose=DROP)),
+    ("member_extra", "An extra member.", {**challenge(), "site": "site-a"}),
+    ("v_2", "v is 2.", challenge(v=2)),
+    ("v_fraction", "v written 1.0.", challenge(v=Raw("1.0"))),
+    ("purpose_other", "purpose is runtime_posture.", challenge(purpose="runtime_posture")),
+    ("nonce_upper", "The issued nonce in upper case.", challenge(nonce=NONCE.upper())),
+    ("nonce_short", "A nonce of 30 characters.", challenge(nonce=NONCE[:30])),
+    ("nonce_long", "A nonce of 66 characters.", challenge(nonce=NONCE64 + "ab")),
+    ("device_form", "device_id outside its pattern.", challenge(device_id="site a")),
+    ("key_identity_form", "key_identity without its prefix.", challenge(key_identity=identity(RUNTIME.pub)[7:])),
+):
+    ecase("challenge_malformed_" + name, note, chal, "challenge_malformed")
+ecase("challenge_malformed_not_canonical", "The challenge's bytes with a space after a colon: not its canonical "
+      "bytes.", text(challenge()).replace('"v":1', '"v": 1'), "challenge_malformed")
+ecase("nonce_mismatch_other", "A well-formed nonce the receiver did not issue for this enrolment.",
+      challenge(nonce=NONCE64), "nonce_mismatch")
+ecase("nonce_mismatch_consumed", "The issued nonce, already consumed by an earlier proof.", challenge(),
+      "nonce_mismatch", consumed=True)
+ecase("device_mismatch", "A proof naming site-a-edge-02 while site-a-edge-01 is being enrolled.",
+      challenge(device_id=OTHER_DEVICE), "device_mismatch")
+ecase("key_mismatch", "runtime's proof while other is being enrolled.", challenge(), "key_mismatch", enrolling=OTHER)
+ecase("key_mismatch_negation", "A proof naming runtime's key_identity while runtime's negation is being enrolled.",
+      challenge(), "key_mismatch", enrolling=NEGATED)
+ecase("signature_invalid_other_signer", "Names runtime, being enrolled, but signed by other.", challenge(),
+      "signature_invalid", signer=OTHER)
+ecase("signature_invalid_record_domain", "Signed under the record prefix ori.alert_delivery.v1.", challenge(),
+      "signature_invalid", domain=DOMAIN)
+ecase("signature_invalid_no_domain", "Signed over the challenge bytes alone.", challenge(), "signature_invalid",
+      domain=b"")
+_ESIG = base64.b64decode(b64(RUNTIME.sign(ENROL_DOMAIN + canonical(challenge()))))
+ecase("signature_invalid_s_not_reduced", "S plus the group order.", challenge(), "signature_invalid",
+      signature=b64(_ESIG[:32] + (int.from_bytes(_ESIG[32:], "little") + ORDER).to_bytes(32, "little")))
+_KEYLESS = b64(penc(BASE) + (1).to_bytes(32, "little"))
+ecase("signature_invalid_inadmissible_key", "The identity point as the key being enrolled, named by its own "
+      "key_identity, with the keyless signature R = B, S = 1: the key fails ed25519-key-admission/v1 "
+      "(small_order).", challenge(key_identity=identity(SMALL_ORDER)), "signature_invalid",
+      enrolling=SMALL_ORDER, signature=_KEYLESS)
+ecase("precedence_malformed_over_nonce", "An upper-case nonce the receiver did not issue: check 1 wins, "
+      "challenge_malformed.", challenge(nonce=NONCE64.upper()), "challenge_malformed")
+ecase("precedence_nonce_over_device", "Another device and an unissued nonce: check 2 wins, nonce_mismatch.",
+      challenge(device_id=OTHER_DEVICE, nonce=NONCE64), "nonce_mismatch")
+ecase("precedence_device_over_key", "Another device and another key: check 3 wins, device_mismatch.",
+      challenge(device_id=OTHER_DEVICE), "device_mismatch", enrolling=OTHER)
+ecase("precedence_key_over_signature", "Another key named and a zero signature: check 4 wins, key_mismatch.",
+      challenge(OTHER), "key_mismatch", signature=b64(b"\x00" * 64))
+
+
+# --- gateway-config/v2 alert_delivery ----------------------------------------------------------------
+CONFIG_CASES: list[dict] = []
+STATE = "/var/lib/ori-gateway/state"
+EVQ, EVR = "/var/lib/ori-gateway/evidence-outbound", "/var/lib/ori-gateway/evidence-return"
+ADQ = "/var/lib/ori-gateway/alert-delivery"
+
+
+def trim(s: str) -> str:
+    i, j = 0, len(s)
+    while i < j and s[i] in WHITE_SPACE:
+        i += 1
+    while j > i and s[j - 1] in WHITE_SPACE:
+        j -= 1
+    return s[i:j]
+
+
+def clean(path: str) -> list:
+    out: list = []
+    for c in path.split("/"):
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(c)
+    return out
+
+
+def related(a: str, b: str) -> bool:
+    ca, cb = clean(a), clean(b)
+    n = min(len(ca), len(cb))
+    return ca[:n] == cb[:n]
+
+
+def config_verdict(ad: dict, state_dir: object, evidence: dict) -> str | None:
+    if not ad.get("enabled"):
+        return None
+    q = ad.get("queue_directory")
+    q = trim(q) if isinstance(q, str) else ""
+    if not q:
+        return "queue_directory_required"
+    if not q.startswith("/"):
+        return "queue_directory_absolute"
+    others = []
+    if isinstance(state_dir, str) and trim(state_dir):
+        others.append(trim(state_dir))
+    if evidence["enabled"]:
+        others += [trim(evidence["queue_directory"]), trim(evidence["return_queue_directory"])]
+    if any(related(q, o) for o in others):
+        return "queue_directory_separate"
+    m = ad.get("max_records_per_device", 4096)
+    if isinstance(m, bool) or not isinstance(m, int) or not 1 <= m <= 65536:
+        return "max_records_per_device_range"
+    return None
+
+
+def ccase(name: str, note: str, ad: dict, expected: str | None = None, *, state_dir: object = STATE,
+          evidence_enabled: bool = True, evq: str = EVQ, evr: str = EVR) -> None:
+    evidence = {"enabled": evidence_enabled, "queue_directory": evq, "return_queue_directory": evr}
+    v = config_verdict(ad, state_dir, evidence)
+    if v != expected:
+        raise AssertionError(f"config {name}: computed {v}, declared {expected}")
+    case = {"name": name, "note": note, "alert_delivery": ad, "state_directory": state_dir, "evidence": evidence,
+            "valid": v is None}
+    if v is None and ad.get("enabled"):
+        case["effective_queue_directory"] = trim(ad["queue_directory"])
+        case["effective_max_records_per_device"] = ad.get("max_records_per_device", 4096)
+    if v is not None:
+        case["rule"] = v
+    CONFIG_CASES.append(case)
+
+
+ccase("disabled", "Disabled: no other key is validated.", {"enabled": False})
+ccase("disabled_bad_keys", "Disabled with a relative queue directory and a bound out of range: still valid.",
+      {"enabled": False, "queue_directory": "relative/q", "max_records_per_device": 0})
+ccase("enabled", "Enabled, a separate absolute queue, the default bound 4096.",
+      {"enabled": True, "queue_directory": ADQ})
+ccase("enabled_bounds_low", "max_records_per_device 1.", {"enabled": True, "queue_directory": ADQ,
+                                                          "max_records_per_device": 1})
+ccase("enabled_bounds_high", "max_records_per_device 65536.", {"enabled": True, "queue_directory": ADQ,
+                                                               "max_records_per_device": 65536})
+ccase("trimmed", "Surrounding spaces, a tab and U+00A0 and U+3000 are White_Space and are removed.",
+      {"enabled": True, "queue_directory": " \t " + ADQ + "　\n"})
+ccase("sibling_by_component", "A queue directory whose name extends the state directory's: not inside it, "
+      "since inside is decided on whole components.", {"enabled": True, "queue_directory": STATE + "-alerts"})
+ccase("case_differs", "Components compare exactly, so a case variant of the state directory is separate.",
+      {"enabled": True, "queue_directory": STATE.upper()})
+ccase("no_state_directory", "No state directory configured: nothing to compare with it.",
+      {"enabled": True, "queue_directory": STATE}, state_dir=None)
+ccase("evidence_disabled_same_path", "With the courier disabled, its queue directories are not configured, so "
+      "an alert queue at evidence.queue_directory is valid.", {"enabled": True, "queue_directory": EVQ},
+      evidence_enabled=False)
+ccase("required_absent", "No queue_directory.", {"enabled": True}, "queue_directory_required")
+ccase("required_empty", "An empty queue_directory.", {"enabled": True, "queue_directory": ""},
+      "queue_directory_required")
+ccase("required_whitespace", "Only White_Space, U+2028 among it: empty once trimmed.",
+      {"enabled": True, "queue_directory": "  \t"}, "queue_directory_required")
+ccase("absolute_relative", "A relative path.", {"enabled": True, "queue_directory": "var/lib/q"},
+      "queue_directory_absolute")
+ccase("absolute_dot", "A path beginning with ./.", {"enabled": True, "queue_directory": "./q"},
+      "queue_directory_absolute")
+ccase("absolute_not_white_space", "A leading U+001F, which is not White_Space, is not removed.",
+      {"enabled": True, "queue_directory": "\x1f" + ADQ}, "queue_directory_absolute")
+ccase("separate_equal_state", "Equal to the state directory.", {"enabled": True, "queue_directory": STATE},
+      "queue_directory_separate")
+ccase("separate_inside_state", "Inside the state directory.", {"enabled": True, "queue_directory": STATE + "/alerts"},
+      "queue_directory_separate")
+ccase("separate_contains_state", "Containing the state directory.",
+      {"enabled": True, "queue_directory": "/var/lib/ori-gateway"}, "queue_directory_separate")
+ccase("separate_root", "/ contains every directory.", {"enabled": True, "queue_directory": "/"},
+      "queue_directory_separate")
+ccase("separate_equal_evidence", "Equal to evidence.queue_directory.", {"enabled": True, "queue_directory": EVQ},
+      "queue_directory_separate", state_dir=None)
+ccase("separate_inside_return", "Inside evidence.return_queue_directory.",
+      {"enabled": True, "queue_directory": EVR + "/alerts"}, "queue_directory_separate", state_dir=None)
+ccase("separate_contains_evidence", "Containing evidence.queue_directory, with the state directory elsewhere.",
+      {"enabled": True, "queue_directory": "/srv/ori"}, "queue_directory_separate", state_dir="/var/lib/state",
+      evq="/srv/ori/evidence-outbound")
+ccase("separate_cleaned", "Equal to the state directory once cleaned: repeated and trailing /, . and ...",
+      {"enabled": True, "queue_directory": "/var//lib/./ori-gateway/x/../state/"}, "queue_directory_separate")
+ccase("separate_dotdot_at_root", "A .. at the root stays at the root: /../var/lib/ori-gateway/state is the "
+      "state directory.", {"enabled": True, "queue_directory": "/../var/lib/ori-gateway/state"},
+      "queue_directory_separate")
+ccase("separate_trimmed_state", "The state directory is compared trimmed.",
+      {"enabled": True, "queue_directory": STATE}, "queue_directory_separate", state_dir="  " + STATE + " ")
+ccase("range_zero", "max_records_per_device 0.", {"enabled": True, "queue_directory": ADQ,
+                                                  "max_records_per_device": 0}, "max_records_per_device_range")
+ccase("range_over", "max_records_per_device 65537.", {"enabled": True, "queue_directory": ADQ,
+                                                      "max_records_per_device": 65537},
+      "max_records_per_device_range")
+ccase("range_negative", "max_records_per_device -1.", {"enabled": True, "queue_directory": ADQ,
+                                                       "max_records_per_device": -1}, "max_records_per_device_range")
+ccase("range_fraction", "max_records_per_device 1.5.", {"enabled": True, "queue_directory": ADQ,
+                                                        "max_records_per_device": 1.5},
+      "max_records_per_device_range")
+ccase("range_string", "max_records_per_device \"64\".", {"enabled": True, "queue_directory": ADQ,
+                                                         "max_records_per_device": "64"},
+      "max_records_per_device_range")
+ccase("range_bool", "max_records_per_device true.", {"enabled": True, "queue_directory": ADQ,
+                                                     "max_records_per_device": True}, "max_records_per_device_range")
+ccase("order_required_before_range", "No queue directory and a bound out of range: rule 1.",
+      {"enabled": True, "max_records_per_device": 0}, "queue_directory_required")
+ccase("order_absolute_before_separate", "Relative, and inside the state directory once read relatively: rule 2.",
+      {"enabled": True, "queue_directory": "var/lib/ori-gateway/state"}, "queue_directory_absolute")
+ccase("order_separate_before_range", "Equal to the state directory and a bound out of range: rule 3.",
+      {"enabled": True, "queue_directory": STATE, "max_records_per_device": 0}, "queue_directory_separate")
+
+
+# --- output ------------------------------------------------------------------------------------------
+def build() -> dict:
+    return {
+        "contract": "alert-delivery/v1",
+        "note": {
+            "keys": ("Ed25519 private keys are SHA-256 of 'ori alert-delivery/v1 <name> test key', for names "
+                     "runtime, other and rotated. runtime_negated is runtime's negation, -A, which runtime's "
+                     "holder signs under with -a: it has no seed, one recognised key with runtime, and its own "
+                     "key_identity. Test keys only."),
+            "records": ("Each record case is one message, `record` its exact bytes, on the alert-delivery topic of "
+                        "`topic_device`, judged by a gateway whose gateway.device_ids is `configured_devices`. "
+                        "`expected_gateway` is `pass` or the reason of checks 3, 4 and 6 of Carriage and custody "
+                        "(check 5 never fails here: the topic's device is configured). `expected_receiver` is "
+                        "`pass` or the reason of checks 1 to 5 of Verifying, where check 1 is carriage checks 3 to "
+                        "6 on the same topic and configuration. Checks 1 and 2 of carriage, and the receiver's "
+                        "own payload bound, are not exercised. The receiver's authenticated registry is "
+                        "`forwarding_registry`, each forwarder mapped to the devices it may forward for; the "
+                        "record arrives from `forwarder`, and check 2 (not_owned) fails when the record's "
+                        "device_id is not in the forwarder's list. `enrolments` is the receiver's enrolment "
+                        "registry: each a device, a test key by name and the purpose; check 3 (key_not_enrolled) "
+                        "fails unless an enrolment for the record's device_id has the record's key_identity, "
+                        "and check 4 verifies under that enrolment's key. `pass` at the receiver means the "
+                        "record goes on to check 6. outcome_refused has no case: check 4 of carriage refuses "
+                        "every outcome outside Submission observation's list as malformed first."),
+            "receiver_sequences": ("Each sequence is records in arrival order to one receiver with the fixture "
+                                   "of `records`. `expected` is the verdict: a refusal of checks 1 to 5, which "
+                                   "changes nothing, or check 6's: `held` for a verified record that is none of "
+                                   "duplicate, conflict or lower_count; `duplicate`; `conflict`, which is kept "
+                                   "beside the record it conflicts with; `lower_count`. An observation's "
+                                   "identity is (delivery_attempt_id, observation_seq); a tally's is its tally "
+                                   "key, its epoch and its count. `expected_reading` is Reading a notice over "
+                                   "the records held (`held`), for each epoch (the key_identity) and alert_id: "
+                                   "per channel the latest attempt state and ever accepted, and accepted on some "
+                                   "channel; `settled` is false when a record about the notice was held as, or "
+                                   "made another, conflict. `expected_tallies` lists, per epoch and tally key, "
+                                   "the held record with the greatest count; a key not listed is unknown."),
+            "carriage_sequences": ("Each sequence is messages in arrival order to one gateway with "
+                                   "`configured_devices` and alert_delivery.max_records_per_device, custody "
+                                   "readable and writable, and nothing retired from custody. `expected` is the "
+                                   "custody verdict: `queued`, `replayed`, `queue_full`, or the refusal of checks "
+                                   "3 to 6. A digest already held is replayed before the bound is judged. "
+                                   "`expected_ack` is the acknowledgement's device_id, outcome, reason and "
+                                   "record_digest, its envelope members being gateway-api/v2's, or null when "
+                                   "none is published."),
+            "enrolment": ("Each case is one enrolment proof judged by a receiver enrolling "
+                          "`enrolling_public_key` for `enrolling_device_id`, having issued `issued_nonce`, "
+                          "consumed already when `nonce_consumed`. `challenge` is the challenge's bytes as "
+                          "signed, `signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
+                          "signature as canonical padded Base64. `expected` is `pass` or the reason of The "
+                          "enrolment proof."),
+            "config": ("gateway-config/v2 alert_delivery load rules. `alert_delivery` lists the keys as written; "
+                       "`state_directory` is the gateway.state_directory value, null when absent, and is always "
+                       "one its own rules admit; `evidence` gives the courier's enabled flag and queue "
+                       "directories, every other key of every other section holding a valid value. An evidence "
+                       "queue directory is configured only while the courier is enabled. `valid`, `rule` when "
+                       "refused, and for a valid enabled case the trimmed queue directory and the bound in force."),
+        },
+        "test_keys": {s.name: {"public_key": "ed25519:" + b64(s.pub), "key_identity": identity(s.pub),
+                               **({"seed_label": f"ori alert-delivery/v1 {s.name} test key"}
+                                  if isinstance(s, Signer) else {"negation_of": "runtime"})}
+                      for s in (RUNTIME, OTHER, ROTATED, NEGATED)},
+        "records": RECORD_CASES,
+        "receiver_sequences": RECEIVER_SEQUENCES,
+        "carriage_sequences": CARRIAGE_SEQUENCES,
+        "enrolment": ENROL_CASES,
+        "config": CONFIG_CASES,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

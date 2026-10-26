@@ -1,0 +1,2140 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the alert-delivery/v1 corpus against the contract texts.
+
+Shares no code with scripts/generate-alert-delivery-vectors-v1, and was
+written without reading it. Every expected value is recomputed from
+alert-delivery/v1.md, the sections it cites of runtime-posture/v1.md
+(*Identities*, *The record*), gateway-mqtt-canonical-json/v1.md, the Ed25519
+key admission and verification contracts, gateway-config/v2.md
+`alert_delivery` and the state directory's `separate_from_evidence_queues`,
+and gateway-api/v2.md *Runtime Alert Delivery Record* and *Runtime Alert
+Delivery Acknowledgement*.
+
+Held to:
+
+- the text: every sentence this checker relies on is pinned, and the ordered
+  vocabularies it judges by are parsed from the text: the gateway's and the
+  receiver's check lists and their reasons, the outcome set, the observation
+  table, the detail table, the member tables and their patterns, the
+  enrolment proof's order of refusal, the config load rules and the tally
+  bound, so an edit to any of them fails here until it is re-pinned;
+- keys: every test key re-derived from its disclosed seed label with this
+  script's own curve arithmetic, `key_identity` as SHA-256 of the RFC 8410
+  SPKI DER, admission from ed25519-key-admission/v1;
+- signatures: verified twice, with this script's own strict cofactorless
+  equation (ed25519-verification/v1) and with OpenSSL through
+  `cryptography`, and the two must agree;
+- records: the gateway verdict at checks 3, 4 and 6 of *Carriage and
+  custody* and the receiver verdict at checks 3 to 5 of *Verifying*,
+  recomputed independently; a reject case must be refused for its declared
+  reason and nothing earlier, a precedence case must fail a second rule
+  behind its first, and a case declared to fail one rule alone fails no other;
+- sequences: receiver verdicts at check 6, the derived reading (latest
+  attempt state, ever accepted, accepted on some channel) and the tallies
+  held; carriage custody verdicts and acknowledgements; enrolment verdicts;
+  config load verdicts;
+- coverage: every reason and every accepted form *Vectors* requires.
+
+    python3 scripts/check-alert-delivery-vectors-v1
+    python3 scripts/check-alert-delivery-vectors-v1 --mutations
+
+`--mutations` runs wrong judges (each rule dropped, reordered or loosened)
+against the corpus, alters the corpus's expectations, and alters the texts
+(each pinned sentence cut, each ordered list reordered, each bound moved);
+every mutant must be refused, and the survivors are printed.
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import functools
+import hashlib
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "alert-delivery" / "vectors" / "alert-delivery-v1.json"
+TEXT_FILES = {
+    "ad": ROOT / "alert-delivery" / "v1.md",
+    "posture": ROOT / "runtime-posture" / "v1.md",
+    "canonical": ROOT / "gateway-mqtt-canonical-json" / "v1.md",
+    "admission": ROOT / "ed25519-key-admission" / "v1.md",
+    "verification": ROOT / "ed25519-verification" / "v1.md",
+    "gateway_config": ROOT / "gateway-config" / "v2.md",
+    "gateway_api": ROOT / "gateway-api" / "v2.md",
+}
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Pinned sentences: each held, whitespace-normalised, as a substring of its
+# document. Every rule the judges below implement rests on one of these or on
+# a list or table parsed from the text in build_model.
+# ---------------------------------------------------------------------------
+
+PINS: list[tuple[str, str]] = [
+    # Identities
+    ("ad", "A retry or a failover to another channel is a new provider call and so a new attempt with a new `delivery_attempt_id`, under the same `alert_id`."),
+    ("ad", "A retransmission of a record is the same record, with the same bytes."),
+    ("ad", "A report **epoch** is one recognised key, as a posture epoch is: a new report key starts a new epoch, and every ordering value below is compared within one epoch only."),
+    ("posture", "`sha256:` followed by the 64 lowercase hex characters of SHA-256 over the key's RFC 8410 SubjectPublicKeyInfo DER: the 12-byte prefix `302a300506032b6570032100` followed by the raw 32-byte key"),
+    ("posture", "The 32 key bytes with bit 255 cleared, as [ed25519-key-admission/v1.md](../ed25519-key-admission/v1.md) *Recognising a key* defines it"),
+    # Records
+    ("ad", "members sorted by name, no insignificant whitespace, every integer a JSON integer token from `0` to 2^53 − 1 with no sign, fraction, exponent or leading zero, and every string ASCII matching its pattern, so that no string needs a JSON escape."),
+    ("ad", "Bytes that parse to a record but are not its canonical bytes are not a record."),
+    ("ad", "A record whose `kind` is neither value, or whose members are not exactly those its kind lists, is `malformed`."),
+    ("posture", "Canonical bytes never respell a number, so a record whose integer is written `1e0` or `1.0` has canonical bytes and is `malformed`, not `not_canonical`."),
+    ("canonical", "Keys are ordered by **Unicode scalar value** (code point), not by UTF-16 code unit."),
+    ("canonical", "Escape only `\"` and `\\`, plus C0 controls."),
+    ("canonical", "A **verifier** MUST reproduce the number token exactly as it appears on the wire, and MUST NOT re-format it."),
+    # Outcomes
+    ("ad", "**`delivered` is reserved.** A record whose `outcome` is `delivered`, or any value not in the table, is refused as `outcome_refused`."),
+    ("ad", "Any other combination is refused as `transition_refused`. `failed` ends an attempt."),
+    ("ad", "A later observation never replaces an earlier one: an attempt that was `accepted` and later `failed` keeps its `accepted` observation, under its own identity."),
+    ("ad", "It orders attempts; arrival order and every clock value are ignored for that purpose."),
+    # Consistency
+    ("ad", "carries the same `device_id`, `key_identity`, `alert_id`, `notice`, `class`, `channel`, `attempt_seq` and `attempted_at_ms`."),
+    ("ad", "- **Every attempt of one `alert_id`** carries the same `notice` and `class`."),
+    ("ad", "- **One `attempt_seq`** names one `delivery_attempt_id` within an epoch."),
+    ("ad", "- **An observation's `prior_outcome`** is the `outcome` of the observation of the same attempt whose `observation_seq` is one lower."),
+    ("ad", "A receiver that holds an earlier verified record, and verifies one that breaks any of these, holds the later one as `conflict` and keeps the earlier, under [Verifying](#verifying)."),
+    ("ad", "A receiver that does not hold the earlier record cannot judge the later, and accepts it if it passes every other check."),
+    # Notices and Class
+    ("ad", "`tier_d` and `protection_degraded` are **mandatory**."),
+    ("ad", "A mandatory notice is reported like any other notice, and its `class` is always `null`."),
+    ("ad", "A receiver never refuses a record for it."),
+    ("ad", "- In a submission observation, a mandatory notice with a non-`null` class is refused as `class_refused`."),
+    ("ad", "- In a tally, `reason: \"disabled\"` with `class: null` is refused as `class_refused`: only a class can be switched off. `capped` may have a class or `null`."),
+    # Detail codes
+    ("ad", "`provider_reported_failure` is permitted only when `prior_outcome` is `accepted`. Any other value, or a code that is not permitted for the outcome, is refused as `detail_refused`."),
+    # Tallies
+    ("ad", "A receiver keeps, for each tally key and epoch, the record with the greatest `count`; it never adds records together. A record with a lower count than the one held is `lower_count` and changes nothing. A record with the same count and different bytes is `conflict`."),
+    ("ad", "Within one month, it keeps tallies for at most 10 distinct class names on each channel, plus `null` for `capped`, whatever classes it binds across that month's reloads."),
+    ("ad", "So for each channel and month there are at most 10 `disabled` tallies and 11 `capped` tallies, and a runtime keeps at most (10 + 11) × 2 channels × 2 months = 84 tallies."),
+    ("ad", "- **Overflow.** A count that reaches 2^53 − 1 stays there, and no further snapshot is published for its key."),
+    ("ad", "Tallies are kept and compared per epoch."),
+    # Reading a notice
+    ("ad", "- **Latest attempt state**: the `outcome` of the highest-`observation_seq` observation held for the attempt with the greatest `attempt_seq`."),
+    ("ad", "- **Ever accepted**: whether any observation held for any attempt on that channel is `accepted`."),
+    ("ad", "For each `alert_id`, it also derives **accepted on some channel**: whether *Ever accepted* holds for any channel."),
+    ("ad", "A reader that holds submission observations derives, for each `alert_id` and `channel`, within one epoch:"),
+    # Signature
+    ("ad", "The signing input is the ASCII bytes `ori.alert_delivery.v1`, one NUL byte, then the canonical bytes of the record without its `signature` member."),
+    ("ad", "A verifier applies [ed25519-key-admission/v1.md](../ed25519-key-admission/v1.md) to the key and verifies under [ed25519-verification/v1.md](../ed25519-verification/v1.md); any failure is `signature_invalid`."),
+    ("ad", "Both kinds share the one signing input, and `kind` is a signed member, so a signature over one kind verifies for no record of the other."),
+    # Carriage and custody
+    ("ad", "judges each message in this order. The first check that fails is the answer."),
+    ("ad", "Records with the same observation identity, or the same tally key and count, but different bytes have different digests, and the gateway queues each."),
+    ("ad", "After the queue commit, or a refusal at checks 3 to 7 for a configured device, the gateway publishes an acknowledgement on `ori/{device_id}/runtime/alert-delivery/ack`, QoS 1, not retained, under the runtime–gateway envelope with `message_type` `alert_delivery_ack`"),
+    ("ad", "A message refused at check 5 is not acknowledged"),
+    ("ad", "`record_digest` is SHA-256 over the record's exact bytes. `outcome` is `queued` for a commit or a `replayed` record, and `refused` otherwise, with `reason` the check's reason, `queue_full` or `store_unavailable`."),
+    ("ad", "`queue_full` and `store_unavailable` describe the gateway's state, not the record's, so they are **retryable**"),
+    # Verifying
+    ("ad", "A record refused at checks 2 to 4 is the forwarder's or the network's, never the runtime's, and changes nothing the receiver holds."),
+    ("ad", "Only a verified record can make another `conflict`"),
+    ("ad", "the receiver keeps both and presents neither as settled."),
+    ("ad", "A record is never refused for its age"),
+    # Key trust
+    ("ad", "The receiver issues a nonce: 32 to 64 lowercase hexadecimal characters from at least 16 random bytes, never issued twice."),
+    ("ad", "The runtime signs, under its report key, the ASCII bytes `ori.report_key_enrolment.v1`, one NUL byte, then the canonical bytes, as [Records](#records) defines them, of exactly this object:"),
+    ("ad", "`device_id` and `key_identity` are the runtime's own, and `purpose` is the constant `alert_delivery_report`."),
+    ("ad", "and consumes the nonce whether or not the proof verifies. It judges the proof in this order, and the first failure is the answer:"),
+    # Vectors
+    ("ad", "Ed25519 test keys, each the SHA-256 of the ASCII label `ori alert-delivery/v1 <name> test key` as its 32-byte seed, with its public key and `key_identity`."),
+    ("ad", "for a configured device `site-a-edge-01`, and the verdict a receiver gives it at checks 3 to 5 of [Verifying](#verifying), with one key enrolled for that device and the forwarder permitted."),
+    ("ad", "Every refusal reason of both lists has a case refused for that reason alone; every outcome, every row of the observation table, every detail code and both record kinds have an accepted case; and `delivered` is refused."),
+    ("ad", "They cover a duplicate, a conflict under one identity, a breach of each rule of [Consistency across records](#consistency-across-records), a lower count, a later failure of an accepted attempt, a failed retry after an accepted attempt, failover to the other channel, and tallies of two epochs kept apart."),
+    ("ad", "messages in arrival order with the gateway's custody verdict: `queued`, `replayed`, both records of a pair with one identity and different bytes queued, and `queue_full` at `max_records_per_device`."),
+    ("ad", "one case for each refusal reason of *The enrolment proof*."),
+    ("ad", "gateway-config/v2 `alert_delivery` load-rule cases, one for each rule and accepted cases."),
+    # gateway-config/v2.md
+    ("gateway_config", "Surrounding whitespace, every character with the Unicode `White_Space` property, is removed from `queue_directory` before these rules apply, and the gateway uses the trimmed path."),
+    ("gateway_config", "A configuration with `enabled` true is refused at load for the first of these it breaks, in this order, and the refusal names the rule:"),
+    ("gateway_config", "Take custody of alert-delivery records. Disabled, the other keys are not validated."),
+    ("gateway_config", "The records the queue holds for one device; a record beyond it is refused `queue_full`."),
+    ("gateway_config", "Before any rule applies, surrounding whitespace is removed from the value, from the queue directories alike. Whitespace here is every character with the Unicode `White_Space` property. A value that is then empty is absent."),
+    ("gateway_config", "Each path is first cleaned lexically: repeated and trailing `/` and `.` components are removed, each `..` removes the component before it, and a `..` at the root stays at the root. Inside and containing are decided on whole components, so `/` contains every queue directory and `/a/b-c` is not inside `/a/b`."),
+    ("gateway_config", "Components compare exactly, so letter case matters."),
+    # gateway-api/v2.md
+    ("gateway_api", "| `ori/{device_id}/runtime/alert-delivery` | Runtime -> Gateway | 4096 | One alert-delivery/v1 record, under 1024 bytes with every member at its bound. |"),
+    ("gateway_api", "A record carries no `auth` envelope and is not signed under the runtime–gateway HMAC: the runtime's report key signs it, and the gateway verifies nothing about it, under alert-delivery/v1.md *Carriage and custody*."),
+    ("gateway_api", "It is an ordinary runtime-bound envelope under the runtime–gateway HMAC, with `message_type` `alert_delivery_ack`, an empty `request_id` and the target `device_id`"),
+    # Ed25519 contracts
+    ("admission", "A public key is refused under the first of these clauses that holds, in this order, and is admitted when none holds:"),
+    ("verification", "A signature is refused under the first of these clauses that holds, in this order, and is accepted when none holds:"),
+    ("verification", "k is the full 512-bit integer, as RFC 8032, section 5.1.7, specifies."),
+]
+
+
+def norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def section(text: str, title: str, level: int) -> str:
+    lines = text.split("\n")
+    head = "#" * level + " " + title
+    starts = [i for i, ln in enumerate(lines) if ln.rstrip() == head]
+    if len(starts) != 1:
+        raise Failure(f"text: heading {head!r} found {len(starts)} times")
+    start = starts[0]
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = re.match(r"^(#+) ", lines[j])
+        if m and len(m.group(1)) <= level:
+            end = j
+            break
+    return "\n".join(lines[start + 1:end])
+
+
+def numbered(body: str) -> list[str]:
+    """Top-level numbered items of the first Markdown ordered list in body."""
+    items: list[str] = []
+    cur: list[str] | None = None
+    done = False
+    for ln in body.split("\n"):
+        if done:
+            break
+        m = re.match(r"^(\d+)\. (.*)$", ln)
+        if m:
+            if cur is not None:
+                items.append(norm(" ".join(cur)))
+            if int(m.group(1)) != len(items) + 1:
+                raise Failure(f"text: ordered list numbered {m.group(1)} at position {len(items) + 1}")
+            cur = [m.group(2)]
+        elif cur is not None and ln.startswith(" ") and ln.strip():
+            cur.append(ln)
+        elif cur is not None and not ln.strip():
+            continue
+        elif cur is not None:
+            items.append(norm(" ".join(cur)))
+            cur = None
+            done = True
+    if cur is not None:
+        items.append(norm(" ".join(cur)))
+    return items
+
+
+def table(body: str, first_header: str) -> list[list[str]]:
+    """Rows of the first Markdown table whose first header cell is first_header."""
+    lines = body.split("\n")
+    for i, ln in enumerate(lines):
+        if ln.startswith("|"):
+            cells = split_row(ln)
+            if cells and cells[0] == first_header and i + 1 < len(lines) and re.match(r"^\|[\s\-:|]+\|$", lines[i + 1]):
+                rows = []
+                for r in lines[i + 2:]:
+                    if not r.startswith("|"):
+                        break
+                    rows.append(split_row(r))
+                return rows
+    raise Failure(f"text: table headed {first_header!r} not found")
+
+
+def split_row(ln: str) -> list[str]:
+    inner = ln.strip()[1:-1]
+    cells, cur, i = [], "", 0
+    while i < len(inner):
+        if inner[i] == "\\" and i + 1 < len(inner) and inner[i + 1] == "|":
+            cur += "|"
+            i += 2
+            continue
+        if inner[i] == "|":
+            cells.append(cur.strip())
+            cur = ""
+        else:
+            cur += inner[i]
+        i += 1
+    cells.append(cur.strip())
+    return cells
+
+
+def ticks(s: str) -> list[str]:
+    return re.findall(r"`([^`]*)`", s)
+
+
+def one(pattern: str, text: str, where: str) -> re.Match:
+    m = re.search(pattern, norm(text))
+    if not m:
+        raise Failure(f"text: {where}: {pattern!r} not found")
+    return m
+
+
+def load_texts() -> dict[str, str]:
+    return {k: p.read_text(encoding="utf-8") for k, p in TEXT_FILES.items()}
+
+
+def build_model(texts: dict[str, str]) -> dict:
+    flat = {k: norm(v) for k, v in texts.items()}
+    for key, sentence in PINS:
+        if norm(sentence) not in flat[key]:
+            raise Failure(f"text: pinned sentence missing from {TEXT_FILES[key].relative_to(ROOT)}: {sentence!r}")
+    ad = texts["ad"]
+    m: dict = {}
+
+    # Identities (runtime-posture/v1 cites)
+    ident = section(texts["posture"], "Identities", 2)
+    m["spki_prefix"] = bytes.fromhex(one(r"12-byte prefix `([0-9a-f]{24})`", ident, "posture Identities").group(1))
+    m["key_identity_re"] = "^sha256:[0-9a-f]{64}$"
+    one(r"`sha256:` followed by the (64) lowercase hex characters", ident, "posture Identities")
+
+    # Records: integers
+    recs = section(ad, "Records", 2)
+    g = one(r"every integer a JSON integer token from `(\d+)` to 2\^(\d+) − (\d+)", recs, "Records integers")
+    m["int_min"] = int(g.group(1))
+    m["int_max"] = 2 ** int(g.group(2)) - int(g.group(3))
+
+    # Member tables
+    def members(title: str) -> list[tuple[str, str]]:
+        rows = table(section(ad, title, 3), "Member")
+        out = []
+        for r in rows:
+            names = ticks(r[0])
+            if len(names) != 1:
+                raise Failure(f"text: {title}: member cell {r[0]!r}")
+            out.append((names[0], r[1]))
+        return out
+
+    sub = members("Submission observation")
+    tal = members("Withholding tally")
+    m["submission_members"] = [n for n, _ in sub]
+    m["tally_members"] = [n for n, _ in tal]
+    sd, td = dict(sub), dict(tal)
+    m["kind_submission"] = ticks(sd["kind"])[0].strip('"')
+    m["kind_tally"] = ticks(td["kind"])[0].strip('"')
+
+    def pat(cell: str) -> str:
+        ps = [p for p in ticks(cell) if p.startswith("^") and p.endswith("$")]
+        if len(ps) != 1:
+            raise Failure(f"text: pattern cell {cell!r}")
+        return ps[0]
+
+    m["patterns"] = {
+        "device_id": pat(sd["device_id"]),
+        "alert_id": pat(sd["alert_id"]),
+        "delivery_attempt_id": pat(sd["delivery_attempt_id"]),
+        "class": pat(sd["class"]),
+        "month": pat(td["month"]),
+    }
+    if not re.fullmatch(r"As above\.", td["device_id"]) or not re.fullmatch(r"As above, or `null`\.", td["class"]):
+        raise Failure("text: tally's device_id/class rows changed")
+    if "or `null`" not in sd["class"]:
+        raise Failure("text: class row no longer admits null")
+    m["v"] = int(one(r"The integer `(\d+)`\.", sd["v"], "v row").group(1))
+    if td["v"] != sd["v"]:
+        raise Failure("text: tally v row differs")
+    m["notices"] = ticks(sd["notice"])[:3]
+    m["channels"] = ticks(sd["channel"])
+    if ticks(td["channel"]) != m["channels"]:
+        raise Failure("text: tally channel set differs")
+    m["obs_seqs"] = [int(x) for x in ticks(sd["observation_seq"])[:3]]
+    m["attempt_seq_min"] = int(one(r"at least `(\d+)`", sd["attempt_seq"], "attempt_seq").group(1))
+    m["count_min"] = int(one(r"at least `(\d+)`", td["count"], "count").group(1))
+    m["tally_reasons"] = ticks(td["reason"])
+    m["outcome_members"] = ticks(sd["outcome"])
+    m["prior_null_when"] = int(one(r"`null` when `observation_seq` is `(\d+)`", sd["prior_outcome"], "prior_outcome").group(1))
+    one(r"canonical padded RFC 4648 Base64 of its (64) bytes", sd["signature"], "signature")
+
+    # Outcomes table
+    outs = section(ad, "Outcomes", 2)
+    m["outcomes"] = [ticks(r[0])[0] for r in table(outs, "Outcome")]
+    m["reserved_outcome"] = one(r"\*\*`(\w+)` is reserved\.\*\*", outs, "reserved").group(1)
+    m["outcome_refused"] = one(r"or any value not in the table, is refused as `(\w+)`", outs, "outcome refusal").group(1)
+    obs = section(ad, "Observations of one attempt", 3)
+    rows = table(obs, "`observation_seq`")
+    m["obs_table"] = []
+    for r in rows:
+        seq = int(ticks(r[0])[0])
+        prior = ticks(r[1])[0]
+        prior = None if prior == "null" else prior
+        head, _, cond = r[2].partition(", and only when ")
+        permitted = ticks(head)
+        if cond and cond != "the attempt's second observation followed an `unconfirmed`":
+            raise Failure(f"text: observation table condition changed: {cond!r}")
+        m["obs_table"].append((seq, prior, tuple(permitted), cond))
+    m["transition_refused"] = one(r"Any other combination is refused as `(\w+)`", obs, "transition").group(1)
+    m["ends"] = one(r"`(\w+)` ends an attempt", obs, "ends").group(1)
+
+    # Notices
+    nots = section(ad, "Notices", 2)
+    mand = one(r"`(\w+)` and `(\w+)` are \*\*mandatory\*\*", nots, "mandatory")
+    m["mandatory"] = [mand.group(1), mand.group(2)]
+    m["optional_notice"] = [n for n in m["notices"] if n not in m["mandatory"]]
+
+    # Class
+    cls = section(ad, "Class", 2)
+    m["class_refused"] = one(r"a mandatory notice with a non-`null` class is refused as `(\w+)`", cls, "class").group(1)
+    g = one(r"In a tally, `reason: \"(\w+)\"` with `class: null` is refused as `(\w+)`", cls, "tally class")
+    m["class_needs"] = g.group(1)
+    if g.group(2) != m["class_refused"]:
+        raise Failure("text: two class refusal names")
+
+    # Detail codes
+    det = section(ad, "Detail codes", 2)
+    m["detail_table"] = {}
+    for r in table(det, "`outcome`"):
+        codes = ticks(r[1])
+        m["detail_table"][ticks(r[0])[0]] = [None if c == "null" else c for c in codes]
+    g = one(r"`(\w+)` is permitted only when `prior_outcome` is `(\w+)`\. Any other value, or a code that is not permitted for the outcome, is refused as `(\w+)`", det, "detail")
+    m["detail_prior_only"] = (g.group(1), g.group(2))
+    m["detail_refused"] = g.group(3)
+
+    # Tallies: the bound
+    wt = section(ad, "Withholding tallies", 2)
+    g = one(r"at most (\d+) distinct class names on each channel", wt, "tally bound")
+    m["tally_class_names"] = int(g.group(1))
+    g = one(r"at most (\d+) `(\w+)` tallies and (\d+) `(\w+)` tallies, and a runtime keeps at most \((\d+) \+ (\d+)\) × (\d+) channels × (\d+) months = (\d+) tallies", wt, "tally bound")
+    m["tally_bound"] = {
+        "disabled_per": int(g.group(1)), "disabled_name": g.group(2),
+        "capped_per": int(g.group(3)), "capped_name": g.group(4),
+        "a": int(g.group(5)), "b": int(g.group(6)), "channels": int(g.group(7)), "months": int(g.group(8)),
+        "total": int(g.group(9)),
+    }
+    tb = m["tally_bound"]
+    if not (tb["disabled_per"] == m["tally_class_names"] and tb["capped_per"] == m["tally_class_names"] + 1
+            and tb["a"] == tb["disabled_per"] and tb["b"] == tb["capped_per"]
+            and tb["channels"] == len(m["channels"]) and tb["months"] == 2
+            and tb["total"] == (tb["a"] + tb["b"]) * tb["channels"] * tb["months"]
+            and [tb["disabled_name"], tb["capped_name"]] == m["tally_reasons"]):
+        raise Failure(f"text: the tally bound's arithmetic does not hold: {tb}")
+    g = one(r"A count that reaches 2\^(\d+) − (\d+) stays there", wt, "overflow")
+    m["count_max"] = 2 ** int(g.group(1)) - int(g.group(2))
+    if m["count_max"] != m["int_max"]:
+        raise Failure("text: tally overflow differs from the integer maximum")
+    pub = section(ad, "Publication", 2)
+    g = one(r"so the queue holds at most one snapshot per tally key, and at most (\d+) in all", pub, "queue tallies")
+    if int(g.group(1)) != tb["total"]:
+        raise Failure("text: publication's tally bound differs from Withholding tallies'")
+    g = one(r"the queue reserves (\d+) places for tallies", pub, "reserved places")
+    if int(g.group(1)) != tb["total"]:
+        raise Failure("text: reserved tally places differ from the tally bound")
+
+    # Signature prefixes
+    sig = section(ad, "Signature", 2)
+    m["record_prefix"] = one(r"The signing input is the ASCII bytes `([a-z0-9._]+)`, one NUL byte", sig, "signature").group(1).encode() + b"\x00"
+
+    # Carriage: the gateway's checks
+    cc = section(ad, "Carriage and custody", 2)
+    items = numbered(cc)
+    if len(items) != 7:
+        raise Failure(f"text: carriage lists {len(items)} checks")
+    gw = []
+    for i, it in enumerate(items, 1):
+        reasons = [t for t in ticks(it) if re.fullmatch(r"[a-z_]+", t) and t not in ("device_id", "outcome", "gateway.device_ids")]
+        gw.append((i, it, reasons))
+    m["gw_checks"] = gw
+    m["gw_reason"] = {3: gw[2][2][-1], 4: gw[3][2][-1], 5: gw[4][2][-1], 6: gw[5][2][-1]}
+    if not re.search(r"`outcome` one of the values \*Submission observation\* lists", items[3]):
+        raise Failure("text: check 4's outcome clause changed")
+    g7 = [t for t in gw[6][2]]
+    m["gw_replayed"] = g7[0]
+    m["gw_store_unavailable"] = g7[-1]
+    m["ack_outcomes"] = one(r"`outcome` is `(\w+)` for a commit or a `(\w+)` record, and `(\w+)` otherwise, with `reason` the check's reason, `(\w+)` or `(\w+)`", cc, "ack").groups()
+    m["ack_unanswered_check"] = int(one(r"A message refused at check (\d) is not acknowledged", cc, "ack").group(1))
+    m["ack_from"] = tuple(int(x) for x in one(r"or a refusal at checks (\d) to (\d) for a configured device", cc, "ack").groups())
+
+    # Verifying: the receiver's checks
+    ver = section(ad, "Verifying", 2)
+    items = numbered(ver)
+    if len(items) != 6:
+        raise Failure(f"text: verifying lists {len(items)} checks")
+    m["rx_check1"] = tuple(int(x) for x in one(r"^Checks (\d) to (\d) of", items[0], "rx 1").groups())
+    m["rx_reasons"] = {
+        2: [t for t in ticks(items[1]) if t == "not_owned" or t.endswith("_owned")],
+        3: [ticks(items[2])[-1]],
+        4: [ticks(items[3])[-1]],
+        5: [t for t in ticks(items[4])],
+        6: [t for t in ticks(items[5])],
+    }
+    m["rx_check3_text"] = items[2]
+    m["rx_check5_text"] = items[4]
+    m["rx_check6_text"] = items[5]
+    if not re.fullmatch(r"The rules of \[Outcomes\]\(#outcomes\), \[Notices\]\(#notices\), \[Class\]\(#class\) and \[Detail codes\]\(#detail-codes\): `\w+`, `\w+`, `\w+` or `\w+`\.", items[4]):
+        raise Failure(f"text: receiver check 5 changed: {items[4]!r}")
+    m["rx5"] = ticks(items[4])
+    for r in (m["outcome_refused"], m["transition_refused"], m["class_refused"], m["detail_refused"]):
+        if r not in m["rx5"]:
+            raise Failure(f"text: {r} is not among receiver check 5's reasons")
+    m["rx6"] = one(r"identical bytes are `(\w+)`\. Different bytes under a held identity, or a record that breaks \[Consistency across records\]\(#consistency-across-records\) against one held, are `(\w+)`\. A tally whose count is below the greatest held for its key is `(\w+)`", items[5], "rx 6").groups()
+
+    # Enrolment proof
+    kt = section(ad, "Key trust", 2)
+    pr = kt[kt.index("**The enrolment proof.**"):]
+    m["nonce"] = tuple(int(x) for x in one(r"a nonce: (\d+) to (\d+) lowercase hexadecimal characters", pr, "nonce").groups())
+    m["enrol_prefix"] = one(r"the ASCII bytes `([a-z0-9._]+)`, one NUL byte", pr, "enrol prefix").group(1).encode() + b"\x00"
+    blk = re.search(r"```json\n(.*?)\n```", pr, re.S)
+    m["enrol_members"] = sorted(json.loads(blk.group(1)).keys())
+    m["enrol_v"] = json.loads(blk.group(1))["v"]
+    m["enrol_purpose"] = one(r"`purpose` is the constant `(\w+)`", pr, "purpose").group(1)
+    if json.loads(blk.group(1))["purpose"] != m["enrol_purpose"]:
+        raise Failure("text: enrolment example purpose differs from the constant")
+    items = numbered(pr)
+    if len(items) != 5:
+        raise Failure(f"text: the enrolment proof lists {len(items)} refusals")
+    m["enrol_order"] = [ticks(it)[-1] for it in items]
+    m["enrol_items"] = items
+
+    # Config load rules (gateway-config/v2 alert_delivery)
+    gc = section(texts["gateway_config"], "`alert_delivery`", 2)
+    rows = table(gc, "Key")
+    keys = {ticks(r[0])[0]: r for r in rows}
+    m["cfg_keys"] = list(keys)
+    m["cfg_default_max"] = int(ticks(keys["max_records_per_device"][2])[0])
+    g = one(r"^(\d+) to (\d+)\.", keys["max_records_per_device"][4], "max_records range")
+    m["cfg_range"] = (int(g.group(1)), int(g.group(2)))
+    m["cfg_enabled_default"] = ticks(keys["enabled"][2])[0]
+    items = numbered(gc)
+    if len(items) != 4:
+        raise Failure(f"text: alert_delivery lists {len(items)} load rules")
+    m["cfg_rules"] = [re.match(r"`(\w+)`:", it).group(1) for it in items]
+    m["cfg_items"] = items
+    g = one(r"not an integer from (\d+) to (\d+)", items[3], "range rule")
+    if (int(g.group(1)), int(g.group(2))) != m["cfg_range"]:
+        raise Failure("text: the range rule and the table disagree")
+    for want, it in (("absent or empty", items[0]), ("does not begin with `/`", items[1]),
+                     ("the state directory, `evidence.queue_directory` or `evidence.return_queue_directory`", items[2])):
+        if want not in it:
+            raise Failure(f"text: config rule changed: {it!r}")
+
+    # gateway-api/v2 payload size
+    g = one(r"\| `ori/\{device_id\}/runtime/alert-delivery` \| Runtime -> Gateway \| (\d+) \|", texts["gateway_api"], "payload size")
+    m["payload_max"] = int(g.group(1))
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Ed25519: this script's own arithmetic, from ed25519-key-admission/v1 and
+# ed25519-verification/v1, cross-checked against OpenSSL via `cryptography`.
+# ---------------------------------------------------------------------------
+
+Q = 2 ** 255 - 19
+ORDER = 2 ** 252 + 27742317777372353535851937790883648493
+CURVE_D = (-121665 * pow(121666, Q - 2, Q)) % Q
+I_SQRT = pow(2, (Q - 1) // 4, Q)
+ZERO_PT = (0, 1, 1, 0)
+
+
+def pt_add(a: tuple, b: tuple) -> tuple:
+    x1, y1, z1, t1 = a
+    x2, y2, z2, t2 = b
+    p1 = (y1 - x1) * (y2 - x2) % Q
+    p2 = (y1 + x1) * (y2 + x2) % Q
+    p3 = t1 * 2 * CURVE_D * t2 % Q
+    p4 = z1 * 2 * z2 % Q
+    e, f, g, h = p2 - p1, p4 - p3, p4 + p3, p2 + p1
+    return (e * f % Q, g * h % Q, f * g % Q, e * h % Q)
+
+
+def pt_mul(n: int, pt: tuple) -> tuple:
+    out = ZERO_PT
+    while n > 0:
+        if n & 1:
+            out = pt_add(out, pt)
+        pt = pt_add(pt, pt)
+        n >>= 1
+    return out
+
+
+def pt_is_zero(pt: tuple) -> bool:
+    return pt[0] % Q == 0 and (pt[1] - pt[2]) % Q == 0
+
+
+def pt_bytes(pt: tuple) -> bytes:
+    zi = pow(pt[2], Q - 2, Q)
+    x, y = pt[0] * zi % Q, pt[1] * zi % Q
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def pt_from(raw: bytes) -> tuple[str | None, tuple | None]:
+    v = int.from_bytes(raw, "little")
+    sign, y = v >> 255, v & ((1 << 255) - 1)
+    if y >= Q:
+        return "non_canonical", None
+    u = (y * y - 1) % Q
+    w = (CURVE_D * y * y + 1) % Q
+    xx = u * pow(w, Q - 2, Q) % Q
+    x = pow(xx, (Q + 3) // 8, Q)
+    if (x * x - xx) % Q != 0:
+        x = x * I_SQRT % Q
+    if (x * x - xx) % Q != 0:
+        return "off_curve", None
+    if x == 0 and sign == 1:
+        return "invalid_sign", None
+    if x & 1 != sign:
+        x = Q - x
+    return None, (x, y, 1, x * y % Q)
+
+
+G = pt_from((4 * pow(5, Q - 2, Q) % Q).to_bytes(32, "little"))[1]
+
+
+@functools.lru_cache(maxsize=None)
+def admit(raw: bytes) -> str | None:
+    if len(raw) != 32:
+        return "length"
+    why, pt = pt_from(raw)
+    if why:
+        return why
+    if pt_is_zero(pt_mul(8, pt)):
+        return "small_order"
+    if not pt_is_zero(pt_mul(ORDER, pt)):
+        return "mixed_order"
+    return None
+
+
+def mine_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    if admit(pub) or len(sig) != 64:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= ORDER:
+        return False
+    r = sig[:32]
+    if pt_from(r)[0]:
+        return False
+    a = pt_from(pub)[1]
+    k = int.from_bytes(hashlib.sha512(r + pub + msg).digest(), "little")
+    minus_a = ((-a[0]) % Q, a[1], a[2], (-a[3]) % Q)
+    return pt_bytes(pt_add(pt_mul(s, G), pt_mul(k, minus_a))) == r
+
+
+def openssl_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    try:
+        Ed25519PublicKey.from_public_bytes(pub).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+@functools.lru_cache(maxsize=None)
+def ed_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    """ed25519-verification/v1 behind ed25519-key-admission/v1; both verifiers must agree."""
+    if admit(pub):
+        return False
+    a, b = mine_verify(pub, msg, sig), openssl_verify(pub, msg, sig)
+    if a != b:
+        raise Failure(f"verifiers disagree under {pub.hex()}: own {a}, OpenSSL {b}")
+    return a
+
+
+def seed_public(seed: bytes) -> bytes:
+    h = hashlib.sha512(seed).digest()
+    s = int.from_bytes(h[:32], "little")
+    s = (s & ((1 << 254) - 8)) | (1 << 254)
+    return pt_bytes(pt_mul(s, G))
+
+
+def openssl_public(seed: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    return Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+
+
+def openssl_spki(seed: bytes) -> bytes:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    return Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+
+
+def key_identity_of(raw: bytes, model: dict) -> str:
+    return "sha256:" + hashlib.sha256(model["spki_prefix"] + raw).hexdigest()
+
+
+def recognised(raw: bytes) -> bytes:
+    return raw[:31] + bytes([raw[31] & 0x7F])
+
+
+def b64_exact(s: object, n: int) -> bytes | None:
+    """Canonical padded RFC 4648 Base64 of exactly n bytes, or None."""
+    if not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9+/]*={0,2}", s) or len(s) % 4:
+        return None
+    try:
+        raw = base64.b64decode(s, validate=True)
+    except ValueError:
+        return None
+    if len(raw) != n or base64.b64encode(raw).decode("ascii") != s:
+        return None
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# JSON: a strict reader that keeps number tokens and reports duplicate names,
+# and the canonical form of gateway-mqtt-canonical-json/v1.
+# ---------------------------------------------------------------------------
+
+class Tok:
+    __slots__ = ("text",)
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Tok) and other.text == self.text
+
+    def __hash__(self) -> int:
+        return hash(("tok", self.text))
+
+    def __repr__(self) -> str:
+        return f"Tok({self.text})"
+
+
+class BadJSON(Exception):
+    pass
+
+
+class JReader:
+    WS = " \t\n\r"
+
+    def __init__(self, s: str):
+        self.s, self.i = s, 0
+        self.dupes = False
+
+    def ws(self) -> None:
+        while self.i < len(self.s) and self.s[self.i] in self.WS:
+            self.i += 1
+
+    def value(self, depth: int) -> object:
+        if depth > 32:
+            raise BadJSON("nesting")
+        self.ws()
+        if self.i >= len(self.s):
+            raise BadJSON("end")
+        c = self.s[self.i]
+        if c == "{":
+            self.i += 1
+            out: dict = {}
+            self.ws()
+            if self.s[self.i:self.i + 1] == "}":
+                self.i += 1
+                return out
+            while True:
+                self.ws()
+                k = self.string()
+                self.ws()
+                if self.s[self.i:self.i + 1] != ":":
+                    raise BadJSON("colon")
+                self.i += 1
+                v = self.value(depth + 1)
+                if k in out:
+                    self.dupes = True
+                out[k] = v
+                self.ws()
+                c = self.s[self.i:self.i + 1]
+                self.i += 1
+                if c == "}":
+                    return out
+                if c != ",":
+                    raise BadJSON("object")
+        if c == "[":
+            self.i += 1
+            arr: list = []
+            self.ws()
+            if self.s[self.i:self.i + 1] == "]":
+                self.i += 1
+                return arr
+            while True:
+                arr.append(self.value(depth + 1))
+                self.ws()
+                c = self.s[self.i:self.i + 1]
+                self.i += 1
+                if c == "]":
+                    return arr
+                if c != ",":
+                    raise BadJSON("array")
+        if c == '"':
+            return self.string()
+        for word, val in (("true", True), ("false", False), ("null", None)):
+            if self.s.startswith(word, self.i):
+                self.i += len(word)
+                return val
+        m = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?").match(self.s, self.i)
+        if not m or not m.group(0) or m.group(0) == "-":
+            raise BadJSON("value")
+        self.i = m.end()
+        return Tok(m.group(0))
+
+    def string(self) -> str:
+        if self.s[self.i:self.i + 1] != '"':
+            raise BadJSON("string")
+        self.i += 1
+        out = []
+        while True:
+            if self.i >= len(self.s):
+                raise BadJSON("unterminated")
+            c = self.s[self.i]
+            if c == '"':
+                self.i += 1
+                return "".join(out)
+            if ord(c) < 0x20:
+                raise BadJSON("control")
+            if c == "\\":
+                e = self.s[self.i + 1:self.i + 2]
+                simple = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+                if e in simple:
+                    out.append(simple[e])
+                    self.i += 2
+                    continue
+                if e == "u":
+                    h = self.s[self.i + 2:self.i + 6]
+                    if not re.fullmatch(r"[0-9a-fA-F]{4}", h):
+                        raise BadJSON("escape")
+                    cp = int(h, 16)
+                    self.i += 6
+                    if 0xD800 <= cp <= 0xDBFF:
+                        h2 = self.s[self.i:self.i + 6]
+                        if re.fullmatch(r"\\u[dD][c-fC-F][0-9a-fA-F]{2}", h2):
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (int(h2[2:], 16) - 0xDC00)
+                            self.i += 6
+                        else:
+                            raise BadJSON("lone surrogate")
+                    elif 0xDC00 <= cp <= 0xDFFF:
+                        raise BadJSON("lone surrogate")
+                    out.append(chr(cp))
+                    continue
+                raise BadJSON("escape")
+            out.append(c)
+            self.i += 1
+
+
+def parse_payload(raw: bytes) -> tuple[str | None, object]:
+    """gateway-api/v2 checks 1 and 2 as far as this corpus needs them: the
+    payload is read only if it passes; returns (refusal, value)."""
+    try:
+        s = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "invalid_unicode", None
+    r = JReader(s)
+    try:
+        v = r.value(1)
+    except BadJSON as e:
+        return f"json:{e}", None
+    except IndexError:
+        return "json:end", None
+    r.ws()
+    if r.i != len(s):
+        return "trailing_data", None
+    if r.dupes:
+        return "duplicate_member", None
+    if not isinstance(v, dict):
+        return "not_an_object", None
+    fold = [k.lower().replace("ſ", "s").replace("K", "k") for k in v]
+    if len(set(fold)) != len(fold):
+        return "case_variant_member", None
+    return None, v
+
+
+def canon_str(s: str) -> str:
+    out = ['"']
+    short = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for ch in s:
+        if ch in short:
+            out.append(short[ch])
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def canon(v: object) -> str:
+    if v is None:
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, Tok):
+        return v.text
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, str):
+        return canon_str(v)
+    if isinstance(v, list):
+        return "[" + ",".join(canon(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ",".join(canon_str(k) + ":" + canon(v[k]) for k in sorted(v)) + "}"
+    raise Failure(f"canon: {type(v)}")
+
+
+def canon_bytes(v: object) -> bytes:
+    return canon(v).encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Record judges. `mut` names a deliberately wrong rule (see JUDGE_MUTANTS).
+# ---------------------------------------------------------------------------
+
+def full(pattern: str, v: object, mut: frozenset, name: str) -> bool:
+    if not isinstance(v, str):
+        return False
+    body = pattern[1:-1] if pattern.startswith("^") and pattern.endswith("$") else pattern
+    if f"loose_pattern:{name}" in mut:
+        body = body.replace("{1,128}", "{1,129}").replace("{16,64}", "{15,65}").replace("{0,31}", "{0,32}")
+        body = body.replace("[A-Za-z0-9._-]", "[A-Za-z0-9._:-]").replace("[A-Za-z0-9_-]", "[A-Za-z0-9_.-]")
+        body = body.replace("(0[1-9]|1[0-2])", "(0[0-9]|1[0-2])").replace("^[a-z]", "^[a-z0-9]")
+        body = body.replace("[a-z][a-z0-9_]", "[a-z0-9_][a-z0-9_]")
+    if "dollar_pattern" in mut:
+        return re.match(pattern, v) is not None
+    return re.fullmatch(body, v) is not None
+
+
+def int_ok(v: object, lo: int, hi: int, model: dict, mut: frozenset) -> bool:
+    if not isinstance(v, Tok):
+        return "int_bool_ok" in mut and isinstance(v, bool)
+    t = v.text
+    if not re.fullmatch(r"0|[1-9][0-9]*", t):
+        if "int_spelling_ok" in mut and re.fullmatch(r"[0-9]+(\.0+)?(e0)?", t):
+            t = str(int(float(t)))
+        else:
+            return False
+    n = int(t)
+    if "int_no_max" in mut:
+        hi = 2 ** 64
+    if "int_no_min" in mut:
+        lo = 0
+    return lo <= n <= hi
+
+
+def form_faults(obj: dict, model: dict, mut: frozenset) -> list[str]:
+    """Check 4 of Carriage and custody: every way the object is not a record."""
+    f: list[str] = []
+    kind = obj.get("kind")
+    if kind == model["kind_submission"]:
+        want = model["submission_members"]
+    elif kind == model["kind_tally"]:
+        want = model["tally_members"]
+    else:
+        return ["kind"]
+    have = set(obj)
+    if "members_extra_ok" in mut:
+        missing = set(want) - have
+        if missing:
+            f.append(f"members:{sorted(missing)}")
+    elif have != set(want):
+        f.append(f"members:{sorted(have ^ set(want))}")
+    P = model["patterns"]
+    lo, hi = model["int_min"], model["int_max"]
+
+    def chk(name: str, ok: bool) -> None:
+        if name in obj and not ok and f"skip_form:{name}" not in mut:
+            f.append(name)
+
+    g = obj.get
+    chk("v", int_ok(g("v"), model["v"], model["v"], model, mut) or ("v_any" in mut and int_ok(g("v"), lo, hi, model, mut)))
+    chk("device_id", full(P["device_id"], g("device_id"), mut, "device_id"))
+    chk("key_identity", full(model["key_identity_re"], g("key_identity"), mut, "key_identity"))
+    chk("class", g("class") is None or full(P["class"], g("class"), mut, "class"))
+    chk("channel", g("channel") in model["channels"])
+    chk("issued_at_ms", int_ok(g("issued_at_ms"), lo, hi, model, mut))
+    chk("signature", b64_exact(g("signature"), 64) is not None or ("sig_form_loose" in mut and isinstance(g("signature"), str)))
+    if kind == model["kind_submission"]:
+        chk("alert_id", full(P["alert_id"], g("alert_id"), mut, "alert_id"))
+        chk("delivery_attempt_id", full(P["delivery_attempt_id"], g("delivery_attempt_id"), mut, "delivery_attempt_id"))
+        chk("notice", g("notice") in model["notices"])
+        chk("attempt_seq", int_ok(g("attempt_seq"), model["attempt_seq_min"], hi, model, mut))
+        chk("attempted_at_ms", int_ok(g("attempted_at_ms"), lo, hi, model, mut))
+        seqs = model["obs_seqs"]
+        chk("observation_seq", int_ok(g("observation_seq"), min(seqs), max(seqs) + (1 if "obs_seq_4" in mut else 0), model, mut))
+        outs = model["outcome_members"]
+        if "outcome_open" in mut:
+            chk("outcome", isinstance(g("outcome"), str))
+        else:
+            chk("outcome", g("outcome") in outs)
+        chk("prior_outcome", g("prior_outcome") is None or g("prior_outcome") in outs)
+        d = g("detail")
+        chk("detail", d is None or (isinstance(d, str) and re.fullmatch(r"[\x20-\x7e]*", d) is not None and '"' not in d and "\\" not in d))
+    else:
+        chk("reason", g("reason") in model["tally_reasons"])
+        chk("month", full(P["month"], g("month"), mut, "month"))
+        chk("count", int_ok(g("count"), model["count_min"], model["count_max"], model, mut))
+    return f
+
+
+def rule5_faults(obj: dict, model: dict, mut: frozenset) -> list[str]:
+    """Receiver check 5, every rule that fails, in the order check 5 names its reasons."""
+    out: dict[str, bool] = {}
+    if obj.get("kind") == model["kind_submission"]:
+        oc, pr, seq, det = obj.get("outcome"), obj.get("prior_outcome"), obj.get("observation_seq"), obj.get("detail")
+        seqn = int(seq.text) if isinstance(seq, Tok) and re.fullmatch(r"[0-9]+", seq.text) else None
+        out[model["outcome_refused"]] = oc not in model["outcomes"] and "no_outcome_rule" not in mut
+        rows = model["obs_table"]
+        if "transition_any_seq" in mut:
+            ok = any(p == pr and oc in perm for _, p, perm, _ in rows)
+        elif "transition_any_prior" in mut:
+            ok = any(s == seqn and oc in perm for s, _, perm, _ in rows)
+        else:
+            ok = any(s == seqn and p == pr and oc in perm for s, p, perm, _ in rows)
+        if "after_failed_ok" in mut and pr == model["ends"]:
+            ok = True
+        out[model["transition_refused"]] = not ok and "no_transition_rule" not in mut
+        cls_bad = obj.get("notice") in model["mandatory"] and obj.get("class") is not None
+        if "class_any_mandatory_ok" in mut:
+            cls_bad = False
+        if "class_optional_null_refused" in mut:
+            cls_bad = cls_bad or (obj.get("notice") not in model["mandatory"] and obj.get("class") is None)
+        out[model["class_refused"]] = cls_bad
+        table = model["detail_table"]
+        if "detail_any_outcome" in mut:
+            allowed = {c for cs in table.values() for c in cs}
+        else:
+            allowed = set(table.get(oc, []))
+        bad = det not in allowed
+        code, prior_needed = model["detail_prior_only"]
+        if det == code and pr != prior_needed and "detail_prior_any" not in mut:
+            bad = True
+        if "no_detail_rule" in mut:
+            bad = False
+        out[model["detail_refused"]] = bad
+    else:
+        bad = obj.get("reason") == model["class_needs"] and obj.get("class") is None
+        if "tally_class_ok" in mut:
+            bad = False
+        if "tally_capped_needs_class" in mut and obj.get("class") is None:
+            bad = True
+        out[model["class_refused"]] = bad
+    order = list(model["rx5"])
+    if "rx5_reversed" in mut:
+        order.reverse()
+    return [r for r in order if out.get(r)]
+
+
+def signing_input(obj: dict, model: dict, mut: frozenset) -> bytes:
+    body = {k: v for k, v in obj.items() if k != "signature"}
+    if "sign_with_signature" in mut:
+        body = dict(obj)
+    prefix = model["record_prefix"]
+    if "no_prefix" in mut:
+        prefix = b""
+    return prefix + canon_bytes(body)
+
+
+class Ctx:
+    """One case's fixture: the gateway's configuration and topic, and the
+    receiver's forwarding registry and enrolment registry."""
+
+    def __init__(self, configured: list[str], topic_device: str, forwarder: str = "",
+                 registry: dict | None = None, enrolments: list | None = None,
+                 keyring: dict[str, bytes] | None = None):
+        self.configured = configured
+        self.topic_device = topic_device
+        self.forwarder = forwarder
+        self.registry = registry or {}
+        self.enrolments = enrolments or []   # (device_id, public key, purpose)
+        self.keyring = keyring or {}         # key_identity -> public key of every disclosed test key
+
+
+def gateway_faults(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> tuple[list[str], dict | None]:
+    """Every failing gateway check from 1 to 6, in order (precedence list),
+    and the parsed object when there is one."""
+    f: list[str] = []
+    if len(raw) > model["payload_max"]:
+        return ["payload_too_large"], None
+    why, obj = parse_payload(raw)
+    if why:
+        return [why], None
+    checks: list[tuple[int, Callable[[], bool]]] = [
+        (3, lambda: canon_bytes(obj) != raw),
+        (4, lambda: bool(form_faults(obj, model, mut))),
+        (5, lambda: ctx.topic_device not in ctx.configured),
+        (6, lambda: obj.get("device_id") != ctx.topic_device),
+    ]
+    if "gw_swap_3_4" in mut:
+        checks[0], checks[1] = checks[1], checks[0]
+    if "gw_swap_4_6" in mut:
+        checks[1], checks[3] = checks[3], checks[1]
+    for n, c in checks:
+        if f"gw_drop_{n}" in mut:
+            continue
+        if c():
+            f.append(model["gw_reason"][n])
+    return f, obj
+
+
+def receiver_faults(raw: bytes, obj: dict, ctx: Ctx, model: dict, mut: frozenset) -> tuple[list[str], bytes | None]:
+    """Every failing receiver rule of checks 2 to 5, in order, and the
+    enrolled key that verified the record when it passed checks 3 and 4."""
+    f: list[str] = []
+    dev, ki = obj.get("device_id"), obj.get("key_identity")
+    owned = isinstance(dev, str) and dev in ctx.registry.get(ctx.forwarder, [])
+    if not owned and "rx_drop:2" not in mut:
+        f.append(model["rx_reasons"][2][0])
+    pubs = [pub for d, pub, purpose in ctx.enrolments
+            if (d == dev or "enrol_any_device" in mut)
+            and (purpose == model["enrol_purpose"] or "enrol_any_purpose_rx" in mut)]
+    match = [pub for pub in pubs if key_identity_of(pub, model) == ki
+             or ("enrol_by_recognised" in mut and ki in ctx.keyring and recognised(ctx.keyring[ki]) == recognised(pub))]
+    bound = bool(match)
+    # Check 4 is judged under the enrolled key the record names; for a record
+    # already refused at check 3 it is judged under the test key the record
+    # names, so that a case refused at check 3 "alone" is one whose signature
+    # is otherwise good.
+    pub = match[0] if bound else ctx.keyring.get(ki) if isinstance(ki, str) else None
+    if "enrol_by_recognised" in mut and bound and isinstance(ki, str) and ki in ctx.keyring:
+        pub = ctx.keyring[ki]
+    steps: list[tuple[str, Callable[[], bool]]] = [
+        (model["rx_reasons"][3][0], lambda: not bound),
+        (model["rx_reasons"][4][0], lambda: not sig_ok(obj, pub, model, mut)),
+    ]
+    if "rx_swap_3_4" in mut:
+        steps.reverse()
+    for name, c in steps:
+        if f"rx_drop:{name}" in mut:
+            continue
+        if c():
+            f.append(name)
+    if "rx_drop:5" not in mut:
+        f += rule5_faults(obj, model, mut)
+    return f, (pub if bound else None)
+
+
+def sig_ok(obj: dict, pub: bytes | None, model: dict, mut: frozenset) -> bool:
+    if "no_signature_check" in mut:
+        return True
+    if pub is None:
+        return False
+    sig = b64_exact(obj.get("signature"), 64)
+    if sig is None:
+        return False
+    try:
+        msg = signing_input(obj, model, mut)
+    except Failure:
+        return False
+    return ed_verify(pub, msg, sig)
+
+
+# ---------------------------------------------------------------------------
+# Receiver check 6 and the reading (Consistency across records, Withholding
+# tallies, Reading a notice).
+# ---------------------------------------------------------------------------
+
+ATTEMPT_FIELDS = ["device_id", "key_identity", "alert_id", "notice", "class", "channel", "attempt_seq", "attempted_at_ms"]
+
+
+class Receiver:
+    """What a receiver holds after check 5: every verified record it kept
+    (held, or conflict kept beside the record it conflicts with), and for
+    each tally key and epoch the record with the greatest count."""
+
+    def __init__(self) -> None:
+        self.kept: list[tuple[bytes, dict, bytes, str]] = []  # (raw, obj, epoch, verdict)
+        self.tallies: dict[tuple, tuple[bytes, dict]] = {}
+        self.unsettled_alerts: set[tuple] = set()
+        self.unsettled_tallies: set[tuple] = set()
+
+    def judge(self, raw: bytes, obj: dict, epoch: bytes, model: dict, mut: frozenset) -> str:
+        dup, conflict, lower = model["rx6"]
+        pool = [k for k in self.kept if "conflicts_not_held" not in mut or k[3] != conflict]
+        if "no_duplicate" not in mut and any(k[0] == raw for k in pool):
+            return dup
+        if obj["kind"] == model["kind_submission"]:
+            other = self._submission(raw, obj, epoch, pool, model, mut)
+            if other is not None:
+                self.unsettled_alerts.add((epoch, obj["alert_id"]))
+                self.unsettled_alerts.add((other[2], other[1]["alert_id"]))
+                v = conflict
+            else:
+                v = "held"
+        else:
+            v = self._tally(raw, obj, epoch, model, mut) or "held"
+        if v not in (lower, dup):
+            self.kept.append((raw, obj, epoch, v))
+        return v
+
+    def _submission(self, raw, obj, epoch, pool, model, mut):
+        """The kept record this one conflicts with, or None."""
+        seq = int(obj["observation_seq"].text)
+        for k in pool:
+            r, o, e, _ = k
+            if o["kind"] != model["kind_submission"]:
+                continue
+            if "identity_per_epoch" in mut and e != epoch:
+                continue
+            same_attempt = o["delivery_attempt_id"] == obj["delivery_attempt_id"]
+            if same_attempt and "no_identity_rule" not in mut and o["observation_seq"] == obj["observation_seq"] and r != raw:
+                return k
+            if same_attempt and "no_attempt_fields_rule" not in mut:
+                fields = ATTEMPT_FIELDS if "attempt_fields_short" not in mut else ATTEMPT_FIELDS[:-2]
+                if any(o.get(fl) != obj.get(fl) for fl in fields):
+                    return k
+            if o["alert_id"] == obj["alert_id"] and "no_alert_rule" not in mut:
+                if o["notice"] != obj["notice"] or o["class"] != obj["class"]:
+                    return k
+            if (e == epoch or "attempt_seq_across_epochs" in mut) and o["attempt_seq"] == obj["attempt_seq"] \
+                    and not same_attempt and "no_attempt_seq_rule" not in mut:
+                return k
+            if same_attempt and "no_prior_rule" not in mut:
+                oseq = int(o["observation_seq"].text)
+                if oseq == seq - 1 and o["outcome"] != obj["prior_outcome"]:
+                    return k
+                if oseq == seq + 1 and o["prior_outcome"] != obj["outcome"] and "prior_one_way" not in mut:
+                    return k
+        return None
+
+    def tally_key(self, obj: dict, epoch: bytes, mut: frozenset) -> tuple:
+        key = (epoch if "tally_no_epoch" not in mut else b"", obj["channel"], obj["class"], obj["reason"], obj["month"])
+        if "tally_key_no_class" in mut:
+            key = key[:2] + key[3:]
+        return key
+
+    def _tally(self, raw, obj, epoch, model, mut) -> str | None:
+        dup, conflict, lower = model["rx6"]
+        key = self.tally_key(obj, epoch, mut)
+        held = self.tallies.get(key)
+        n = int(obj["count"].text)
+        if held is not None:
+            hn = int(held[1]["count"].text)
+            if n == hn and "no_tally_conflict" not in mut:
+                self.unsettled_tallies.add(key)
+                return conflict
+            if n < hn and "no_lower_count" not in mut:
+                return lower
+        if held is None or n > int(held[1]["count"].text) or "tally_last_wins" in mut:
+            self.tallies[key] = (raw, obj)
+        return None
+
+    def reading(self, model: dict, mut: frozenset) -> list[dict]:
+        """Reading a notice over the records held, per epoch and alert_id."""
+        conflict = model["rx6"][1]
+        per: dict[tuple, list] = {}
+        for _, o, e, v in self.kept:
+            if o["kind"] != model["kind_submission"]:
+                continue
+            if v == conflict and "reading_with_conflicts" not in mut:
+                continue
+            per.setdefault((e, o["alert_id"]), []).append(o)
+        out = []
+        for (e, a), obs in per.items():
+            chans: dict = {}
+            for ch in sorted({o["channel"] for o in obs}):
+                on = [o for o in obs if o["channel"] == ch or "channels_merged" in mut]
+                if "latest_by_issued" in mut:
+                    top = max(int(o["issued_at_ms"].text) for o in on)
+                    latest = [o for o in on if int(o["issued_at_ms"].text) == top]
+                elif "latest_by_arrival" in mut:
+                    latest = [on[-1]]
+                else:
+                    top = max(int(o["attempt_seq"].text) for o in on)
+                    latest = [o for o in on if int(o["attempt_seq"].text) == top]
+                pick = min if "latest_first_obs" in mut else max
+                st = pick(latest, key=lambda o: int(o["observation_seq"].text))["outcome"]
+                pool = latest if "ever_latest_only" in mut else on
+                ever = any(o["outcome"] == "accepted" for o in pool)
+                chans[ch] = {"latest_attempt_state": st, "ever_accepted": ever}
+            some = any(c["ever_accepted"] for c in chans.values())
+            if "some_channel_sms_only" in mut:
+                some = chans.get("sms", {}).get("ever_accepted", False)
+            out.append({"epoch": e, "alert_id": a, "channels": chans, "accepted_on_some_channel": some,
+                        "settled": (e, a) not in self.unsettled_alerts or "settled_always" in mut})
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Gateway custody (check 7) and the acknowledgement.
+# ---------------------------------------------------------------------------
+
+class Custody:
+    def __init__(self, configured: list[str], max_per_device: int, available: bool = True):
+        self.configured = configured
+        self.max = max_per_device
+        self.available = available
+        self.queue: dict[str, list[str]] = {}
+        self._held: dict[str, list] = {}
+
+    def receive(self, topic_device: str, raw: bytes, model: dict, mut: frozenset) -> tuple[str, dict | None]:
+        ctx = Ctx(self.configured, topic_device)
+        f, obj = gateway_faults(raw, ctx, model, mut)
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        q = self.queue.setdefault(topic_device, [])
+        if f:
+            verdict = f[0]
+        elif not self.available and "store_after_replay" not in mut:
+            verdict = model["gw_store_unavailable"]
+        elif digest in q and "no_replay" not in mut:
+            verdict = model["gw_replayed"]
+        elif "replay_by_identity" in mut and obj is not None and any(identity_of(o, model) == identity_of(obj, model) for o in self._objs(topic_device)):
+            verdict = model["gw_replayed"]
+        elif len(q) >= self.max + (1 if "queue_off_by_one" in mut else 0):
+            verdict = "queue_full"
+        else:
+            q.append(digest)
+            self._held.setdefault(topic_device, []).append(obj)
+            verdict = "queued"
+        return verdict, self.ack(topic_device, digest, verdict, model, mut)
+
+    def _objs(self, dev: str) -> list:
+        return self._held.get(dev, [])
+
+    def ack(self, dev: str, digest: str, verdict: str, model: dict, mut: frozenset) -> dict | None:
+        q_out, replayed, refused, qf, su = model["ack_outcomes"]
+        lo, hi = model["ack_from"]
+        reasons_acked = [model["gw_reason"][n] for n in range(lo, hi) if n in model["gw_reason"] and n != model["ack_unanswered_check"]]
+        if "ack_unknown_device" in mut:
+            reasons_acked.append(model["gw_reason"][5])
+        if verdict in ("queued", replayed):
+            return {"outcome": q_out, "reason": "", "record_digest": digest, "device_id": dev}
+        if verdict in reasons_acked or verdict in (qf, su, model["gw_replayed"]):
+            return {"outcome": refused, "reason": verdict, "record_digest": digest, "device_id": dev}
+        return None
+
+
+def identity_of(obj: dict, model: dict) -> tuple:
+    if obj.get("kind") == model["kind_submission"]:
+        return ("s", obj.get("delivery_attempt_id"), canon(obj.get("observation_seq")))
+    return ("t", obj.get("channel"), obj.get("class"), obj.get("reason"), obj.get("month"), canon(obj.get("count")))
+
+
+# ---------------------------------------------------------------------------
+# The enrolment proof (Key trust).
+# ---------------------------------------------------------------------------
+
+def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consumed: bool,
+                 device: str, pub: bytes, model: dict, mut: frozenset) -> list[str]:
+    order = model["enrol_order"]
+    r_malformed, r_nonce, r_device, r_key, r_sig = order
+    f: list[str] = []
+    why, obj = parse_payload(challenge)
+    malformed = why is not None
+    if not malformed:
+        lo, hi = model["nonce"]
+        malformed = (
+            canon_bytes(obj) != challenge and "enrol_noncanonical_ok" not in mut
+            or sorted(obj) != model["enrol_members"] and not ("enrol_extra_ok" in mut and set(model["enrol_members"]) <= set(obj))
+            or not int_ok(obj.get("v"), model["enrol_v"], model["enrol_v"], model, mut)
+            or (obj.get("purpose") != model["enrol_purpose"] and "enrol_any_purpose" not in mut)
+            or not full(model["patterns"]["device_id"], obj.get("device_id"), mut, "device_id")
+            or not full(model["key_identity_re"], obj.get("key_identity"), mut, "key_identity")
+            or not (full("^[0-9a-f]{%d,%d}$" % (lo, hi), obj.get("nonce"), mut, "nonce") or "enrol_nonce_form_any" in mut)
+        )
+    if malformed and "enrol_drop_1" not in mut:
+        f.append(r_malformed)
+        if obj is None:
+            return f
+    obj = obj or {}
+    tests = [
+        (r_nonce, obj.get("nonce") != issued_nonce or (consumed and "enrol_reuse_ok" not in mut)),
+        (r_device, obj.get("device_id") != device),
+        (r_key, obj.get("key_identity") != key_identity_of(pub, model)),
+        (r_sig, sig is None or not ed_verify(pub, model["enrol_prefix"] + challenge, sig) if "enrol_no_prefix" not in mut
+         else not ed_verify(pub, challenge, sig or b"")),
+    ]
+    if "enrol_swap_2_3" in mut:
+        tests[0], tests[1] = tests[1], tests[0]
+    if "enrol_swap_3_4" in mut:
+        tests[1], tests[2] = tests[2], tests[1]
+    for name, bad in tests:
+        if f"enrol_drop:{name}" in mut:
+            continue
+        if bad:
+            f.append(name)
+    return f
+
+
+# ---------------------------------------------------------------------------
+# gateway-config/v2 `alert_delivery` load rules.
+# ---------------------------------------------------------------------------
+
+WHITE_SPACE = set("\u0009\u000a\u000b\u000c\u000d \u0085  "
+                  "           "
+                  "    　")
+
+
+def ws_trim(s: str, mut: frozenset) -> str:
+    if "trim_python_strip" in mut:
+        return s.strip()
+    if "no_trim" in mut:
+        return s
+    i, j = 0, len(s)
+    while i < j and s[i] in WHITE_SPACE:
+        i += 1
+    while j > i and s[j - 1] in WHITE_SPACE:
+        j -= 1
+    return s[i:j]
+
+
+def clean(path: str, mut: frozenset) -> list[str]:
+    parts: list[str] = []
+    for c in path.split("/"):
+        if c in ("", "."):
+            continue
+        if c == ".." and "no_dotdot" not in mut:
+            if parts:
+                parts.pop()
+            continue
+        parts.append(c if "fold_case" not in mut else c.lower())
+    return parts
+
+
+def related(a: list[str], b: list[str], mut: frozenset) -> bool:
+    if "prefix_by_string" in mut:
+        sa, sb = "/" + "/".join(a), "/" + "/".join(b)
+        return sa.startswith(sb) or sb.startswith(sa)
+    n = min(len(a), len(b))
+    if "no_containing" in mut:
+        return len(a) >= len(b) and a[:len(b)] == b
+    return a[:n] == b[:n]
+
+
+def load_alert_delivery(cfg: dict, model: dict, mut: frozenset) -> str | None:
+    """cfg: {"alert_delivery": {...}, "state_directory": ..., "evidence": {...}};
+    returns the refused rule or None."""
+    r_req, r_abs, r_sep, r_range = model["cfg_rules"]
+    ad = cfg.get("alert_delivery") or {}
+    if ad.get("enabled") is not True and "validate_disabled" not in mut:
+        return None
+    qd = ad.get("queue_directory")
+    qd = ws_trim(qd, mut) if isinstance(qd, str) else qd
+    rules: list[tuple[str, Callable[[], bool]]] = []
+    rules.append((r_req, lambda: not isinstance(qd, str) or qd == ""))
+    rules.append((r_abs, lambda: not qd.startswith("/")))
+
+    def sep() -> bool:
+        others = []
+        sd = cfg.get("state_directory")
+        others.append(sd)
+        ev = cfg.get("evidence") or {}
+        # An evidence queue directory counts only while evidence.enabled is
+        # true, as separate_from_evidence_queues decides it (see the report:
+        # rule 3's "for each of those that is configured" is read this way).
+        if "sep_evidence_always" in mut or ev.get("enabled") is True:
+            others += [ev.get("queue_directory"), ev.get("return_queue_directory")]
+        if "sep_no_state_dir" in mut:
+            others = others[1:]
+        mine = clean(qd, mut)
+        for o in others:
+            if not isinstance(o, str):
+                continue
+            o = ws_trim(o, mut)
+            if o == "":
+                continue
+            if related(mine, clean(o, mut), mut):
+                return True
+        return False
+
+    rules.append((r_sep, sep))
+
+    def rng() -> bool:
+        lo, hi = model["cfg_range"]
+        if "max_records_per_device" not in ad:
+            return False
+        v = ad["max_records_per_device"]
+        if isinstance(v, bool) or not isinstance(v, int):
+            return not ("range_float_ok" in mut and isinstance(v, float) and v == int(v))
+        return not (lo - (1 if "range_zero_ok" in mut else 0) <= v <= hi + (1 if "range_high_ok" in mut else 0))
+
+    rules.append((r_range, rng))
+    if "cfg_swap_2_3" in mut:
+        rules[1], rules[2] = rules[2], rules[1]
+    for name, c in rules:
+        if f"cfg_drop:{name}" in mut:
+            continue
+        if c():
+            return name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The at-bound records: the greatest length a record of each kind can take
+# while passing every rule, computed from the member tables.
+# ---------------------------------------------------------------------------
+
+def longest(pattern: str) -> int:
+    ms = re.findall(r"\{(\d+),(\d+)\}", pattern)
+    if pattern == "^[0-9]{4}-(0[1-9]|1[0-2])$":
+        return 7
+    if len(ms) != 1:
+        raise Failure(f"at-bound: cannot bound {pattern!r}")
+    lo, hi = map(int, ms[0])
+    fixed = 1 if pattern.startswith("^[a-z][") else 0
+    return hi + fixed
+
+
+def at_bound_lengths(model: dict, mut: frozenset = frozenset()) -> dict[str, int]:
+    """For each kind, the maximum canonical length over every admitted
+    combination of vocabulary values, every string at its longest and every
+    integer at its bound."""
+    P = model["patterns"]
+    imax = len(str(model["int_max"]))
+    ki = len("sha256:") + 64
+    sig = 88
+    best: dict[str, int] = {}
+
+    def size(obj: dict) -> int:
+        return len(canon_bytes(obj))
+
+    def S(n: int) -> str:
+        return "a" * n
+
+    base = {"v": Tok(str(model["v"])), "device_id": S(longest(P["device_id"])), "key_identity": S(ki),
+            "issued_at_ms": Tok(str(model["int_max"])), "signature": S(sig)}
+    cls = S(longest(P["class"]))
+    for notice in model["notices"]:
+        for c in (None, cls):
+            for ch in model["channels"]:
+                for seq, prior, perm, _ in model["obs_table"]:
+                    for oc in perm:
+                        for d in model["detail_table"][oc]:
+                            o = dict(base, kind=model["kind_submission"], alert_id=S(longest(P["alert_id"])),
+                                     delivery_attempt_id=S(longest(P["delivery_attempt_id"])), notice=notice,
+                                     **{"class": c}, channel=ch, attempt_seq=Tok(str(model["int_max"])),
+                                     attempted_at_ms=Tok(str(model["int_max"])), observation_seq=Tok(str(seq)),
+                                     prior_outcome=prior, outcome=oc, detail=d)
+                            if rule5_faults(o, model, mut):
+                                continue
+                            best["submission"] = max(best.get("submission", 0), size(o))
+    for ch in model["channels"]:
+        for c in (None, cls):
+            for rs in model["tally_reasons"]:
+                o = dict(base, kind=model["kind_tally"], channel=ch, **{"class": c}, reason=rs,
+                         month="9999-12", count=Tok(str(model["int_max"])))
+                if rule5_faults(o, model, mut):
+                    continue
+                best["withheld_tally"] = max(best.get("withheld_tally", 0), size(o))
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Text mutants: every pinned sentence cut, and each parsed list, table and
+# bound altered in place.
+# ---------------------------------------------------------------------------
+
+def _sub(texts: dict[str, str], key: str, old: str, new: str, regex: bool = False) -> dict[str, str] | None:
+    t = dict(texts)
+    if regex:
+        t[key], n = re.subn(old, new, t[key], count=1)
+    else:
+        n = t[key].count(old)
+        t[key] = t[key].replace(old, new, 1)
+    return t if n and t[key] != texts[key] else None
+
+
+def _swap(texts: dict[str, str], key: str, a: str, b: str) -> dict[str, str] | None:
+    t = dict(texts)
+    s = t[key]
+    if a not in s or b not in s:
+        return None
+    s = s.replace(a, "\x00A\x00", 1).replace(b, a, 1).replace("\x00A\x00", b, 1)
+    t[key] = s
+    return t
+
+
+TEXT_EDITS: list[tuple[str, str, str, str, bool]] = [
+    # (label, document, old, new, regex)
+    ("gateway checks 3 and 4 reasons swapped", "ad", "of the object it parses to: `not_canonical`.", "of the object it parses to: `malformed`.", False),
+    ("gateway check 6 reason renamed", "ad", "differs from the topic's device: `device_mismatch`.", "differs from the topic's device: `device_differs`.", False),
+    ("gateway check 4 outcome clause dropped", "ad", "and `outcome` one of the values *Submission observation*\n   lists: `malformed`.", "lists: `malformed`.", False),
+    ("receiver check 3 reason renamed", "ad", "under [Key trust](#key-trust): `key_not_enrolled`.", "under [Key trust](#key-trust): `key_unknown`.", False),
+    ("receiver check 5 reasons reordered", "ad", "`outcome_refused`, `transition_refused`,\n   `class_refused` or `detail_refused`.", "`outcome_refused`, `class_refused`,\n   `transition_refused` or `detail_refused`.", False),
+    ("receiver check 6 duplicate renamed", "ad", "identical bytes are `duplicate`.", "identical bytes are `replayed`.", False),
+    ("receiver check 6 lower_count renamed", "ad", "below the greatest held for its key\n   is `lower_count`.", "below the greatest held for its key\n   is `lower`.", False),
+    ("outcome added", "ad", "| `unconfirmed` | The submission may have occurred", "| `pending` | Pending. |\n| `unconfirmed` | The submission may have occurred", False),
+    ("outcome member set grows", "ad", "| `outcome` | `accepted`, `failed` or `unconfirmed`;", "| `outcome` | `accepted`, `failed`, `delivered` or `unconfirmed`;", False),
+    ("observation row 2/accepted admits accepted", "ad", "| `2` | `accepted` | `failed` |", "| `2` | `accepted` | `accepted`, `failed` |", False),
+    ("observation row 2/unconfirmed loses failed", "ad", "| `2` | `unconfirmed` | `accepted`, `failed` |", "| `2` | `unconfirmed` | `accepted` |", False),
+    ("observation row 1 loses unconfirmed", "ad", "| `1` | `null` | `accepted`, `failed`, `unconfirmed` |", "| `1` | `null` | `accepted`, `failed` |", False),
+    ("observation row 3 dropped", "ad", "| `3` | `accepted` | `failed`, and only when the attempt's second observation followed an `unconfirmed` |\n", "", False),
+    ("observation row 3 prior changed", "ad", "| `3` | `accepted` | `failed`, and only", "| `3` | `unconfirmed` | `failed`, and only", False),
+    ("detail: accepted admits provider_refused", "ad", "| `accepted` | `null` |", "| `accepted` | `provider_refused`, or `null` |", False),
+    ("detail: failed loses not_submitted", "ad", "`provider_reported_failure`, `not_submitted`, or `null`", "`provider_reported_failure`, or `null`", False),
+    ("detail: unconfirmed loses null", "ad", "| `unconfirmed` | `timeout_after_submit`, `response_unreadable`, or `null` |", "| `unconfirmed` | `timeout_after_submit`, `response_unreadable` |", False),
+    ("detail: code moved between outcomes", "ad", "| `unconfirmed` | `timeout_after_submit`, `response_unreadable`, or `null` |", "| `unconfirmed` | `timeout_after_submit`, `response_unreadable`, `not_submitted`, or `null` |", False),
+    ("detail: prior-only code changed", "ad", "`provider_reported_failure` is permitted only when `prior_outcome` is\n`accepted`.", "`provider_refused` is permitted only when `prior_outcome` is\n`accepted`.", False),
+    ("mandatory set changed", "ad", "`tier_d` and `protection_degraded` are **mandatory**.", "`optional` and `protection_degraded` are **mandatory**.", False),
+    ("tally class rule moved to capped", "ad", "- In a tally, `reason: \"disabled\"` with `class: null`", "- In a tally, `reason: \"capped\"` with `class: null`", False),
+    ("device_id pattern loosened", "ad", "| `device_id` | Matches `^[A-Za-z0-9._-]{1,128}$`. |", "| `device_id` | Matches `^[A-Za-z0-9._-]{1,129}$`. |", False),
+    ("device_id pattern narrowed", "ad", "| `device_id` | Matches `^[A-Za-z0-9._-]{1,128}$`. |", "| `device_id` | Matches `^[A-Za-z0-9_-]{1,128}$`. |", False),
+    ("alert_id pattern lower bound", "ad", "| `alert_id` | Matches `^[A-Za-z0-9_-]{16,64}$`;", "| `alert_id` | Matches `^[A-Za-z0-9_-]{15,64}$`;", False),
+    ("alert_id pattern upper bound", "ad", "| `alert_id` | Matches `^[A-Za-z0-9_-]{16,64}$`;", "| `alert_id` | Matches `^[A-Za-z0-9_-]{16,63}$`;", False),
+    ("delivery_attempt_id pattern loosened", "ad", "| `delivery_attempt_id` | Matches `^[A-Za-z0-9_-]{16,64}$`. |", "| `delivery_attempt_id` | Matches `^[A-Za-z0-9_.-]{16,64}$`. |", False),
+    ("class pattern loosened", "ad", "alert class name matching `^[a-z][a-z0-9_]{0,31}$`", "alert class name matching `^[a-z][a-z0-9_]{0,32}$`", False),
+    ("class pattern leading digit", "ad", "alert class name matching `^[a-z][a-z0-9_]{0,31}$`", "alert class name matching `^[a-z0-9][a-z0-9_]{0,31}$`", False),
+    ("month pattern loosened", "ad", "`^[0-9]{4}-(0[1-9]\\|1[0-2])$`", "`^[0-9]{4}-(0[0-9]\\|1[0-2])$`", False),
+    ("attempt_seq minimum lowered", "ad", "attempt order (below), at least `1`.", "attempt order (below), at least `0`.", False),
+    ("count minimum lowered", "ad", "withheld under this tally key, at least `1`.", "withheld under this tally key, at least `0`.", False),
+    ("integer maximum lowered", "ad", "JSON integer token from `0` to 2^53 − 1", "JSON integer token from `0` to 2^53 − 2", False),
+    ("observation_seq set grows", "ad", "| `observation_seq` | `1`, `2` or `3`:", "| `observation_seq` | `1`, `2` or `4`:", False),
+    ("tally reasons swapped", "ad", "| `reason` | `disabled` or `capped`. |", "| `reason` | `capped` or `disabled`. |", False),
+    ("channel set changed", "ad", "| `channel` | `sms` or `whatsapp`. |\n| `delivery_attempt_id`", "| `channel` | `sms` or `email`. |\n| `delivery_attempt_id`", False),
+    ("record prefix changed", "ad", "The signing input is the ASCII bytes `ori.alert_delivery.v1`, one NUL byte", "The signing input is the ASCII bytes `ori.alert_delivery.v2`, one NUL byte", False),
+    ("tally bound: 11 distinct names", "ad", "at most 10 distinct class names on", "at most 11 distinct class names on", False),
+    ("tally bound: total 85", "ad", "2 channels × 2 months = 84 tallies", "2 channels × 2 months = 85 tallies", False),
+    ("tally bound: reserved places 83", "ad", "the queue reserves 84 places", "the queue reserves 83 places", False),
+    ("enrolment refusals 2 and 3 swapped", "ad", "2. `nonce` is not the nonce the receiver issued for this enrolment, or that\n   nonce was already consumed: `nonce_mismatch`.\n3. `device_id` is not the device being enrolled: `device_mismatch`.", "2. `device_id` is not the device being enrolled: `device_mismatch`.\n3. `nonce` is not the nonce the receiver issued for this enrolment, or that\n   nonce was already consumed: `nonce_mismatch`.", False),
+    ("enrolment refusals 4 and 5 swapped", "ad", "4. `key_identity` is not the `key_identity` of the key being enrolled:\n   `key_mismatch`.\n5. The key fails ed25519-key-admission/v1.md, or the signature fails under it:\n   `signature_invalid`.", "4. The key fails ed25519-key-admission/v1.md, or the signature fails under it:\n   `signature_invalid`.\n5. `key_identity` is not the `key_identity` of the key being enrolled:\n   `key_mismatch`.", False),
+    ("enrolment nonce range", "ad", "a nonce: 32 to 64 lowercase", "a nonce: 32 to 65 lowercase", False),
+    ("enrolment purpose renamed", "ad", "`purpose` is the\nconstant `alert_delivery_report`.", "`purpose` is the\nconstant `alert_delivery_reports`.", False),
+    ("enrolment prefix changed", "ad", "`ori.report_key_enrolment.v1`, one NUL byte, then the canonical bytes, as", "`ori.report_key_enrolment.v2`, one NUL byte, then the canonical bytes, as", False),
+    ("config rules 1 and 2 swapped", "gateway_config", "1. `queue_directory_required`: `queue_directory` is absent or empty;\n2. `queue_directory_absolute`: it does not begin with `/`;", "1. `queue_directory_absolute`: it does not begin with `/`;\n2. `queue_directory_required`: `queue_directory` is absent or empty;", False),
+    ("config rule 3 and 4 names swapped", "gateway_config", "3. `queue_directory_separate`:", "3. `max_records_per_device_range`:", False),
+    ("config range upper bound", "gateway_config", r"not\s+an\s+integer\s+from\s+1\s+to\s+65536", "not an integer from 1 to 65535", True),
+    ("config table range", "gateway_config", "| 1 to 65536. The records", "| 1 to 65535. The records", False),
+    ("payload size bound", "gateway_api", "| `ori/{device_id}/runtime/alert-delivery` | Runtime -> Gateway | 4096 |", "| `ori/{device_id}/runtime/alert-delivery` | Runtime -> Gateway | 812 |", False),
+    ("SPKI prefix changed", "posture", "the 12-byte prefix `302a300506032b6570032100`", "the 12-byte prefix `302a300506032b6570032200`", False),
+]
+
+
+def text_mutants(texts: dict[str, str]) -> list[tuple[str, dict[str, str] | None]]:
+    out: list[tuple[str, dict[str, str] | None]] = []
+    for key, sentence in PINS:
+        words = sentence.split()
+        pattern = r"\s+".join(re.escape(w) for w in words)
+        t = dict(texts)
+        t[key], n = re.subn(pattern, lambda _m: " ".join(words[:-1]) + " XX", t[key], count=1)
+        out.append((f"text cut: {key}: {sentence[:60]}", t if n == 1 else None))
+    for label, key, old, new, rx in TEXT_EDITS:
+        out.append((f"text edit: {label}", _sub(texts, key, old, new, rx)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The corpus.
+# ---------------------------------------------------------------------------
+
+def pub_of(s: object) -> bytes | None:
+    if not isinstance(s, str) or not s.startswith("ed25519:"):
+        return None
+    return b64_exact(s[len("ed25519:"):], 32)
+
+
+def keys_of(corpus: dict, model: dict, bad: Callable[[str], None]) -> dict[str, bytes]:
+    out: dict[str, bytes] = {}
+    tk = corpus.get("test_keys")
+    if not isinstance(tk, dict) or not tk:
+        bad("test_keys: missing")
+        return out
+    for name, k in tk.items():
+        pub = pub_of(k.get("public_key"))
+        if pub is None:
+            bad(f"test_keys.{name}: public_key is not ed25519:<canonical Base64 of 32 bytes>")
+            continue
+        if "seed_label" in k:
+            if k["seed_label"] != f"ori alert-delivery/v1 {name} test key":
+                bad(f"test_keys.{name}: seed label {k['seed_label']!r} is not the disclosed form")
+            seed = hashlib.sha256(k["seed_label"].encode("ascii")).digest()
+            mine = seed_public(seed)
+            if mine != openssl_public(seed):
+                raise Failure(f"test_keys.{name}: own and OpenSSL key derivation disagree")
+            if openssl_spki(seed) != model["spki_prefix"] + mine:
+                raise Failure(f"test_keys.{name}: OpenSSL SPKI DER is not the pinned prefix and the key")
+            if mine != pub:
+                bad(f"test_keys.{name}: public_key is not derived from its seed label")
+        elif "negation_of" in k:
+            base = pub_of((tk.get(k["negation_of"]) or {}).get("public_key"))
+            if base is None or pub != base[:31] + bytes([base[31] ^ 0x80]):
+                bad(f"test_keys.{name}: not the negation of {k['negation_of']}")
+            elif recognised(pub) != recognised(base):
+                bad(f"test_keys.{name}: negation does not share a recognised key")
+        else:
+            bad(f"test_keys.{name}: neither a seed label nor a negation")
+        if admit(pub) is not None:
+            bad(f"test_keys.{name}: refused by key admission ({admit(pub)})")
+        if k.get("key_identity") != key_identity_of(pub, model):
+            bad(f"test_keys.{name}: key_identity is not SHA-256 of the SPKI DER")
+        out[name] = pub
+    return out
+
+
+def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str], None], where: str) -> Ctx:
+    enrol = []
+    for e in case.get("enrolments", []):
+        if e.get("key") not in keys:
+            bad(f"{where}: enrolment names unknown key {e.get('key')!r}")
+            continue
+        enrol.append((e.get("device_id"), keys[e["key"]], e.get("purpose")))
+    ring = {key_identity_of(p, model): p for p in keys.values()}
+    return Ctx(case.get("configured_devices", []), case.get("topic_device", ""), case.get("forwarder", ""),
+               case.get("forwarding_registry", {}), enrol, ring)
+
+
+def judge_record(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> dict:
+    """Gateway verdict at checks 3, 4 and 6; receiver verdict at checks 1 to 5;
+    every failing rule, in order; and the epoch a passing record verifies in."""
+    gw, obj = gateway_faults(raw, ctx, model, mut)
+    out = {"obj": obj, "pre": None, "gw": "pass", "rx": "pass", "fails": list(gw), "epoch": None}
+    if obj is None:
+        out["pre"] = gw[0]
+        return out
+    if model["gw_reason"][5] in gw:
+        out["pre"] = model["gw_reason"][5]
+    if gw:
+        out["gw"] = out["rx"] = gw[0]
+    form = form_faults(obj, model, mut)
+    out["form"] = form
+    if not form:
+        rx, pub = receiver_faults(raw, obj, ctx, model, mut)
+        out["fails"] += rx
+        if not gw and rx:
+            out["rx"] = rx[0]
+        if pub is not None:
+            out["epoch"] = recognised(pub)
+    else:
+        # A malformed record's later rules are judged only as far as its members allow.
+        try:
+            rx, _ = receiver_faults(raw, obj, ctx, model, mut)
+            out["fails"] += rx
+        except (KeyError, AttributeError, TypeError, ValueError):
+            pass
+    return out
+
+
+def entailed(name: str, j: dict, model: dict) -> set[str]:
+    """Rules that a record's declared failure itself makes fail, so a case
+    "refused for that reason alone" may still fail them."""
+    out: set[str] = set()
+    sig_r, key_r = model["rx_reasons"][4][0], model["rx_reasons"][3][0]
+    form = set(j.get("form") or [])
+    if form & {"signature", "kind", "v"} or any(f.startswith("members") for f in form):
+        out.add(sig_r)  # a signature over a non-record, or of the wrong form
+    if form & {"key_identity", "device_id", "kind"} or any(f.startswith("members") for f in form):
+        out |= {key_r, sig_r, model["rx_reasons"][2][0]}
+    if form & {"outcome", "observation_seq", "prior_outcome"}:
+        out |= {model["outcome_refused"], model["transition_refused"], model["detail_refused"]}
+    if form & {"notice", "class"}:
+        out.add(model["class_refused"])
+    if form & {"detail"}:
+        out.add(model["detail_refused"])
+    if form & {"reason"}:
+        out.add(model["class_refused"])
+    return out
+
+
+def check(corpus: dict, model: dict, mut: frozenset = frozenset()) -> list[str]:
+    errs: list[str] = []
+    try:
+        _check(corpus, model, mut, errs.append)
+    except Failure as e:
+        errs.append(f"fatal: {e}")
+    except (KeyError, TypeError, AttributeError, ValueError, IndexError) as e:
+        errs.append(f"fatal: corpus shape: {type(e).__name__}: {e}")
+    return errs
+
+
+def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> None:
+    if corpus.get("contract") != "alert-delivery/v1":
+        bad("contract: not alert-delivery/v1")
+    keys = keys_of(corpus, model, bad)
+    kid_name = {key_identity_of(p, model): n for n, p in keys.items()}
+    cov: dict[str, set] = {k: set() for k in (
+        "gw_alone", "rx_alone", "outcomes", "rows", "details", "kinds", "delivered", "bound",
+        "rx6", "rules", "seq_shapes", "carriage", "enrol_alone", "enrol_pass", "cfg")}
+    every_reason_gw = [model["gw_reason"][n] for n in (3, 4, 6)]
+    every_reason_rx = model["rx_reasons"][2] + model["rx_reasons"][3] + model["rx_reasons"][4] + model["rx5"]
+
+    # --- records ---------------------------------------------------------
+    bounds = at_bound_lengths(model)
+    names = set()
+    for case in corpus.get("records", []):
+        name = case["name"]
+        where = f"records.{name}"
+        if name in names:
+            bad(f"{where}: duplicate case name")
+        names.add(name)
+        raw = case["record"].encode("utf-8")
+        ctx = fixture(case, keys, model, bad, where)
+        if ctx.topic_device not in ctx.configured:
+            bad(f"{where}: the topic's device is not configured, so check 5 would fail")
+        j = judge_record(raw, ctx, model, mut)
+        if j["pre"]:
+            bad(f"{where}: refused at {j['pre']}, outside checks 3, 4 and 6")
+            continue
+        obj = j["obj"]
+        if j["gw"] != case["expected_gateway"]:
+            bad(f"{where}: gateway verdict {j['gw']}, corpus says {case['expected_gateway']}")
+        if j["rx"] != case["expected_receiver"]:
+            bad(f"{where}: receiver verdict {j['rx']}, corpus says {case['expected_receiver']}")
+        fails = j["fails"]
+        declared = case["expected_receiver"]
+        if name.startswith("precedence_"):
+            if len(fails) < 2:
+                bad(f"{where}: a precedence case with no second failing rule (fails {fails})")
+            m = re.fullmatch(r"precedence_(.+)_over_(.+)", name)
+            if m and len(fails) >= 2:
+                second = m.group(2)
+                if not any(second in f or f.startswith(second) for f in fails[1:]):
+                    bad(f"{where}: the rule its name puts second ({second}) does not fail behind {fails[0]} (fails {fails})")
+        elif declared != "pass":
+            extra = [f for f in fails[1:] if f not in entailed(name, j, model)]
+            if extra:
+                bad(f"{where}: refused for {fails[0]} but not alone: also fails {extra}")
+            if j["gw"] != "pass":
+                cov["gw_alone"].add(j["gw"])
+            else:
+                cov["rx_alone"].add(j["rx"])
+        if obj is not None and obj.get("outcome") == model["reserved_outcome"] and declared != "pass":
+            cov["delivered"].add(True)
+        if declared == "pass" and j["rx"] == "pass":
+            cov["kinds"].add(obj["kind"])
+            if obj["kind"] == model["kind_submission"]:
+                cov["outcomes"].add(obj["outcome"])
+                cov["rows"].add((int(obj["observation_seq"].text), obj["prior_outcome"], obj["outcome"]))
+                cov["details"].add((obj["outcome"], obj["detail"]))
+            if len(raw) == bounds.get(obj["kind"]):
+                ints = [k for k in ("attempt_seq", "attempted_at_ms", "issued_at_ms", "count") if k in obj]
+                if all(obj[k].text == str(model["int_max"]) for k in ints):
+                    cov["bound"].add(obj["kind"])
+            if len(raw) > bounds.get(obj["kind"], 0):
+                bad(f"{where}: {len(raw)} bytes, longer than the {bounds.get(obj['kind'])} this checker computes as the bound")
+    for r in every_reason_gw:
+        if r not in cov["gw_alone"]:
+            bad(f"coverage: no record case refused by the gateway for {r} alone")
+    for r in every_reason_rx:
+        if r not in cov["rx_alone"]:
+            bad(f"coverage: no record case refused by the receiver for {r} alone")
+    for o in model["outcomes"]:
+        if o not in cov["outcomes"]:
+            bad(f"coverage: no accepted case with outcome {o}")
+    for seq, prior, perm, _ in model["obs_table"]:
+        for o in perm:
+            if (seq, prior, o) not in cov["rows"]:
+                bad(f"coverage: no accepted case for observation row ({seq}, {prior}, {o})")
+    for o, codes in model["detail_table"].items():
+        for d in codes:
+            if (o, d) not in cov["details"]:
+                bad(f"coverage: no accepted case with outcome {o} and detail {d}")
+    for k in (model["kind_submission"], model["kind_tally"]):
+        if k not in cov["kinds"]:
+            bad(f"coverage: no accepted {k}")
+        if k not in cov["bound"]:
+            bad(f"coverage: no accepted {k} at its bound ({bounds.get(k)} bytes, every free integer {model['int_max']})")
+        if bounds.get(k, 0) >= 1024:
+            bad(f"bound: a {k} at its bound is {bounds.get(k)} bytes, not under the 1024 gateway-api/v2 claims")
+    if not cov["delivered"]:
+        bad("coverage: no case with outcome delivered refused")
+
+    # --- receiver sequences ----------------------------------------------
+    for seq in corpus.get("receiver_sequences", []):
+        where = f"receiver_sequences.{seq['name']}"
+        ctx = fixture(seq, keys, model, bad, where)
+        rcv = Receiver()
+        verdicts = []
+        epoch_label: dict[bytes, str] = {}
+        for i, ev in enumerate(seq["records"]):
+            raw = ev["record"].encode("utf-8")
+            j = judge_record(raw, ctx, model, mut)
+            if j["pre"]:
+                bad(f"{where}[{i}]: refused at {j['pre']}")
+                continue
+            if j["rx"] != "pass":
+                v = j["rx"]
+            else:
+                epoch_label.setdefault(j["epoch"], j["obj"]["key_identity"])
+                if epoch_label[j["epoch"]] != j["obj"]["key_identity"]:
+                    bad(f"{where}[{i}]: two key_identity values share one recognised key in this sequence")
+                before = len([k for k in rcv.kept if k[3] == model["rx6"][1]])
+                v = rcv.judge(raw, j["obj"], j["epoch"], model, mut)
+                if v == model["rx6"][1]:
+                    cov["rules"].add(conflict_rule(rcv, raw, j["obj"], j["epoch"], model))
+            verdicts.append(v)
+            cov["rx6"].add(v)
+            if v != ev["expected"]:
+                bad(f"{where}[{i}]: verdict {v}, corpus says {ev['expected']}")
+        want_reading = sorted(seq.get("expected_reading", []), key=lambda r: (r["epoch"], r["alert_id"]))
+        got = sorted(({**r, "epoch": epoch_label.get(r["epoch"], "?")} for r in rcv.reading(model, mut)),
+                     key=lambda r: (r["epoch"], r["alert_id"]))
+        if got != want_reading:
+            bad(f"{where}: reading {json.dumps(got, sort_keys=True)} but corpus says {json.dumps(want_reading, sort_keys=True)}")
+        tal = []
+        for key, (raw, obj) in rcv.tallies.items():
+            tal.append({"epoch": epoch_label.get(key[0], "?"), "channel": obj["channel"], "class": obj["class"],
+                        "reason": obj["reason"], "month": obj["month"], "count": int(obj["count"].text),
+                        "record_digest": "sha256:" + hashlib.sha256(raw).hexdigest(),
+                        "settled": key not in rcv.unsettled_tallies})
+        k = lambda t: (t["epoch"], t["channel"], str(t["class"]), t["reason"], t["month"])
+        if sorted(tal, key=k) != sorted(seq.get("expected_tallies", []), key=k):
+            bad(f"{where}: tallies held {json.dumps(sorted(tal, key=k))} but corpus says {json.dumps(sorted(seq.get('expected_tallies', []), key=k))}")
+        shape_coverage(rcv, verdicts, model, cov)
+    for v in model["rx6"] + ("held",):
+        if v not in cov["rx6"]:
+            bad(f"coverage: no receiver sequence gives {v}")
+    for r in ("identity", "attempt_fields", "alert", "attempt_seq", "prior"):
+        if r not in cov["rules"]:
+            bad(f"coverage: no receiver sequence breaches the {r} rule of Consistency across records")
+    for s in ("later_failure", "failed_retry", "failover", "tally_epochs"):
+        if s not in cov["seq_shapes"]:
+            bad(f"coverage: no receiver sequence shows {s}")
+
+    # --- carriage ----------------------------------------------------------
+    for seq in corpus.get("carriage_sequences", []):
+        where = f"carriage_sequences.{seq['name']}"
+        cu = Custody(seq["configured_devices"], seq["max_records_per_device"])
+        for i, ev in enumerate(seq["events"]):
+            raw = ev["message"].encode("utf-8")
+            v, ack = cu.receive(ev["topic_device"], raw, model, mut)
+            if v != ev["expected"]:
+                bad(f"{where}[{i}]: custody verdict {v}, corpus says {ev['expected']}")
+            if ack != ev.get("expected_ack"):
+                bad(f"{where}[{i}]: acknowledgement {ack}, corpus says {ev.get('expected_ack')}")
+            cov["carriage"].add(v)
+            if v == "queue_full" and len(cu.queue.get(ev["topic_device"], [])) == seq["max_records_per_device"]:
+                cov["carriage"].add("queue_full_at_bound")
+        same_id: dict[tuple, set] = {}
+        for dev, objs in cu._held.items():
+            for o in objs:
+                same_id.setdefault((dev, identity_of(o, model)), set()).add(canon(o))
+        if any(len(v) > 1 for v in same_id.values()):
+            cov["carriage"].add("pair_queued")
+    for v in ("queued", "replayed", "queue_full_at_bound", "pair_queued"):
+        if v not in cov["carriage"]:
+            bad(f"coverage: no carriage sequence shows {v}")
+
+    # --- enrolment -------------------------------------------------------
+    for case in corpus.get("enrolment", []):
+        where = f"enrolment.{case['name']}"
+        pub = pub_of(case["enrolling_public_key"])
+        if pub is None:
+            bad(f"{where}: enrolling_public_key unreadable")
+            continue
+        if case["enrolling_key_identity"] != key_identity_of(pub, model):
+            bad(f"{where}: enrolling_key_identity is not the key's")
+        ch = case["challenge"].encode("utf-8")
+        if bytes.fromhex(case["signing_input_hex"]) != model["enrol_prefix"] + ch:
+            bad(f"{where}: signing_input_hex is not the enrolment prefix, NUL and the challenge")
+        sig = b64_exact(case["signature"], 64)
+        if sig is None:
+            bad(f"{where}: signature is not canonical Base64 of 64 bytes")
+        f = enrol_faults(ch, sig, case["issued_nonce"], case["nonce_consumed"], case["enrolling_device_id"], pub, model, mut)
+        v = f[0] if f else "pass"
+        if v != case["expected"]:
+            bad(f"{where}: verdict {v}, corpus says {case['expected']} (fails {f})")
+        if case["name"].startswith("precedence_"):
+            if len(f) < 2:
+                bad(f"{where}: a precedence case with no second failing rule (fails {f})")
+        elif v != "pass":
+            if len(f) > 1:
+                bad(f"{where}: refused for {v} but not alone: also fails {f[1:]}")
+            cov["enrol_alone"].add(v)
+        else:
+            cov["enrol_pass"].add(True)
+    for r in model["enrol_order"]:
+        if r not in cov["enrol_alone"]:
+            bad(f"coverage: no enrolment case refused for {r} alone")
+    if not cov["enrol_pass"]:
+        bad("coverage: no enrolment proof that passes")
+
+    # --- config ----------------------------------------------------------
+    for case in corpus.get("config", []):
+        where = f"config.{case['name']}"
+        r = load_alert_delivery(case, model, mut)
+        if (r is None) != case["valid"] or (r is not None and r != case.get("rule")):
+            bad(f"{where}: load gives {r or 'valid'}, corpus says {case.get('rule') if not case['valid'] else 'valid'}")
+        cov["cfg"].add(r or ("enabled" if case["alert_delivery"].get("enabled") is True else "disabled"))
+        ad = case["alert_delivery"]
+        if r is None and ad.get("enabled") is True:
+            eq = ws_trim(ad["queue_directory"], mut)
+            em = ad.get("max_records_per_device", model["cfg_default_max"])
+            if case.get("effective_queue_directory") != eq or case.get("effective_max_records_per_device") != em:
+                bad(f"{where}: in force {eq!r}, {em}; corpus says {case.get('effective_queue_directory')!r}, {case.get('effective_max_records_per_device')}")
+    for r in model["cfg_rules"] + ["enabled", "disabled"]:
+        if r not in cov["cfg"]:
+            bad(f"coverage: no config case for {r}")
+
+
+def conflict_rule(rcv: Receiver, raw: bytes, obj: dict, epoch: bytes, model: dict) -> str:
+    """Which rule of Consistency (or the identity rule) made this record conflict."""
+    for rule, m in (("identity", {"no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule"}),
+                    ("attempt_fields", {"no_identity_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule"}),
+                    ("alert", {"no_identity_rule", "no_attempt_fields_rule", "no_attempt_seq_rule", "no_prior_rule"}),
+                    ("attempt_seq", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_prior_rule"}),
+                    ("prior", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule"})):
+        pool = [k for k in rcv.kept[:-1]]
+        if obj["kind"] == model["kind_submission"] and rcv._submission(raw, obj, epoch, pool, model, frozenset(m)) is not None:
+            return rule
+    return "tally" if obj["kind"] == model["kind_tally"] else "?"
+
+
+def shape_coverage(rcv: Receiver, verdicts: list[str], model: dict, cov: dict) -> None:
+    held = [(o, e) for _, o, e, v in rcv.kept if v == "held" and o["kind"] == model["kind_submission"]]
+    for o, e in held:
+        for p, pe in held:
+            if pe != e or p["alert_id"] != o["alert_id"]:
+                continue
+            if p["delivery_attempt_id"] == o["delivery_attempt_id"] and o["outcome"] == "accepted" and p["outcome"] == "failed" \
+                    and p["prior_outcome"] == "accepted":
+                cov["seq_shapes"].add("later_failure")
+            if p["delivery_attempt_id"] != o["delivery_attempt_id"] and p["channel"] == o["channel"] \
+                    and o["outcome"] == "accepted" and p["outcome"] == "failed" \
+                    and int(p["attempt_seq"].text) > int(o["attempt_seq"].text):
+                cov["seq_shapes"].add("failed_retry")
+            if p["channel"] != o["channel"] and o["outcome"] == "accepted":
+                cov["seq_shapes"].add("failover")
+    keys = {}
+    for k in rcv.tallies:
+        keys.setdefault(k[1:], set()).add(k[0])
+    if any(len(v) > 1 for v in keys.values()):
+        cov["seq_shapes"].add("tally_epochs")
+
+
+# ---------------------------------------------------------------------------
+# --mutations
+# ---------------------------------------------------------------------------
+
+JUDGE_MUTANTS = [
+    # gateway checks 3, 4, 6: dropped, reordered
+    "gw_drop_3", "gw_drop_4", "gw_drop_6", "gw_swap_3_4", "gw_swap_4_6",
+    # check 4 loosened, one form at a time
+    "members_extra_ok", "int_bool_ok", "int_spelling_ok", "int_no_max", "int_no_min", "v_any",
+    "dollar_pattern", "obs_seq_4", "outcome_open", "sig_form_loose",
+    "loose_pattern:device_id", "loose_pattern:alert_id", "loose_pattern:delivery_attempt_id",
+    "loose_pattern:class", "loose_pattern:month", "loose_pattern:key_identity",
+    "skip_form:v", "skip_form:device_id", "skip_form:key_identity", "skip_form:alert_id",
+    "skip_form:delivery_attempt_id", "skip_form:notice", "skip_form:class", "skip_form:channel",
+    "skip_form:attempt_seq", "skip_form:attempted_at_ms", "skip_form:observation_seq", "skip_form:outcome",
+    "skip_form:prior_outcome", "skip_form:detail", "skip_form:issued_at_ms", "skip_form:signature",
+    "skip_form:reason", "skip_form:month", "skip_form:count",
+    # receiver checks 2 to 5
+    "rx_drop:2", "rx_drop:key_not_enrolled", "rx_drop:signature_invalid", "rx_drop:5", "rx_swap_3_4",
+    "enrol_any_device", "enrol_any_purpose_rx", "enrol_by_recognised", "no_signature_check",
+    "sign_with_signature", "no_prefix",
+    "no_outcome_rule", "transition_any_seq", "transition_any_prior", "after_failed_ok", "no_transition_rule",
+    "class_any_mandatory_ok", "class_optional_null_refused", "tally_class_ok", "tally_capped_needs_class",
+    "detail_any_outcome", "detail_prior_any", "no_detail_rule", "rx5_reversed",
+    # receiver check 6 and the reading
+    "no_duplicate", "no_identity_rule", "no_attempt_fields_rule", "attempt_fields_short", "no_alert_rule",
+    "no_attempt_seq_rule", "attempt_seq_across_epochs", "no_prior_rule", "prior_one_way", "identity_per_epoch",
+    "tally_no_epoch", "tally_key_no_class", "no_tally_conflict", "no_lower_count", "tally_last_wins",
+    "reading_with_conflicts", "channels_merged", "latest_by_issued", "latest_by_arrival", "latest_first_obs",
+    "ever_latest_only", "some_channel_sms_only", "settled_always",
+    # custody and acknowledgement
+    "no_replay", "replay_by_identity", "queue_off_by_one", "ack_unknown_device",
+    # enrolment
+    "enrol_noncanonical_ok", "enrol_extra_ok", "enrol_any_purpose", "enrol_nonce_form_any", "enrol_drop_1",
+    "enrol_reuse_ok", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
+    "enrol_drop:nonce_mismatch", "enrol_drop:device_mismatch", "enrol_drop:key_mismatch", "enrol_drop:signature_invalid",
+    "loose_pattern:nonce",
+    # config
+    "validate_disabled", "trim_python_strip", "no_trim", "no_dotdot", "fold_case", "prefix_by_string",
+    "no_containing", "sep_evidence_always", "sep_no_state_dir", "range_float_ok", "range_zero_ok", "range_high_ok",
+    "cfg_swap_2_3", "cfg_drop:queue_directory_required", "cfg_drop:queue_directory_absolute",
+    "cfg_drop:queue_directory_separate", "cfg_drop:max_records_per_device_range",
+]
+
+
+def corpus_mutants(corpus: dict) -> list[tuple[str, dict]]:
+    out = []
+
+    def mk(label: str, f: Callable[[dict], None]) -> None:
+        x = copy.deepcopy(corpus)
+        f(x)
+        out.append((label, x))
+
+    other_gw = {"pass": "malformed", "malformed": "pass", "not_canonical": "malformed", "device_mismatch": "pass"}
+    for i, c in enumerate(corpus.get("records", [])):
+        mk(f"records.{c['name']}: expected_gateway flipped",
+           lambda x, i=i: x["records"][i].__setitem__("expected_gateway", other_gw.get(x["records"][i]["expected_gateway"], "pass")))
+        mk(f"records.{c['name']}: expected_receiver flipped",
+           lambda x, i=i: x["records"][i].__setitem__("expected_receiver", "class_refused" if x["records"][i]["expected_receiver"] != "class_refused" else "pass"))
+        mk(f"records.{c['name']}: removed", lambda x, i=i: x["records"].pop(i))
+    for i, s in enumerate(corpus.get("receiver_sequences", [])):
+        for j, _ in enumerate(s["records"]):
+            mk(f"receiver_sequences.{s['name']}[{j}]: verdict flipped",
+               lambda x, i=i, j=j: x["receiver_sequences"][i]["records"][j].__setitem__(
+                   "expected", "conflict" if x["receiver_sequences"][i]["records"][j]["expected"] != "conflict" else "held"))
+        if s.get("expected_reading"):
+            def flip_reading(x, i=i):
+                r = x["receiver_sequences"][i]["expected_reading"][0]
+                r["accepted_on_some_channel"] = not r["accepted_on_some_channel"]
+            mk(f"receiver_sequences.{s['name']}: reading flipped", flip_reading)
+
+            def flip_settled(x, i=i):
+                r = x["receiver_sequences"][i]["expected_reading"][-1]
+                r["settled"] = not r["settled"]
+            mk(f"receiver_sequences.{s['name']}: settled flipped", flip_settled)
+        if s.get("expected_tallies"):
+            def bump(x, i=i):
+                x["receiver_sequences"][i]["expected_tallies"][0]["count"] += 1
+            mk(f"receiver_sequences.{s['name']}: tally count changed", bump)
+    for i, s in enumerate(corpus.get("carriage_sequences", [])):
+        for j, _ in enumerate(s["events"]):
+            mk(f"carriage_sequences.{s['name']}[{j}]: verdict flipped",
+               lambda x, i=i, j=j: x["carriage_sequences"][i]["events"][j].__setitem__(
+                   "expected", "replayed" if x["carriage_sequences"][i]["events"][j]["expected"] != "replayed" else "queued"))
+
+            def ack_flip(x, i=i, j=j):
+                e = x["carriage_sequences"][i]["events"][j]
+                e["expected_ack"] = None if e["expected_ack"] else {"outcome": "refused", "reason": e["expected"], "record_digest": "", "device_id": e["topic_device"]}
+            mk(f"carriage_sequences.{s['name']}[{j}]: ack flipped", ack_flip)
+    for i, c in enumerate(corpus.get("enrolment", [])):
+        mk(f"enrolment.{c['name']}: verdict flipped",
+           lambda x, i=i: x["enrolment"][i].__setitem__("expected", "pass" if x["enrolment"][i]["expected"] != "pass" else "nonce_mismatch"))
+    for i, c in enumerate(corpus.get("config", [])):
+        mk(f"config.{c['name']}: verdict flipped", lambda x, i=i: x["config"][i].__setitem__("valid", not x["config"][i]["valid"]))
+    for name in list(corpus.get("test_keys", {})):
+        def flipkey(x, name=name):
+            k = x["test_keys"][name]
+            k["key_identity"] = k["key_identity"][:-1] + ("0" if k["key_identity"][-1] != "0" else "1")
+        mk(f"test_keys.{name}: key_identity altered", flipkey)
+    return out
+
+
+def run_mutations(corpus: dict, model: dict, texts: dict[str, str]) -> int:
+    survivors: list[str] = []
+    total = 0
+    baseline = set(check(corpus, model))
+    for m in JUDGE_MUTANTS:
+        total += 1
+        errs = set(check(corpus, model, frozenset([m]))) - baseline
+        if not [e for e in errs if not e.startswith("coverage:")]:
+            survivors.append(f"judge mutant {m}")
+    for name, x in corpus_mutants(corpus):
+        total += 1
+        if not (set(check(x, model)) - baseline):
+            survivors.append(f"corpus mutant {name}")
+    for name, t in text_mutants(texts):
+        total += 1
+        if t is None:
+            survivors.append(f"{name} (did not apply)")
+            continue
+        try:
+            mm = build_model(t)
+        except Failure:
+            continue
+        if not (set(check(corpus, mm)) - baseline):
+            survivors.append(name)
+    for s in survivors:
+        print(f"SURVIVED: {s}", file=sys.stderr)
+    if survivors:
+        print(f"check-alert-delivery-vectors-v1 --mutations: {len(survivors)} of {total} mutants survived", file=sys.stderr)
+        return 1
+    print(f"check-alert-delivery-vectors-v1 --mutations: all {total} mutants refused")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if args not in ([], ["--mutations"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        texts = load_texts()
+        model = build_model(texts)
+        corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    except (Failure, OSError, ValueError) as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    errs = check(corpus, model)
+    for e in errs:
+        print(f"FAIL: {e}", file=sys.stderr)
+    if errs:
+        print(f"check-alert-delivery-vectors-v1: {len(errs)} failures", file=sys.stderr)
+    else:
+        print(f"check-alert-delivery-vectors-v1: {len(corpus['records'])} records, "
+              f"{len(corpus['receiver_sequences'])} receiver sequences, {len(corpus['carriage_sequences'])} carriage "
+              f"sequences, {len(corpus['enrolment'])} enrolment and {len(corpus['config'])} config cases hold "
+              f"against the text; {len(PINS)} sentences pinned")
+    if args == ["--mutations"]:
+        rc = run_mutations(corpus, model, texts)
+        return 1 if errs else rc
+    return 1 if errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
