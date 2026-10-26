@@ -957,9 +957,20 @@ def int_ok(v: object, lo: int, hi: int, model: dict, mut: frozenset) -> bool:
     return lo <= n <= hi
 
 
+STRING_MEMBERS = ("kind", "device_id", "key_identity", "alert_id", "notice", "class", "channel",
+                  "delivery_attempt_id", "prior_outcome", "outcome", "detail", "reason", "month", "signature")
+
+
+def num_as_str(obj: dict, names: tuple) -> dict:
+    """A wrong reader's view: a JSON number token taken as the string of its digits."""
+    return {k: (v.text if isinstance(v, Tok) and k in names else v) for k, v in obj.items()}
+
+
 def form_faults(obj: dict, model: dict, mut: frozenset) -> list[str]:
     """Check 4 of Carriage and custody: every way the object is not a record."""
     f: list[str] = []
+    if "num_as_str_record" in mut:
+        obj = num_as_str(obj, STRING_MEMBERS)
     kind = obj.get("kind")
     if kind == model["kind_submission"]:
         want = model["submission_members"]
@@ -1376,10 +1387,13 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
     f: list[str] = []
     why, obj = parse_payload(challenge)
     malformed = why is not None
+    orig = obj
+    if obj is not None and "num_as_str_enrol" in mut:
+        obj = num_as_str(obj, ("device_id", "key_identity", "nonce", "purpose"))
     if not malformed:
         lo, hi = model["nonce"]
         malformed = (
-            canon_bytes(obj) != challenge and "enrol_noncanonical_ok" not in mut
+            canon_bytes(orig) != challenge and "enrol_noncanonical_ok" not in mut
             or sorted(obj) != model["enrol_members"] and not ("enrol_extra_ok" in mut and set(model["enrol_members"]) <= set(obj))
             or not int_ok(obj.get("v"), model["enrol_v"], model["enrol_v"], model, mut)
             or (obj.get("purpose") != model["enrol_purpose"] and "enrol_any_purpose" not in mut)
@@ -1465,6 +1479,8 @@ def load_alert_delivery(cfg: dict, model: dict, mut: frozenset) -> str | None:
     if ad.get("enabled") is not True and "validate_disabled" not in mut:
         return None
     qd = ad.get("queue_directory")
+    if "num_as_str_config" in mut and isinstance(qd, (int, float)) and not isinstance(qd, bool):
+        qd = str(qd)
     qd = ws_trim(qd, mut) if isinstance(qd, str) else qd
     rules: list[tuple[str, Callable[[], bool]]] = []
     rules.append((r_req, lambda: not isinstance(qd, str) or qd == ""))
@@ -1808,10 +1824,129 @@ def entailed(name: str, j: dict, model: dict) -> set[str]:
 ENROL_NOT_ALONE: list[str] = []
 
 
+class Seen(dict):
+    """A corpus object that records which of its members the checker reads.
+    Equality reads every member, so a compared expectation is read whole."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.read: set = set()
+
+    def __getitem__(self, k):
+        self.read.add(k)
+        return super().__getitem__(k)
+
+    def get(self, k, default=None):
+        self.read.add(k)
+        return super().get(k, default)
+
+    def __contains__(self, k):
+        self.read.add(k)
+        return super().__contains__(k)
+
+    def __iter__(self):
+        self.read.update(super().keys())
+        return super().__iter__()
+
+    def items(self):
+        self.read.update(super().keys())
+        return [(k, super(Seen, self).__getitem__(k)) for k in super().keys()]
+
+    def keys(self):
+        self.read.update(super().keys())
+        return super().keys()
+
+    def values(self):
+        return [self[k] for k in super().keys()]
+
+    def _all(self):
+        for k in super().keys():
+            self.read.add(k)
+            v = super().__getitem__(k)
+            if isinstance(v, (Seen, SeenList)):
+                v._all()
+
+    def __eq__(self, other):
+        self._all()
+        if isinstance(other, (Seen, SeenList)):
+            other._all()
+        return dict.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = None
+
+
+class SeenList(list):
+    def _all(self):
+        for v in list.__iter__(self):
+            if isinstance(v, (Seen, SeenList)):
+                v._all()
+
+    def __eq__(self, other):
+        self._all()
+        if isinstance(other, (Seen, SeenList)):
+            other._all()
+        return list.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    __hash__ = None
+
+
+def watch(v: object) -> object:
+    if isinstance(v, dict):
+        return Seen({k: watch(x) for k, x in v.items()})
+    if isinstance(v, list):
+        return SeenList(watch(x) for x in v)
+    return v
+
+
+# Maps whose keys are data, not members: every key is a name the corpus chooses.
+DATA_MAPS = ("forwarding_registry", "channels")
+
+
+def _walk(v: object, path: tuple, data_map: bool, visit) -> None:
+    if isinstance(v, Seen):
+        for k in dict.keys(v):
+            visit(v, k, path, data_map)
+            _walk(dict.__getitem__(v, k), path + ("*" if data_map else k,), k in DATA_MAPS, visit)
+    elif isinstance(v, SeenList):
+        for x in list.__iter__(v):
+            _walk(x, path + ("[]",), False, visit)
+
+
+def unread(v: object, path: str, out: list[str]) -> None:
+    """The corpus schema is closed at every level. The allowed members at each
+    place (a case of a section, an entry of a sequence, a nested object) are
+    exactly those the checker read at that place in some case of this run; any
+    other member is unknown. Keys of a data map (forwarder names, channels) are
+    the corpus's own names, and their values are judged the same way."""
+    allowed: dict[tuple, set] = {}
+
+    def collect(obj, k, at, data_map):
+        if data_map or k in obj.read:
+            allowed.setdefault(at, set()).add("*" if data_map else k)
+
+    def judge(obj, k, at, data_map):
+        names = allowed.get(at, set())
+        if not ("*" in names if data_map else k in names):
+            out.append(f"schema: {path}{''.join('.' + x if x != '[]' else x for x in at)}.{k} is a member this checker never reads")
+
+    _walk(v, (), False, collect)
+    _walk(v, (), False, judge)
+
+
 def check(corpus: dict, model: dict, mut: frozenset = frozenset()) -> list[str]:
     errs: list[str] = []
+    if not isinstance(corpus, dict):
+        return ["fatal: corpus root is not an object"]
+    corpus = watch(corpus)
     try:
         _check(corpus, model, mut, errs.append)
+        unread(corpus, "corpus", errs)
     except Failure as e:
         errs.append(f"fatal: {e}")
     except (KeyError, TypeError, AttributeError, ValueError, IndexError) as e:
@@ -1822,6 +1957,17 @@ def check(corpus: dict, model: dict, mut: frozenset = frozenset()) -> list[str]:
 def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> None:
     if corpus.get("contract") != "alert-delivery/v1":
         bad("contract: not alert-delivery/v1")
+
+    def notes(obj: object, where: str) -> None:
+        if isinstance(obj, dict) and "note" in obj and not isinstance(obj["note"], (str, dict)):
+            bad(f"{where}: note is not text")
+    notes(corpus, "corpus")
+    for k, v in (corpus.get("note") or {}).items():
+        if not isinstance(v, str):
+            bad(f"note.{k}: not text")
+    for sec in ("records", "receiver_sequences", "carriage_sequences", "enrolment", "config"):
+        for case in corpus.get(sec, []):
+            notes(case, f"{sec}.{case.get('name')}")
     keys = keys_of(corpus, model, bad)
     cov: dict[str, set] = {k: set() for k in (
         "gw_alone", "rx_alone", "outcomes", "rows", "details", "kinds", "delivered", "bound",
@@ -2100,7 +2246,7 @@ JUDGE_MUTANTS = [
     "gw_drop_3", "gw_drop_4", "gw_drop_6", "gw_swap_3_4", "gw_swap_4_6",
     # check 4 loosened, one form at a time
     "members_extra_ok", "int_bool_ok", "int_spelling_ok", "int_no_max", "int_no_min", "v_any",
-    "dollar_pattern", "obs_seq_4", "outcome_open", "sig_form_loose", "prior_open", "detail_open",
+    "num_as_str_record", "dollar_pattern", "obs_seq_4", "outcome_open", "sig_form_loose", "prior_open", "detail_open",
     "loose_pattern:device_id", "loose_pattern:alert_id", "loose_pattern:delivery_attempt_id",
     "loose_pattern:class", "loose_pattern:month", "loose_pattern:key_identity",
     "skip_form:v", "skip_form:device_id", "skip_form:key_identity", "skip_form:alert_id",
@@ -2129,9 +2275,9 @@ JUDGE_MUTANTS = [
     "enrol_noncanonical_ok", "enrol_extra_ok", "enrol_any_purpose", "enrol_nonce_form_any", "enrol_drop_1",
     "enrol_reuse_ok", "enrol_nonce_odd_ok", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
     "enrol_drop:nonce_mismatch", "enrol_drop:device_mismatch", "enrol_drop:key_mismatch", "enrol_drop:signature_invalid",
-    "loose_pattern:nonce",
+    "loose_pattern:nonce", "num_as_str_enrol",
     # config
-    "validate_disabled", "trim_python_strip", "no_trim", "no_dotdot", "fold_case", "prefix_by_string",
+    "num_as_str_config", "validate_disabled", "trim_python_strip", "no_trim", "no_dotdot", "fold_case", "prefix_by_string",
     "no_containing", "sep_evidence_always", "sep_no_state_dir", "range_float_ok", "range_zero_ok", "range_high_ok",
     "cfg_swap_2_3", "cfg_drop:queue_directory_required", "cfg_drop:queue_directory_absolute",
     "cfg_drop:queue_directory_separate", "cfg_drop:max_records_per_device_range",
