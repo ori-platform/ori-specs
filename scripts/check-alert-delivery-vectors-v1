@@ -90,7 +90,8 @@ PINS: list[tuple[str, str]] = [
     ("ad", "`attempt_seq` is not: it counts every attempt of a lineage, across every report key of that lineage, so attempts keep their order across a rotation."),
     ("ad", "That act makes a new report key, so a receiver sees every new lineage as a new key's enrolment"),
     ("ad", "- **A rotation continues it.** A new report key from a rotation of the evidence device key signs the lineage's later records, including later observations of attempts claimed under the key before it."),
-    ("ad", "- **The enrolment says which.** The receiver's enrolment of each report key records whether it continues the lineage of the key before it or begins a new one; an enrolment to another owner always begins one."),
+    ("ad", "- **The enrolment says which, and the runtime signs it.** The receiver's enrolment of each report key records whether it continues the lineage of the key before it or begins a new one; an enrolment to another owner always begins one. The runtime states which in its enrolment proof, under [Key trust](#key-trust), and the receiver refuses an enrolment whose recorded lineage differs from the one the runtime signed."),
+    ("ad", "for report signing, and not revoked, under [Key trust](#key-trust): `key_not_enrolled`. A revoked key is not enrolled."),
     ("ad", "The rules of [Consistency across records](#consistency-across-records), the uniqueness of `attempt_seq`, and [Reading a notice](#reading-a-notice) hold within one lineage."),
     ("posture", "`sha256:` followed by the 64 lowercase hex characters of SHA-256 over the key's RFC 8410 SubjectPublicKeyInfo DER: the 12-byte prefix `302a300506032b6570032100` followed by the raw 32-byte key"),
     ("posture", "The 32 key bytes with bit 255 cleared, as [ed25519-key-admission/v1.md](../ed25519-key-admission/v1.md) *Recognising a key* defines it"),
@@ -127,7 +128,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "A code no row lists is outside `detail`'s form, and is `malformed`."),
     ("ad", "After an `unconfirmed`, `failed` may carry `not_submitted` or `provider_refused`, for a runtime that later learns which."),
     # Tallies
-    ("ad", "A receiver keeps, for each tally key and epoch, every snapshot it stored, and presents the one with the greatest `count`; it never adds records together. A record with a lower count than the one held is `lower_count` and changes nothing. A record with the same count and different bytes is `conflict`."),
+    ("ad", "A receiver keeps, for each tally key and epoch, every snapshot it stored, and presents the one with the greatest `count`; it never adds records together. A record with a count below the greatest held is `lower_count` and changes nothing; a record with the same count as any held one but different bytes is `conflict`, as check 6 of [Verifying](#verifying) says."),
     ("ad", "Within one month, it keeps tallies for at most 10 distinct class names on each channel, plus `null` for `capped`, whatever classes it binds across that month's reloads."),
     ("ad", "So for each channel and month there are at most 10 `disabled` tallies and 11 `capped` tallies, and a runtime keeps at most (10 + 11) × 2 channels × 2 months = 84 tallies."),
     ("ad", "- **Overflow.** A count that reaches 2^53 − 1 stays there, and no further snapshot is published for its key."),
@@ -442,7 +443,7 @@ def build_model(texts: dict[str, str]) -> dict:
     if m["count_max"] != m["int_max"]:
         raise Failure("text: tally overflow differs from the integer maximum")
     pub = section(ad, "Publication", 2)
-    g = one(r"so the queue holds at most one snapshot per tally key, and at most (\d+) in all", pub, "queue tallies")
+    g = one(r"so the queue holds at most one snapshot per tally key, and at most (\d+) of the current epoch", pub, "queue tallies")
     if int(g.group(1)) != tb["total"]:
         raise Failure("text: publication's tally bound differs from Withholding tallies'")
     g = one(r"the queue reserves (\d+) places for tallies", pub, "reserved places")
@@ -556,8 +557,13 @@ def build_model(texts: dict[str, str]) -> dict:
     if json.loads(blk.group(1))["purpose"] != m["enrol_purpose"]:
         raise Failure("text: enrolment example purpose differs from the constant")
     items = numbered(pr)
-    if len(items) != 5:
+    if len(items) != 6:
         raise Failure(f"text: the enrolment proof lists {len(items)} refusals")
+    gl = one(r"`lineage` is `(\w+)` when the key was made by the act that began its lineage, and `(\w+)` when it was made by a rotation", pr, "lineage")
+    m["enrol_lineage_vocab"] = [gl.group(1), gl.group(2)]
+    if not re.fullmatch(r"`lineage` differs from the lineage the commissioning act records for this enrolment, or is `(\w+)` for an enrolment to another owner than the key before it: `\w+`\.", items[5]) \
+            or re.search(r"is `(\w+)` for an enrolment", items[5]).group(1) != gl.group(2):
+        raise Failure(f"text: enrolment check 6 changed: {items[5]!r}")
     m["enrol_order"] = [ticks(it)[-1] for it in items]
     m["enrol_items"] = items
 
@@ -1459,15 +1465,16 @@ def identity_of(obj: dict, model: dict) -> tuple:
 # ---------------------------------------------------------------------------
 
 def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consumed: bool,
-                 device: str, pub: bytes, model: dict, mut: frozenset) -> list[str]:
+                 device: str, pub: bytes, model: dict, mut: frozenset,
+                 recorded_lineage: object = None, owner_change: bool = False) -> list[str]:
     order = model["enrol_order"]
-    r_malformed, r_nonce, r_device, r_key, r_sig = order
+    r_malformed, r_nonce, r_device, r_key, r_sig, r_lineage = order
     f: list[str] = []
     why, obj = parse_payload(challenge)
     malformed = why is not None
     orig = obj
     if obj is not None and "num_as_str_enrol" in mut:
-        obj = num_as_str(obj, ("device_id", "key_identity", "nonce", "purpose"))
+        obj = num_as_str(obj, ("device_id", "key_identity", "nonce", "purpose", "lineage"))
     if not malformed:
         lo, hi = model["nonce"]
         malformed = (
@@ -1477,6 +1484,7 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
             or (obj.get("purpose") != model["enrol_purpose"] and "enrol_any_purpose" not in mut)
             or not full(model["patterns"]["device_id"], obj.get("device_id"), mut, "device_id")
             or not full(model["key_identity_re"], obj.get("key_identity"), mut, "key_identity")
+            or (obj.get("lineage") not in model["enrol_lineage_vocab"] and "enrol_lineage_form_any" not in mut)
             or not (full(model["nonce_re"] if "enrol_nonce_odd_ok" not in mut else "^[0-9a-f]{%d,%d}$" % (lo, hi),
                          obj.get("nonce"), mut, "nonce") or "enrol_nonce_form_any" in mut)
         )
@@ -1492,6 +1500,11 @@ def enrol_faults(challenge: bytes, sig: bytes | None, issued_nonce: str, consume
         (r_sig, sig is None or not ed_verify(pub, model["enrol_prefix"] + challenge, sig) if "enrol_no_prefix" not in mut
          else not ed_verify(pub, challenge, sig or b"")),
     ]
+    signed = obj.get("lineage") if "lineage_unsigned" not in mut else recorded_lineage
+    tests.append((r_lineage, signed != recorded_lineage
+                  or (signed == model["enrol_lineage_vocab"][1] and owner_change and "lineage_owner_change_ok" not in mut)))
+    if "enrol_lineage_before_signature" in mut:
+        tests[3], tests[4] = tests[4], tests[3]
     if "enrol_swap_2_3" in mut:
         tests[0], tests[1] = tests[1], tests[0]
     if "enrol_swap_3_4" in mut:
@@ -1712,7 +1725,8 @@ TEXT_EDITS: list[tuple[str, str, str, str, bool]] = [
     ("gateway check 6 reason renamed", "ad", "differs from the topic's device: `device_mismatch`.", "differs from the topic's device: `device_differs`.", False),
     ("gateway check 4 unsupported_version renamed", "ad", "`1`: `unsupported_version`. A `v` outside", "`1`: `version_unsupported`. A `v` outside", False),
     ("gateway check 4 out-of-rule v unsupported", "ad", r"among\s+them,\s+is\s+`malformed`\.", "among them, is `unsupported_version`.", True),
-    ("receiver check 3 reason renamed", "ad", "under [Key trust](#key-trust): `key_not_enrolled`.", "under [Key trust](#key-trust): `key_unknown`.", False),
+    ("receiver check 3 reason renamed", "ad", r"under\s+\[Key\s+trust\]\(#key-trust\):\s+`key_not_enrolled`\.\s+A\s+revoked", "under [Key trust](#key-trust): `key_unknown`. A revoked", True),
+    ("receiver check 3: revoked key admitted", "ad", r"for\s+report\s+signing,\s+and\s+not\s+revoked,\s+under", "for report signing, under", True),
     ("receiver check 5: class before transition", "ad", "the observation table,\n   `transition_refused`; the class rules of [Class](#class), `class_refused`;", "the class rules of [Class](#class), `class_refused`; the observation table,\n   `transition_refused`;", False),
     ("receiver check 5: detail before class", "ad", "the class rules of [Class](#class), `class_refused`;\n   the detail table, `detail_refused`.", "the detail table, `detail_refused`;\n   the class rules of [Class](#class), `class_refused`.", False),
     ("receiver check 6 stored renamed", "ad", "Any other record is `stored`.", "Any other record is `held`.", False),
@@ -1852,7 +1866,9 @@ def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str]
         if e.get("key") not in keys:
             bad(f"{where}: enrolment names unknown key {e.get('key')!r}")
             continue
-        if e.get("lineage") not in ("begins", "continues") or not isinstance(e.get("revision"), int) \
+        if not isinstance(e.get("revoked", False), bool):
+            bad(f"{where}: enrolment {e.get('key')} revoked is not a boolean")
+        if e.get("lineage") not in model["enrol_lineage_vocab"] or not isinstance(e.get("revision"), int) \
                 or isinstance(e.get("revision"), bool) or not isinstance(e.get("owner"), str):
             bad(f"{where}: enrolment {e.get('key')} lacks an owner, a revision or a lineage")
             continue
@@ -1863,13 +1879,18 @@ def fixture(case: dict, keys: dict[str, bytes], model: dict, bad: Callable[[str]
             bad(f"{where}: two enrolments of {dev} share a revision")
         n, prev = 0, None
         for e in sorted(es, key=lambda e: e["revision"]):
-            begins = prev is None or e["lineage"] == "begins" or (e["owner"] != prev["owner"] and "lineage_owner_ignored" not in mut)
+            # An enrolment to another owner always begins a lineage, whatever
+            # a registry entry's flag says (*Lineage*); a conforming enrolment
+            # cannot record such a flag, since check 6 refuses it.
+            begins = prev is None or e["lineage"] == model["enrol_lineage_vocab"][0] \
+                or (e["owner"] != prev["owner"] and "lineage_owner_ignored" not in mut)
             if prev is None and e["lineage"] == "continues":
                 bad(f"{where}: {dev}'s first enrolment continues no lineage")
             if begins and prev is not None and any(x[1] == keys[e["key"]] for x in enrol if x[0] == dev):
                 bad(f"{where}: {dev}'s enrolment revision {e['revision']} begins a lineage under a key already enrolled")
             n += 1 if begins else 0
-            enrol.append((dev, keys[e["key"]], e.get("purpose"), e["owner"], n, e["revision"]))
+            if e.get("revoked", False) is not True or "revoked_ok" in mut:
+                enrol.append((dev, keys[e["key"]], e.get("purpose"), e["owner"], n, e["revision"]))
             prev = e
     ring = {key_identity_of(p, model): p for p in keys.values()}
     reg = {}
@@ -2284,7 +2305,10 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         sig = b64_exact(case["signature"], 64)
         if sig is None:
             bad(f"{where}: signature is not canonical Base64 of 64 bytes")
-        f = enrol_faults(ch, sig, case["issued_nonce"], case["nonce_consumed"], case["enrolling_device_id"], pub, model, mut)
+        f = enrol_faults(ch, sig, case["issued_nonce"], case["nonce_consumed"], case["enrolling_device_id"], pub, model, mut,
+                         case["recorded_lineage"], case["owner_change"])
+        if case["recorded_lineage"] not in model["enrol_lineage_vocab"] or not isinstance(case["owner_change"], bool):
+            bad(f"{where}: recorded_lineage or owner_change outside its form")
         v = f[0] if f else "pass"
         if v != case["expected"]:
             bad(f"{where}: verdict {v}, corpus says {case['expected']} (fails {f})")
@@ -2380,7 +2404,7 @@ JUDGE_MUTANTS = [
     "skip_form:prior_outcome", "skip_form:detail", "skip_form:issued_at_ms", "skip_form:signature",
     "skip_form:reason", "skip_form:month", "skip_form:count",
     # receiver checks 2 to 5
-    "owner_current", "owner_ignored", "lineage_ignored", "lineage_owner_ignored",
+    "owner_current", "owner_ignored", "lineage_ignored", "lineage_owner_ignored", "revoked_ok",
     "rx_drop:2", "rx_drop:key_not_enrolled", "rx_drop:signature_invalid", "rx_drop:5", "rx_swap_3_4",
     "enrol_any_device", "enrol_any_purpose_rx", "rx_checks_device_ids", "rx_checks_topic",
     "dup_stored_only", "tally_conflict_greatest_only", "enrol_by_recognised", "no_signature_check",
@@ -2399,7 +2423,8 @@ JUDGE_MUTANTS = [
     "no_replay", "replay_by_identity", "queue_off_by_one", "ack_unknown_device",
     # enrolment
     "enrol_noncanonical_ok", "enrol_extra_ok", "enrol_any_purpose", "enrol_nonce_form_any", "enrol_drop_1",
-    "enrol_reuse_ok", "enrol_nonce_odd_ok", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
+    "enrol_reuse_ok", "enrol_nonce_odd_ok", "enrol_drop:lineage_mismatch", "lineage_unsigned",
+    "lineage_owner_change_ok", "enrol_lineage_before_signature", "enrol_lineage_form_any", "enrol_swap_2_3", "enrol_swap_3_4", "enrol_no_prefix",
     "enrol_drop:nonce_mismatch", "enrol_drop:device_mismatch", "enrol_drop:key_mismatch", "enrol_drop:signature_invalid",
     "loose_pattern:nonce", "num_as_str_enrol",
     # config
