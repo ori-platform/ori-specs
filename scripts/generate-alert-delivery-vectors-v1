@@ -346,14 +346,9 @@ def form_ok(o: object) -> bool:
             and int_in(o["count"], 1, MAX_INT))
 
 
-def json_integer(v: object) -> bool:
-    """A JSON integer token: an optional minus, then 0 or a digit 1 to 9 and digits; no fraction or exponent."""
-    return isinstance(v, Raw) and re.fullmatch(r"-?(0|[1-9][0-9]*)", v) is not None
-
-
 def shape(obj: object) -> str | None:
-    """Check 4 of Carriage and custody: unsupported_version for a JSON integer v other than 1, else form."""
-    if isinstance(obj, dict) and json_integer(obj.get("v")) and obj["v"] != "1":
+    """Check 4 of Carriage and custody: unsupported_version for a v within the integer rule other than 1."""
+    if isinstance(obj, dict) and int_in(obj.get("v"), 2, MAX_INT):
         return "unsupported_version"
     return None if form_ok(obj) else "malformed"
 
@@ -430,11 +425,15 @@ def enrolment_of(obj: dict, enrolments: list) -> dict | None:
 
 
 def lineage_of(enrolment: dict, enrolments: list) -> int:
-    """1 for a device's first lineage; each enrolment that begins a lineage, by revision, starts the next."""
+    """1 for a device's first lineage; by revision, each enrolment that begins a lineage starts the next.
+
+    An enrolment to another owner than the revision before it always begins one, whatever its flag says.
+    """
     mine = sorted((e for e in enrolments if e["device_id"] == enrolment["device_id"]), key=lambda e: e["revision"])
-    n = 0
+    n, prev = 0, None
     for e in mine:
-        n += e["lineage"] == "begins"
+        n += e["lineage"] == "begins" or (prev is not None and prev["owner"] != e["owner"])
+        prev = e
         if e is enrolment:
             return n
     raise KeyError(enrolment["key"])
@@ -450,7 +449,7 @@ def perm(device: str, owner: str = "site-a") -> dict:
     return {"device_id": device, "owner": owner}
 
 
-def check_enrolments(enrolments: list) -> None:
+def check_enrolments(enrolments: list, owner_flag_checked: bool = True) -> None:
     by_device: dict = {}
     for e in enrolments:
         by_device.setdefault(e["device_id"], []).append(e)
@@ -458,14 +457,15 @@ def check_enrolments(enrolments: list) -> None:
         es = sorted(es, key=lambda e: e["revision"])
         assert len({e["revision"] for e in es}) == len(es) and es[0]["lineage"] == "begins"
         for a, b in itertools.pairwise(es):
-            assert a["owner"] == b["owner"] or b["lineage"] == "begins", "another owner always begins a lineage"
+            if owner_flag_checked:
+                assert a["owner"] == b["owner"] or b["lineage"] == "begins", "another owner always begins a lineage"
 
 
 def fixture(device: str = DEVICE, *, enrol: tuple = ("runtime",), forwarder: str = FORWARDER,
-            registry: dict | None = None, enrolments: list | None = None) -> dict:
+            registry: dict | None = None, enrolments: list | None = None, owner_flag_checked: bool = True) -> dict:
     enrolments = enrolments if enrolments is not None else [
         enr(device, k, i + 1, "begins" if i == 0 else "continues") for i, k in enumerate(enrol)]
-    check_enrolments(enrolments)
+    check_enrolments(enrolments, owner_flag_checked)
     return {"topic_device": device, "configured_devices": [device], "forwarder": forwarder,
             "forwarding_registry": registry if registry is not None else {FORWARDER: [perm(device)]},
             "enrolments": enrolments}
@@ -828,12 +828,14 @@ rcase("precedence_unsupported_version_over_device_mismatch", "Another device's r
 # Gateway check 4: unsupported_version, a JSON integer v other than 1.
 gw("unsupported_version_2", "v is 2, a later version.", submission(v=2), "unsupported_version")
 gw("unsupported_version_tally", "A tally with v 2.", tally(v=2), "unsupported_version")
-gw("unsupported_version_0", "v is 0: a JSON integer other than 1, so unsupported_version, though no member is "
-   "ever 0.", submission(v=0), "unsupported_version")
-gw("unsupported_version_negative", "v is -1: a JSON integer token, with its sign, other than 1.",
-   submission(v=-1), "unsupported_version")
-gw("unsupported_version_over_bound", "v is 2^53, a JSON integer beyond every integer member's bound.",
-   submission(v=MAX_INT + 1), "unsupported_version")
+gw("unsupported_version_bound", "v is 2^53 - 1, the largest integer the integer rule admits.",
+   submission(v=MAX_INT), "unsupported_version")
+gw("malformed_v_0", "v is 0, outside the integer rule (1 to 2^53 - 1), so malformed, not unsupported_version.",
+   submission(v=0), "malformed")
+gw("malformed_v_negative", "v is -1: a sign is outside the integer rule, so malformed.", submission(v=-1),
+   "malformed")
+gw("malformed_v_over_bound", "v is 2^53, above the integer rule's bound, so malformed.",
+   submission(v=MAX_INT + 1), "malformed")
 rcase("precedence_not_owned_over_key_other_device", "Another device's record, on site-a-edge-01's topic, signed by "
       "other: device_mismatch at the gateway; at the receiver check 2 wins over key_not_enrolled, not_owned.",
       submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch", "not_owned")
@@ -1134,6 +1136,17 @@ rseq("reset_new_lineage", "runtime enrolled (lineage 1), then rotated enrolled a
      [obs(AL1, AT1, 1, 1, None, "accepted"),
       obs(AL1, AT1, 1, 1, None, "failed", "provider_refused", signer=ROTATED, notice="tier_d",
           **{"class": None})], RESET)
+# The one fixture whose flag contradicts its owner: the owner_flag_checked assert is lifted for it alone.
+MOVED_FLAG_CONTINUES = fixture(registry={FORWARDER: [perm(DEVICE), perm(DEVICE, "site-b")]},
+                               enrolments=[enr(DEVICE, "runtime"), enr(DEVICE, "rotated", 2, "continues", "site-b")],
+                               owner_flag_checked=False)
+rseq("owner_change_begins_lineage", "Revision 2 enrols rotated to site-b, another owner, with lineage flagged "
+     "continues. The generator's assert that no fixture flags an owner change as continues is lifted for this "
+     "case alone. An enrolment to another owner always begins a lineage, whatever its flag says, so rotated's "
+     "records are lineage 2: attempt_seq 1 reused under rotated for another attempt is stored, not conflict, and "
+     "the notices are read apart. The forwarder may forward for the device on behalf of both owners.",
+     [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL2, AT2, 1, 1, None, "accepted", signer=ROTATED)],
+     MOVED_FLAG_CONTINUES)
 rseq("restore_same_lineage", "rotated continues runtime's lineage, a rotation, but the store was restored without "
      "the act that begins a new lineage: attempt_seq 1 reused under rotated for another attempt is a conflict, "
      "and both notices are unsettled.",
@@ -1517,9 +1530,9 @@ def build() -> dict:
             "records": ("Each record case is one message, `record` its exact bytes, on the alert-delivery topic of "
                         "`topic_device`. `expected_gateway` is `pass` or the reason of checks 3 to 6 of Carriage "
                         "and custody, for a gateway whose gateway.device_ids is `configured_devices`; check 4 "
-                        "is unsupported_version for a v that is a JSON integer token (an optional minus, no "
-                        "fraction or exponent) other than 1, and otherwise malformed for a record outside its "
-                        "form. `expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check "
+                        "is unsupported_version for a v within the integer rule of Records (1 to 2^53 - 1, no "
+                        "sign, fraction or exponent) other than 1, and otherwise malformed for a record outside "
+                        "its form. `expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check "
                         "1 being carriage checks 3 and 4: the receiver receives no topic and reads neither "
                         "`topic_device` nor `configured_devices`. Checks 1 and 2 of carriage, and the "
                         "receiver's own payload bound, are not exercised. `enrolments` is the receiver's "
@@ -1538,7 +1551,8 @@ def build() -> dict:
                                    "`forwarder`, `forwarding_registry` and `enrolments` as in `records`. A "
                                    "record's lineage is that of its key's enrolment: a device's lineages are "
                                    "numbered from 1, by revision, each enrolment that begins one starting the "
-                                   "next. `expected` is the verdict: a refusal of checks 1 to 5, which changes "
+                                   "next, as does an enrolment to another owner than the revision before it, "
+                                   "whatever its flag says. `expected` is the verdict: a refusal of checks 1 to 5, which changes "
                                    "nothing, or check 6's: `stored`, `duplicate`, `conflict` or `lower_count`, in "
                                    "that order. Bytes identical to a record held as stored or as conflict are "
                                    "duplicate; every other judgement is against `stored` records only. A tally "
