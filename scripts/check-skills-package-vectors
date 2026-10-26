@@ -22,6 +22,12 @@ contract's sentences: each refused case must carry exactly the defect its
 value kind and alternative the contract lists must have a case, and no manifest
 in any other file may carry one of the three defects.
 
+**Field types.** `field-types.json` is evaluated against a type model of its
+own, checked against v3's field tables: each refused case must carry exactly
+the one defect its `field` and `kind` name, each accepted case none, every
+member the tables type must have a `null` case and a wrong-type case, and
+each case must differ from the accepted base manifest at its `field` alone.
+
 Run from the repository root:
 
     python3 scripts/check-skills-package-vectors
@@ -45,6 +51,7 @@ VECTORS = ROOT / "skills-package" / "vectors"
 CORE = ROOT / "schema-descriptor" / "v1.md"
 CONTRACT = ROOT / "skills-package" / "v3.md"
 TIER_B = "tier-b-policy.json"
+FIELD_TYPES = "field-types.json"
 DECLARED_CONTRACT = "skills-package/v3"
 
 #: Which cases discharge each requirement of the descriptor core, in the order
@@ -299,7 +306,7 @@ def check_tier_b(documents: dict[str, dict], contract_text: str) -> list[str]:
         if not {True, False} <= trigger_only_values:
             failures.append("trigger_only: needs a case with true and one with false")
         for filename, other in documents.items():
-            if filename == TIER_B:
+            if filename in (TIER_B, FIELD_TYPES):
                 continue
             for case in other["cases"]:
                 manifest = case.get("manifest")
@@ -311,6 +318,360 @@ def check_tier_b(documents: dict[str, dict], contract_text: str) -> list[str]:
     except (KeyError, TypeError, IndexError, AttributeError) as error:
         failures.append(f"{TIER_B}: malformed ({error!r})")
     return failures
+
+
+#: Member types, by path pattern: `[]` is any list index and `*` any mapping key.
+#: Written from v3's tables, which `field_type_tables_agree` reads back.
+#: `requires_approval` is typed in tier-b-policy.json and is left out here.
+TYPED: dict[str, str] = {
+    "name": "string", "version": "string", "author": "string", "signature": "string",
+    "triggers": "array", "sensors_required": "array", "actions": "object",
+    "prompts": "object", "config": "object", "config_schema": "object",
+    "triggers[]": "object",
+    "triggers[].name": "string", "triggers[].condition": "string",
+    "triggers[].action_tier": "string", "triggers[].cooldown_seconds": "integer",
+    "triggers[].escalate_to": "string", "triggers[].bypass_llm": "bool",
+    "triggers[].reasoning_policy": "string",
+    "triggers[].approval_timeout_seconds": "integer",
+    "triggers[].safe_default_action": "string",
+    "sensors_required[]": "object", "sensors_required[].type": "string",
+    "actions.available": "array", "actions.available[]": "object",
+    "actions.available[].name": "string", "actions.available[].tier": "string",
+    "actions.defaults": "object", "actions.defaults.*": "array",
+    "actions.defaults.*[]": "string", "prompts.*": "string",
+}
+
+#: How each table names a member, mapped to the pattern above.
+TABLE_NAMES: dict[str, str] = {
+    "triggers[]": "triggers[]", "sensors_required[]": "sensors_required[]",
+    "sensors_required[].type": "sensors_required[].type",
+    "actions.available": "actions.available", "actions.available[]": "actions.available[]",
+    "actions.available[].name": "actions.available[].name",
+    "actions.available[].tier": "actions.available[].tier",
+    "actions.defaults": "actions.defaults", "actions.defaults.<trigger>": "actions.defaults.*",
+    "prompts.<name>": "prompts.*",
+}
+
+FIELD_SENTENCES: dict[str, str] = {
+    "one_type": "Every field a loader reads admits exactly one type.",
+    "null": "A member present with `null` is refused as a wrong type.",
+    "integer": "An `integer` field refuses a boolean and a floating-point number, `1.0` included.",
+    "type_first": "A type is checked before anything reads the member.",
+    "tier": "`actions.available[].tier`, where present, is exactly `A`, `B` or `C`, "
+    "like a trigger's `action_tier`.",
+    "cooldown": "**`cooldown_seconds` is at least `0`.**",
+    "condition": "A non-empty `condition` longer than 4,096 characters, or one the "
+    "runtime rule engine cannot evaluate, is refused at load.",
+}
+
+CONDITION_MAX = 4096
+
+FIELD_MUTANTS: dict[str, bool] = {
+    "null_is_absent": False,
+    "integer_admits_bool": False,
+    "integer_admits_float": False,
+    "tier_upper_cased": False,
+    "tier_stripped": False,
+    "negative_cooldown_admitted": False,
+    "condition_bound_inclusive": False,
+}
+
+
+def _admits(value: object, kind: str) -> bool:
+    if value is None:
+        return False
+    if kind == "integer":
+        if type(value) is bool:
+            return FIELD_MUTANTS["integer_admits_bool"]
+        if type(value) is float:
+            return FIELD_MUTANTS["integer_admits_float"]
+        return type(value) is int
+    return isinstance(value, {"string": str, "bool": bool, "array": list, "object": dict}[kind])
+
+
+def field_defects(manifest: object) -> set[tuple[str, str]]:
+    """Every (path, kind) defect a manifest carries under v3's field types."""
+    found: set[tuple[str, str]] = set()
+
+    def walk(value: object, path: str, pattern: str) -> None:
+        kind = TYPED.get(pattern)
+        if kind is not None and not _admits(value, kind):
+            if value is None and FIELD_MUTANTS["null_is_absent"]:
+                return
+            found.add((path, "type"))
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else key
+                exact = f"{pattern}.{key}" if pattern else key
+                walk(child, child_path, exact if exact in TYPED else f"{pattern}.*")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(child, f"{path}[{index}]", f"{pattern}[]")
+        elif pattern == "actions.available[].tier" and isinstance(value, str) and value != "D":
+            # A Tier D action is refused under v3's Tier D rule, which
+            # tier-authority.json exercises; this model owns the letter's form.
+            tier = value
+            if FIELD_MUTANTS["tier_stripped"]:
+                tier = tier.strip()
+            if FIELD_MUTANTS["tier_upper_cased"] and tier.isascii():
+                tier = tier.upper()
+            if tier not in ("A", "B", "C"):
+                found.add((path, "value"))
+        elif pattern == "triggers[].cooldown_seconds" and type(value) is int:
+            if value < 0 and not FIELD_MUTANTS["negative_cooldown_admitted"]:
+                found.add((path, "value"))
+        elif pattern == "triggers[].condition" and isinstance(value, str):
+            limit = CONDITION_MAX + (1 if FIELD_MUTANTS["condition_bound_inclusive"] else 0)
+            if len(value) > limit:
+                found.add((path, "value"))
+
+    walk(manifest, "", "")
+    return found
+
+
+def _steps(field: str) -> list[object]:
+    return [int(p) if p.isdigit() else p for p in re.findall(r"[^.\[\]]+", field)]
+
+
+def _restore(manifest: dict, base: dict, field: str) -> dict:
+    """*manifest* with *field* put back as *base* holds it, or removed."""
+    out = copy.deepcopy(manifest)
+    steps = _steps(field)
+    target, source = out, base
+    for step in steps[:-1]:
+        target, source = target[step], source[step]
+    last = steps[-1]
+    try:
+        target[last] = copy.deepcopy(source[last])
+    except (KeyError, IndexError):
+        del target[last]
+    return out
+
+
+def _must_name(manifest: dict, field: str) -> set[str]:
+    """What a refusal must name: the trigger or action by its name where it has
+    one, and otherwise every named step of the path to the member."""
+    steps = _steps(field)
+    for prefix in (["triggers"], ["actions", "available"]):
+        n = len(prefix)
+        if steps[:n] == prefix and len(steps) > n + 1:
+            entry = manifest
+            for step in steps[: n + 1]:
+                entry = entry[step]
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if isinstance(name, str) and steps[n + 1] != "name":
+                return {name} | {s for s in steps[n + 1 :] if isinstance(s, str)}
+    return {s for s in steps if isinstance(s, str)}
+
+
+def field_type_tables_agree(contract_text: str) -> list[str]:
+    failures: list[str] = []
+    text = _norm(contract_text)
+    for key, sentence in FIELD_SENTENCES.items():
+        if _norm(sentence) not in text:
+            failures.append(f"v3 no longer states the {key} sentence this checker encodes")
+
+    def rows(heading: str) -> dict[str, str]:
+        section = contract_text.split(heading, 1)[1].split("\n## ", 1)[0]
+        found = re.findall(r"^\| `([^`]+)` \| `(\w+)`(?: of `(\w+)`)?", section, flags=re.M)
+        return {name: (kind, item) for name, kind, item in found}
+
+    tables: dict[str, str] = {}
+    for prefix, heading in (("", "## skill.yaml Top-Level Fields"), ("triggers[].", "## Trigger Fields"), (None, "## Field types")):
+        for name, (kind, item) in rows(heading).items():
+            pattern = f"{prefix}{name}" if prefix is not None else TABLE_NAMES.get(name, f"?{name}")
+            tables[pattern] = kind
+            if item:
+                tables[f"{pattern}[]"] = item
+    tables.pop("triggers[].requires_approval", None)
+    if tables != TYPED:
+        differ = sorted(set(tables.items()) ^ set(TYPED.items()))
+        failures.append(f"v3's field tables and this checker's type model differ: {differ}")
+    return failures
+
+
+def check_field_types(documents: dict[str, dict], contract_text: str) -> list[str]:
+    failures = field_type_tables_agree(contract_text)
+    try:
+        document = documents[FIELD_TYPES]
+        declared = set(re.findall(r"skills-package/v\d+", str(document.get("contract", ""))))
+        if declared != {DECLARED_CONTRACT}:
+            failures.append(f"{FIELD_TYPES} declares {sorted(declared)}; it exercises {DECLARED_CONTRACT}")
+        cases = {case["name"]: case for case in document["cases"]}
+        base_case = cases.get("every_field_typed_accepted")
+        if base_case is None:
+            return failures + [f"{FIELD_TYPES}: no base case every_field_typed_accepted"]
+        base = base_case["manifest"]
+        base_defects = set(policy_defects(base, {"alert_sms": "A"})) | field_defects(base)
+        if base_defects:
+            failures.append(f"every_field_typed_accepted: base carries {sorted(base_defects)}")
+        covered: dict[str, set[str]] = {}
+        by_pattern: dict[str, set[str]] = {}
+        for name, case in cases.items():
+            manifest, field = case["manifest"], case.get("field", "")
+            if "requires_approval" in json.dumps(manifest):
+                failures.append(f"{name}: requires_approval belongs to {TIER_B}")
+            try:
+                restored = _restore(manifest, base, field)
+            except (KeyError, IndexError, TypeError):
+                failures.append(f"{name}: field {field!r} is not a member of the manifest")
+                continue
+            if restored != base:
+                failures.append(f"{name}: differs from the base manifest beyond {field!r}")
+            found = field_defects(manifest)
+            if case["expect"] == "accepted":
+                if found or "kind" in case:
+                    failures.append(f"{name}: accepted, but carries {sorted(found)}")
+                covered.setdefault(field, set()).add(f"accepted:{_value_tag(manifest, field)}")
+                by_pattern.setdefault(_pattern(field), set()).add(f"accepted:{_value_tag(manifest, field)}")
+                continue
+            if case["expect"] != "refused":
+                failures.append(f"{name}: expect is {case['expect']!r}")
+                continue
+            kind = case.get("kind")
+            if found != {(field, kind)}:
+                failures.append(f"{name}: declares {field} {kind}, carries {sorted(found)}")
+                continue
+            if case.get("error") != "SkillValidationError":
+                failures.append(f"{name}: a field-type refusal is a SkillValidationError")
+            missing = _must_name(manifest, field) - set(case.get("must_name", []))
+            if missing:
+                failures.append(f"{name}: must_name omits {sorted(missing)}")
+            covered.setdefault(field, set()).add(f"{kind}:{_value_tag(manifest, field)}")
+            by_pattern.setdefault(_pattern(field), set()).add(f"{kind}:{_value_tag(manifest, field)}")
+        failures += _field_coverage(covered, by_pattern)
+    except (KeyError, TypeError, IndexError, AttributeError) as error:
+        failures.append(f"{FIELD_TYPES}: malformed ({error!r})")
+    return failures
+
+
+def _value_tag(manifest: dict, field: str) -> str:
+    value: object = manifest
+    for step in _steps(field):
+        value = value[step]  # type: ignore[index]
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "bool"
+    if type(value) is float:
+        return "float"
+    if isinstance(value, str) and field.endswith("condition"):
+        return f"len{len(value)}"
+    if type(value) is int:
+        return "negative" if value < 0 else "zero" if value == 0 else "positive"
+    return repr(value) if isinstance(value, str) else type(value).__name__
+
+
+def _pattern(field: str) -> str:
+    """The TYPED pattern a concrete member path falls under."""
+    pattern = ""
+    for step in _steps(field):
+        if isinstance(step, int):
+            pattern += "[]"
+        else:
+            exact = f"{pattern}.{step}" if pattern else step
+            pattern = exact if exact in TYPED else f"{pattern}.*"
+    return pattern
+
+
+def _field_coverage(covered: dict[str, set[str]], by_pattern: dict[str, set[str]]) -> list[str]:
+    failures: list[str] = []
+    for pattern, kind in sorted(TYPED.items()):
+        tags = by_pattern.get(pattern, set())
+        if "type:null" not in tags:
+            failures.append(f"{pattern}: no null case")
+        if not any(t.startswith("type:") and t != "type:null" for t in tags):
+            failures.append(f"{pattern}: no wrong-type case")
+        if kind == "integer" and not ({"type:bool", "type:float"} <= tags and any(t.startswith("type:'") for t in tags)):
+            failures.append(f"{pattern}: integer needs a boolean, a float and a string case")
+    required = {
+        "actions.available[0].tier": {"value:'a'", "value:''", "value:' A'", "value:'Ａ'"},
+        "triggers[0].cooldown_seconds": {"value:negative", "accepted:zero"},
+        "triggers[0].condition": {f"value:len{CONDITION_MAX + 1}", f"accepted:len{CONDITION_MAX}", "accepted:len0"},
+    }
+    for path, tags in required.items():
+        absent = tags - covered.get(path, set())
+        if absent:
+            failures.append(f"{path}: no case for {sorted(absent)}")
+    return failures
+
+
+def field_corpus_mutants(documents: dict[str, dict]):
+    document = documents[FIELD_TYPES]
+
+    def with_doc(bad: dict) -> dict[str, dict]:
+        return {**documents, FIELD_TYPES: bad}
+
+    bad = copy.deepcopy(document)
+    bad["contract"] = "skills-package/v2 — field types"
+    yield "field types declares v2", with_doc(bad)
+    base = next(c for c in document["cases"] if c["name"] == "every_field_typed_accepted")["manifest"]
+    for i, case in enumerate(document["cases"]):
+        name = case["name"]
+        bad = copy.deepcopy(document)
+        del bad["cases"][i]
+        yield f"without {name}", with_doc(bad)
+        bad = copy.deepcopy(document)
+        if case["expect"] == "refused":
+            bad["cases"][i]["expect"] = "accepted"
+            for key in ("kind", "error", "must_name"):
+                bad["cases"][i].pop(key)
+            yield f"{name} expected accepted", with_doc(bad)
+            bad = copy.deepcopy(document)
+            bad["cases"][i]["kind"] = "value" if case["kind"] == "type" else "type"
+            yield f"{name} with the other kind", with_doc(bad)
+            for j in range(len(case["must_name"])):
+                bad = copy.deepcopy(document)
+                del bad["cases"][i]["must_name"][j]
+                yield f"{name} must_name without {case['must_name'][j]}", with_doc(bad)
+            bad = copy.deepcopy(document)
+            bad["cases"][i]["manifest"] = _restore(case["manifest"], base, case["field"])
+            yield f"{name} repaired, still expected refused", with_doc(bad)
+            bad = copy.deepcopy(document)
+            other = "author" if case["field"] == "version" else "version"
+            bad["cases"][i]["manifest"][other] = None
+            yield f"{name} with a second defect", with_doc(bad)
+        else:
+            bad["cases"][i].update(expect="refused", kind="type", error="SkillValidationError", must_name=["x"])
+            yield f"{name} expected refused", with_doc(bad)
+            if name != "every_field_typed_accepted":
+                bad = copy.deepcopy(document)
+                bad["cases"][i]["manifest"]["triggers"][0]["cooldown_seconds"] = 7
+                yield f"{name} differing beyond its field", with_doc(bad)
+
+
+def run_field_mutations(documents: dict[str, dict], contract_text: str) -> list[str]:
+    survived: list[str] = []
+    total = 0
+    for label, bad in field_corpus_mutants(documents):
+        total += 1
+        if not check_field_types(bad, contract_text):
+            survived.append(label)
+    for flag in FIELD_MUTANTS:
+        total += 1
+        FIELD_MUTANTS[flag] = True
+        try:
+            if not check_field_types(documents, contract_text):
+                survived.append(f"field model mutant {flag}")
+        finally:
+            FIELD_MUTANTS[flag] = False
+    for key, sentence in FIELD_SENTENCES.items():
+        total += 1
+        pattern = r"\s+".join(re.escape(w) for w in sentence.split())
+        edited, count = re.subn(pattern, sentence.rsplit(" ", 1)[0].replace("\\", "\\\\"), contract_text, count=1)
+        if count != 1 or not check_field_types(documents, edited):
+            survived.append(f"reword {key}")
+    for row, replacement in (
+        ("| `cooldown_seconds` | `integer` |", "| `cooldown_seconds` | `string` |"),
+        ("| `prompts.<name>` | `string` |", "| `prompts.<name>` | `object` |"),
+    ):
+        total += 1
+        if row not in contract_text or not check_field_types(documents, contract_text.replace(row, replacement)):
+            survived.append(f"table row {row}")
+    if not survived:
+        print(f"  field-type mutations: {total} refused")
+    return survived
 
 
 def _repair(case: dict) -> dict:
@@ -386,7 +747,7 @@ def corpus_mutants(documents: dict[str, dict]):
             if policy_defects(bad["cases"][i]["manifest"], registry) != before:
                 yield f"{name} with {label}", with_tier_b(bad)
     for filename, other in documents.items():
-        if filename == TIER_B:
+        if filename in (TIER_B, FIELD_TYPES):
             continue
         for i, case in enumerate(other["cases"]):
             if case.get("manifest"):
@@ -495,10 +856,10 @@ def check_core(cases: dict[str, dict], failures: list[str]) -> None:
                 failures.append(f"primitive {kind}: missing case {name!r}")
 
 
-def check_isolation(cases: dict[str, dict], failures: list[str]) -> None:
+def check_isolation(cases: dict[str, dict], failures: list[str], skip: set[str]) -> None:
     for name, case in cases.items():
         manifest = case.get("manifest")
-        if not manifest:
+        if not manifest or name in skip:
             continue
         exempt = ISOLATION_EXEMPT.get(name)
         triggers = {trigger["name"] for trigger in manifest["triggers"]}
@@ -519,10 +880,18 @@ def main() -> int:
     cases = load_cases(documents)
     failures: list[str] = []
     check_core(cases, failures)
-    check_isolation(cases, failures)
+    field_cases = {case["name"] for case in documents.get(FIELD_TYPES, {}).get("cases", [])}
+    check_isolation(cases, failures, field_cases)
     failures += check_tier_b(documents, contract_text)
+    failures += check_field_types(documents, contract_text)
+    others = {f: d for f, d in documents.items() if f != FIELD_TYPES}
+    for filename, other in others.items():
+        for case in other["cases"]:
+            if case.get("manifest") and field_defects(case["manifest"]):
+                failures.append(f"{filename} {case['name']}: carries field-type defect {sorted(field_defects(case['manifest']))}")
     if not failures and "--mutations" in sys.argv[1:]:
         failures += [f"mutant survived: {label}" for label in run_mutations(documents, contract_text)]
+        failures += [f"mutant survived: {label}" for label in run_field_mutations(documents, contract_text)]
     if failures:
         print("skills-package vector check FAILED")
         for failure in failures:
@@ -533,6 +902,7 @@ def main() -> int:
     print(f"  {len(PRIMITIVES)} primitives accepted and refused")
     tier_b = documents[TIER_B]["cases"]
     print(f"  {len(tier_b)} Tier B execution-policy cases hold to {DECLARED_CONTRACT}'s three rules")
+    print(f"  {len(documents[FIELD_TYPES]['cases'])} field-type cases hold to {DECLARED_CONTRACT}'s field tables")
     return 0
 
 
