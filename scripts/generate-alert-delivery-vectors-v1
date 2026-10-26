@@ -379,14 +379,12 @@ def verify(pub: bytes, sig_b64: str, message: bytes) -> bool:
 
 
 def receiver_stateless(data: str, ctx: dict) -> str | None:
-    """Checks 1 to 5 of Verifying. Check 1 is carriage checks 3, 4 and 6; there is no check 5 here."""
+    """Checks 1 to 5 of Verifying. Check 1 is carriage checks 3 and 4: a receiver receives no topic."""
     obj = parse(data)
     if canonical(obj) != data.encode("utf-8"):
         return "not_canonical"
     if not form_ok(obj):
         return "malformed"
-    if obj["device_id"] != ctx["topic_device"]:
-        return "device_mismatch"
     if obj["device_id"] not in ctx["forwarding_registry"].get(ctx["forwarder"], []):
         return "not_owned"
     enrolled = [e for e in ctx["enrolments"]
@@ -603,10 +601,17 @@ gw("delivered_refused", "outcome delivered, which is reserved: outside outcome's
    submission(observation_seq=2, prior_outcome="accepted", outcome="delivered"), "malformed")
 
 # Gateway check 6: device_mismatch.
-gw("device_mismatch", "A well-formed record naming site-a-edge-02, on site-a-edge-01's topic.",
-   submission(device_id=OTHER_DEVICE), "device_mismatch")
-gw("device_mismatch_tally", "A tally naming site-a-edge-02, on site-a-edge-01's topic.",
-   tally(device_id=OTHER_DEVICE), "device_mismatch")
+rcase("device_mismatch", "A well-formed record naming site-a-edge-02, on site-a-edge-01's topic: device_mismatch "
+      "at the gateway. The receiver runs no topic check; the forwarder is not permitted for site-a-edge-02, so "
+      "not_owned.", submission(device_id=OTHER_DEVICE), "device_mismatch", "not_owned")
+rcase("device_mismatch_tally", "A tally naming site-a-edge-02, on site-a-edge-01's topic: device_mismatch at the "
+      "gateway, not_owned at the receiver.", tally(device_id=OTHER_DEVICE), "device_mismatch", "not_owned")
+rcase("device_mismatch_gateway_only", "A record naming site-a-edge-02, on site-a-edge-01's topic, where the "
+      "forwarder is permitted for site-a-edge-02 and runtime is enrolled for it: device_mismatch at the gateway; "
+      "the receiver, judging permission against the record's own device_id, passes it.",
+      submission(device_id=OTHER_DEVICE), "device_mismatch", "pass",
+      {**fixture(), "forwarding_registry": {FORWARDER: [DEVICE, OTHER_DEVICE]},
+       "enrolments": [{"device_id": OTHER_DEVICE, "key": "runtime", "purpose": PURPOSE}]})
 
 # Receiver check 2: not_owned. The receiver's registry permits gateway-site-b for another device only.
 NOT_OWNED = fixture(forwarder=OTHER_FORWARDER, registry={FORWARDER: [DEVICE], OTHER_FORWARDER: ["site-b-edge-01"]})
@@ -701,8 +706,9 @@ gw("precedence_not_canonical_over_malformed", "Not canonical and v 2: check 3 wi
    text(submission(v=2)).replace('"v":2', '"v": 2'), "not_canonical")
 gw("precedence_malformed_over_device_mismatch", "Another device's record with v 2: check 4 wins, malformed.",
    submission(device_id=OTHER_DEVICE, v=2), "malformed")
-gw("precedence_device_mismatch_over_key", "Another device's record signed by other: check 6 of carriage, in the "
-   "receiver's check 1, wins over key_not_enrolled.", submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch")
+rcase("precedence_not_owned_over_key_other_device", "Another device's record, on site-a-edge-01's topic, signed by "
+      "other: device_mismatch at the gateway; at the receiver check 2 wins over key_not_enrolled, not_owned.",
+      submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch", "not_owned")
 rcase("unknown_device_gateway_only", "A record on the topic of a device the gateway does not serve: the gateway "
       "refuses it at check 5; the receiver holds no gateway.device_ids and skips check 5, and the forwarder is "
       "permitted for the device, so the receiver passes it.", GOOD, "unknown_device", "pass",
@@ -771,9 +777,9 @@ class Receiver:
         self.kept: list[dict] = []  # {"data", "obj", "verdict", "hit"}
 
     def check6(self, data: str, o: dict) -> tuple[str, list]:
-        stored = [k for k in self.kept if k["verdict"] == "stored"]  # a conflict record is never judged against
-        if any(k["data"] == data for k in stored):
+        if any(k["data"] == data for k in self.kept):  # identical to a record held as stored or as conflict
             return "duplicate", []
+        stored = [k for k in self.kept if k["verdict"] == "stored"]  # never judged against a conflict record
         if o["kind"] == "submission":
             hit = [k for k in stored if k["obj"]["kind"] == "submission" and breaks(k["obj"], o)]
             return ("conflict", hit) if hit else ("stored", [])
@@ -785,8 +791,8 @@ class Receiver:
             return "lower_count", []
         return "stored", []
 
-    def receive(self, data: str, topic: str) -> str:
-        reason = receiver_stateless(data, {**self.ctx, "topic_device": topic})
+    def receive(self, data: str) -> str:
+        reason = receiver_stateless(data, self.ctx)
         if reason is not None:
             return reason
         o = parse(data)
@@ -840,13 +846,11 @@ def rseq(name: str, note: str, recs: list, ctx: dict | None = None) -> None:
     ctx = ctx or fixture()
     ctx = {k: v for k, v in ctx.items() if k not in ("topic_device", "configured_devices")}
     datas = [r if isinstance(r, str) else text(r) for r in recs]
-    topics = [parse(d)["device_id"] for d in datas]
     rcv = Receiver(ctx)
-    verdicts = [rcv.receive(d, t) for d, t in zip(datas, topics)]
+    verdicts = [rcv.receive(d) for d in datas]
     reading, tallies = rcv.reading()
     RECEIVER_SEQUENCES.append({"name": name, "note": note, **ctx,
-                               "records": [{"topic_device": t, "record": d, "expected": v}
-                                           for d, t, v in zip(datas, topics, verdicts)],
+                               "records": [{"record": d, "expected": v} for d, v in zip(datas, verdicts)],
                                "expected_reading": reading, "expected_tallies": tallies})
 
 
@@ -913,9 +917,8 @@ rseq("conflict_record_not_judged_against", "seq 1 unconfirmed is stored; a secon
      "then seq 2 after unconfirmed is judged against the stored seq 1 only, never the conflict record, and is "
      "stored. The notice is unsettled.",
      [_U, obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "unconfirmed", "failed", "not_submitted")])
-rseq("conflict_record_again", "The conflict record arriving a second time is judged against the stored record "
-     "only, since a conflict record is never the earlier record a later one is judged against: conflict again, "
-     "not duplicate.",
+rseq("conflict_record_again", "The conflict record arriving a second time: bytes identical to a record held as "
+     "conflict are duplicate.",
      [_U, obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
 rseq("consistency_prior_outcome", "Consistency, prior_outcome: seq 1 is unconfirmed, then seq 2 says its prior "
      "was accepted (a row the table permits on its own). Conflict.",
@@ -969,6 +972,9 @@ rseq("tally_lower_count", "Snapshot 5, then 3 under the same key: lower_count, t
 rseq("tally_duplicate", "One snapshot twice: duplicate.", [tally(count=5), tally(count=5)])
 rseq("tally_conflict", "Two snapshots of one key and count, different bytes: conflict, and the tally is not "
      "settled.", [tally(count=5), tally(count=5, issued_at_ms=T0 + 70_000)])
+rseq("tally_conflict_below_greatest", "Snapshots 5 then 7 stored, then another 5 with different bytes: same "
+     "count as a held one, so conflict, not lower_count, though a greater count is held. The key is unsettled.",
+     [tally(count=5), tally(count=7, issued_at_ms=T0 + 70_000), tally(count=5, issued_at_ms=T0 + 80_000)])
 rseq("tally_keys_apart", "Same channel, class and month, reasons disabled and capped, and the same reason on two "
      "channels and two months: four keys, each stored alone.",
      [tally(count=4), tally(reason="capped", count=2), tally(channel="whatsapp", count=1),
@@ -1308,8 +1314,9 @@ def build() -> dict:
                         "`topic_device`. `expected_gateway` is `pass` or the reason of checks 3 to 6 of Carriage "
                         "and custody, for a gateway whose gateway.device_ids is `configured_devices`. "
                         "`expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check 1 being "
-                        "carriage checks 3, 4 and 6 on the same topic; the receiver reads no "
-                        "`configured_devices`. Checks 1 and 2 of carriage, and the receiver's own payload bound, "
+                        "carriage checks 3 and 4: the receiver receives no topic, reads neither `topic_device` "
+                        "nor `configured_devices`, and judges forwarding permission against the record's own "
+                        "device_id. Checks 1 and 2 of carriage, and the receiver's own payload bound, "
                         "are not exercised. The receiver's authenticated registry is `forwarding_registry`, each "
                         "forwarder mapped to the devices it may forward for; the record arrives from `forwarder`, "
                         "and check 2 (not_owned) fails when the record's device_id is not in the forwarder's "
@@ -1318,19 +1325,19 @@ def build() -> dict:
                         "record's device_id has the record's key_identity, and check 4 verifies under that "
                         "enrolment's key. `pass` at the receiver means the record goes on to check 6."),
             "receiver_sequences": ("Each sequence is records in arrival order to one receiver with "
-                                   "`forwarder`, `forwarding_registry` and `enrolments` as in `records`, each record "
-                                   "arriving on its own device's topic, `topic_device`. `expected` is the verdict: "
+                                   "`forwarder`, `forwarding_registry` and `enrolments` as in `records`. `expected` is the verdict: "
                                    "a refusal of checks 1 to 5, which changes nothing, or check 6's: `stored`, "
-                                   "`duplicate`, `conflict` or `lower_count`. Only `stored` records are judged "
-                                   "against, for duplicate as for the rest: a record held as conflict is never the "
-                                   "earlier record. An observation's identity is (device_id, "
+                                   "`duplicate`, `conflict` or `lower_count`, in that order. Bytes identical to a "
+                                   "record held as stored or as conflict are duplicate; every other judgement is "
+                                   "against `stored` records only. A tally with the count of a stored one and "
+                                   "other bytes is conflict even when a greater count is stored. An observation's identity is (device_id, "
                                    "delivery_attempt_id, observation_seq), and every consistency rule holds within "
                                    "one device_id whatever key signs; a tally's identity is its tally key, its "
                                    "epoch and its count. `expected_reading` is Reading a notice over the `stored` "
                                    "records, for each device_id and alert_id: per channel the latest attempt state "
-                                   "and ever accepted, and accepted on some channel; `settled` is false when a "
-                                   "record about the notice was held as conflict or is one a conflict record "
-                                   "conflicts with. `expected_tallies` lists, per device, epoch (the key_identity) "
+                                   "and ever accepted, and accepted on some channel; `settled` is false for every "
+                                   "notice a record held as conflict names, and every one the record it conflicted "
+                                   "with names. `expected_tallies` lists, per device, epoch (the key_identity) "
                                    "and tally key, the stored record with the greatest count, `settled` as for a "
                                    "notice; a key not listed is unknown."),
             "carriage_sequences": ("Each sequence is messages in arrival order to one gateway with "

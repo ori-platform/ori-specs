@@ -148,8 +148,9 @@ PINS: list[tuple[str, str]] = [
     # Verifying
     ("ad", "A record refused at checks 2 to 4 is the forwarder's or the network's, never the runtime's, and changes nothing the receiver holds."),
     ("ad", "Only a verified record can make another `conflict`"),
-    ("ad", "A receiver holds no `gateway.device_ids`; the forwarding permission of check 2 stands in for check 5."),
-    ("ad", "A record held as `conflict` is never the earlier record a later one is judged against, and no reading uses it: a notice, or a tally key, with a record held as `conflict` is presented as unsettled."),
+    ("ad", "A receiver receives no topic and holds no `gateway.device_ids`, so it runs neither check 5 nor check 6: the forwarding permission of check 2, judged against the record's own `device_id`, stands in for both."),
+    ("ad", "a tally with the same count as a held one but different bytes is `conflict` even when a greater count is held, since one key signed both."),
+    ("ad", "A record held as `conflict` is never the earlier record a later, different one is judged against, and no reading uses it. Every notice and every tally key that a record held as `conflict` names, and every one the record it conflicted with names, is presented as unsettled."),
     ("ad", "the receiver keeps both and presents neither as settled."),
     ("ad", "A record is never refused for its age"),
     # Key trust
@@ -467,7 +468,7 @@ def build_model(texts: dict[str, str]) -> dict:
     items = numbered(ver)
     if len(items) != 6:
         raise Failure(f"text: verifying lists {len(items)} checks")
-    m["rx_check1"] = tuple(int(x) for x in one(r"^Checks (\d) to (\d) and (\d) of \[Carriage and custody\]", items[0], "rx 1").groups())
+    m["rx_check1"] = tuple(int(x) for x in one(r"^Checks (\d) to (\d) of \[Carriage and custody\]", items[0], "rx 1").groups())
     m["rx_reasons"] = {
         2: [t for t in ticks(items[1]) if t == "not_owned" or t.endswith("_owned")],
         3: [ticks(items[2])[-1]],
@@ -496,8 +497,11 @@ def build_model(texts: dict[str, str]) -> dict:
         if r not in m["rx5"]:
             raise Failure(f"text: {r} is not among receiver check 5's reasons")
     m["rx_reasons"][5] = list(m["rx5"])
-    m["rx6"] = one(r"identical bytes are `(\w+)`\. Different bytes under a held identity, or a record that breaks \[Consistency across records\]\(#consistency-across-records\) against one held, are `(\w+)`\. A tally whose count is below the greatest held for its key is `(\w+)`", items[5], "rx 6").groups()
+    m["rx6_dup_pool"] = one(r"in this order: bytes identical to a record it holds, as `(\w+)` or as `(\w+)`, are `(\w+)`", items[5], "rx 6").groups()
+    m["rx6"] = one(r"are `(\w+)`\. Different bytes under a held identity, or a record that breaks \[Consistency across records\]\(#consistency-across-records\) against one held, are `(\w+)`\. A tally whose count is below the greatest held for its key is `(\w+)`", items[5], "rx 6").groups()
     m["stored"] = one(r"Any other record is `(\w+)`\.", items[5], "rx 6").group(1)
+    if m["rx6_dup_pool"] != (m["stored"], m["rx6"][1], m["rx6"][0]):
+        raise Failure(f"text: check 6's duplicate pool changed: {m['rx6_dup_pool']}")
 
     # Consistency across records
     con = section(ad, "Consistency across records", 3)
@@ -929,6 +933,8 @@ def full(pattern: str, v: object, mut: frozenset, name: str) -> bool:
         body = body.replace("[A-Za-z0-9._-]", "[A-Za-z0-9._:-]").replace("[A-Za-z0-9_-]", "[A-Za-z0-9_.-]")
         body = body.replace("(0[1-9]|1[0-2])", "(0[0-9]|1[0-2])").replace("^[a-z]", "^[a-z0-9]")
         body = body.replace("[a-z][a-z0-9_]", "[a-z0-9_][a-z0-9_]")
+    if f"loose_pattern:{name}" in mut:
+        body = body.replace("{64}", "{63,65}").replace("{16,32}", "{16,33}")
     if "dollar_pattern" in mut:
         return re.match(pattern, v) is not None
     return re.fullmatch(body, v) is not None
@@ -1182,9 +1188,10 @@ class Receiver:
         dup, conflict, lower = model["rx6"]
         # A record held as conflict is never the earlier record a later one is
         # judged against, for duplicate as for the rest.
-        pool = [k for k in self.kept if k[3] != conflict or "conflicts_in_pool" in mut]
-        if "no_duplicate" not in mut and any(k[0] == raw for k in pool):
+        dup_pool = self.kept if "dup_stored_only" not in mut else [k for k in self.kept if k[3] != conflict]
+        if "no_duplicate" not in mut and any(k[0] == raw for k in dup_pool):
             return dup
+        pool = [k for k in self.kept if k[3] != conflict or "conflicts_in_pool" in mut]
         if obj["kind"] == model["kind_submission"]:
             other = self._submission(raw, obj, epoch, pool, model, mut)
             if other is not None:
@@ -1249,11 +1256,15 @@ class Receiver:
         key = self.tally_key(obj, epoch, mut)
         held = self.tallies.get(key)
         n = int(obj["count"].text)
+        stored = [o for r, o, e, v in self.kept if v == model["stored"] and o["kind"] == model["kind_tally"]
+                  and self.tally_key(o, e, mut) == key]
+        if "tally_conflict_greatest_only" in mut:
+            stored = [held[1]] if held is not None else []
+        if "no_tally_conflict" not in mut and any(int(o["count"].text) == n for o in stored):
+            self.unsettled_tallies.add(key)
+            return conflict
         if held is not None:
             hn = int(held[1]["count"].text)
-            if n == hn and "no_tally_conflict" not in mut:
-                self.unsettled_tallies.add(key)
-                return conflict
             if n < hn and "no_lower_count" not in mut:
                 return lower
         if held is None or n > int(held[1]["count"].text) or "tally_last_wins" in mut:
@@ -1523,7 +1534,6 @@ def at_bound_lengths(model: dict, mut: frozenset = frozenset()) -> dict[str, int
     combination of vocabulary values, every string at its longest and every
     integer at its bound."""
     P = model["patterns"]
-    imax = len(str(model["int_max"]))
     ki = len("sha256:") + 64
     sig = 88
     best: dict[str, int] = {}
@@ -1608,8 +1618,10 @@ TEXT_EDITS: list[tuple[str, str, str, str, bool]] = [
     ("nonce pattern admits odd lengths", "ad", "matching\n`^(?:[0-9a-f]{2}){16,32}$`", "matching\n`^[0-9a-f]{32,64}$`", False),
     ("integer minimum 0", "ad", "every integer a JSON integer token from `1` to 2^53 − 1", "every integer a JSON integer token from `0` to 2^53 − 1", False),
     ("config: evidence queues count always", "gateway_config", "and the two evidence queue directories count while\n   `evidence.enabled` is true;", "and the two evidence queue directories count whenever configured;", False),
-    ("receiver check 6 duplicate renamed", "ad", "identical bytes are `duplicate`.", "identical bytes are `replayed`.", False),
-    ("receiver check 6 lower_count renamed", "ad", "below the greatest held for its key\n   is `lower_count`.", "below the greatest held for its key\n   is `lower`.", False),
+    ("receiver check 6 duplicate renamed", "ad", "as `stored` or as `conflict`, are `duplicate`.", "as `stored` or as `conflict`, are `replayed`.", False),
+    ("receiver check 6 duplicate pool narrowed", "ad", "record it holds, as `stored` or as `conflict`, are", "record it holds, as `stored`, are", False),
+    ("receiver check 6 lower_count renamed", "ad", "below the greatest held for its key\n   is `lower_count`;", "below the greatest held for its key\n   is `lower`;", False),
+    ("receiver check 1 runs check 6 again", "ad", "1. Checks 1 to 4 of [Carriage and custody](#carriage-and-custody), and its own", "1. Checks 1 to 6 of [Carriage and custody](#carriage-and-custody), and its own", False),
     ("outcome member set grows", "ad", "| `outcome` | `accepted`, `failed` or `unconfirmed`;", "| `outcome` | `accepted`, `failed`, `delivered` or `unconfirmed`;", False),
     ("observation row 2/accepted admits accepted", "ad", "| `2` | `accepted` | `failed` |", "| `2` | `accepted` | `accepted`, `failed` |", False),
     ("observation row 2/unconfirmed loses failed", "ad", "| `2` | `unconfirmed` | `accepted`, `failed` |", "| `2` | `unconfirmed` | `accepted` |", False),
@@ -1739,8 +1751,15 @@ def judge_record(raw: bytes, ctx: Ctx, model: dict, mut: frozenset) -> dict:
         return out
     if gw:
         out["gw"] = gw[0]
-    rx1 = [f for f in gw if f != model["gw_reason"][5] or "rx_checks_device_ids" in mut]
+    lo, hi = model["rx_check1"]
+    rx1_reasons = {model["gw_reason"][n] for n in range(3, hi + 1) if n in model["gw_reason"]}
+    if "rx_checks_device_ids" in mut:
+        rx1_reasons |= {model["gw_reason"][5], model["gw_reason"][6]}
+    if "rx_checks_topic" in mut:
+        rx1_reasons.add(model["gw_reason"][6])
+    rx1 = [f for f in gw if f in rx1_reasons]
     out["fails"] = list(rx1)
+    out["gw_fails"] = list(gw)
     if rx1:
         out["rx"] = rx1[0]
     form = form_faults(obj, model, mut)
@@ -1802,7 +1821,6 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
     if corpus.get("contract") != "alert-delivery/v1":
         bad("contract: not alert-delivery/v1")
     keys = keys_of(corpus, model, bad)
-    kid_name = {key_identity_of(p, model): n for n, p in keys.items()}
     cov: dict[str, set] = {k: set() for k in (
         "gw_alone", "rx_alone", "outcomes", "rows", "details", "kinds", "delivered", "bound",
         "rx6", "rules", "seq_shapes", "carriage", "enrol_alone", "enrol_pass", "cfg")}
@@ -1840,7 +1858,8 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
             m = re.fullmatch(r"precedence_(.+)_over_(.+)", name)
             if m and len(fails) >= 2:
                 second = m.group(2)
-                if not any(second in f or f.startswith(second) for f in fails[1:]):
+                later = fails[1:] + [f for f in j["gw_fails"][1:] if f not in fails]
+                if not any(f.split("_")[0] == second.split("_")[0] for f in later):
                     bad(f"{where}: the rule its name puts second ({second}) does not fail behind {fails[0]} (fails {fails})")
         elif declared != "pass" or case["expected_gateway"] != "pass":
             extra = [f for f in fails[1:] if f not in entailed(name, j, model)]
@@ -1906,7 +1925,7 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         epoch_label: dict[bytes, str] = {}
         for i, ev in enumerate(seq["records"]):
             raw = ev["record"].encode("utf-8")
-            ctx.topic_device = ev["topic_device"]
+            ctx.topic_device = ev.get("topic_device", "")
             j = judge_record(raw, ctx, model, mut)
             if j["pre"]:
                 bad(f"{where}[{i}]: refused at {j['pre']}")
@@ -1920,7 +1939,6 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
                 epoch_label.setdefault(j["epoch"], j["obj"]["key_identity"])
                 if epoch_label[j["epoch"]] != j["obj"]["key_identity"]:
                     bad(f"{where}[{i}]: two key_identity values share one recognised key in this sequence")
-                before = len([k for k in rcv.kept if k[3] == model["rx6"][1]])
                 v = rcv.judge(raw, j["obj"], j["epoch"], model, mut)
                 if v == model["rx6"][1]:
                     cov["rules"].add(conflict_rule(rcv, raw, j["obj"], j["epoch"], model))
@@ -2086,7 +2104,8 @@ JUDGE_MUTANTS = [
     "skip_form:reason", "skip_form:month", "skip_form:count",
     # receiver checks 2 to 5
     "rx_drop:2", "rx_drop:key_not_enrolled", "rx_drop:signature_invalid", "rx_drop:5", "rx_swap_3_4",
-    "enrol_any_device", "enrol_any_purpose_rx", "rx_checks_device_ids", "enrol_by_recognised", "no_signature_check",
+    "enrol_any_device", "enrol_any_purpose_rx", "rx_checks_device_ids", "rx_checks_topic",
+    "dup_stored_only", "tally_conflict_greatest_only", "enrol_by_recognised", "no_signature_check",
     "sign_with_signature", "no_prefix",
     "transition_any_seq", "transition_any_prior", "after_failed_ok", "no_transition_rule",
     "class_any_mandatory_ok", "class_optional_null_refused", "tally_class_ok", "tally_capped_needs_class",
@@ -2095,7 +2114,7 @@ JUDGE_MUTANTS = [
     "no_duplicate", "conflicts_in_pool", "no_identity_rule", "identity_without_device", "no_device_scope",
     "scope_per_epoch", "no_attempt_fields_rule", "attempt_fields_short", "attempt_fields_with_key", "no_alert_rule",
     "no_attempt_seq_rule", "attempt_seq_per_epoch", "no_prior_rule", "prior_one_way",
-    "tally_no_epoch", "tally_key_no_class", "no_tally_conflict", "no_lower_count", "tally_last_wins",
+    "tally_no_epoch", "tally_key_no_class", "no_tally_conflict", "no_lower_count",
     "reading_with_conflicts", "reading_per_epoch", "channels_merged", "latest_by_issued", "latest_by_arrival", "latest_first_obs",
     "ever_latest_only", "some_channel_sms_only", "settled_always",
     # custody and acknowledgement
@@ -2127,7 +2146,14 @@ def corpus_mutants(corpus: dict) -> list[tuple[str, dict]]:
            lambda x, i=i: x["records"][i].__setitem__("expected_gateway", other_gw.get(x["records"][i]["expected_gateway"], "pass")))
         mk(f"records.{c['name']}: expected_receiver flipped",
            lambda x, i=i: x["records"][i].__setitem__("expected_receiver", "class_refused" if x["records"][i]["expected_receiver"] != "class_refused" else "pass"))
-        mk(f"records.{c['name']}: removed", lambda x, i=i: x["records"].pop(i))
+    for reason in sorted({c["expected_receiver"] for c in corpus.get("records", [])} | {c["expected_gateway"] for c in corpus.get("records", [])}):
+        if reason in ("pass", "unknown_device"):  # *Vectors* asks no check-5 case of records
+            continue
+        mk(f"records: every case refused for {reason} removed",
+           lambda x, reason=reason: x.__setitem__("records", [c for c in x["records"]
+                                                              if reason not in (c["expected_receiver"], c["expected_gateway"])]))
+    for name in ("bound_submission", "bound_tally", "bound_submission_mandatory"):
+        mk(f"records.{name}: removed", lambda x, name=name: x.__setitem__("records", [c for c in x["records"] if c["name"] != name]))
     for i, s in enumerate(corpus.get("receiver_sequences", [])):
         for j, _ in enumerate(s["records"]):
             mk(f"receiver_sequences.{s['name']}[{j}]: verdict flipped",
