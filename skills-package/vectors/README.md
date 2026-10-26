@@ -1,11 +1,12 @@
 # `skills-package/v3` vectors
 
-Five files, split by what a failure would blame.
+Six files, split by what a failure would blame.
 
 | File | Blames |
 | --- | --- |
 | `tier-authority.json` | A package reaching for authority v3 does not grant |
 | `tier-b-policy.json` | A Tier B execution policy that is ambiguous, misplaced or not a boolean |
+| `field-types.json` | A member of the wrong type, `null` included, or an action tier, cooldown or condition outside what it admits |
 | `schema-load.json` | The `config_schema` a skill author wrote |
 | `package-config.json` | The `config` beside that schema |
 | `signature.json` | A manifest altered between signing and loading |
@@ -44,6 +45,11 @@ contract; the fixture exists so a consumer with no registry of its own, an
 authoring SDK or a catalogue, reaches the same verdict as a runtime instead of
 importing runtime state. A case that needs it says so with `"registry":
 "action_registry"`.
+
+`field-types.json` changes one member of one accepted base manifest per case,
+named by `field`; `kind` says whether the value has the wrong type or the right
+type outside what the field admits. It does not test whether the rule engine
+can evaluate a condition, because v3 does not state the engine's grammar.
 
 `signature.json` carries complete community manifests with real ed25519
 signatures over the canonical bytes of [`signing/v1`](../../signing/v1.md),
