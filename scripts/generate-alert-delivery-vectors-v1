@@ -53,7 +53,7 @@ ID_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 CLASS_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
 MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
 KEY_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
-NONCE_RE = re.compile(r"[0-9a-f]{32,64}")
+NONCE_RE = re.compile(r"(?:[0-9a-f]{2}){16,32}")
 NOTICES = ("optional", "tier_d", "protection_degraded")
 MANDATORY = ("tier_d", "protection_degraded")
 CHANNELS = ("sms", "whatsapp")
@@ -313,21 +313,21 @@ def class_ok(v: object) -> bool:
 
 
 def form_ok(o: object) -> bool:
-    """Gateway check 4: a record of either kind, every member present, of its type and within its own form.
+    """Gateway check 4: a record of either kind, every member present, of its type and within its form.
 
     A member's form is its own type, pattern, bounds and vocabulary. Rules that relate two members, the
-    observation table, the detail table and the class rules, are check 5's of Verifying.
+    observation table, the class rules and the detail table, are check 5's of Verifying.
     """
     if not isinstance(o, dict) or o.get("kind") not in ("submission", "withheld_tally"):
         return False
     common = (integer(o.get("v")) == 1 and string(o.get("device_id"), DEVICE_RE)
               and string(o.get("key_identity"), KEY_ID_RE) and o.get("channel") in CHANNELS
-              and class_ok(o.get("class")) and int_in(o.get("issued_at_ms"), 0, MAX_INT)
+              and class_ok(o.get("class")) and int_in(o.get("issued_at_ms"), 1, MAX_INT)
               and b64_ok(o.get("signature"), 64))
     if o["kind"] == "submission":
         return (set(o) == SUBMISSION and common and string(o["alert_id"], ID_RE)
                 and o["notice"] in NOTICES and string(o["delivery_attempt_id"], ID_RE)
-                and int_in(o["attempt_seq"], 1, MAX_INT) and int_in(o["attempted_at_ms"], 0, MAX_INT)
+                and int_in(o["attempt_seq"], 1, MAX_INT) and int_in(o["attempted_at_ms"], 1, MAX_INT)
                 and int_in(o["observation_seq"], 1, 3)
                 and (o["prior_outcome"] is None or o["prior_outcome"] in OUTCOMES)
                 and o["outcome"] in OUTCOMES
@@ -353,15 +353,14 @@ def gateway_stateless(data: str, topic: str, configured: list) -> str | None:
 def rules_verdict(o: dict) -> str | None:
     """Check 5 of Verifying, in the order it lists its reasons."""
     if o["kind"] == "submission":
-        if o["outcome"] not in OUTCOMES:
-            return "outcome_refused"  # unreachable: check 4 refuses it first
         seq = integer(o["observation_seq"])
         if o["outcome"] not in TRANSITIONS.get((seq, o["prior_outcome"]), set()):
             return "transition_refused"
         if o["notice"] in MANDATORY and o["class"] is not None:
             return "class_refused"
-        if o["detail"] is not None and (o["detail"] not in DETAILS[o["outcome"]] or (
-                o["detail"] == "provider_reported_failure" and o["prior_outcome"] != "accepted")):
+        code = o["detail"]
+        if code is not None and (code not in DETAILS[o["outcome"]]
+                                 or (o["prior_outcome"] == "accepted") != (code == "provider_reported_failure")):
             return "detail_refused"
         return None
     if o["reason"] == "disabled" and o["class"] is None:
@@ -380,11 +379,14 @@ def verify(pub: bytes, sig_b64: str, message: bytes) -> bool:
 
 
 def receiver_stateless(data: str, ctx: dict) -> str | None:
-    """Checks 1 to 5 of Verifying."""
-    reason = gateway_stateless(data, ctx["topic_device"], ctx["configured_devices"])
-    if reason is not None:
-        return reason
+    """Checks 1 to 5 of Verifying. Check 1 is carriage checks 3, 4 and 6; there is no check 5 here."""
     obj = parse(data)
+    if canonical(obj) != data.encode("utf-8"):
+        return "not_canonical"
+    if not form_ok(obj):
+        return "malformed"
+    if obj["device_id"] != ctx["topic_device"]:
+        return "device_mismatch"
     if obj["device_id"] not in ctx["forwarding_registry"].get(ctx["forwarder"], []):
         return "not_owned"
     enrolled = [e for e in ctx["enrolments"]
@@ -454,6 +456,10 @@ ok("row2_unconfirmed_to_accepted", "Row 2: seq 2, prior unconfirmed, accepted.",
 ok("row2_unconfirmed_to_failed", "Row 2: seq 2, prior unconfirmed, failed, detail provider_refused.",
    submission(observation_seq=2, prior_outcome="unconfirmed", outcome="failed", detail="provider_refused",
               issued_at_ms=T0 + 3000))
+ok("row2_unconfirmed_to_failed_not_submitted", "Row 2: seq 2, prior unconfirmed, failed, detail not_submitted, "
+   "which a failed after an unconfirmed may carry.",
+   submission(observation_seq=2, prior_outcome="unconfirmed", outcome="failed", detail="not_submitted",
+              issued_at_ms=T0 + 3000))
 ok("row3_accepted_to_failed_reported", "Row 3: seq 2, prior accepted, failed, detail "
    "provider_reported_failure, which only a prior accepted permits.",
    submission(observation_seq=2, prior_outcome="accepted", outcome="failed",
@@ -475,8 +481,8 @@ ok("class_one_character", "A class name of one character.", submission(**{"class
 ok("channel_whatsapp", "The whatsapp channel.", submission(channel="whatsapp"))
 ok("ids_at_lower_bound", "alert_id and delivery_attempt_id of 16 characters, using - and _.",
    submission(alert_id="a-b_c-d_e-f_g-h_", delivery_attempt_id="Z_Y-X_W-V_U-T_S-"))
-ok("signing_times_zero", "attempted_at_ms 0 and issued_at_ms 0: the text bounds every integer from 0, and only "
-   "attempt_seq, observation_seq, count and v further.", submission(attempted_at_ms=0, issued_at_ms=0))
+ok("signing_times_one", "attempted_at_ms 1 and issued_at_ms 1, the least integers.",
+   submission(attempted_at_ms=1, issued_at_ms=1))
 ok("tally_disabled", "A disabled tally with a class.", TGOOD)
 ok("tally_capped_class", "A capped tally with a class.", tally(reason="capped"))
 ok("tally_capped_null", "A capped tally with class null.", tally(reason="capped", **{"class": None}))
@@ -538,6 +544,9 @@ for name, note, rec in (
                           "and the value is no integer."), submission(attempt_seq=Raw("41e0"))),
     ("integer_negative", "attempted_at_ms is -1.", submission(attempted_at_ms=-1)),
     ("integer_over", "issued_at_ms is 2^53.", submission(issued_at_ms=MAX_INT + 1)),
+    ("issued_at_zero", "issued_at_ms 0: every integer is at least 1.", submission(issued_at_ms=0)),
+    ("attempted_at_zero", "attempted_at_ms 0.", submission(attempted_at_ms=0)),
+    ("tally_issued_at_zero", "A tally's issued_at_ms 0.", tally(issued_at_ms=0)),
     ("attempt_seq_zero", "attempt_seq is 0; it is at least 1.", submission(attempt_seq=0)),
     ("observation_seq_zero", "observation_seq is 0.", submission(observation_seq=0)),
     ("observation_seq_four", "observation_seq is 4, outside 1 to 3.",
@@ -589,9 +598,8 @@ gw("malformed_signature_pad_bits", "Base64 with nonzero pad bits.", {**GOOD, "si
    "malformed")
 gw("malformed_signature_unpadded", "Base64 without its padding.", {**GOOD, "signature": GOOD["signature"].rstrip("=")},
    "malformed")
-gw("delivered_refused", "outcome delivered, which is reserved. Check 4 of Carriage and custody refuses an outcome "
-   "outside Submission observation's list as malformed, and the receiver's check 1 applies it, so it is malformed "
-   "at both, before check 5 could name outcome_refused.",
+gw("delivered_refused", "outcome delivered, which is reserved: outside outcome's vocabulary, so malformed at "
+   "the gateway and, by check 1, at the receiver.",
    submission(observation_seq=2, prior_outcome="accepted", outcome="delivered"), "malformed")
 
 # Gateway check 6: device_mismatch.
@@ -677,6 +685,12 @@ for name, note, kw in (
      {"outcome": "unconfirmed", "detail": "provider_reported_failure"}),
     ("reported_failure_first", "provider_reported_failure at seq 1, prior null.",
      {"outcome": "failed", "detail": "provider_reported_failure"}),
+    ("not_submitted_after_accepted", "failed with not_submitted after accepted, which permits only two codes.",
+     {"observation_seq": 2, "prior_outcome": "accepted", "outcome": "failed", "detail": "not_submitted"}),
+    ("provider_refused_after_accepted", "failed with provider_refused after accepted.",
+     {"observation_seq": 2, "prior_outcome": "accepted", "outcome": "failed", "detail": "provider_refused"}),
+    ("provider_refused_seq3", "failed with provider_refused at seq 3, after accepted.",
+     {"observation_seq": 3, "prior_outcome": "accepted", "outcome": "failed", "detail": "provider_refused"}),
     ("reported_failure_after_unconfirmed", "provider_reported_failure after unconfirmed, not accepted.",
      {"observation_seq": 2, "prior_outcome": "unconfirmed", "outcome": "failed", "detail": "provider_reported_failure"}),
 ):
@@ -689,6 +703,10 @@ gw("precedence_malformed_over_device_mismatch", "Another device's record with v 
    submission(device_id=OTHER_DEVICE, v=2), "malformed")
 gw("precedence_device_mismatch_over_key", "Another device's record signed by other: check 6 of carriage, in the "
    "receiver's check 1, wins over key_not_enrolled.", submission(OTHER, device_id=OTHER_DEVICE), "device_mismatch")
+rcase("unknown_device_gateway_only", "A record on the topic of a device the gateway does not serve: the gateway "
+      "refuses it at check 5; the receiver holds no gateway.device_ids and skips check 5, and the forwarder is "
+      "permitted for the device, so the receiver passes it.", GOOD, "unknown_device", "pass",
+      {**fixture(), "configured_devices": [OTHER_DEVICE]})
 rx_only("precedence_not_owned_over_key", "An unpermitted forwarder and an unenrolled key: check 2 wins, not_owned.",
         submission(OTHER), "not_owned", NOT_OWNED)
 rx_only("precedence_key_over_signature", "An unenrolled key named and a zero signature: check 3 wins, "
@@ -699,38 +717,42 @@ rx_only("precedence_signature_over_transition", "A refused transition with a cor
 rx_only("precedence_signature_over_class", "A disabled null-class tally with the domain omitted: check 4 wins.",
         tally(domain=b"", **{"class": None}), "signature_invalid")
 rx_only("precedence_transition_over_class", "seq 1 with prior accepted on a tier_d notice with a class: check 5 "
-        "lists transition_refused before class_refused, and this corpus takes that order.",
+        "orders transition_refused before class_refused.",
         submission(notice="tier_d", prior_outcome="accepted", outcome="failed"), "transition_refused")
 rx_only("precedence_class_over_detail", "A tier_d notice with a class, accepted with provider_refused: "
-        "class_refused before detail_refused, in check 5's listed order.",
+        "class_refused before detail_refused.",
         submission(notice="tier_d", detail="provider_refused"), "class_refused")
 rx_only("precedence_transition_over_detail", "seq 2 after failed, with timeout_after_submit on failed: "
-        "transition_refused before detail_refused, in check 5's listed order.",
+        "transition_refused before detail_refused.",
         submission(observation_seq=2, prior_outcome="failed", outcome="failed", detail="timeout_after_submit"),
         "transition_refused")
 
 
 # --- receiver sequences (check 6) --------------------------------------------------------------------
 def epoch_of(key_identity: str) -> bytes:
-    for s in KEYS.values():
-        if identity(s.pub) == key_identity:
-            return recognised(s.pub)
+    for k in KEYS.values():
+        if identity(k.pub) == key_identity:
+            return recognised(k.pub)
     raise KeyError(key_identity)
 
 
 def breaks(h: dict, o: dict) -> bool:
-    """Whether o, against the held observation h, is different bytes under h's identity or breaks Consistency."""
+    """Whether o, against the stored observation h, is different bytes under h's identity or breaks Consistency.
+
+    Every rule holds within one device_id, whatever key signs each record.
+    """
+    if h["device_id"] != o["device_id"]:
+        return False
     same_attempt = h["delivery_attempt_id"] == o["delivery_attempt_id"]
     hs, os_ = integer(h["observation_seq"]), integer(o["observation_seq"])
     if same_attempt and hs == os_:
         return True  # different bytes under a held identity
-    if same_attempt and any(h[m] != o[m] for m in ("device_id", "key_identity", "alert_id", "notice", "class",
-                                                     "channel", "attempt_seq", "attempted_at_ms")):
+    if same_attempt and any(h[m] != o[m] for m in ("alert_id", "notice", "class", "channel", "attempt_seq",
+                                                     "attempted_at_ms")):
         return True
     if h["alert_id"] == o["alert_id"] and (h["notice"], h["class"]) != (o["notice"], o["class"]):
         return True
-    if (not same_attempt and h["attempt_seq"] == o["attempt_seq"]
-            and epoch_of(h["key_identity"]) == epoch_of(o["key_identity"])):
+    if not same_attempt and h["attempt_seq"] == o["attempt_seq"]:
         return True
     if same_attempt and hs == os_ - 1:
         return h["outcome"] != o["prior_outcome"]
@@ -739,86 +761,76 @@ def breaks(h: dict, o: dict) -> bool:
     return False
 
 
-class Receiver:
-    def __init__(self, ctx: dict, conflicts_count: bool) -> None:
-        self.ctx = ctx
-        self.kept: list[dict] = []  # {"data", "obj", "verdict"}
-        self.conflicts_count = conflicts_count  # whether a record kept as conflict is judged against
+def tally_key(o: dict) -> tuple:
+    return (o["device_id"], epoch_of(o["key_identity"]), o["channel"], o["class"] or "", o["reason"], o["month"])
 
-    def judged_against(self) -> list[dict]:
-        return [k for k in self.kept if self.conflicts_count or k["verdict"] == "held"]
+
+class Receiver:
+    def __init__(self, ctx: dict) -> None:
+        self.ctx = ctx
+        self.kept: list[dict] = []  # {"data", "obj", "verdict", "hit"}
 
     def check6(self, data: str, o: dict) -> tuple[str, list]:
-        against = self.judged_against()
-        if any(k["data"] == data for k in self.kept):
+        stored = [k for k in self.kept if k["verdict"] == "stored"]  # a conflict record is never judged against
+        if any(k["data"] == data for k in stored):
             return "duplicate", []
-        hit: list = []
         if o["kind"] == "submission":
-            hit = [k for k in against if k["obj"]["kind"] == "submission" and breaks(k["obj"], o)]
-            return ("conflict", hit) if hit else ("held", [])
-        tkey = (o["channel"], o["class"], o["reason"], o["month"], epoch_of(o["key_identity"]))
-        same = [k for k in against if k["obj"]["kind"] == "withheld_tally"
-                and (k["obj"]["channel"], k["obj"]["class"], k["obj"]["reason"], k["obj"]["month"],
-                     epoch_of(k["obj"]["key_identity"])) == tkey]
+            hit = [k for k in stored if k["obj"]["kind"] == "submission" and breaks(k["obj"], o)]
+            return ("conflict", hit) if hit else ("stored", [])
+        same = [k for k in stored if k["obj"]["kind"] == "withheld_tally" and tally_key(k["obj"]) == tally_key(o)]
         hit = [k for k in same if integer(k["obj"]["count"]) == integer(o["count"])]
         if hit:
             return "conflict", hit
         if same and integer(o["count"]) < max(integer(k["obj"]["count"]) for k in same):
             return "lower_count", []
-        return "held", []
+        return "stored", []
 
-    def receive(self, data: str) -> str:
-        reason = receiver_stateless(data, self.ctx)
+    def receive(self, data: str, topic: str) -> str:
+        reason = receiver_stateless(data, {**self.ctx, "topic_device": topic})
         if reason is not None:
             return reason
         o = parse(data)
         verdict, hit = self.check6(data, o)
-        if verdict in ("held", "conflict"):
+        if verdict in ("stored", "conflict"):
             self.kept.append({"data": data, "obj": o, "verdict": verdict, "hit": hit})
         return verdict
 
     def reading(self) -> tuple[list, list]:
-        held = [k["obj"] for k in self.kept if k["verdict"] == "held"]
+        stored = [k["obj"] for k in self.kept if k["verdict"] == "stored"]
         unsettled = set()
         for k in self.kept:
             if k["verdict"] == "conflict":
-                for r in [k] + k["hit"]:
+                for r in [k] + k["hit"]:  # neither side of a conflict is presented as settled
                     o = r["obj"]
-                    if o["kind"] == "submission":
-                        unsettled.add((o["key_identity"], o["alert_id"]))
-                    else:
-                        unsettled.add((o["key_identity"], o["channel"], o["class"], o["reason"], o["month"]))
+                    unsettled.add((o["device_id"], o["alert_id"]) if o["kind"] == "submission" else tally_key(o))
         alerts: dict = {}
-        for o in held:
-            if o["kind"] != "submission":
-                continue
-            alerts.setdefault((o["key_identity"], o["alert_id"]), {}).setdefault(o["channel"], []).append(o)
+        for o in stored:
+            if o["kind"] == "submission":
+                alerts.setdefault((o["device_id"], o["alert_id"]), {}).setdefault(o["channel"], []).append(o)
         reading = []
-        for (kid, aid), chans in sorted(alerts.items()):
+        for (dev, aid), chans in sorted(alerts.items()):
             out = {}
-            for ch, obs in sorted(chans.items()):
-                top = max(integer(x["attempt_seq"]) for x in obs)
-                last = max((x for x in obs if integer(x["attempt_seq"]) == top),
+            for ch, obs_ in sorted(chans.items()):
+                top = max(integer(x["attempt_seq"]) for x in obs_)
+                last = max((x for x in obs_ if integer(x["attempt_seq"]) == top),
                            key=lambda x: integer(x["observation_seq"]))
                 out[ch] = {"latest_attempt_state": last["outcome"],
-                           "ever_accepted": any(x["outcome"] == "accepted" for x in obs)}
-            reading.append({"epoch": kid, "alert_id": aid, "channels": out,
+                           "ever_accepted": any(x["outcome"] == "accepted" for x in obs_)}
+            reading.append({"device_id": dev, "alert_id": aid, "channels": out,
                             "accepted_on_some_channel": any(c["ever_accepted"] for c in out.values()),
-                            "settled": (kid, aid) not in unsettled})
+                            "settled": (dev, aid) not in unsettled})
         tallies: dict = {}
-        for o in held:
-            if o["kind"] != "withheld_tally":
-                continue
-            tk = (o["key_identity"], o["channel"], o["class"] or "", o["reason"], o["month"])
-            if tk not in tallies or integer(o["count"]) > integer(tallies[tk]["count"]):
-                tallies[tk] = o
-        held_tallies = [{"epoch": o["key_identity"], "channel": o["channel"], "class": o["class"],
-                         "reason": o["reason"], "month": o["month"], "count": integer(o["count"]),
-                         "record_digest": digest(text(o)),
-                         "settled": (o["key_identity"], o["channel"], o["class"], o["reason"], o["month"])
-                         not in unsettled}
-                        for _, o in sorted(tallies.items())]
-        return reading, held_tallies
+        for o in stored:
+            if o["kind"] == "withheld_tally":
+                tk = tally_key(o)
+                if tk not in tallies or integer(o["count"]) > integer(tallies[tk]["count"]):
+                    tallies[tk] = o
+        held = [{"device_id": o["device_id"], "epoch": o["key_identity"], "channel": o["channel"],
+                 "class": o["class"], "reason": o["reason"], "month": o["month"], "count": integer(o["count"]),
+                 "record_digest": digest(text(o)), "settled": tk not in unsettled}
+                for tk, o in sorted(tallies.items(), key=lambda kv: (kv[1]["device_id"], kv[1]["key_identity"],
+                                                                     kv[0][2:]))]
+        return reading, held
 
 
 RECEIVER_SEQUENCES: list[dict] = []
@@ -826,17 +838,15 @@ RECEIVER_SEQUENCES: list[dict] = []
 
 def rseq(name: str, note: str, recs: list, ctx: dict | None = None) -> None:
     ctx = ctx or fixture()
+    ctx = {k: v for k, v in ctx.items() if k not in ("topic_device", "configured_devices")}
     datas = [r if isinstance(r, str) else text(r) for r in recs]
-    runs = []
-    for conflicts_count in (True, False):
-        rcv = Receiver(ctx, conflicts_count)
-        verdicts = [rcv.receive(d) for d in datas]
-        runs.append((verdicts, rcv.reading()))
-    if runs[0] != runs[1]:
-        raise AssertionError(f"{name} depends on whether a conflict record is judged against")
-    verdicts, (reading, tallies) = runs[0]
+    topics = [parse(d)["device_id"] for d in datas]
+    rcv = Receiver(ctx)
+    verdicts = [rcv.receive(d, t) for d, t in zip(datas, topics)]
+    reading, tallies = rcv.reading()
     RECEIVER_SEQUENCES.append({"name": name, "note": note, **ctx,
-                               "records": [{"record": d, "expected": v} for d, v in zip(datas, verdicts)],
+                               "records": [{"topic_device": t, "record": d, "expected": v}
+                                           for d, t, v in zip(datas, topics, verdicts)],
                                "expected_reading": reading, "expected_tallies": tallies})
 
 
@@ -853,7 +863,7 @@ AL1, AL2 = "alert-0000000001", "alert-0000000002"
 AT1, AT2, AT3 = "attempt-00000001", "attempt-00000002", "attempt-00000003"
 BOTH = fixture(enrol=("runtime", "rotated"))
 
-rseq("duplicate", "The same record twice: held, then duplicate.",
+rseq("duplicate", "The same record twice: stored, then duplicate.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
 rseq("conflict_one_identity", "Two records of one observation identity, different bytes (another "
      "issued_at_ms): the later is conflict, both are kept, and the notice is not settled.",
@@ -871,9 +881,9 @@ for member, value in (("alert_id", AL2), ("notice", "tier_d"), ("class", "later_
          f"another {member}, every other member and the path as rule 4 requires. Conflict."
          + (" One attempt has one alert_id, so the alert_id rule is broken too, to the same verdict."
             if member in ("notice", "class") else ""), [base, later])
-rseq("consistency_attempt_key_identity", "Consistency, one delivery_attempt_id: its second observation is signed "
-     "by rotated, also enrolled, so key_identity differs. The rule names key_identity, so an observation identity "
-     "is compared across epochs. Conflict.",
+rseq("rotation_mid_attempt", "An attempt's first observation signed by runtime, its second by rotated after "
+     "a rotation, both enrolled: the consistency rules hold per device whatever key signs, and key_identity is "
+     "not among rule 1's members, so it is the same attempt. Stored.",
      [_U, obs(AL1, AT1, 1, 2, "unconfirmed", "accepted", signer=ROTATED)], BOTH)
 rseq("consistency_alert_notice", "Consistency, one alert_id: a second attempt carries notice tier_d (class "
      "null) where the first carried optional (class null). Conflict.",
@@ -882,28 +892,47 @@ rseq("consistency_alert_notice", "Consistency, one alert_id: a second attempt ca
 rseq("consistency_alert_class", "Consistency, one alert_id: a second attempt carries class null where the first "
      "carried grid_power_restored. Conflict.",
      [obs(AL1, AT1, 1, 1, None, "failed"), obs(AL1, AT2, 2, 1, None, "accepted", **{"class": None})])
-rseq("consistency_attempt_seq", "Consistency, one attempt_seq names one delivery_attempt_id in an epoch: two "
-     "attempts of different notices share attempt_seq 7. Conflict.",
+rseq("consistency_attempt_seq", "Consistency, one attempt_seq names one delivery_attempt_id: two attempts of "
+     "different notices share attempt_seq 7. Conflict.",
      [obs(AL1, AT1, 7, 1, None, "accepted"), obs(AL2, AT2, 7, 1, None, "accepted")])
-rseq("attempt_seq_across_epochs", "attempt_seq 7 under runtime and under rotated, both enrolled: compared within "
-     "an epoch only, so both are held, and each epoch reads apart.",
-     [obs(AL1, AT1, 7, 1, None, "accepted"), obs(AL2, AT2, 7, 1, None, "failed", "provider_refused",
-                                                  signer=ROTATED)], BOTH)
+rseq("attempt_seq_across_keys", "attempt_seq 7 under runtime and again under rotated for another attempt: "
+     "attempt_seq counts across every key of the store, so one attempt_seq names one attempt whatever key "
+     "signs. Conflict.",
+     [obs(AL1, AT1, 7, 1, None, "accepted"),
+      obs(AL2, AT2, 7, 1, None, "failed", "provider_refused", signer=ROTATED)], BOTH)
+TWO_DEVICES = {"forwarder": FORWARDER, "forwarding_registry": {FORWARDER: [DEVICE, OTHER_DEVICE]},
+               "enrolments": [{"device_id": DEVICE, "key": "runtime", "purpose": PURPOSE},
+                              {"device_id": OTHER_DEVICE, "key": "other", "purpose": PURPOSE}]}
+rseq("consistency_per_device", "Two devices, each with its own enrolled key, reuse one delivery_attempt_id, "
+     "attempt_seq and alert_id with another notice and channel: every rule holds within one device_id, so "
+     "both are stored and each device reads apart.",
+     [obs(AL1, AT1, 7, 1, None, "accepted"),
+      obs(AL1, AT1, 7, 1, None, "failed", "provider_refused", signer=OTHER, device_id=OTHER_DEVICE,
+          channel="whatsapp", notice="tier_d", **{"class": None})], TWO_DEVICES)
+rseq("conflict_record_not_judged_against", "seq 1 unconfirmed is stored; a second seq 1, accepted, is conflict; "
+     "then seq 2 after unconfirmed is judged against the stored seq 1 only, never the conflict record, and is "
+     "stored. The notice is unsettled.",
+     [_U, obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "unconfirmed", "failed", "not_submitted")])
+rseq("conflict_record_again", "The conflict record arriving a second time is judged against the stored record "
+     "only, since a conflict record is never the earlier record a later one is judged against: conflict again, "
+     "not duplicate.",
+     [_U, obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 1, None, "accepted")])
 rseq("consistency_prior_outcome", "Consistency, prior_outcome: seq 1 is unconfirmed, then seq 2 says its prior "
      "was accepted (a row the table permits on its own). Conflict.",
      [_U, obs(AL1, AT1, 1, 2, "accepted", "failed", "provider_reported_failure")])
 rseq("consistency_prior_outcome_reverse", "Consistency, prior_outcome, arriving out of order: seq 2 (prior "
-     "unconfirmed) is held without seq 1, which the receiver cannot judge; then seq 1 arrives as failed, which "
-     "breaks the rule against the held seq 2. The later, seq 1, is conflict.",
+     "unconfirmed) is stored without seq 1, which the receiver cannot judge; then seq 1 arrives as failed, which "
+     "breaks the rule against the stored seq 2. The later, seq 1, is conflict.",
      [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted"), obs(AL1, AT1, 1, 1, None, "failed")])
 rseq("consistency_prior_outcome_seq3", "Consistency, prior_outcome at seq 3: seq 1 accepted, seq 2 failed after "
      "accepted, then seq 3 says its prior was accepted, but seq 2's outcome was failed. Conflict.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed"),
       obs(AL1, AT1, 1, 3, "accepted", "failed", "provider_reported_failure")])
-rseq("gap_held", "seq 2 of an attempt held with no seq 1: the receiver does not hold the earlier and accepts it; "
-     "the reading is a lower bound.", [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted")])
+rseq("gap_stored", "seq 2 of an attempt with no seq 1: the receiver does not hold the earlier and stores it; "
+     "the reading says what the records held say, never that it is complete.",
+     [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted")])
 rseq("accepted_then_reported_failure", "An accepted attempt later failed by the provider: both observations "
-     "held; latest failed, ever accepted true.",
+     "stored; latest failed, ever accepted true.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed", "provider_reported_failure")])
 rseq("unconfirmed_accepted_reported_failure", "Every step of the longest path: unconfirmed, accepted, failed "
      "with provider_reported_failure.",
@@ -925,15 +954,15 @@ rseq("failover_both_failed", "sms unconfirmed then whatsapp failed: accepted on 
      [obs(AL1, AT1, 1, 1, None, "unconfirmed"),
       obs(AL1, AT2, 2, 1, None, "failed", "not_submitted", channel="whatsapp")])
 rseq("refused_records_change_nothing", "A forged record of one identity (signed by other while naming runtime), "
-     "then the genuine one: the forgery is signature_invalid and changes nothing, so the genuine record is held, "
+     "then the genuine one: the forgery is signature_invalid and changes nothing, so the genuine record is stored, "
      "not conflict.",
      [obs(AL1, AT1, 1, 1, None, "failed", signer=OTHER, key_identity=identity(RUNTIME.pub)),
       obs(AL1, AT1, 1, 1, None, "accepted")])
 rseq("check5_refusal_changes_nothing", "A record refused at check 5 (tier_d with a class) changes nothing; a "
-     "consistent record of the same identity is then held.",
+     "consistent record of the same identity is then stored.",
      [obs(AL1, AT1, 1, 1, None, "accepted", notice="tier_d"),
       obs(AL1, AT1, 1, 1, None, "accepted", notice="tier_d", **{"class": None})])
-rseq("tally_rising", "Snapshots 3 then 7 of one tally key: both held, the tally held is 7.",
+rseq("tally_rising", "Snapshots 3 then 7 of one tally key: both stored, the tally held is 7.",
      [tally(count=3), tally(count=7, issued_at_ms=T0 + 70_000)])
 rseq("tally_lower_count", "Snapshot 5, then 3 under the same key: lower_count, the tally held stays 5.",
      [tally(count=5), tally(count=3, issued_at_ms=T0 + 70_000)])
@@ -941,17 +970,18 @@ rseq("tally_duplicate", "One snapshot twice: duplicate.", [tally(count=5), tally
 rseq("tally_conflict", "Two snapshots of one key and count, different bytes: conflict, and the tally is not "
      "settled.", [tally(count=5), tally(count=5, issued_at_ms=T0 + 70_000)])
 rseq("tally_keys_apart", "Same channel, class and month, reasons disabled and capped, and the same reason on two "
-     "channels and two months: four keys, each held alone.",
+     "channels and two months: four keys, each stored alone.",
      [tally(count=4), tally(reason="capped", count=2), tally(channel="whatsapp", count=1),
       tally(month="2026-07", count=9)])
 rseq("tally_two_epochs", "runtime's snapshot 5, then rotated's snapshot 2 of the same tally key: a new epoch "
-     "starts again, so 2 is not lower_count, and both are held and listed apart. Then runtime's 4 is lower_count "
+     "starts again, so 2 is not lower_count, and both are stored and listed apart. Then runtime's 4 is lower_count "
      "in its own epoch.",
      [tally(count=5), tally(ROTATED, count=2, issued_at_ms=T0 + 80_000), tally(count=4, issued_at_ms=T0 + 90_000)],
      BOTH)
-rseq("notice_two_epochs", "One alert_id's attempts under runtime then rotated: each epoch reads apart.",
+rseq("notice_across_rotation", "One alert_id's attempts under runtime then, after a rotation, rotated: one "
+     "device, so one notice, read across both keys; latest is attempt_seq 2's.",
      [obs(AL1, AT1, 1, 1, None, "failed", "provider_refused"),
-      obs(AL1, AT2, 1, 1, None, "accepted", signer=ROTATED)], BOTH)
+      obs(AL1, AT2, 2, 1, None, "accepted", signer=ROTATED)], BOTH)
 
 
 # --- carriage sequences ------------------------------------------------------------------------------
@@ -1058,6 +1088,7 @@ def ecase(name: str, note: str, chal: object, expected: str, *, signer: object =
     ENROL_CASES.append({"name": name, "note": note, "enrolling_device_id": device,
                         "enrolling_public_key": "ed25519:" + b64(pub), "enrolling_key_identity": identity(pub),
                         "issued_nonce": nonce, "nonce_consumed": consumed, "challenge": data,
+                        "challenge_b64": b64(data.encode("utf-8")),
                         "signing_input_hex": (ENROL_DOMAIN + data.encode("utf-8")).hex(), "signature": sig,
                         "expected": v})
 
@@ -1075,6 +1106,7 @@ for name, note, chal in (
     ("nonce_upper", "The issued nonce in upper case.", challenge(nonce=NONCE.upper())),
     ("nonce_short", "A nonce of 30 characters.", challenge(nonce=NONCE[:30])),
     ("nonce_long", "A nonce of 66 characters.", challenge(nonce=NONCE64 + "ab")),
+    ("nonce_odd", "A nonce of 33 characters: an odd number.", challenge(nonce=NONCE + "a")),
     ("device_form", "device_id outside its pattern.", challenge(device_id="site a")),
     ("key_identity_form", "key_identity without its prefix.", challenge(key_identity=identity(RUNTIME.pub)[7:])),
 ):
@@ -1273,51 +1305,55 @@ def build() -> dict:
                      "holder signs under with -a: it has no seed, one recognised key with runtime, and its own "
                      "key_identity. Test keys only."),
             "records": ("Each record case is one message, `record` its exact bytes, on the alert-delivery topic of "
-                        "`topic_device`, judged by a gateway whose gateway.device_ids is `configured_devices`. "
-                        "`expected_gateway` is `pass` or the reason of checks 3, 4 and 6 of Carriage and custody "
-                        "(check 5 never fails here: the topic's device is configured). `expected_receiver` is "
-                        "`pass` or the reason of checks 1 to 5 of Verifying, where check 1 is carriage checks 3 to "
-                        "6 on the same topic and configuration. Checks 1 and 2 of carriage, and the receiver's "
-                        "own payload bound, are not exercised. The receiver's authenticated registry is "
-                        "`forwarding_registry`, each forwarder mapped to the devices it may forward for; the "
-                        "record arrives from `forwarder`, and check 2 (not_owned) fails when the record's "
-                        "device_id is not in the forwarder's list. `enrolments` is the receiver's enrolment "
-                        "registry: each a device, a test key by name and the purpose; check 3 (key_not_enrolled) "
-                        "fails unless an enrolment for the record's device_id has the record's key_identity, "
-                        "and check 4 verifies under that enrolment's key. `pass` at the receiver means the "
-                        "record goes on to check 6. outcome_refused has no case: check 4 of carriage refuses "
-                        "every outcome outside Submission observation's list as malformed first."),
-            "receiver_sequences": ("Each sequence is records in arrival order to one receiver with the fixture "
-                                   "of `records`. `expected` is the verdict: a refusal of checks 1 to 5, which "
-                                   "changes nothing, or check 6's: `held` for a verified record that is none of "
-                                   "duplicate, conflict or lower_count; `duplicate`; `conflict`, which is kept "
-                                   "beside the record it conflicts with; `lower_count`. An observation's "
-                                   "identity is (delivery_attempt_id, observation_seq); a tally's is its tally "
-                                   "key, its epoch and its count. `expected_reading` is Reading a notice over "
-                                   "the records held (`held`), for each epoch (the key_identity) and alert_id: "
-                                   "per channel the latest attempt state and ever accepted, and accepted on some "
-                                   "channel; `settled` is false when a record about the notice was held as, or "
-                                   "made another, conflict. `expected_tallies` lists, per epoch and tally key, "
-                                   "the held record with the greatest count; a key not listed is unknown."),
+                        "`topic_device`. `expected_gateway` is `pass` or the reason of checks 3 to 6 of Carriage "
+                        "and custody, for a gateway whose gateway.device_ids is `configured_devices`. "
+                        "`expected_receiver` is `pass` or the reason of checks 1 to 5 of Verifying, check 1 being "
+                        "carriage checks 3, 4 and 6 on the same topic; the receiver reads no "
+                        "`configured_devices`. Checks 1 and 2 of carriage, and the receiver's own payload bound, "
+                        "are not exercised. The receiver's authenticated registry is `forwarding_registry`, each "
+                        "forwarder mapped to the devices it may forward for; the record arrives from `forwarder`, "
+                        "and check 2 (not_owned) fails when the record's device_id is not in the forwarder's "
+                        "list. `enrolments` is the receiver's enrolment registry: each a device, a test key by "
+                        "name and the purpose; check 3 (key_not_enrolled) fails unless an enrolment for the "
+                        "record's device_id has the record's key_identity, and check 4 verifies under that "
+                        "enrolment's key. `pass` at the receiver means the record goes on to check 6."),
+            "receiver_sequences": ("Each sequence is records in arrival order to one receiver with "
+                                   "`forwarder`, `forwarding_registry` and `enrolments` as in `records`, each record "
+                                   "arriving on its own device's topic, `topic_device`. `expected` is the verdict: "
+                                   "a refusal of checks 1 to 5, which changes nothing, or check 6's: `stored`, "
+                                   "`duplicate`, `conflict` or `lower_count`. Only `stored` records are judged "
+                                   "against, for duplicate as for the rest: a record held as conflict is never the "
+                                   "earlier record. An observation's identity is (device_id, "
+                                   "delivery_attempt_id, observation_seq), and every consistency rule holds within "
+                                   "one device_id whatever key signs; a tally's identity is its tally key, its "
+                                   "epoch and its count. `expected_reading` is Reading a notice over the `stored` "
+                                   "records, for each device_id and alert_id: per channel the latest attempt state "
+                                   "and ever accepted, and accepted on some channel; `settled` is false when a "
+                                   "record about the notice was held as conflict or is one a conflict record "
+                                   "conflicts with. `expected_tallies` lists, per device, epoch (the key_identity) "
+                                   "and tally key, the stored record with the greatest count, `settled` as for a "
+                                   "notice; a key not listed is unknown."),
             "carriage_sequences": ("Each sequence is messages in arrival order to one gateway with "
                                    "`configured_devices` and alert_delivery.max_records_per_device, custody "
                                    "readable and writable, and nothing retired from custody. `expected` is the "
                                    "custody verdict: `queued`, `replayed`, `queue_full`, or the refusal of checks "
-                                   "3 to 6. A digest already held is replayed before the bound is judged. "
+                                   "3 to 6. A digest already held is replayed even when the queue is full. "
                                    "`expected_ack` is the acknowledgement's device_id, outcome, reason and "
                                    "record_digest, its envelope members being gateway-api/v2's, or null when "
                                    "none is published."),
             "enrolment": ("Each case is one enrolment proof judged by a receiver enrolling "
                           "`enrolling_public_key` for `enrolling_device_id`, having issued `issued_nonce`, "
                           "consumed already when `nonce_consumed`. `challenge` is the challenge's bytes as "
-                          "signed, `signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
+                          "signed, `challenge_b64` the same bytes as operator-socket/v3 answers them, "
+                          "`signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
                           "signature as canonical padded Base64. `expected` is `pass` or the reason of The "
                           "enrolment proof."),
             "config": ("gateway-config/v2 alert_delivery load rules. `alert_delivery` lists the keys as written; "
                        "`state_directory` is the gateway.state_directory value, null when absent, and is always "
                        "one its own rules admit; `evidence` gives the courier's enabled flag and queue "
-                       "directories, every other key of every other section holding a valid value. An evidence "
-                       "queue directory is configured only while the courier is enabled. `valid`, `rule` when "
+                       "directories, every other key of every other section holding a valid value. The state "
+                       "directory counts when present after trimming; the evidence queue directories count while "
+                       "evidence.enabled is true. `valid`, `rule` when "
                        "refused, and for a valid enabled case the trimmed queue directory and the bound in force."),
         },
         "test_keys": {s.name: {"public_key": "ed25519:" + b64(s.pub), "key_identity": identity(s.pub),
