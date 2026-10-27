@@ -378,14 +378,22 @@ def breaks_consistency(h: dict, o: dict) -> bool:
         return True
     if h["alert_id"] == o["alert_id"] and (h["notice"], h["class"]) != (o["notice"], o["class"]):
         return True
-    if h["attempt_seq"] == o["attempt_seq"] and h["delivery_attempt_id"] != o["delivery_attempt_id"]:
-        return True
-    if h["delivery_attempt_id"] == o["delivery_attempt_id"]:
-        if h["observation_seq"] == o["observation_seq"] - 1 and h["outcome"] != o["prior_outcome"]:
-            return True
-        if o["observation_seq"] == h["observation_seq"] - 1 and o["outcome"] != h["prior_outcome"]:
-            return True
-    return False
+    return h["attempt_seq"] == o["attempt_seq"] and h["delivery_attempt_id"] != o["delivery_attempt_id"]
+
+
+# The complete legal paths of one attempt's observations through the observation table.
+LEGAL_PATHS = (("accepted",), ("failed",), ("unconfirmed",), ("unconfirmed", "accepted"), ("unconfirmed", "failed"),
+               ("accepted", "failed"), ("unconfirmed", "accepted", "failed"))
+
+
+def admits_a_path(observations: list[dict]) -> bool:
+    """Whether one attempt's observations, held and incoming together, fit at least one complete legal path: each
+    at its observation_seq, with its outcome there and its prior_outcome the outcome one step earlier."""
+    def fits(path: tuple, o: dict) -> bool:
+        n = o["observation_seq"]
+        return (n <= len(path) and path[n - 1] == o["outcome"]
+                and o["prior_outcome"] == (path[n - 2] if n > 1 else None))
+    return any(all(fits(path, o) for o in observations) for path in LEGAL_PATHS)
 
 
 def check8_verdict(obj: dict, body: bytes, held: list) -> str:
@@ -399,6 +407,11 @@ def check8_verdict(obj: dict, body: bytes, held: list) -> str:
         if any(h["kind"] == "submission"
                and (h["device_id"], h["key_identity"], h["delivery_attempt_id"], h["observation_seq"]) == ident
                for h in stored) or any(breaks_consistency(h, obj) for h in stored):
+            return "conflict"
+        attempt = [h for h in stored if h["kind"] == "submission" and h["device_id"] == obj["device_id"]
+                   and h["key_identity"] == obj["key_identity"]
+                   and h["delivery_attempt_id"] == obj["delivery_attempt_id"]]
+        if not admits_a_path([*attempt, obj]):
             return "conflict"
         return "stored"
     same_key = [h for h in stored if h["kind"] == "withheld_tally" and tally_key(h) == tally_key(obj)]
@@ -869,6 +882,30 @@ def requests_corpus_refused() -> None:
            delivery_attempt_id="Cq7Wd2Rf9Ls4Kp0x", attempt_seq=42, observation_seq=2, prior_outcome="accepted",
            outcome="failed", detail="provider_reported_failure", issued_at_ms=T0 + 1200)),
        None, held=((held_c, "stored"),), expect200="conflict")
+    path_ids = {"alert_id": "q3Jx0bS6lVb8nT2aXw9e1g", "delivery_attempt_id": "Pa7Th2Ob9Sv4Lw1e", "attempt_seq": 50}
+
+    def obs(seq: int, prior: str | None, outcome: str, t: int) -> bytes:
+        return submission(DEVICE_A, observation_seq=seq, prior_outcome=prior, outcome=outcome, issued_at_ms=T0 + t,
+                          **path_ids)
+    third = obs(3, "accepted", "failed", 4000)
+    for held_outcome, verdict, why in (
+            ("failed", "conflict", "failed ends an attempt, so no legal path has a third observation after it"),
+            ("accepted", "conflict", ("a third observation follows only an unconfirmed resolved as accepted, so no "
+                                      "legal path begins accepted and has three steps; the two are not adjacent, "
+                                      "so an adjacent-pair judge misses it")),
+            ("unconfirmed", "stored", "the path unconfirmed, accepted, failed fits both")):
+        rq(f"accepted_path_first_{held_outcome}_then_third", f"The receiver holds the attempt's first observation, "
+           f"{held_outcome}; the incoming record is its third, after accepted: {why}.",
+           build_request(f"accepted_path_first_{held_outcome}_then_third", body=third), None,
+           held=((obs(1, None, held_outcome, 3000), "stored"),), expect200=verdict)
+    rq("accepted_path_third_then_first_accepted", "The receiver holds the attempt's third observation; the incoming "
+       "record is its first, accepted: no legal path fits both, in whichever order they arrive.",
+       build_request("accepted_path_third_then_first_accepted", body=obs(1, None, "accepted", 3000)), None,
+       held=((third, "stored"),), expect200="conflict")
+    rq("accepted_path_second_failed_then_third", "The receiver holds the second observation, failed after "
+       "unconfirmed; the incoming third claims accepted before it: conflict.",
+       build_request("accepted_path_second_failed_then_third", body=third), None,
+       held=((obs(2, "unconfirmed", "failed", 3500), "stored"),), expect200="conflict")
     rq("accepted_tally_same_count_conflict", "A tally with the count of one held but different bytes, while a "
        "greater count is held for its key: conflict, since one key signed both, answered stored.",
        build_request("accepted_tally_same_count_conflict", body=tally(count=3, issued_at_ms=T0 + 2500)), None,
@@ -994,8 +1031,8 @@ def responses_corpus() -> None:
     rs("row_401_refused", "Transport authentication failed: unauthenticated, it omits record_digest; the gateway "
        "keeps the record and repairs its credential.", 401,
        resp_body("refused", rdigest=None), "keep", row="401 refused", retires_nothing="unauthenticated")
-    rs("row_403_not_owned", "The authenticated client may not forward for this device: keep, never retire, never "
-       "reject.", 403, resp_body("refused", "not_owned"), "keep", row="403 refused")
+    rs("row_403_not_owned", "The authenticated client may not forward for this device: keep, under the bounded "
+       "hold, and never retire.", 403, resp_body("refused", "not_owned"), "keep", row="403 refused")
     for reason in ("key_revoked", "signature_invalid", "transition_refused", "class_refused", "detail_refused"):
         rs(f"row_422_{reason}", f"Verification fails for a reason no later state cures: {reason}.", 422,
            resp_body("refused", reason), "reject", row="422 refused")
@@ -1103,6 +1140,12 @@ def responses_corpus() -> None:
        '{"v": 1, "record_digest": "' + REQ_DIGEST + '", "reason": "", "outcome": "stored"}', "retire",
        row="200 stored")
     # Unauthenticated.
+    rs("unparsable_429_unauthenticated_form", "429 retry_later of three members: a 429 is sent only once checks 1 "
+       "to 5 have passed, so it names the digest; in the unauthenticated form it does not parse.", 429,
+       resp_body("retry_later", rdigest=None), "keep", retires_nothing="unparsable", headers={"Retry-After": "30"})
+    rs("unparsable_503_unauthenticated_refused", "503 refused of three members with an empty reason: the "
+       "unauthenticated form is a 400 or 401 only.", 503, resp_body("refused", rdigest=None), "keep",
+       retires_nothing="unparsable")
     rs("unauthenticated_400_check2", "A 400 refused in the unauthenticated form, as a request refused at check 2 "
        "is answered: keep, never reject.", 400, resp_body("refused", rdigest=None), "keep",
        retires_nothing="unauthenticated")
@@ -1170,6 +1213,8 @@ def config_verdict(doc: dict) -> str | None:
     for k in ENV_KEYS:
         if any(c in WS or c == "=" for c in ad[k]):
             return "env_name_malformed"
+    if ad["secret_env"].encode("utf-8") in (ad["endpoint_env"].encode("utf-8"), ad["client_id_env"].encode("utf-8")):
+        return "secret_env_shared"
     for path, default in SHARED_WITH:
         v = get(doc, path)
         name = default if v is ABSENT else v
@@ -1317,6 +1362,10 @@ def config_corpus() -> None:
     for path, value in names.items():
         cf("rule8_" + "_".join(path), f"secret_env names the same variable as {'.'.join(path)}.",
            ad_set(secret_env=value), "secret_env_shared")
+    cf("rule8_secret_is_endpoint_env", "secret_env names the same variable as this section's endpoint_env.",
+       ad_set(secret_env="ORI_ALERT_DELIVERY_ENDPOINT"), "secret_env_shared")
+    cf("rule8_secret_is_client_id_env", "secret_env names the same variable as this section's client_id_env.",
+       ad_set(secret_env="ORI_ALERT_DELIVERY_CLIENT_ID"), "secret_env_shared")
     cf("rule8_shared_secret_env_default", "gateway.auth.shared_secret_env absent, so its default "
        "GATEWAY_SHARED_SECRET is the name in force, and secret_env names it.",
        both(at(("gateway", "auth", "shared_secret_env"), ABSENT), ad_set(secret_env="GATEWAY_SHARED_SECRET")),

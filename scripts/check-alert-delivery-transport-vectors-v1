@@ -100,8 +100,14 @@ PINS: list[tuple[str, str]] = [
     ("tr", "**Bound to the digest.** An authenticated response names the request's `record_digest`, and a gateway acts on it only when it is that digest."),
     ("tr", "A response that names another digest, does not parse, names an outcome or an HTTP status this table does not pair, or never arrives retires nothing, and the gateway keeps the record and retries."),
     ("tr", "Unauthenticated responses omit `record_digest`, so the receiver is no membership oracle."),
-    ("tr", "A 401 or a 403 never rejects a record: credential and permission faults are repaired, and the records they hold back wait."),
-    ("tr", "`stored` and `duplicate` are idempotent: the same bytes under a fresh request get the same outcome, and never a different one."),
+    ("tr", "A 401 never rejects a record: a credential fault is repaired, and the records it holds back wait."),
+    ("tr", "**One storage effect.** The same bytes under a fresh request have one durable storage effect at the receiver: a first `stored` may later be answered `duplicate`, and both retire."),
+    ("tr", "The receiver judges forwarding permission and verification before it answers `duplicate`, never after."),
+    ("tr", "That deadline is one per record, recorded durably with it: retries, restarts and an answer that alternates between the two reasons never extend it."),
+    ("tr", "Keeping it so is an obligation on whoever provisions the gateway: the configuration loader proves only the comparisons gateway-config/v2.md `alert_delivery` rule 8 makes, never that the secret differs from every credential the gateway holds."),
+    ("tr", "`endpoint_env` names an HTTPS origin: the scheme `https`, a host and an optional port, with no path, userinfo, query or fragment. The request URL is that origin followed by the path of *Endpoint*, exactly."),
+    ("tr", "and follows no redirect: a request that breaks any of these retires nothing."),
+    ("gateway_config", "This rule checks these names only: it does not prove the forwarding secret differs from every credential the gateway holds, which is a provisioning obligation."),
     ("tr", "- **Nothing infers delivery.** A network success, a TLS handshake, or an HTTP status the table does not pair with a matching digest never means the receiver holds a record."),
     # Configuration
     ("tr", "A gateway's forwarding keys are gateway-config/v2.md `alert_delivery` `endpoint_env`, `client_id_env` and `secret_env`, under that section's load rules."),
@@ -121,7 +127,8 @@ PINS: list[tuple[str, str]] = [
     ("ad", "and, when the receiver holds the record's key enrolled, revoked or not, on behalf of the owner its enrolment names, as the receiver's own authenticated registry holds it"),
     ("ad", "A record whose key is not enrolled for the device passes this check on the device alone, and check 3 refuses it."),
     ("ad", "Observation identity, `attempt_seq` uniqueness, the rules of [Consistency across records](#consistency-across-records), tallies, and [Reading a notice](#reading-a-notice) all hold within one `device_id` and one epoch."),
-    ("tr", "A record answered 202 `key_not_enrolled` is kept and sent again with the long back-off, for at most 7 days from its first such answer. It is then rejected, as below, with reason `key_not_enrolled`."),
+    ("tr", "A record answered 202 `key_not_enrolled` or 403 `not_owned` is kept and sent again with the long back-off, for at most 7 days from the first of those answers."),
+    ("tr", "At the deadline the record is rejected, as below, with the reason of its last such answer."),
     ("ad", "3. Not the canonical bytes of the object it parses to: `not_canonical`."),
     ("ad", "4. `v` is an integer under the integer rule of [Records](#records), other than `1`: `unsupported_version`. A `v` outside that rule, `0`, a negative or one above 2^53 − 1 among them, is `malformed`. Otherwise, not a record of either kind, with every member present, of its type and within its form: `malformed`."),
     ("ad", "A record whose `kind` is neither value, or whose members are not exactly those its kind lists, is `malformed`."),
@@ -404,11 +411,21 @@ def build_model(texts: dict[str, str]) -> dict:
         if (st, model["form_outcome"][reason]) not in pairs:
             raise Failure(f"text: check 6 {reason} {st} is not a table row")
     rej = sorted(s for (s, _), a in pairs.items() if a == "reject")
-    mm = one(r"A gateway rejects a record only on an\s+authenticated (\d+) or (\d+) response bound to its digest, or at the end of its\s+hold awaiting enrolment\.", resp, "rejection")
+    mm = one(r"A gateway rejects a record only on an\s+authenticated (\d+) or (\d+) response bound to its digest, or at the end of its\s+bounded hold\.", resp, "rejection")
     if rej != sorted([int(mm.group(1)), int(mm.group(2))]):
         raise Failure(f"text: rejecting statuses {rej} differ from the rejection rule")
-    mm = one(r"A (\d+) or a (\d+) never rejects a record", resp, "never rejects")
-    for s in (int(mm.group(1)), int(mm.group(2))):
+    mm = one(r"A (\d+) never rejects a record", resp, "never rejects")
+    # The held-back answers keep, and are rejected only at the end of the hold.
+    mh = one(r"answered 202 `([a-z_]+)` or 403 `([a-z_]+)` is kept", resp, "bounded hold")
+    model["held_back"] = {(202, mh.group(1)), (403, mh.group(2))}
+    for st, rsn in model["held_back"]:
+        if pairs.get((st, "retry_later" if st == 202 else "refused")) != "keep":
+            raise Failure(f"text: {st} {rsn} is held back but does not keep")
+    ms = one(r"Sent only once checks 1 to (\d+) have passed; a receiver that cannot serve before then fails the request at the transport, which retires nothing\.", resp, "backpressure placement")
+    model["backpressure_after"] = int(ms.group(1))
+    if model["backpressure_after"] != model["auth_checks"]:
+        raise Failure("text: 429 and 503 are not sent only after the authenticating checks")
+    for s in (int(mm.group(1)),):
         if any(a != "keep" for (st, _), a in pairs.items() if st == s):
             raise Failure(f"text: status {s} does not keep")
     # The response form.
@@ -511,10 +528,11 @@ def build_model(texts: dict[str, str]) -> dict:
     model["env_keys"] = [ticks(x)[0] for x in mm.groups()]
     mm = one(r"^`env_name_malformed`: one of them contains a character with the Unicode `White_Space` property or `(.)`, judged in that order;$", rules[6], "rule 7")
     model["env_bad_char"] = mm.group(1)
-    mm = one(r"^`secret_env_shared`: `secret_env` names the same variable as (.*?), each as the name in force after defaults, compared byte for byte; "
-             r"a key with no default that is absent names nothing, and `evidence\.secret_env` counts whether or not `evidence\.enabled` is true; "
-             r"so the forwarding secret is never another credential\. The refusal names the rule, not which variable matched\.$", rules[7], "rule 8")
-    model["shared_with"] = ticks(mm.group(1))
+    mm = one(r"^`secret_env_shared`: `secret_env` names the same variable as this section's (`[a-z_]+`) or (`[a-z_]+`), or as (.*?), each as the name in force after defaults, compared byte for byte; "
+             r"a key with no default that is absent names nothing, and `evidence\.secret_env` counts whether or not `evidence\.enabled` is true\. "
+             r"The refusal names the rule, not which variable matched\. This rule checks these names only: it does not prove the forwarding secret differs from every credential the gateway holds, which is a provisioning obligation\.$", rules[7], "rule 8")
+    model["shared_own"] = [ticks(mm.group(1))[0], ticks(mm.group(2))[0]]
+    model["shared_with"] = ticks(mm.group(3))
     defaults: dict[str, str | None] = {}
     for dotted in model["shared_with"]:
         parts = dotted.split(".")
@@ -1453,6 +1471,11 @@ def load_verdict(cfg: dict, model: dict, mut: frozenset) -> tuple[str | None, bo
             s = val("secret_env")
             if not s:
                 continue
+            for own in model["shared_own"]:
+                if f"shared_skip:{own}" in mut:
+                    continue
+                if val(own) and val(own) == s:
+                    return rule, None
             for other in model["shared_with"]:
                 if f"shared_skip:{other}" in mut:
                     continue
@@ -1914,6 +1937,9 @@ def _check(c: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> 
                     break
         if rule == R[7]:
             s = ad.get("secret_env")
+            for own in model["shared_own"]:
+                if ad.get(own) == s:
+                    cover(f"config {rule} with {own}", name)
             for other in model["shared_with"]:
                 o = dig(doc, other)
                 if o == s:
@@ -1957,7 +1983,7 @@ def required_coverage(model: dict) -> set[str]:
     req |= {f"config {R[5]} without {k}" for k in model["env_keys"]}
     req |= {f"config {R[6]} {k}" for k in model["env_keys"]}
     req.add(f"config {R[6]} non-ASCII white space")
-    req |= {f"config {R[7]} with {o}" for o in model["shared_with"]}
+    req |= {f"config {R[7]} with {o}" for o in model["shared_with"] + model["shared_own"]}
     req |= {f"config {R[7]} with {o} by default" for o, d in model["shared_defaults"].items() if d}
     req |= {f"config {R[typ - 1]} {k} {kind}" for k in model["env_keys"] for kind in ("null", "number")}
     req |= {"config accepted with forwarding", "config accepted without forwarding", "config accepted disabled"}
@@ -2000,7 +2026,7 @@ JUDGE_MUTANTS = [
 
 
 def judge_mutants(model: dict) -> list[str]:
-    return JUDGE_MUTANTS + [f"drop:{r}" for r in model["cfg_rules"][5:]] + [f"shared_skip:{o}" for o in model["shared_with"]]
+    return JUDGE_MUTANTS + [f"drop:{r}" for r in model["cfg_rules"][5:]] + [f"shared_skip:{o}" for o in model["shared_with"] + model["shared_own"]]
 
 
 def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
@@ -2177,7 +2203,10 @@ TEXT_EDITS: list[tuple[str, str, str, str]] = [
     ("HMAC object loses path", "tr", '"path": "/v1/runtime/alert-delivery-records",\n', ""),
     ("HMAC object loses nonce", "tr", '"nonce": "<X-Ori-Alert-Nonce>",\n', ""),
     ("401 retires", "tr", "| Keep; repair the credential and back off. Never retire. |", "| Retire. |"),
-    ("403 rejects", "tr", "| Keep; report it in site health. Never retire. |", "| Reject (below). |"),
+    ("403 rejects", "tr", "| Keep, under the bounded hold below; report it in site health. |", "| Reject (below). |"),
+    ("backpressure before authentication", "tr", "Sent only once checks 1 to 5 have passed;", "Sent only once checks 1 to 4 have passed;"),
+    ("hold not_owned dropped", "tr", "answered 202 `key_not_enrolled` or 403 `not_owned` is kept", "answered 202 `key_not_enrolled` or 403 `not_held` is kept"),
+    ("config rule 8 loses own variables", "gateway_config", "names the same variable as this\n   section's `endpoint_env` or `client_id_env`, or as", "names the same variable as this\n   section's `endpoint_env` or `endpoint_env`, or as"),
     ("202 retires", "tr", "| Keep, and retry with long back-off. |", "| Retire. |"),
     ("422 keeps", "tr", "`detail_refused`. | Reject (below). |", "`detail_refused`. | Keep. |"),
     ("authenticated 400 keeps", "tr", "Authenticated: reject (below). |", "Authenticated: keep. |"),
