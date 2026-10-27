@@ -142,14 +142,17 @@ class Signer:
         self.public_key = "ed25519:" + base64.b64encode(self.pub).decode("ascii")
 
 
-SIGNERS = {n: Signer(n) for n in ("runtime-a", "runtime-b", "moved-old", "moved-new", "unenrolled")}
-RT_A, RT_B, MOVED_OLD, MOVED_NEW, UNENROLLED = (SIGNERS[n] for n in SIGNERS)
+SIGNERS = {n: Signer(n) for n in ("runtime-a", "runtime-b", "moved-old", "moved-new", "unenrolled", "rotated-a",
+                                   "revoked-a")}
+RT_A, RT_B, MOVED_OLD, MOVED_NEW, UNENROLLED, ROTATED_A, REVOKED_A = (SIGNERS[n] for n in SIGNERS)
 DEFAULT_SIGNER = {DEVICE_A: RT_A, DEVICE_B: RT_B, DEVICE_MOVED: MOVED_NEW, DEVICE_UNKNOWN: UNENROLLED}
 
 # The receiver's own registry. Each client: the key_ids it holds for it, the devices it may forward for, and the
 # owners on whose behalf it may forward. Each enrolment: a report key bound to a device and to the owner the
 # device belonged to when the key was enrolled. DEVICE_MOVED moved from site-a to site-b: the key enrolled while
-# it was site-a's, moved-old, still names site-a, and the key enrolled since, moved-new, names site-b.
+# it was site-a's, moved-old, still names site-a, and the key enrolled since, moved-new, names site-b. Device A
+# also holds rotated-a, a retired key of its own that still verifies and is its own epoch, and revoked-a, a key
+# once enrolled for it and since revoked.
 REGISTRY = {
     "clients": {
         CLIENT_A: {"key_ids": [KEY_IDS["gateway-site-a"]], "devices": [DEVICE_A], "owners": [OWNER_A]},
@@ -158,12 +161,18 @@ REGISTRY = {
         CLIENT_LONG: {"key_ids": [KEY_IDS["gateway-long"]], "devices": [DEVICE_A], "owners": [OWNER_A]},
     },
     "enrolments": [
-        {"device_id": DEVICE_A, "key_identity": RT_A.identity, "public_key": RT_A.public_key, "owner": OWNER_A},
-        {"device_id": DEVICE_B, "key_identity": RT_B.identity, "public_key": RT_B.public_key, "owner": OWNER_B},
+        {"device_id": DEVICE_A, "key_identity": RT_A.identity, "public_key": RT_A.public_key, "owner": OWNER_A,
+         "revoked": False},
+        {"device_id": DEVICE_A, "key_identity": ROTATED_A.identity, "public_key": ROTATED_A.public_key,
+         "owner": OWNER_A, "revoked": False},
+        {"device_id": DEVICE_A, "key_identity": REVOKED_A.identity, "public_key": REVOKED_A.public_key,
+         "owner": OWNER_A, "revoked": True},
+        {"device_id": DEVICE_B, "key_identity": RT_B.identity, "public_key": RT_B.public_key, "owner": OWNER_B,
+         "revoked": False},
         {"device_id": DEVICE_MOVED, "key_identity": MOVED_OLD.identity, "public_key": MOVED_OLD.public_key,
-         "owner": OWNER_A},
+         "owner": OWNER_A, "revoked": False},
         {"device_id": DEVICE_MOVED, "key_identity": MOVED_NEW.identity, "public_key": MOVED_NEW.public_key,
-         "owner": OWNER_B},
+         "owner": OWNER_B, "revoked": False},
     ],
 }
 CLIENTS = REGISTRY["clients"]
@@ -336,6 +345,8 @@ def check8_reasons(obj: dict) -> list[str]:
     if e is None:
         reasons.append("key_not_enrolled")
     else:
+        if e["revoked"]:
+            reasons.append("key_revoked")
         pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(e["public_key"].split(":", 1)[1]))
         try:
             pub.verify(base64.b64decode(obj["signature"]),
@@ -359,7 +370,8 @@ def check8_reasons(obj: dict) -> list[str]:
 
 def breaks_consistency(h: dict, o: dict) -> bool:
     """Consistency across records, between a held submission h and a new one o of the same device."""
-    if h["kind"] != "submission" or o["kind"] != "submission" or h["device_id"] != o["device_id"]:
+    if h["kind"] != "submission" or o["kind"] != "submission" or h["device_id"] != o["device_id"] \
+            or h["key_identity"] != o["key_identity"]:
         return False
     if h["delivery_attempt_id"] == o["delivery_attempt_id"] and any(
             h[k] != o[k] for k in ("alert_id", "notice", "class", "channel", "attempt_seq", "attempted_at_ms")):
@@ -383,8 +395,9 @@ def check8_verdict(obj: dict, body: bytes, held: list) -> str:
         return "duplicate"
     stored = [json.loads(h["body"]) for h in held if h["held_as"] == "stored"]
     if obj["kind"] == "submission":
-        ident = (obj["device_id"], obj["delivery_attempt_id"], obj["observation_seq"])
-        if any(h["kind"] == "submission" and (h["device_id"], h["delivery_attempt_id"], h["observation_seq"]) == ident
+        ident = (obj["device_id"], obj["key_identity"], obj["delivery_attempt_id"], obj["observation_seq"])
+        if any(h["kind"] == "submission"
+               and (h["device_id"], h["key_identity"], h["delivery_attempt_id"], h["observation_seq"]) == ident
                for h in stored) or any(breaks_consistency(h, obj) for h in stored):
             return "conflict"
         return "stored"
@@ -807,6 +820,19 @@ def requests_corpus_refused() -> None:
     rq("check8_key_enrolled_for_other_device", "A record for device A under device B's enrolled key.",
        build_request("check8_key_enrolled_for_other_device", body=submission(DEVICE_A, RT_B)), 8)
     tampered = canonical({**submission_obj(), "attempt_seq": 43})
+    rq("check8_key_revoked", "A record for device A, signed and valid under a key once enrolled for it and since "
+       "revoked: key_revoked, a 422 no later state cures. The enrolment still names site-a, so check 7 passes.",
+       build_request("check8_key_revoked", body=submission(DEVICE_A, REVOKED_A)), 8)
+    rq("accepted_epochs_apart_attempt_seq", "The receiver holds device A's record under its current key; this one, "
+       "under device A's retired key, reuses attempt_seq 41 under another delivery_attempt_id. Within one epoch "
+       "that breaks consistency, but records under different keys are never judged against each other: stored.",
+       build_request("accepted_epochs_apart_attempt_seq", body=submission(
+           DEVICE_A, ROTATED_A, delivery_attempt_id="Rt5Hn8Jw1Qe6Zb3m")), None, held=((submission(), "stored"),))
+    rq("accepted_epochs_apart_identity", "The receiver holds device A's record under its current key; this one has "
+       "the same delivery_attempt_id and observation_seq under the retired key: an observation's identity is "
+       "within one epoch, so it is stored, not conflict.",
+       build_request("accepted_epochs_apart_identity", body=submission(DEVICE_A, ROTATED_A)), None,
+       held=((submission(), "stored"),))
     rq("check8_signature_invalid", "A record changed after signing: attempt_seq 43 under the signature over 41.",
        build_request("check8_signature_invalid", body=tampered), 8)
     rq("check8_transition_refused", "observation_seq 2 after a null prior_outcome.",
@@ -887,7 +913,8 @@ ROW_REASONS = {(200, "stored"): ("",), (200, "duplicate"): ("",), (200, "superse
                (202, "retry_later"): ("key_not_enrolled", "unsupported_version"),
                (400, "refused"): ("not_canonical", "malformed"), (401, "refused"): (),
                (403, "refused"): ("not_owned",),
-               (422, "refused"): ("signature_invalid", "transition_refused", "class_refused", "detail_refused"),
+               (422, "refused"): ("key_revoked", "signature_invalid", "transition_refused", "class_refused",
+                                  "detail_refused"),
                (429, "retry_later"): ("",), (503, "retry_later"): ("",)}
 REQ_DIGEST = digest(submission())
 OTHER_DIGEST = digest(submission(attempt_seq=42))
@@ -969,7 +996,7 @@ def responses_corpus() -> None:
        resp_body("refused", rdigest=None), "keep", row="401 refused", retires_nothing="unauthenticated")
     rs("row_403_not_owned", "The authenticated client may not forward for this device: keep, never retire, never "
        "reject.", 403, resp_body("refused", "not_owned"), "keep", row="403 refused")
-    for reason in ("signature_invalid", "transition_refused", "class_refused", "detail_refused"):
+    for reason in ("key_revoked", "signature_invalid", "transition_refused", "class_refused", "detail_refused"):
         rs(f"row_422_{reason}", f"Verification fails for a reason no later state cures: {reason}.", 422,
            resp_body("refused", reason), "reject", row="422 refused")
     rs("row_429_retry_later", "A rate limit, with Retry-After.", 429, resp_body("retry_later"), "keep",
@@ -1326,7 +1353,8 @@ def build() -> dict:
                                   "the record bodies. Test keys only."),
             "registry": ("The receiver's own registry, shared by every request case: each client's key_ids, the "
                          "devices it may forward for and the owners on whose behalf it may; and each report-key "
-                         "enrolment, binding a key to a device and to the owner it names."),
+                         "enrolment, binding a key to a device and to the owner it names, and `revoked` true for "
+                         "a key since revoked. Each key is its own epoch."),
             "requests": ("Requests as an exact request line, every header received in order, and body, with the HMAC "
                          "input as hex wherever X-Ori-Alert-Sent-At-Ms carries an integer's own spelling, and the "
                          "receiver's verdict at checks 1 to 8 of Order. `receiver` gives the receiver's clock, the "
