@@ -12,6 +12,7 @@ below are checked against those records.
 
 | Contract | File | Maturity | Adoption | Compatibility |
 | --- | --- | --- | --- | --- |
+| Alert delivery report | [alert-delivery/v1.md](alert-delivery/v1.md) | `draft` | none recorded | `amendable` |
 | Capability grant | [capability-grant/v1.md](capability-grant/v1.md) | `draft` | none recorded | `amendable` |
 | Capability grant issuance | [capability-grant-issuance/v1.md](capability-grant-issuance/v1.md) | `draft` | none recorded | `amendable` |
 | CLI commands | [cli-commands/v1.md](cli-commands/v1.md) | `draft` | runtime `shipped` in v0.9.0-beta.1, `partial` at assessed implementation snapshot `eee40d3` (7 missing requirements); current `d2aba48` unassessed, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `complete` |
