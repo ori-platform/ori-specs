@@ -1365,6 +1365,58 @@ ecase("precedence_key_over_signature", "Another key named and a zero signature: 
       challenge(OTHER), "key_mismatch", signature=b64(b"\x00" * 64))
 
 
+# --- enrolment sequences ---------------------------------------------------------------------------
+ENROL_SEQUENCES: list[dict] = []
+NONCE_C = hashlib.sha256(b"ori alert-delivery/v1 test nonce c").hexdigest()[:48]
+
+
+def estep(signer: object, issued: str, *, named_nonce: str | None = None, signed_by: object = None,
+          device: str = DEVICE, owner: str = "site-a") -> dict:
+    """One proof: `signer` is the key being enrolled; the challenge names `named_nonce` (the issued one when None),
+    and `signed_by` signs it (the key being enrolled when None)."""
+    chal = text(challenge(signer, nonce=named_nonce or issued, device_id=device))
+    sig = b64((signed_by or signer).sign(ENROL_DOMAIN + chal.encode("utf-8")))
+    return {"enrolling_device_id": device, "enrolling_owner": owner, "enrolling_public_key": "ed25519:" + b64(signer.pub),
+            "enrolling_key_identity": identity(signer.pub), "issued_nonce": issued, "challenge": chal,
+            "challenge_b64": b64(chal.encode("utf-8")),
+            "signing_input_hex": (ENROL_DOMAIN + chal.encode("utf-8")).hex(), "signature": sig}
+
+
+def eseq(name: str, note: str, steps: list) -> None:
+    held_now: list = []
+    consumed: set = set()
+    out = []
+    for st in steps:
+        pub = base64.b64decode(st["enrolling_public_key"][8:])
+        v = enrol_verdict(st["challenge"], st["signature"], st["enrolling_device_id"], pub, st["issued_nonce"],
+                          st["issued_nonce"] in consumed, held_now) or "pass"
+        consumed.add(st["issued_nonce"])  # consumed whether or not the proof verifies
+        if v == "pass":
+            held_now.append({"device_id": st["enrolling_device_id"], "public_key": st["enrolling_public_key"],
+                             "key_identity": st["enrolling_key_identity"], "purpose": PURPOSE,
+                             "owner": st["enrolling_owner"], "revoked": False})
+        out.append({**st, "expected": v, "expected_held": [dict(h) for h in held_now]})
+    ENROL_SEQUENCES.append({"name": name, "note": note, "steps": out})
+
+
+eseq("refused_nonce_then_valid", "runtime's proof names a nonce the receiver did not issue: nonce_mismatch, which "
+     "holds nothing and consumes the issued nonce. A fresh nonce, and runtime's valid proof passes.",
+     [estep(RUNTIME, NONCE, named_nonce=NONCE64), estep(RUNTIME, NONCE_C)])
+eseq("refused_signature_then_valid", "runtime's proof signed by other: signature_invalid, which holds nothing. A "
+     "fresh nonce, and runtime's valid proof passes.",
+     [estep(RUNTIME, NONCE, signed_by=OTHER), estep(RUNTIME, NONCE_C)])
+eseq("valid_then_again", "runtime's valid proof passes and is held; the same key presented again, under a fresh "
+     "nonce, is key_already_enrolled, and the held set is unchanged.",
+     [estep(RUNTIME, NONCE), estep(RUNTIME, NONCE_C)])
+eseq("valid_then_negation", "runtime's valid proof passes; runtime's negation, its own proof signed under it, is "
+     "one recognised key with runtime: key_already_enrolled.",
+     [estep(RUNTIME, NONCE), estep(NEGATED, NONCE_C)])
+eseq("valid_then_other_key", "runtime's valid proof passes; then rotated's, another key, passes too, and both "
+     "are held.", [estep(RUNTIME, NONCE), estep(ROTATED, NONCE_C)])
+eseq("nonce_reused_after_pass", "runtime's valid proof passes and consumes its nonce; rotated's proof under the "
+     "same nonce is nonce_mismatch.", [estep(RUNTIME, NONCE), estep(ROTATED, NONCE)])
+
+
 # --- gateway-config/v2 alert_delivery ----------------------------------------------------------------
 CONFIG_CASES: list[dict] = []
 STATE = "/var/lib/ori-gateway/state"
@@ -1620,6 +1672,12 @@ def build() -> dict:
                           "`signing_input_hex` the ASCII prefix, NUL and those bytes, `signature` the "
                           "signature as canonical padded Base64. `expected` is `pass` or the reason of The "
                           "enrolment proof."),
+            "enrolment_sequences": ("Each sequence is enrolment proofs judged in order by one receiver that holds no "
+                                    "key at its start, each step as an `enrolment` case for one device and owner. "
+                                    "The receiver consumes each step's `issued_nonce` whether or not its proof "
+                                    "passes, so a later step under the same nonce is nonce_mismatch. Only a proof "
+                                    "that passes every check is held. `expected_held` is the held set after the "
+                                    "step, in the order enrolled, each entry as in `held_enrolments`."),
             "config": ("gateway-config/v2 alert_delivery load rules. `alert_delivery` lists the keys as written, "
                        "each value of the type the configuration document gives it (a JSON boolean, string, "
                        "integer or float), which type_mismatch judges uncoerced; "
@@ -1638,6 +1696,7 @@ def build() -> dict:
         "receiver_sequences": RECEIVER_SEQUENCES,
         "carriage_sequences": CARRIAGE_SEQUENCES,
         "enrolment": ENROL_CASES,
+        "enrolment_sequences": ENROL_SEQUENCES,
         "config": CONFIG_CASES,
     }
 
