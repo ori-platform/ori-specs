@@ -475,6 +475,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | Contract | Version | Maturity | Compatibility | Frozen by |
 | --- | --- | --- | --- | --- |
 | alert-delivery | v1 | `draft` | `amendable` | — |
+| alert-delivery-transport | v1 | `draft` | `amendable` | — |
 | capability-grant | v1 | `draft` | `amendable` | — |
 | capability-grant-issuance | v1 | `draft` | `amendable` | — |
 | cli-commands | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |

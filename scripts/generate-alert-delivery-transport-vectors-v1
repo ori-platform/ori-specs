@@ -1,0 +1,1475 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Generate alert-delivery-transport/v1 vectors.
+
+Writes alert-delivery-transport/vectors/alert-delivery-transport-v1.json:
+
+- key_ids: test secrets, each the SHA-256 of a published label written as 64
+  lowercase hexadecimal characters, with the key_id the contract derives;
+- requests: exact request lines, header lists and bodies, each with its HMAC
+  input and Authorization header and the receiver's verdict at checks 1 to 8
+  of Order, for the forwarding permissions, owners, enrolments and held
+  records the case names: its check, HTTP status, response outcome and reason,
+  and the exact response body;
+- responses: a receiver's response to a request of known digest, with the
+  gateway's action, retire, keep or reject;
+- config: the gateway-config/v2 alert_delivery load rules on the forwarding
+  keys, rule 1 on their types and rules 6 to 8, and accepted cases.
+
+Every refused case is refused for one check alone, except a case that declares
+its precedence: the check that wins and the later checks it also fails. The
+generator judges every case with its own judges and stops if the verdict it
+declares is not the one they reach. The secrets and runtime keys are test
+values only.
+
+Usage: generate-alert-delivery-transport-vectors-v1 [--check]
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import hashlib
+import hmac
+import json
+import pathlib
+import re
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+OUT = ROOT / "alert-delivery-transport" / "vectors" / "alert-delivery-transport-v1.json"
+
+METHOD = "POST"
+PATH = "/v1/runtime/alert-delivery-records"
+REQUEST_LINE = f"{METHOD} {PATH} HTTP/1.1"
+HOST = "receiver.example"
+MAX_REQUEST_LINE = 1024
+MAX_HEADERS = 32
+MAX_HEADER_BYTES = 1024
+MAX_BODY = 4096
+MAX_INT = 2**53 - 1
+SKEW_MS = 300_000
+CONTENT_TYPE = "application/octet-stream"
+KEY_ID_SALT = b"ori.alert_delivery_forward_key_id.v1"
+KEY_ID_INFO = b"alert_delivery_forward"
+HMAC_DOMAIN = b"ori.alert_delivery_forward_request.v1\x00"
+RECORD_DOMAIN = b"ori.alert_delivery.v1\x00"
+SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+T0 = 1_787_000_000_000
+NOW_MS = T0 + 60_000
+
+H_HOST = "Host"
+H_LEN = "Content-Length"
+H_CT = "Content-Type"
+H_CLIENT = "X-Ori-Alert-Client"
+H_KEY = "X-Ori-Alert-Key-Id"
+H_SENT = "X-Ori-Alert-Sent-At-Ms"
+H_NONCE = "X-Ori-Alert-Nonce"
+H_DIGEST = "X-Ori-Alert-Record-Digest"
+H_AUTH = "Authorization"
+REQUIRED = (H_CLIENT, H_KEY, H_SENT, H_NONCE, H_DIGEST, H_AUTH)
+STANDARD = (H_HOST, H_LEN, H_CT)
+
+CLIENT_A = "gateway-site-a"
+CLIENT_B = "gateway-site-b"
+CLIENT_ESCAPED = 'gw "a" \\ 01'
+CLIENT_LONG = "g" * 128
+DEVICE_A = "site-a-edge-01"
+DEVICE_B = "site-b-edge-01"
+DEVICE_MOVED = "site-m-edge-01"
+DEVICE_UNKNOWN = "site-z-edge-99"
+OWNER_A = "site-a"
+OWNER_B = "site-b"
+
+PRINTABLE_RE = re.compile(r"[\x20-\x7e]{1,128}")
+KEY_ID_RE = re.compile(r"hkdf-sha256:[0-9a-f]{32}")
+SENT_RE = re.compile(r"[1-9][0-9]{0,15}")
+DIGITS_RE = re.compile(r"0|[1-9][0-9]*")
+NONCE_RE = re.compile(r"[0-9a-f]{32}")
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+AUTH_RE = re.compile(r"Ori-Alert-HMAC hmac-sha256:([0-9a-f]{64})")
+
+
+# --- secrets and key identifiers ---------------------------------------------------------------------
+def label(name: str) -> str:
+    return f"ori alert-delivery-transport/v1 {name} test secret"
+
+
+def secret(name: str) -> str:
+    return hashlib.sha256(label(name).encode("ascii")).hexdigest()
+
+
+def hkdf_stdlib(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out, block, i = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([i]), hashlib.sha256).digest()
+        out += block
+        i += 1
+    return out[:length]
+
+
+def derive_key_id(sec: str) -> str:
+    ikm = sec.encode("utf-8")
+    ours = hkdf_stdlib(ikm, KEY_ID_SALT, KEY_ID_INFO, 16)
+    theirs = HKDF(algorithm=hashes.SHA256(), length=16, salt=KEY_ID_SALT, info=KEY_ID_INFO).derive(ikm)
+    assert ours == theirs, "the two HKDF implementations disagree"
+    return "hkdf-sha256:" + ours.hex()
+
+
+SECRET_NAMES = ("gateway-site-a", "gateway-site-b", "gateway-escaped", "gateway-long", "unheld")
+SECRETS = {n: secret(n) for n in SECRET_NAMES}
+KEY_IDS = {n: derive_key_id(SECRETS[n]) for n in SECRET_NAMES}
+SECRET_BY_KEY_ID = {KEY_IDS[n]: SECRETS[n] for n in SECRET_NAMES}
+assert len(set(KEY_IDS.values())) == len(KEY_IDS)
+
+
+# --- runtime report keys -------------------------------------------------------------------------------
+class Signer:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.seed_label = f"ori alert-delivery-transport/v1 {name} test key"
+        self.key = Ed25519PrivateKey.from_private_bytes(hashlib.sha256(self.seed_label.encode("ascii")).digest())
+        self.pub = self.key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        self.identity = "sha256:" + hashlib.sha256(SPKI_PREFIX + self.pub).hexdigest()
+        self.public_key = "ed25519:" + base64.b64encode(self.pub).decode("ascii")
+
+
+SIGNERS = {n: Signer(n) for n in ("runtime-a", "runtime-b", "moved-old", "moved-new", "unenrolled", "rotated-a",
+                                   "revoked-a")}
+RT_A, RT_B, MOVED_OLD, MOVED_NEW, UNENROLLED, ROTATED_A, REVOKED_A = (SIGNERS[n] for n in SIGNERS)
+DEFAULT_SIGNER = {DEVICE_A: RT_A, DEVICE_B: RT_B, DEVICE_MOVED: MOVED_NEW, DEVICE_UNKNOWN: UNENROLLED}
+
+# The receiver's own registry. Each client: the key_ids it holds for it, the devices it may forward for, and the
+# owners on whose behalf it may forward. Each enrolment: a report key bound to a device and to the owner the
+# device belonged to when the key was enrolled. DEVICE_MOVED moved from site-a to site-b: the key enrolled while
+# it was site-a's, moved-old, still names site-a, and the key enrolled since, moved-new, names site-b. Device A
+# also holds rotated-a, a retired key of its own that still verifies and is its own epoch, and revoked-a, a key
+# once enrolled for it and since revoked.
+REGISTRY = {
+    "clients": {
+        CLIENT_A: {"key_ids": [KEY_IDS["gateway-site-a"]], "devices": [DEVICE_A], "owners": [OWNER_A]},
+        CLIENT_B: {"key_ids": [KEY_IDS["gateway-site-b"]], "devices": [DEVICE_B, DEVICE_MOVED], "owners": [OWNER_B]},
+        CLIENT_ESCAPED: {"key_ids": [KEY_IDS["gateway-escaped"]], "devices": [DEVICE_A], "owners": [OWNER_A]},
+        CLIENT_LONG: {"key_ids": [KEY_IDS["gateway-long"]], "devices": [DEVICE_A], "owners": [OWNER_A]},
+    },
+    "enrolments": [
+        {"device_id": DEVICE_A, "key_identity": RT_A.identity, "public_key": RT_A.public_key, "owner": OWNER_A,
+         "revoked": False},
+        {"device_id": DEVICE_A, "key_identity": ROTATED_A.identity, "public_key": ROTATED_A.public_key,
+         "owner": OWNER_A, "revoked": False},
+        {"device_id": DEVICE_A, "key_identity": REVOKED_A.identity, "public_key": REVOKED_A.public_key,
+         "owner": OWNER_A, "revoked": True},
+        {"device_id": DEVICE_B, "key_identity": RT_B.identity, "public_key": RT_B.public_key, "owner": OWNER_B,
+         "revoked": False},
+        {"device_id": DEVICE_MOVED, "key_identity": MOVED_OLD.identity, "public_key": MOVED_OLD.public_key,
+         "owner": OWNER_A, "revoked": False},
+        {"device_id": DEVICE_MOVED, "key_identity": MOVED_NEW.identity, "public_key": MOVED_NEW.public_key,
+         "owner": OWNER_B, "revoked": False},
+    ],
+}
+CLIENTS = REGISTRY["clients"]
+
+
+def enrolment(device: object, identity: object) -> dict | None:
+    for e in REGISTRY["enrolments"]:
+        if e["device_id"] == device and e["key_identity"] == identity:
+            return e
+    return None
+
+
+# --- canonical JSON (gateway-mqtt-canonical-json/v1) -----------------------------------------------
+def canonical(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      allow_nan=False).encode("utf-8")
+
+
+# --- record bodies (alert-delivery/v1 Records) -------------------------------------------------------
+def signed_obj(obj: dict, signer: Signer) -> dict:
+    unsigned = {k: v for k, v in obj.items() if k != "signature"}
+    sig = signer.key.sign(RECORD_DOMAIN + canonical(unsigned))
+    return {**unsigned, "signature": base64.b64encode(sig).decode("ascii")}
+
+
+def submission_obj(device: str = DEVICE_A, signer: Signer | None = None, **over: object) -> dict:
+    signer = signer or DEFAULT_SIGNER[device]
+    obj = {"v": 1, "kind": "submission", "device_id": device, "key_identity": signer.identity,
+           "alert_id": "q3Jx0bS6lVb8nT2aXw9e1g", "notice": "optional", "class": "grid_power_restored",
+           "channel": "sms", "delivery_attempt_id": "Zt4Qm8yK2cR7vP1nL0sW5a", "attempt_seq": 41,
+           "attempted_at_ms": T0 + 500, "observation_seq": 1, "prior_outcome": None, "outcome": "accepted",
+           "detail": None, "issued_at_ms": T0 + 1000}
+    obj.update(over)
+    return signed_obj(obj, signer)
+
+
+def submission(device: str = DEVICE_A, signer: Signer | None = None, **over: object) -> bytes:
+    return canonical(submission_obj(device, signer, **over))
+
+
+def tally(device: str = DEVICE_A, signer: Signer | None = None, **over: object) -> bytes:
+    signer = signer or DEFAULT_SIGNER[device]
+    obj = {"v": 1, "kind": "withheld_tally", "device_id": device, "key_identity": signer.identity,
+           "channel": "whatsapp", "class": None, "reason": "capped", "month": "2026-08", "count": 3,
+           "issued_at_ms": T0 + 2000}
+    obj.update(over)
+    return canonical(signed_obj(obj, signer))
+
+
+def digest(body: bytes) -> str:
+    return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+# --- the receiver's record judges: Verifying check 1, then checks 3 to 6 -------------------------------
+NOTICES = ("optional", "tier_d", "protection_degraded")
+CHANNELS = ("sms", "whatsapp")
+OUTCOMES_REC = ("accepted", "failed", "unconfirmed")
+DETAILS = {"accepted": (), "failed": ("provider_refused", "provider_reported_failure", "not_submitted"),
+           "unconfirmed": ("timeout_after_submit", "response_unreadable")}
+ALL_DETAILS = tuple(d for v in DETAILS.values() for d in v)
+TRANSITIONS = {(1, None): ("accepted", "failed", "unconfirmed"), (2, "unconfirmed"): ("accepted", "failed"),
+               (2, "accepted"): ("failed",), (3, "accepted"): ("failed",)}
+SUBMISSION_MEMBERS = ("v", "kind", "device_id", "key_identity", "alert_id", "notice", "class", "channel",
+                      "delivery_attempt_id", "attempt_seq", "attempted_at_ms", "observation_seq", "prior_outcome",
+                      "outcome", "detail", "issued_at_ms", "signature")
+TALLY_MEMBERS = ("v", "kind", "device_id", "key_identity", "channel", "class", "reason", "month", "count",
+                 "issued_at_ms", "signature")
+DEVICE_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+ID_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
+IDENTITY_RE = re.compile(r"sha256:[0-9a-f]{64}")
+CLASS_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+MONTH_RE = re.compile(r"[0-9]{4}-(0[1-9]|1[0-2])")
+
+
+def fold(name: str) -> str:
+    return "".join("s" if c == "\u017f" else "k" if c == "\u212a" else c.lower() if "A" <= c <= "Z" else c
+                   for c in name)
+
+
+class Refused(Exception):
+    pass
+
+
+def member_rule(body: bytes) -> object:
+    """Payload Member Rule, as far as this corpus's bodies need it: each failure is malformed at check 6."""
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refused("malformed") from None
+
+    def pairs(items: list) -> dict:
+        names = [k for k, _ in items]
+        if len(set(names)) != len(names):
+            raise Refused("malformed")
+        folded = [fold(k) for k in names]
+        if len(set(folded)) != len(folded):
+            raise Refused("malformed")
+        defined = set(SUBMISSION_MEMBERS) | set(TALLY_MEMBERS)
+        if any(k not in defined and fold(k) in {fold(d) for d in defined} for k in names):
+            raise Refused("malformed")
+        return dict(items)
+    try:
+        obj = json.loads(text, object_pairs_hook=pairs)
+    except ValueError:
+        raise Refused("malformed") from None
+    if not isinstance(obj, dict):
+        raise Refused("malformed")
+    return obj
+
+
+def is_int(v: object, lo: int = 1, hi: int = MAX_INT) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def is_str(v: object, pattern: re.Pattern) -> bool:
+    return isinstance(v, str) and pattern.fullmatch(v) is not None
+
+
+def sig_ok(v: object) -> bool:
+    if not isinstance(v, str) or len(v) != 88:
+        return False
+    try:
+        raw = base64.b64decode(v, validate=True)
+    except ValueError:
+        return False
+    return len(raw) == 64 and base64.b64encode(raw).decode("ascii") == v
+
+
+def form_ok(o: dict) -> bool:
+    common = (is_str(o.get("device_id"), DEVICE_RE) and is_str(o.get("key_identity"), IDENTITY_RE)
+              and o.get("channel") in CHANNELS and (o.get("class") is None or is_str(o.get("class"), CLASS_RE))
+              and is_int(o.get("issued_at_ms")) and sig_ok(o.get("signature")))
+    if o.get("kind") == "submission":
+        return (tuple(sorted(o)) == tuple(sorted(SUBMISSION_MEMBERS)) and common
+                and is_str(o["alert_id"], ID_RE) and o["notice"] in NOTICES
+                and is_str(o["delivery_attempt_id"], ID_RE) and is_int(o["attempt_seq"])
+                and is_int(o["attempted_at_ms"]) and is_int(o["observation_seq"], 1, 3)
+                and (o["prior_outcome"] is None or o["prior_outcome"] in OUTCOMES_REC)
+                and o["outcome"] in OUTCOMES_REC and (o["detail"] is None or o["detail"] in ALL_DETAILS))
+    if o.get("kind") == "withheld_tally":
+        return (tuple(sorted(o)) == tuple(sorted(TALLY_MEMBERS)) and common
+                and o["reason"] in ("disabled", "capped") and is_str(o["month"], MONTH_RE) and is_int(o["count"]))
+    return False
+
+
+def check6(body: bytes) -> tuple[str | None, dict | None]:
+    """Order check 6: the body is a record. The reason or None, and the object when it parsed to one."""
+    try:
+        obj = member_rule(body)
+    except Refused as e:
+        return str(e), None
+    if canonical(obj) != body:
+        return "not_canonical", obj
+    v = obj.get("v")
+    if is_int(v) and v != 1:
+        return "unsupported_version", obj
+    if v != 1 or isinstance(v, bool) or not form_ok(obj):
+        return "malformed", obj
+    return None, obj
+
+
+def tally_key(o: dict) -> tuple:
+    return (o["device_id"], o["key_identity"], o["channel"], o["class"], o["reason"], o["month"])
+
+
+def check8_reasons(obj: dict) -> list[str]:
+    """Verifying checks 3 to 5, each judged where its input exists, in order: the first is the answer."""
+    reasons = []
+    e = enrolment(obj["device_id"], obj["key_identity"])
+    if e is None:
+        reasons.append("key_not_enrolled")
+    else:
+        if e["revoked"]:
+            reasons.append("key_revoked")
+        pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(e["public_key"].split(":", 1)[1]))
+        try:
+            pub.verify(base64.b64decode(obj["signature"]),
+                       RECORD_DOMAIN + canonical({k: v for k, v in obj.items() if k != "signature"}))
+        except InvalidSignature:
+            reasons.append("signature_invalid")
+    if obj["kind"] == "submission":
+        if obj["outcome"] not in TRANSITIONS.get((obj["observation_seq"], obj["prior_outcome"]), ()):
+            reasons.append("transition_refused")
+        if obj["notice"] != "optional" and obj["class"] is not None:
+            reasons.append("class_refused")
+        d = obj["detail"]
+        if d is not None and (d not in DETAILS[obj["outcome"]]
+                              or (obj["prior_outcome"] == "accepted" and d != "provider_reported_failure")
+                              or (obj["prior_outcome"] != "accepted" and d == "provider_reported_failure")):
+            reasons.append("detail_refused")
+    elif obj["reason"] == "disabled" and obj["class"] is None:
+        reasons.append("class_refused")
+    return reasons
+
+
+def breaks_consistency(h: dict, o: dict) -> bool:
+    """Consistency across records, between a held submission h and a new one o of the same device."""
+    if h["kind"] != "submission" or o["kind"] != "submission" or h["device_id"] != o["device_id"] \
+            or h["key_identity"] != o["key_identity"]:
+        return False
+    if h["delivery_attempt_id"] == o["delivery_attempt_id"] and any(
+            h[k] != o[k] for k in ("alert_id", "notice", "class", "channel", "attempt_seq", "attempted_at_ms")):
+        return True
+    if h["alert_id"] == o["alert_id"] and (h["notice"], h["class"]) != (o["notice"], o["class"]):
+        return True
+    return h["attempt_seq"] == o["attempt_seq"] and h["delivery_attempt_id"] != o["delivery_attempt_id"]
+
+
+# The complete legal paths of one attempt's observations through the observation table.
+LEGAL_PATHS = (("accepted",), ("failed",), ("unconfirmed",), ("unconfirmed", "accepted"), ("unconfirmed", "failed"),
+               ("accepted", "failed"), ("unconfirmed", "accepted", "failed"))
+
+
+def admits_a_path(observations: list[dict]) -> bool:
+    """Whether one attempt's observations, held and incoming together, fit at least one complete legal path: each
+    at its observation_seq, with its outcome there and its prior_outcome the outcome one step earlier."""
+    def fits(path: tuple, o: dict) -> bool:
+        n = o["observation_seq"]
+        return (n <= len(path) and path[n - 1] == o["outcome"]
+                and o["prior_outcome"] == (path[n - 2] if n > 1 else None))
+    return any(all(fits(path, o) for o in observations) for path in LEGAL_PATHS)
+
+
+def check8_verdict(obj: dict, body: bytes, held: list) -> str:
+    """Verifying check 6, against the records the receiver holds verified. A record held as conflict counts
+    only for duplicate: it is never the earlier record another is judged against."""
+    if any(json.loads(h["body"]) == obj for h in held):
+        return "duplicate"
+    stored = [json.loads(h["body"]) for h in held if h["held_as"] == "stored"]
+    if obj["kind"] == "submission":
+        ident = (obj["device_id"], obj["key_identity"], obj["delivery_attempt_id"], obj["observation_seq"])
+        if any(h["kind"] == "submission"
+               and (h["device_id"], h["key_identity"], h["delivery_attempt_id"], h["observation_seq"]) == ident
+               for h in stored) or any(breaks_consistency(h, obj) for h in stored):
+            return "conflict"
+        attempt = [h for h in stored if h["kind"] == "submission" and h["device_id"] == obj["device_id"]
+                   and h["key_identity"] == obj["key_identity"]
+                   and h["delivery_attempt_id"] == obj["delivery_attempt_id"]]
+        if not admits_a_path([*attempt, obj]):
+            return "conflict"
+        return "stored"
+    same_key = [h for h in stored if h["kind"] == "withheld_tally" and tally_key(h) == tally_key(obj)]
+    if any(h["count"] == obj["count"] for h in same_key):
+        return "conflict"
+    if same_key and obj["count"] < max(h["count"] for h in same_key):
+        return "lower_count"
+    return "stored"
+
+
+# --- requests -----------------------------------------------------------------------------------------
+def nonce(tag: str) -> str:
+    return hashlib.sha256(f"ori alert-delivery-transport/v1 nonce {tag}".encode("ascii")).digest()[:16].hex()
+
+
+def hmac_input(client: str, key_id: str, sent: int, nonce_: str, rdigest: str) -> bytes:
+    return HMAC_DOMAIN + canonical({"client_id": client, "key_id": key_id, "method": METHOD, "nonce": nonce_,
+                                    "path": PATH, "record_digest": rdigest, "sent_at_ms": sent})
+
+
+def mac(sec: str, data: bytes) -> str:
+    return hmac.new(sec.encode("utf-8"), data, hashlib.sha256).hexdigest()
+
+
+ZERO_AUTH = "Ori-Alert-HMAC hmac-sha256:" + "0" * 64
+
+
+def build_request(tag: str, *, body: bytes | None = None, client: str = CLIENT_A, secret_name: str = "gateway-site-a",
+                  sent: int = NOW_MS - 2_000, nonce_: str | None = None, digest_header: str | None = None,
+                  sign_with: str | None = None, over: dict | None = None, drop: tuple = (),
+                  extra: tuple = (), request_line: str = REQUEST_LINE, rename: dict | None = None) -> dict:
+    """A request whose headers are well formed and whose HMAC is over the headers as sent, unless told otherwise.
+    `over` replaces a header's value, `drop` removes a header, `extra` appends (name, value) pairs, and `rename`
+    writes a header under another spelling of its name."""
+    body = submission() if body is None else body
+    nonce_ = nonce(tag) if nonce_ is None else nonce_
+    values = {H_HOST: HOST, H_LEN: str(len(body)), H_CT: CONTENT_TYPE, H_CLIENT: client,
+              H_KEY: KEY_IDS[secret_name], H_SENT: str(sent), H_NONCE: nonce_,
+              H_DIGEST: digest(body) if digest_header is None else digest_header}
+    values.update({k: v for k, v in (over or {}).items() if k != H_AUTH})
+    # The HMAC input is built from the headers as sent, wherever X-Ori-Alert-Sent-At-Ms carries an integer's own
+    # spelling; sent_at_ms is the integer the header carries.
+    data = None
+    required_lower = {k.lower() for k in REQUIRED}
+    single = not (set(drop) & set(REQUIRED)) and not any(n.lower() in required_lower for n, _ in extra)
+    if single and DIGITS_RE.fullmatch(values[H_SENT]):
+        data = hmac_input(values[H_CLIENT], values[H_KEY], int(values[H_SENT]), values[H_NONCE], values[H_DIGEST])
+    if over and H_AUTH in over:
+        values[H_AUTH] = over[H_AUTH]
+    elif data is None:
+        assert not single, tag
+        values[H_AUTH] = ZERO_AUTH
+    else:
+        values[H_AUTH] = "Ori-Alert-HMAC hmac-sha256:" + mac(SECRETS[sign_with or secret_name], data)
+    names = rename or {}
+    headers = [[names.get(k, k), values[k]] for k in (*STANDARD, *REQUIRED) if k not in drop]
+    headers += [list(p) for p in extra]
+    return {"request_line": request_line, "headers": headers, "body": body, "hmac_input": data}
+
+
+def failing_checks(req: dict, ctx: dict) -> tuple[list[int], dict, str]:
+    """Each check of Order judged on its own, so a case can show it is refused for one check alone. Returns the
+    failing checks, the reasons of checks 6 to 8, and the 200 verdict when check 8 passes."""
+    headers, body = req["headers"], req["body"]
+    fails, reasons = [], {}
+    if (len(req["request_line"].encode("ascii")) > MAX_REQUEST_LINE or len(headers) > MAX_HEADERS
+            or any(len(f"{k}: {v}".encode()) > MAX_HEADER_BYTES for k, v in headers) or len(body) > MAX_BODY
+            or not any(k.lower() == H_LEN.lower() for k, _ in headers)
+            or any(k.lower() == H_LEN.lower() and v != str(len(body)) for k, v in headers)):
+        fails.append(1)
+    counts: dict = {}
+    for k, v in headers:
+        counts.setdefault(k.lower(), []).append(v)
+    one = {k: counts[k.lower()][0] for k in (H_CT, *REQUIRED) if len(counts.get(k.lower(), [])) == 1}
+    h = {k: one.get(k, "") for k in (H_CT, *REQUIRED)}
+    parts = req["request_line"].split(" ")
+    sent_ok = SENT_RE.fullmatch(h[H_SENT]) and 1 <= int(h[H_SENT]) <= MAX_INT
+    forms = (len(parts) == 3 and parts[0] == METHOD and parts[1] == PATH and len(one) == 1 + len(REQUIRED)
+             and h[H_CT].lower() == CONTENT_TYPE
+             and PRINTABLE_RE.fullmatch(h[H_CLIENT]) and KEY_ID_RE.fullmatch(h[H_KEY]) and sent_ok
+             and NONCE_RE.fullmatch(h[H_NONCE]) and DIGEST_RE.fullmatch(h[H_DIGEST]) and AUTH_RE.fullmatch(h[H_AUTH]))
+    if not forms or h[H_DIGEST] != digest(body):
+        fails.append(2)
+    # A later check is judged only where its inputs exist: one value of each header it reads, an integer's own
+    # spelling for sent_at_ms, and, for checks 7 and 8, a body that is a record.
+    has = {k: k in one for k in REQUIRED}
+    sent = int(h[H_SENT]) if has[H_SENT] and DIGITS_RE.fullmatch(h[H_SENT]) else None
+    client = CLIENTS.get(h[H_CLIENT], {})
+    if has[H_CLIENT] and has[H_KEY] and h[H_KEY] not in client.get("key_ids", []):
+        fails.append(3)
+    # Check 4 judged alone: under the secret the key_id names, whether or not this client holds it.
+    if all(has.values()) and sent is not None:
+        sec = SECRET_BY_KEY_ID.get(h[H_KEY])
+        m = AUTH_RE.fullmatch(h[H_AUTH])
+        if sec is None or m is None or not hmac.compare_digest(
+                m.group(1), mac(sec, hmac_input(h[H_CLIENT], h[H_KEY], sent, h[H_NONCE], h[H_DIGEST]))):
+            fails.append(4)
+    if has[H_CLIENT] and has[H_KEY] and has[H_NONCE] and sent is not None:
+        replayed = [h[H_CLIENT], h[H_KEY], h[H_NONCE]] in ctx["held_nonces"]
+        if abs(sent - ctx["now_ms"]) > SKEW_MS or replayed:
+            fails.append(5)
+    reason, obj = check6(body)
+    if reason:
+        fails.append(6)
+        reasons[6] = reason
+    verdict200 = ""
+    if reason is None:
+        if has[H_CLIENT]:
+            e = enrolment(obj["device_id"], obj["key_identity"])
+            if obj["device_id"] not in client.get("devices", []) or (
+                    e is not None and e["owner"] not in client.get("owners", [])):
+                fails.append(7)
+                reasons[7] = "not_owned"
+        r8 = check8_reasons(obj)
+        if r8:
+            fails.append(8)
+            reasons[8] = r8[0]
+            reasons["8_also"] = r8[1:]
+        else:
+            verdict200 = check8_verdict(obj, body, ctx["held"])
+    return fails, reasons, verdict200
+
+
+def response_for(check: int | None, reason: str | None, verdict200: str, rdigest: str) -> tuple[int, str, str]:
+    """The status, response outcome and reason a check's answer carries."""
+    if check is None:
+        outcome = {"stored": "stored", "conflict": "stored", "duplicate": "duplicate",
+                   "lower_count": "superseded"}[verdict200]
+        return 200, outcome, "lower_count" if verdict200 == "lower_count" else ""
+    if check in (1, 2):
+        return 400, "refused", ""
+    if check in (3, 4, 5):
+        return 401, "refused", ""
+    if check == 6:
+        return (202, "retry_later", reason) if reason == "unsupported_version" else (400, "refused", reason)
+    if check == 7:
+        return 403, "refused", reason
+    return (202, "retry_later", reason) if reason == "key_not_enrolled" else (422, "refused", reason)
+
+
+REQUEST_CASES: list[dict] = []
+
+
+def rq(name: str, note: str, req: dict, check: int | None, *, also: tuple = (), held_nonces: tuple = (),
+       held: tuple = (), now_ms: int = NOW_MS, alike: str | None = None, expect200: str = "stored",
+       also_reasons: tuple = ()) -> None:
+    ctx = {"now_ms": now_ms, "held_nonces": [list(t) for t in held_nonces],
+           "held": [{"body": b.decode("ascii"), "held_as": a} for b, a in held]}
+    fails, reasons, verdict200 = failing_checks(req, ctx)
+    expected = ([check] if check else []) + list(also)
+    assert fails == expected, (name, fails, expected)
+    if check is None:
+        assert verdict200 == expect200, (name, verdict200, expect200)
+    assert tuple(reasons.get("8_also", ())) == (also_reasons if check == 8 else tuple(reasons.get("8_also", ()))), \
+        (name, reasons.get("8_also"), also_reasons)
+    status, outcome, reason = response_for(check, reasons.get(check), verdict200, digest(req["body"]))
+    authenticated = check is None or check >= 6
+    response = {"outcome": outcome, "reason": reason, "v": 1}
+    if authenticated:
+        response["record_digest"] = digest(req["body"])
+    case: dict = {"name": name, "note": note, "receiver": ctx, "request": {
+        "request_line": req["request_line"],
+        "headers": req["headers"],
+        "body": req["body"].decode("ascii"),
+        "body_length": len(req["body"]),
+        "body_sha256": digest(req["body"]),
+    }}
+    if req["hmac_input"] is not None:
+        case["hmac_input_hex"] = req["hmac_input"].hex()
+    v: dict = {"outcome": "accepted" if check is None else "refused", "check": check, "status": status,
+               "authenticated": authenticated, "response_body": canonical(response).decode("ascii")}
+    if check is None:
+        v["receiver_verdict"] = verdict200
+    else:
+        v["reason"] = reason
+    if also:
+        v["precedence"] = {"wins": check, "also_fails": list(also)}
+    if check == 8 and also_reasons:
+        v["reason_precedence"] = {"wins": reason, "also_fails": list(also_reasons)}
+    if alike:
+        v["answered_alike_with"] = alike
+    case["verdict"] = v
+    REQUEST_CASES.append(case)
+
+
+def requests_corpus() -> None:
+    # Accepted at checks 1 to 7, with check 8's 200 verdict.
+    rq("accepted_submission", "A submission observation for a device the client may forward for, under the key "
+       "enrolled for it, sent 2000 ms before the receiver's clock: stored.", build_request("accepted_submission"),
+       None)
+    rq("accepted_tally", "A withholding tally: the hop carries either kind of record alike.",
+       build_request("accepted_tally", body=tally()), None)
+    rq("accepted_client_b", "The second client, under its own secret, for its own device.",
+       build_request("accepted_client_b", body=submission(DEVICE_B), client=CLIENT_B, secret_name="gateway-site-b"),
+       None)
+    rq("accepted_retry_duplicate", "A retry of accepted_submission after its response was lost: the same body and "
+       "digest under a fresh sent_at_ms, nonce and HMAC, with the first nonce held and the record held: duplicate.",
+       build_request("accepted_retry_duplicate", sent=NOW_MS - 1_000), None,
+       held_nonces=((CLIENT_A, KEY_IDS["gateway-site-a"], nonce("accepted_submission")),),
+       held=((submission(), "stored"),), expect200="duplicate")
+    rq("accepted_conflict_stored", "Different bytes under an observation identity the receiver holds: held as "
+       "conflict, answered stored.", build_request("accepted_conflict_stored", body=submission(issued_at_ms=T0 + 1001)),
+       None, held=((submission(), "stored"),), expect200="conflict")
+    rq("accepted_lower_count_superseded", "A tally whose count is below the greatest held for its key: "
+       "lower_count, answered superseded.", build_request("accepted_lower_count_superseded", body=tally(count=3)),
+       None, held=((tally(count=5, issued_at_ms=T0 + 3000), "stored"),), expect200="lower_count")
+    rq("accepted_moved_device_new_key", "The moved device, forwarded by its new site's client, under the key "
+       "enrolled since it moved, which names that site.",
+       build_request("accepted_moved_device_new_key", body=submission(DEVICE_MOVED), client=CLIENT_B,
+                     secret_name="gateway-site-b"), None)
+    rq("accepted_skew_at_bound_past", "sent_at_ms exactly 300000 ms before the receiver's clock: within the bound.",
+       build_request("accepted_skew_at_bound_past", sent=NOW_MS - SKEW_MS), None)
+    rq("accepted_skew_at_bound_future", "sent_at_ms exactly 300000 ms after the receiver's clock: within the bound.",
+       build_request("accepted_skew_at_bound_future", sent=NOW_MS + SKEW_MS), None)
+    shared = nonce("shared_nonce")
+    rq("accepted_nonce_held_for_other_client", "The nonce is held, but under another (client_id, key_id): the "
+       "reservation is of the triple, so this is no replay.",
+       build_request("accepted_nonce_held_for_other_client", nonce_=shared), None,
+       held_nonces=((CLIENT_B, KEY_IDS["gateway-site-b"], shared),))
+    rq("accepted_client_id_escaped", "A client identifier with a space, a quotation mark and a backslash, all "
+       "printable ASCII: its HMAC input carries them escaped under gateway-mqtt-canonical-json/v1.",
+       build_request("accepted_client_id_escaped", client=CLIENT_ESCAPED, secret_name="gateway-escaped"), None)
+    rq("accepted_client_id_128", "A client identifier of 128 characters, the bound.",
+       build_request("accepted_client_id_128", client=CLIENT_LONG, secret_name="gateway-long"), None)
+    pads = tuple((f"X-Pad-{i:02d}", "p") for i in range(MAX_HEADERS - len(STANDARD) - len(REQUIRED)))
+    rq("accepted_32_headers", "Host, Content-Length, Content-Type, the six required headers and 23 others: 32 "
+       "headers, the bound.", build_request("accepted_32_headers", extra=pads), None)
+    rq("accepted_header_1024_bytes", "One header of exactly 1024 bytes, counted as its name, `: ` and its value.",
+       build_request("accepted_header_1024_bytes", extra=(("X-Pad", "p" * (MAX_HEADER_BYTES - len("X-Pad: "))),)),
+       None)
+    rq("accepted_content_type_other_case", "Content-Type Application/Octet-Stream: the media type is compared "
+       "without regard to case.", build_request("accepted_content_type_other_case",
+                                                over={H_CT: "Application/Octet-Stream"}), None)
+    rq("accepted_header_names_other_case", "Required headers named in other case: x-ori-alert-nonce and "
+       "AUTHORIZATION. Names are compared without regard to case.",
+       build_request("accepted_header_names_other_case", rename={H_NONCE: "x-ori-alert-nonce",
+                                                                  H_AUTH: "AUTHORIZATION"}), None)
+
+
+
+def requests_corpus_refused() -> None:
+    # Check 1.
+    pads = tuple((f"X-Pad-{i:02d}", "p") for i in range(MAX_HEADERS + 1 - len(STANDARD) - len(REQUIRED)))
+    rq("check1_33_headers", "33 headers, Host and Content-Length counted, one past the bound; every required "
+       "header is present once and well formed.", build_request("check1_33_headers", extra=pads), 1)
+    rq("check1_header_over_1024_bytes", "One header of 1025 bytes, counted as its name, `: ` and its value.",
+       build_request("check1_header_over_1024_bytes",
+                     extra=(("X-Pad", "p" * (MAX_HEADER_BYTES + 1 - len("X-Pad: "))),)), 1)
+    rq("check1_content_length_mismatch", "Content-Length one more than the body's length; every other header "
+       "matches the body.", build_request("check1_content_length_mismatch",
+                                          over={H_LEN: str(len(submission()) + 1)}), 1)
+    rq("check1_content_length_absent", "No Content-Length header: it must be present, and equal to the body's "
+       "length.", build_request("check1_content_length_absent", drop=(H_LEN,)), 1)
+    rq("check1_content_length_short", "Content-Length one less than the body's length.",
+       build_request("check1_content_length_short", over={H_LEN: str(len(submission()) - 1)}), 1)
+    long_path = PATH + "/" + "p" * (MAX_REQUEST_LINE - len(REQUEST_LINE))
+    rq("precedence_1_over_2_long_path", "A request line of 1025 bytes made by a longer path: check 1 is first, and "
+       "the target, not exactly the path, would fail check 2.",
+       build_request("precedence_1_over_2_long_path", request_line=f"{METHOD} {long_path} HTTP/1.1"), 1, also=(2,))
+    padded = submission() + b" " * (MAX_BODY + 1 - len(submission()))
+    rq("check1_body_over_limit", "A body of 4097 bytes, one past the bound: a record padded with spaces, its digest "
+       "header and HMAC over the padded bytes. The padding also makes it not_canonical at check 6.",
+       build_request("check1_body_over_limit", body=padded), 1, also=(6,))
+    # Check 2: the target and header forms.
+    base = "check2_"
+    rq(base + "query", "The request target is the path with a query: not exactly the path.",
+       build_request(base + "query", request_line=f"{METHOD} {PATH}?x=1 HTTP/1.1"), 2)
+    rq(base + "method_put", "The method PUT on the exact path. The HMAC input names POST, as it always does, and is "
+       "valid; only the method refuses it.", build_request(base + "method_put",
+                                                            request_line=f"PUT {PATH} HTTP/1.1"), 2)
+    rq(base + "method_lower", "The method post in lower case: HTTP methods are case-sensitive, so not POST.",
+       build_request(base + "method_lower", request_line=f"post {PATH} HTTP/1.1"), 2)
+    rq(base + "client_empty", "An empty X-Ori-Alert-Client. The registry holds no such client, so checks 3 and 7 "
+       "would refuse it too; check 2 is first.", build_request(base + "client_empty", client=""), 2, also=(3, 7))
+    rq(base + "client_129", "An X-Ori-Alert-Client of 129 characters, one past the bound.",
+       build_request(base + "client_129", client="g" * 129), 2, also=(3, 7))
+    rq(base + "client_control", "An X-Ori-Alert-Client holding a DEL character, outside printable ASCII.",
+       build_request(base + "client_control", client=CLIENT_A[:-1] + "\x7f"), 2, also=(3, 7))
+    rq(base + "key_id_upper", "An X-Ori-Alert-Key-Id in upper-case hexadecimal: not of its form. The HMAC is over "
+       "the header as sent.", build_request(base + "key_id_upper", over={
+           H_KEY: KEY_IDS["gateway-site-a"].upper().replace("HKDF-SHA256", "hkdf-sha256")}), 2, also=(3, 4))
+    rq(base + "sent_zero", "X-Ori-Alert-Sent-At-Ms of 0, below 1. The HMAC is valid over the integer 0, so only "
+       "freshness would also refuse it.", build_request(base + "sent_zero", sent=0), 2, also=(5,))
+    rq(base + "sent_over_max", "X-Ori-Alert-Sent-At-Ms of 9007199254740992, one past 2^53 - 1, with a valid HMAC "
+       "over that integer.", build_request(base + "sent_over_max", sent=MAX_INT + 1), 2, also=(5,))
+    rq(base + "sent_leading_zero", "X-Ori-Alert-Sent-At-Ms with a leading zero: no integer's own spelling, so "
+       "neither the HMAC input nor freshness has a sent_at_ms, and Authorization is a fixed well-formed value.",
+       build_request(base + "sent_leading_zero", over={H_SENT: "0" + str(NOW_MS - 2_000), H_AUTH: ZERO_AUTH}), 2)
+    rq(base + "nonce_upper", "An X-Ori-Alert-Nonce in upper-case hexadecimal.",
+       build_request(base + "nonce_upper", nonce_=nonce(base + "nonce_upper").upper()), 2)
+    rq(base + "nonce_short", "An X-Ori-Alert-Nonce of 30 hexadecimal characters, 15 bytes.",
+       build_request(base + "nonce_short", nonce_=nonce(base + "nonce_short")[:30]), 2)
+    rq(base + "digest_upper", "An X-Ori-Alert-Record-Digest in upper-case hexadecimal.",
+       build_request(base + "digest_upper", digest_header="sha256:" + hashlib.sha256(submission()).hexdigest().upper()),
+       2)
+    rq(base + "digest_mismatch", "A well-formed X-Ori-Alert-Record-Digest over other bytes than the body, and an "
+       "HMAC over the header as sent: only the recomputed digest refuses it.",
+       build_request(base + "digest_mismatch", digest_header=digest(submission(attempt_seq=42))), 2)
+    good = build_request(base + "auth_scheme")
+    rq(base + "auth_scheme", "An Authorization header with a valid HMAC under another scheme name.",
+       build_request(base + "auth_scheme", over={H_AUTH: good["headers"][-1][1].replace("Ori-Alert-HMAC ", "Bearer ")}),
+       2, also=(4,))
+    good = build_request(base + "auth_upper")
+    rq(base + "auth_upper", "An Authorization header whose HMAC is the right value in upper-case hexadecimal.",
+       build_request(base + "auth_upper", over={
+           H_AUTH: "Ori-Alert-HMAC hmac-sha256:" + good["headers"][-1][1].rsplit(":", 1)[1].upper()}), 2, also=(4,))
+    rq(base + "nonce_missing", "No X-Ori-Alert-Nonce header: no HMAC input exists, and Authorization is a fixed "
+       "well-formed value. Neither check 4 nor check 5 has its inputs.",
+       build_request(base + "nonce_missing", drop=(H_NONCE,)), 2)
+    rq(base + "authorization_missing", "No Authorization header: a missing header is a header form, at check 2, and "
+       "no HMAC input exists.", build_request(base + "authorization_missing", drop=(H_AUTH,)), 2)
+    rq(base + "client_twice", "X-Ori-Alert-Client twice, both copies the same value: each required header is "
+       "present exactly once. No HMAC input exists, and checks 3, 4, 5 and 7 lack a single client identifier.",
+       build_request(base + "client_twice", extra=((H_CLIENT, CLIENT_A),)), 2)
+    rq(base + "client_twice_different", "X-Ori-Alert-Client twice with different values, the first the client "
+       "whose key_id and device the request carries and the last another client the registry holds. There is no "
+       "single client identifier, so neither check 3 nor check 7 has its input: a judge that kept the last value "
+       "would refuse it at 3 and 7 as well, and one that kept the first would accept it there.",
+       build_request(base + "client_twice_different", extra=((H_CLIENT, CLIENT_B),)), 2)
+    rq(base + "nonce_twice_other_case", "X-Ori-Alert-Nonce twice, once in other case: names compared without "
+       "regard to case are the same header, present twice. No HMAC input exists.",
+       build_request(base + "nonce_twice_other_case", extra=(("x-ori-alert-nonce", nonce(base + "x")),)), 2)
+    rq(base + "content_type_missing", "No Content-Type header.",
+       build_request(base + "content_type_missing", drop=(H_CT,)), 2)
+    rq(base + "content_type_parameter", "Content-Type application/octet-stream with a parameter: the media type "
+       "takes none.", build_request(base + "content_type_parameter",
+                                    over={H_CT: "application/octet-stream; charset=x"}), 2)
+    rq(base + "content_type_other", "Content-Type application/json.",
+       build_request(base + "content_type_other", over={H_CT: "application/json"}), 2)
+    # Check 3.
+    rq("check3_key_id_unheld", "A well-formed key_id the receiver holds for no client, with a valid HMAC under the "
+       "secret it derives from: the credential is selected by (client_id, key_id), never by trial verification.",
+       build_request("check3_key_id_unheld", secret_name="unheld"), 3)
+    rq("check3_key_id_of_other_client", "Client A's request under client B's key_id and a valid HMAC under B's "
+       "secret: a key_id held for another client selects nothing.",
+       build_request("check3_key_id_of_other_client", secret_name="gateway-site-b"), 3)
+    # Check 4.
+    rq("check4_hmac_other_secret", "An HMAC under client B's secret beside client A's key_id.",
+       build_request("check4_hmac_other_secret", sign_with="gateway-site-b"), 4)
+    auth = build_request("check4_hmac_flipped")["headers"][-1][1]
+    rq("check4_hmac_flipped", "The right HMAC with its last hexadecimal character changed.",
+       build_request("check4_hmac_flipped", over={H_AUTH: auth[:-1] + ("0" if auth[-1] != "0" else "1")}), 4)
+    rq("check4_hmac_over_other_digest", "An HMAC computed over another record's digest; the digest header names "
+       "this body.", build_request("check4_hmac_over_other_digest", over={
+           H_AUTH: "Ori-Alert-HMAC hmac-sha256:" + mac(SECRETS["gateway-site-a"], hmac_input(
+               CLIENT_A, KEY_IDS["gateway-site-a"], NOW_MS - 2_000, nonce("check4_hmac_over_other_digest"),
+               digest(submission(attempt_seq=42))))}), 4)
+    rq("check4_hmac_raw_secret_key", "An HMAC keyed with the secret's 32 decoded bytes, not its UTF-8 bytes.",
+       build_request("check4_hmac_raw_secret_key", over={H_AUTH: "Ori-Alert-HMAC hmac-sha256:" + hmac.new(
+           bytes.fromhex(SECRETS["gateway-site-a"]), hmac_input(
+               CLIENT_A, KEY_IDS["gateway-site-a"], NOW_MS - 2_000, nonce("check4_hmac_raw_secret_key"),
+               digest(submission())), hashlib.sha256).hexdigest()}), 4)
+    # Check 5.
+    rq("check5_skew_past_bound_past", "sent_at_ms 300001 ms before the receiver's clock: one past the bound.",
+       build_request("check5_skew_past_bound_past", sent=NOW_MS - SKEW_MS - 1), 5)
+    rq("check5_skew_past_bound_future", "sent_at_ms 300001 ms after the receiver's clock: one past the bound.",
+       build_request("check5_skew_past_bound_future", sent=NOW_MS + SKEW_MS + 1), 5)
+    n = nonce("check5_nonce_reused")
+    rq("check5_nonce_reused", "The (client_id, key_id, nonce) triple is already reserved: a transport replay, "
+       "although sent_at_ms, the HMAC and the body are fresh.",
+       build_request("check5_nonce_reused", nonce_=n, sent=NOW_MS - 500), 5,
+       held_nonces=((CLIENT_A, KEY_IDS["gateway-site-a"], n),))
+    # Check 6.
+    record = submission()
+    pretty = json.dumps(json.loads(record), sort_keys=True, indent=1).encode("ascii")
+    rq("check6_not_canonical", "The record's members, indented: not the canonical bytes of the object it parses to.",
+       build_request("check6_not_canonical", body=pretty), 6)
+    rq("check6_unsupported_version", "A record whose v is 2, signed as such: unsupported_version, a 202 the "
+       "receiver's state may cure.", build_request("check6_unsupported_version", body=submission(v=2)), 6)
+    rq("check6_unsupported_version_max", "A record whose v is 2^53 - 1, the greatest integer the integer rule "
+       "admits: unsupported_version.", build_request("check6_unsupported_version_max", body=submission(v=MAX_INT)), 6)
+    rq("check6_malformed_v_zero", "A record whose v is 0, signed as such: outside the integer rule, so malformed, "
+       "never unsupported_version.", build_request("check6_malformed_v_zero", body=submission(v=0)), 6)
+    rq("check6_malformed_v_negative", "A record whose v is -1: outside the integer rule, so malformed.",
+       build_request("check6_malformed_v_negative", body=submission(v=-1)), 6)
+    rq("check6_malformed_v_over_max", "A record whose v is 2^53, one past the integer rule: malformed.",
+       build_request("check6_malformed_v_over_max", body=submission(v=MAX_INT + 1)), 6)
+    no_detail = {k: v for k, v in submission_obj().items() if k != "detail"}
+    rq("check6_malformed_member_absent", "A submission observation without its detail member.",
+       build_request("check6_malformed_member_absent", body=canonical(no_detail)), 6)
+    rq("check6_malformed_kind", "A record whose kind is neither value.",
+       build_request("check6_malformed_kind", body=submission(kind="observation")), 6)
+    rq("check6_malformed_outcome_delivered", "A submission observation whose outcome is delivered, a reserved value "
+       "outside the form.", build_request("check6_malformed_outcome_delivered", body=submission(outcome="delivered")),
+       6)
+    rq("check6_malformed_not_json", "A body that is not JSON.",
+       build_request("check6_malformed_not_json", body=b"alert-delivery record"), 6)
+    rq("check6_malformed_not_object", "A body that is a JSON array holding the record: not one JSON object.",
+       build_request("check6_malformed_not_object", body=b"[" + record + b"]"), 6)
+    rq("check6_malformed_trailing_data", "The record followed by a second value: not one JSON object.",
+       build_request("check6_malformed_trailing_data", body=record + b"{}"), 6)
+    dup = record[:-1] + b',"v":1}'
+    rq("check6_malformed_member_twice", "The record with v named twice, the second after its last member.",
+       build_request("check6_malformed_member_twice", body=dup), 6)
+    variant = record[:-1] + b',"Device_id":"' + DEVICE_A.encode() + b'"}'
+    rq("check6_malformed_case_variant_member", "The record with a Device_id member beside device_id: a case "
+       "variant under the Payload Member Rule's closed fold.",
+       build_request("check6_malformed_case_variant_member", body=variant), 6)
+    # Check 7.
+    rq("check7_device_unknown", "A record for a device the receiver knows for no client.",
+       build_request("check7_device_unknown", body=submission(DEVICE_UNKNOWN)), 7,
+       alike="check7_device_unauthorised", also=(8,))
+    rq("check7_device_unauthorised", "A record for a device the receiver knows, but outside this client's set: "
+       "answered as an unknown device is.",
+       build_request("check7_device_unauthorised", body=submission(DEVICE_B)), 7, alike="check7_device_unknown")
+    rq("check7_device_unauthorised_tally", "A tally for a device of another client.",
+       build_request("check7_device_unauthorised_tally", body=tally(DEVICE_B)), 7)
+    rq("check7_moved_key", "The moved device, in the new site's client's set, forwarded by that client under the "
+       "key enrolled while the device was the old site's: the enrolment names the old owner, never the current "
+       "one.", build_request("check7_moved_key", body=submission(DEVICE_MOVED, MOVED_OLD), client=CLIENT_B,
+                             secret_name="gateway-site-b"), 7)
+    rq("check7_moved_key_tally", "A tally from the moved device under its old key, forwarded by the new site's "
+       "client.", build_request("check7_moved_key_tally", body=tally(DEVICE_MOVED, MOVED_OLD), client=CLIENT_B,
+                                secret_name="gateway-site-b"), 7)
+    # Check 8.
+    rq("check8_key_not_enrolled", "A record for a device the client may forward for, under a key enrolled for "
+       "no device: it passes check 7 on the device alone, and check 8 answers key_not_enrolled.",
+       build_request("check8_key_not_enrolled", body=submission(DEVICE_A, UNENROLLED)), 8)
+    rq("check8_key_enrolled_for_other_device", "A record for device A under device B's enrolled key.",
+       build_request("check8_key_enrolled_for_other_device", body=submission(DEVICE_A, RT_B)), 8)
+    tampered = canonical({**submission_obj(), "attempt_seq": 43})
+    rq("check8_key_revoked", "A record for device A, signed and valid under a key once enrolled for it and since "
+       "revoked: key_revoked, a 422 no later state cures. The enrolment still names site-a, so check 7 passes.",
+       build_request("check8_key_revoked", body=submission(DEVICE_A, REVOKED_A)), 8)
+    rq("accepted_epochs_apart_attempt_seq", "The receiver holds device A's record under its current key; this one, "
+       "under device A's retired key, reuses attempt_seq 41 under another delivery_attempt_id. Within one epoch "
+       "that breaks consistency, but records under different keys are never judged against each other: stored.",
+       build_request("accepted_epochs_apart_attempt_seq", body=submission(
+           DEVICE_A, ROTATED_A, delivery_attempt_id="Rt5Hn8Jw1Qe6Zb3m")), None, held=((submission(), "stored"),))
+    rq("accepted_epochs_apart_identity", "The receiver holds device A's record under its current key; this one has "
+       "the same delivery_attempt_id and observation_seq under the retired key: an observation's identity is "
+       "within one epoch, so it is stored, not conflict.",
+       build_request("accepted_epochs_apart_identity", body=submission(DEVICE_A, ROTATED_A)), None,
+       held=((submission(), "stored"),))
+    rq("check8_signature_invalid", "A record changed after signing: attempt_seq 43 under the signature over 41.",
+       build_request("check8_signature_invalid", body=tampered), 8)
+    rq("check8_transition_refused", "observation_seq 2 after a null prior_outcome.",
+       build_request("check8_transition_refused", body=submission(observation_seq=2)), 8)
+    rq("check8_class_refused", "A mandatory tier_d notice with a class.",
+       build_request("check8_class_refused", body=submission(notice="tier_d")), 8)
+    rq("check8_class_refused_tally", "A tally withheld as disabled with a null class.",
+       build_request("check8_class_refused_tally", body=tally(reason="disabled")), 8)
+    rq("check8_detail_refused", "outcome accepted with detail provider_refused: a listed code on another row.",
+       build_request("check8_detail_refused", body=submission(detail="provider_refused")), 8)
+    tampered_transition = canonical({**submission_obj(), "observation_seq": 2})
+    rq("check8_signature_over_transition", "A record changed after signing to observation_seq 2 after a null "
+       "prior_outcome: Verifying check 4 refuses it before check 5, so signature_invalid wins.",
+       build_request("check8_signature_over_transition", body=tampered_transition), 8,
+       also_reasons=("transition_refused",))
+    rq("check8_key_not_enrolled_over_class", "A tier_d notice with a class under a key enrolled for no device: "
+       "Verifying check 3 is first.",
+       build_request("check8_key_not_enrolled_over_class", body=submission(DEVICE_A, UNENROLLED, notice="tier_d")),
+       8, also_reasons=("class_refused",))
+    held_s = submission()
+    held_c = submission(delivery_attempt_id="Cq7Wd2Rf9Ls4Kp0x", issued_at_ms=T0 + 1100)
+    rq("accepted_conflict_never_earlier", "The receiver holds a record as stored and another as conflict, the second "
+       "for reusing the first's attempt_seq under another delivery_attempt_id. A new record of the conflict "
+       "record's attempt, under another attempt_seq, would break consistency against that record, but a record "
+       "held as conflict is never the earlier one: it is stored.",
+       build_request("accepted_conflict_never_earlier", body=submission(
+           delivery_attempt_id="Cq7Wd2Rf9Ls4Kp0x", attempt_seq=42, observation_seq=2, prior_outcome="accepted",
+           outcome="failed", detail="provider_reported_failure", issued_at_ms=T0 + 1200)),
+       None, held=((held_s, "stored"), (held_c, "conflict")))
+    rq("accepted_conflict_consistency", "The same new record when the receiver holds the other attempt's first "
+       "observation as stored: it breaks consistency, attempt_seq differing within one attempt, and is held as "
+       "conflict, answered stored.",
+       build_request("accepted_conflict_consistency", body=submission(
+           delivery_attempt_id="Cq7Wd2Rf9Ls4Kp0x", attempt_seq=42, observation_seq=2, prior_outcome="accepted",
+           outcome="failed", detail="provider_reported_failure", issued_at_ms=T0 + 1200)),
+       None, held=((held_c, "stored"),), expect200="conflict")
+    path_ids = {"alert_id": "q3Jx0bS6lVb8nT2aXw9e1g", "delivery_attempt_id": "Pa7Th2Ob9Sv4Lw1e", "attempt_seq": 50}
+
+    def obs(seq: int, prior: str | None, outcome: str, t: int) -> bytes:
+        return submission(DEVICE_A, observation_seq=seq, prior_outcome=prior, outcome=outcome, issued_at_ms=T0 + t,
+                          **path_ids)
+    third = obs(3, "accepted", "failed", 4000)
+    for held_outcome, verdict, why in (
+            ("failed", "conflict", "failed ends an attempt, so no legal path has a third observation after it"),
+            ("accepted", "conflict", ("a third observation follows only an unconfirmed resolved as accepted, so no "
+                                      "legal path begins accepted and has three steps; the two are not adjacent, "
+                                      "so an adjacent-pair judge misses it")),
+            ("unconfirmed", "stored", "the path unconfirmed, accepted, failed fits both")):
+        rq(f"accepted_path_first_{held_outcome}_then_third", f"The receiver holds the attempt's first observation, "
+           f"{held_outcome}; the incoming record is its third, after accepted: {why}.",
+           build_request(f"accepted_path_first_{held_outcome}_then_third", body=third), None,
+           held=((obs(1, None, held_outcome, 3000), "stored"),), expect200=verdict)
+    rq("accepted_path_third_then_first_accepted", "The receiver holds the attempt's third observation; the incoming "
+       "record is its first, accepted: no legal path fits both, in whichever order they arrive.",
+       build_request("accepted_path_third_then_first_accepted", body=obs(1, None, "accepted", 3000)), None,
+       held=((third, "stored"),), expect200="conflict")
+    rq("accepted_path_second_failed_then_third", "The receiver holds the second observation, failed after "
+       "unconfirmed; the incoming third claims accepted before it: conflict.",
+       build_request("accepted_path_second_failed_then_third", body=third), None,
+       held=((obs(2, "unconfirmed", "failed", 3500), "stored"),), expect200="conflict")
+    for name, over, why in (
+            ("accepted_same_alert_notice_changed",
+             {"delivery_attempt_id": "Nk5Rv8Tq2Wm6Ys3a", "attempt_seq": 60, "notice": "protection_degraded",
+              "class": None}, "another attempt of the same alert_id under another notice"),
+            ("accepted_same_alert_class_changed",
+             {"delivery_attempt_id": "Cl4Ss9Dp3Xh7Ub2e", "attempt_seq": 61, "class": "grid_power_lost"},
+             "another attempt of the same alert_id under another class"),
+            ("accepted_attempt_seq_reused",
+             {"delivery_attempt_id": "Sq8Rr1Us5Ey3Dk7m", "attempt_seq": 41},
+             "another delivery_attempt_id under the held attempt's attempt_seq")):
+        rq(name, f"The receiver holds one stored observation; the incoming record is {why}, each record valid "
+           "alone: conflict, answered stored.",
+           build_request(name, body=submission(attempted_at_ms=T0 + 4500, issued_at_ms=T0 + 5000, **over)), None,
+           held=((submission(), "stored"),), expect200="conflict")
+    rq("accepted_tally_same_count_conflict", "A tally with the count of one held but different bytes, while a "
+       "greater count is held for its key: conflict, since one key signed both, answered stored.",
+       build_request("accepted_tally_same_count_conflict", body=tally(count=3, issued_at_ms=T0 + 2500)), None,
+       held=((tally(count=3), "stored"), (tally(count=5, issued_at_ms=T0 + 3000), "stored")), expect200="conflict")
+    # Precedence.
+    rq("precedence_1_over_2", "33 headers and an upper-case nonce: check 1 is first.",
+       build_request("precedence_1_over_2", extra=pads, nonce_=nonce("precedence_1_over_2").upper()), 1, also=(2,))
+    rq("precedence_2_over_3", "A body digest that does not match, under a key_id the receiver does not hold: "
+       "check 2 is first.", build_request("precedence_2_over_3", secret_name="unheld",
+                                          digest_header=digest(submission(attempt_seq=42))), 2, also=(3,))
+    rq("precedence_3_over_4", "A key_id the receiver does not hold and an HMAC under another secret: check 3 is "
+       "first, and the HMAC is never tried.", build_request("precedence_3_over_4", secret_name="unheld",
+                                                             sign_with="gateway-site-a"), 3, also=(4,))
+    rq("precedence_4_over_5", "An invalid HMAC on a request one past the skew bound: check 4 is first.",
+       build_request("precedence_4_over_5", sent=NOW_MS - SKEW_MS - 1, sign_with="gateway-site-b"), 4, also=(5,))
+    n = nonce("precedence_4_over_5_replay")
+    rq("precedence_4_over_5_replay", "An invalid HMAC on a reused nonce: check 4 is first, so a forged request "
+       "never consumes or tests a reservation.",
+       build_request("precedence_4_over_5_replay", nonce_=n, sign_with="gateway-site-b"), 4, also=(5,),
+       held_nonces=((CLIENT_A, KEY_IDS["gateway-site-a"], n),))
+    rq("precedence_5_over_6", "A stale request whose body is not canonical: check 5 is first, and its response is "
+       "unauthenticated.", build_request("precedence_5_over_6", body=pretty, sent=NOW_MS + SKEW_MS + 1), 5,
+       also=(6,))
+    rq("precedence_5_over_7", "A stale request for a device outside the client's set: check 5 is first.",
+       build_request("precedence_5_over_7", body=submission(DEVICE_B), sent=NOW_MS + SKEW_MS + 1), 5, also=(7,))
+    rq("check6_unsupported_version_other_device", "A record of unsupported version for a device outside the "
+       "client's set: a body that is not a record reaches neither check 7 nor check 8.",
+       build_request("check6_unsupported_version_other_device", body=submission(DEVICE_B, v=2)), 6)
+    rq("precedence_7_over_8", "A record for a device outside the client's set, changed after signing: check 7 is "
+       "first.", build_request("precedence_7_over_8", body=canonical({**submission_obj(DEVICE_B), "attempt_seq": 43})),
+       7, also=(8,))
+
+
+# --- responses ----------------------------------------------------------------------------------------
+ACTION = {(200, "stored"): "retire", (200, "duplicate"): "retire", (200, "superseded"): "retire",
+          (202, "retry_later"): "keep", (400, "refused"): "reject", (401, "refused"): "keep",
+          (403, "refused"): "keep", (422, "refused"): "reject", (429, "retry_later"): "keep",
+          (503, "retry_later"): "keep"}
+OUTCOMES = ("stored", "duplicate", "superseded", "retry_later", "refused")
+# The reasons each row names, by (status, outcome). A 401 is never authenticated, so its row names none.
+ROW_REASONS = {(200, "stored"): ("",), (200, "duplicate"): ("",), (200, "superseded"): ("lower_count",),
+               (202, "retry_later"): ("key_not_enrolled", "unsupported_version"),
+               (400, "refused"): ("not_canonical", "malformed"), (401, "refused"): (),
+               (403, "refused"): ("not_owned",),
+               (422, "refused"): ("key_revoked", "signature_invalid", "transition_refused", "class_refused",
+                                  "detail_refused"),
+               (429, "retry_later"): ("",), (503, "retry_later"): ("",)}
+REQ_DIGEST = digest(submission())
+OTHER_DIGEST = digest(submission(attempt_seq=42))
+RESPONSE_CASES: list[dict] = []
+
+
+def gateway_action(status: int, body: str, request_digest: str) -> tuple[str, str | None]:
+    """The gateway's action, and when it retires nothing, the way it retires nothing, classed in the order of
+    Response: does not parse by form, unauthenticated, another digest, unpaired, does not parse by reason, and
+    then the row's action."""
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return "keep", "unparsable"
+    if not isinstance(obj, dict) or obj.get("v") != 1 or isinstance(obj.get("v"), bool) \
+            or obj.get("outcome") not in OUTCOMES:
+        return "keep", "unparsable"
+    if set(obj) == {"v", "outcome", "reason"}:
+        if obj["outcome"] == "refused" and obj["reason"] == "" and status in (400, 401):
+            return "keep", "unauthenticated"
+        return "keep", "unparsable"
+    if set(obj) != {"v", "outcome", "reason", "record_digest"} or not isinstance(obj["record_digest"], str) \
+            or not DIGEST_RE.fullmatch(obj["record_digest"]):
+        return "keep", "unparsable"
+    if obj["record_digest"] != request_digest:
+        return "keep", "another_digest"
+    pair = (status, obj["outcome"])
+    if pair not in ACTION:
+        return "keep", "unpaired"
+    if obj["reason"] not in ROW_REASONS[pair]:
+        return "keep", "unparsable"
+    return ACTION[pair], None
+
+
+def resp_body(outcome: str, reason: str = "", rdigest: str | None = REQ_DIGEST, **extra: object) -> str:
+    obj: dict = {"outcome": outcome, "reason": reason, "v": 1, **extra}
+    if rdigest is not None:
+        obj["record_digest"] = rdigest
+    return canonical(obj).decode("utf-8")
+
+
+def rs(name: str, note: str, status: int, body: str, action: str, *, row: str | None = None,
+       retires_nothing: str | None = None, headers: dict | None = None) -> None:
+    got = gateway_action(status, body, REQ_DIGEST)
+    assert row is not None or retires_nothing is not None, name
+    assert got == (action, retires_nothing), (name, got, action, retires_nothing)
+    case: dict = {"name": name, "note": note, "request_digest": REQ_DIGEST, "response": {
+        "status": status, "headers": {"Content-Type": "application/json", **(headers or {})}, "body": body},
+        "action": action}
+    if row is not None:
+        case["row"] = row
+    if retires_nothing is not None:
+        case["retires_nothing"] = retires_nothing
+    RESPONSE_CASES.append(case)
+
+
+def responses_corpus() -> None:
+    rs("row_200_stored", "The receiver verified the record and holds it durably.", 200, resp_body("stored"),
+       "retire", row="200 stored")
+    rs("row_200_stored_conflict", "The receiver holds the record as conflict beside another: the response is the "
+       "same stored, and the gateway retires it.", 200, resp_body("stored"), "retire", row="200 stored")
+    rs("row_200_duplicate", "The receiver already holds these exact bytes.", 200, resp_body("duplicate"), "retire",
+       row="200 duplicate")
+    rs("row_200_superseded", "A verified tally below the count held: lower_count.", 200,
+       resp_body("superseded", "lower_count"), "retire", row="200 superseded")
+    rs("row_202_key_not_enrolled", "The key is not yet enrolled for the device: the receiver's state may cure it.",
+       202, resp_body("retry_later", "key_not_enrolled"), "keep", row="202 retry_later")
+    rs("row_202_unsupported_version", "The record's version is not one the receiver takes yet.", 202,
+       resp_body("retry_later", "unsupported_version"), "keep", row="202 retry_later")
+    rs("row_400_unauthenticated", "A 400 from check 1 or 2: unauthenticated, exactly v, outcome and an empty "
+       "reason; the gateway keeps the record and never rejects it.", 400, resp_body("refused", rdigest=None), "keep",
+       row="400 refused", retires_nothing="unauthenticated")
+    rs("row_400_not_canonical", "An authenticated 400 from check 6, bound to the request's digest: reject, to the "
+       "audited rejected store.", 400, resp_body("refused", "not_canonical"), "reject", row="400 refused")
+    rs("row_400_malformed", "An authenticated 400 from check 6, malformed, bound to the request's digest: reject.",
+       400, resp_body("refused", "malformed"), "reject", row="400 refused")
+    rs("row_401_refused", "Transport authentication failed: unauthenticated, it omits record_digest; the gateway "
+       "keeps the record and repairs its credential.", 401,
+       resp_body("refused", rdigest=None), "keep", row="401 refused", retires_nothing="unauthenticated")
+    rs("row_403_not_owned", "The authenticated client may not forward for this device: keep, under the bounded "
+       "hold, and never retire.", 403, resp_body("refused", "not_owned"), "keep", row="403 refused")
+    for reason in ("key_revoked", "signature_invalid", "transition_refused", "class_refused", "detail_refused"):
+        rs(f"row_422_{reason}", f"Verification fails for a reason no later state cures: {reason}.", 422,
+           resp_body("refused", reason), "reject", row="422 refused")
+    rs("row_429_retry_later", "A rate limit, with Retry-After.", 429, resp_body("retry_later"), "keep",
+       row="429 retry_later", headers={"Retry-After": "30"})
+    rs("row_503_retry_later", "The receiver cannot commit durably.", 503, resp_body("retry_later"), "keep",
+       row="503 retry_later")
+    # Another digest.
+    rs("another_digest_stored", "200 stored naming another record's digest.", 200,
+       resp_body("stored", rdigest=OTHER_DIGEST), "keep", retires_nothing="another_digest")
+    rs("another_digest_duplicate", "200 duplicate naming another record's digest.", 200,
+       resp_body("duplicate", rdigest=OTHER_DIGEST), "keep", retires_nothing="another_digest")
+    rs("another_digest_400", "An authenticated 400 malformed naming another record's digest: the gateway does not "
+       "reject.", 400, resp_body("refused", "malformed", OTHER_DIGEST), "keep", retires_nothing="another_digest")
+    rs("another_digest_422", "422 signature_invalid naming another record's digest: the gateway does not reject.",
+       422, resp_body("refused", "signature_invalid", OTHER_DIGEST), "keep", retires_nothing="another_digest")
+    # Does not parse.
+    rs("unparsable_truncated", "A 200 body cut short.", 200, resp_body("stored")[:-1], "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_empty", "A 200 with an empty body.", 200, "", "keep", retires_nothing="unparsable")
+    rs("unparsable_text", "A 200 with a body that is not JSON.", 200, "OK", "keep", retires_nothing="unparsable")
+    rs("unparsable_not_object", "A 200 whose body is a JSON array, not the response object.", 200,
+       "[" + resp_body("stored") + "]", "keep", retires_nothing="unparsable")
+    rs("unparsable_extra_member", "200 stored with a fifth member: neither form's members.", 200,
+       resp_body("stored", held=True), "keep", retires_nothing="unparsable")
+    rs("unparsable_v_2", "200 stored with v 2.", 200,
+       canonical({"outcome": "stored", "reason": "", "record_digest": REQ_DIGEST, "v": 2}).decode(), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_outcome_absent", "200 with no outcome member.", 200,
+       canonical({"reason": "", "record_digest": REQ_DIGEST, "v": 1}).decode(), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_outcome_unknown", "200 with an outcome outside the table's vocabulary.", 200,
+       resp_body("conflict"), "keep", retires_nothing="unparsable")
+    rs("unparsable_digest_upper", "200 stored naming the request's digest in upper-case hexadecimal: not of the "
+       "digest's form.", 200, resp_body("stored", rdigest="sha256:" + REQ_DIGEST[7:].upper()), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_stored_with_reason", "200 stored with a reason that is not empty.", 200,
+       resp_body("stored", "lower_count"), "keep", retires_nothing="unparsable")
+    rs("unparsable_422_reason_outside", "422 refused whose reason is not one of the four.", 422,
+       resp_body("refused", "not_owned"), "keep", retires_nothing="unparsable")
+    rs("unparsable_400_reason_empty", "A 400 that names the request's digest but carries no reason: an "
+       "authenticated 400 carries check 6's reason.", 400, resp_body("refused"), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_429_reason", "429 retry_later whose reason is not empty: a 429 carries only an empty reason.",
+       429, resp_body("retry_later", "rate_limited"), "keep", retires_nothing="unparsable",
+       headers={"Retry-After": "30"})
+    rs("unparsable_503_reason", "503 retry_later carrying key_not_enrolled: a 503 carries only an empty reason.",
+       503, resp_body("retry_later", "key_not_enrolled"), "keep", retires_nothing="unparsable")
+    rs("unparsable_202_reason_empty", "202 retry_later with an empty reason: a 202 carries check 6's or 8's "
+       "reason.", 202, resp_body("retry_later"), "keep", retires_nothing="unparsable")
+    rs("unparsable_unauthenticated_reason", "A 401 of three members whose reason is not empty: the unauthenticated "
+       "form carries only an empty reason.", 401, resp_body("refused", "malformed", None), "keep",
+       retires_nothing="unparsable")
+    # Not paired.
+    rs("unpaired_200_refused", "200 with outcome refused: in form, but the table pairs neither.", 200,
+       resp_body("refused", "malformed"), "keep", retires_nothing="unpaired")
+    rs("unpaired_200_retry_later", "200 with outcome retry_later.", 200, resp_body("retry_later", "key_not_enrolled"),
+       "keep", retires_nothing="unpaired")
+    rs("unpaired_202_stored", "202 with outcome stored.", 202, resp_body("stored"), "keep",
+       retires_nothing="unpaired")
+    rs("unpaired_201_stored", "201 with outcome stored: a status the table does not hold.", 201,
+       resp_body("stored"), "keep", retires_nothing="unpaired")
+    rs("unpaired_422_retry_later", "422 with outcome retry_later.", 422, resp_body("retry_later", "key_not_enrolled"),
+       "keep", retires_nothing="unpaired")
+    rs("unpaired_400_stored", "400 with outcome stored.", 400, resp_body("stored"), "keep",
+       retires_nothing="unpaired")
+    rs("unpaired_500_refused", "500 with outcome refused: a status the table does not hold.", 500,
+       resp_body("refused", "malformed"), "keep", retires_nothing="unpaired")
+    rs("unparsable_three_members_200_stored", "200 stored of exactly v, outcome and an empty reason: the "
+       "unauthenticated form is only refused, at 400 or 401.", 200, resp_body("stored", rdigest=None), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_three_members_422", "422 refused of three members: the unauthenticated form is only a 400 or "
+       "401, so the gateway keeps and never rejects.", 422, resp_body("refused", rdigest=None), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_three_members_403", "403 refused of three members: a 403 is authenticated and names the digest.",
+       403, resp_body("refused", rdigest=None), "keep", retires_nothing="unparsable")
+    rs("unparsable_three_members_401_retry_later", "401 of three members with outcome retry_later: the "
+       "unauthenticated form's outcome is refused.", 401, resp_body("retry_later", rdigest=None), "keep",
+       retires_nothing="unparsable")
+    rs("unparsable_three_members_400_stored", "400 of three members with outcome stored.", 400,
+       resp_body("stored", rdigest=None), "keep", retires_nothing="unparsable")
+    rs("unpaired_200_retry_later_empty", "200 retry_later with an empty reason: in form, and the table pairs 200 "
+       "with no retry_later row.", 200, resp_body("retry_later"), "keep", retires_nothing="unpaired")
+    rs("unpaired_429_stored", "429 stored with an empty reason: in form, and the table pairs 429 with no stored row.",
+       429, resp_body("stored"), "keep", retires_nothing="unpaired")
+    rs("unpaired_403_retry_later", "403 retry_later with key_not_enrolled.", 403,
+       resp_body("retry_later", "key_not_enrolled"), "keep", retires_nothing="unpaired")
+    # The order of the classes.
+    rs("order_another_digest_over_unpaired", "200 refused naming another record's digest: another digest is "
+       "classed before unpaired.", 200, resp_body("refused", "malformed", OTHER_DIGEST), "keep",
+       retires_nothing="another_digest")
+    rs("order_another_digest_over_reason", "422 refused with a reason its row does not name, naming another "
+       "record's digest: another digest is classed before the reason.", 422,
+       resp_body("refused", "not_owned", OTHER_DIGEST), "keep", retires_nothing="another_digest")
+    rs("order_unpaired_over_reason", "200 retry_later with a reason no row names: unpaired is classed before the "
+       "reason.", 200, resp_body("retry_later", "rate_limited"), "keep", retires_nothing="unpaired")
+    rs("order_form_over_another_digest", "200 stored with v 2 and another record's digest: the form is classed "
+       "first.", 200, canonical({"outcome": "stored", "reason": "", "record_digest": OTHER_DIGEST, "v": 2}).decode(),
+       "keep", retires_nothing="unparsable")
+    rs("order_unauthenticated_parsed_not_bytes", "A 401 in the unauthenticated form with insignificant whitespace "
+       "and its members in another order: judged as the JSON it parses to.", 401,
+       '{ "v": 1, "reason": "", "outcome": "refused" }', "keep", retires_nothing="unauthenticated")
+    rs("row_200_stored_parsed_not_bytes", "200 stored with whitespace and its members out of order: judged as the "
+       "JSON it parses to, and retired.", 200,
+       '{"v": 1, "record_digest": "' + REQ_DIGEST + '", "reason": "", "outcome": "stored"}', "retire",
+       row="200 stored")
+    # Unauthenticated.
+    rs("unparsable_429_unauthenticated_form", "429 retry_later of three members: a 429 is sent only once checks 1 "
+       "to 5 have passed, so it names the digest; in the unauthenticated form it does not parse.", 429,
+       resp_body("retry_later", rdigest=None), "keep", retires_nothing="unparsable", headers={"Retry-After": "30"})
+    rs("unparsable_503_unauthenticated_refused", "503 refused of three members with an empty reason: the "
+       "unauthenticated form is a 400 or 401 only.", 503, resp_body("refused", rdigest=None), "keep",
+       retires_nothing="unparsable")
+    rs("unauthenticated_400_check2", "A 400 refused in the unauthenticated form, as a request refused at check 2 "
+       "is answered: keep, never reject.", 400, resp_body("refused", rdigest=None), "keep",
+       retires_nothing="unauthenticated")
+    rs("unauthenticated_401_check5", "A 401 refused in the unauthenticated form, as a replayed request is "
+       "answered: keep.", 401, resp_body("refused", rdigest=None), "keep", retires_nothing="unauthenticated")
+
+
+# --- config (gateway-config/v2 alert_delivery, forwarding keys) ------------------------------------
+BASE_DOC = {
+    "gateway": {
+        "state_directory": "/var/lib/ori-gateway/state",
+        "auth": {"shared_secret_env": "ORI_GATEWAY_SHARED_SECRET",
+                 "previous_shared_secret_env": "ORI_GATEWAY_PREVIOUS_SHARED_SECRET"},
+        "custody": {"secret_env": "ORI_GATEWAY_CUSTODY_SECRET"},
+    },
+    "evidence": {"enabled": True, "queue_directory": "/var/lib/ori-gateway/evidence-outbound",
+                 "return_queue_directory": "/var/lib/ori-gateway/evidence-return",
+                 "secret_env": "ORI_EVIDENCE_INGEST_SECRET"},
+    "alert_delivery": {"enabled": True, "queue_directory": "/var/lib/ori-gateway/alert-delivery",
+                       "endpoint_env": "ORI_ALERT_DELIVERY_ENDPOINT",
+                       "client_id_env": "ORI_ALERT_DELIVERY_CLIENT_ID",
+                       "secret_env": "ORI_ALERT_DELIVERY_SECRET"},
+}
+ENV_KEYS = ("endpoint_env", "client_id_env", "secret_env")
+# Each variable rule 8 names, with its default when the key is absent (None: no default, so it names nothing).
+SHARED_WITH = ((("gateway", "auth", "shared_secret_env"), "GATEWAY_SHARED_SECRET"),
+               (("gateway", "auth", "previous_shared_secret_env"), ""),
+               (("gateway", "custody", "secret_env"), None),
+               (("evidence", "secret_env"), None))
+WS = set("\t\n\x0b\x0c\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000") | {chr(c) for c in range(0x2000, 0x200B)}
+CONFIG_CASES: list[dict] = []
+ABSENT = object()
+
+
+def get(doc: dict, path: tuple) -> object:
+    for p in path:
+        if not isinstance(doc, dict) or p not in doc:
+            return ABSENT
+        doc = doc[p]
+    return doc
+
+
+def config_verdict(doc: dict) -> str | None:
+    """The first of rules 1, 6, 7 and 8 the document breaks. Every case keeps rules 2 to 5 satisfied, which the
+    generator asserts."""
+    ad = doc["alert_delivery"]
+    if not isinstance(ad.get("enabled"), bool):
+        return "type_mismatch"
+    if not ad["enabled"]:
+        return None
+    for k in ("queue_directory", *ENV_KEYS):
+        if k in ad and not isinstance(ad[k], str):
+            return "type_mismatch"
+    if "max_records_per_device" in ad and (isinstance(ad["max_records_per_device"], bool)
+                                           or not isinstance(ad["max_records_per_device"], int)):
+        return "type_mismatch"
+    qd = ad["queue_directory"].strip("".join(WS))
+    assert qd == "/var/lib/ori-gateway/alert-delivery", "rules 2 to 4 hold in every case"
+    assert 1 <= ad.get("max_records_per_device", 4096) <= 65536, "rule 5 holds in every case"
+    configured = [k for k in ENV_KEYS if ad.get(k, "") != ""]
+    if configured and len(configured) != len(ENV_KEYS):
+        return "forwarding_incomplete"
+    if not configured:
+        return None
+    for k in ENV_KEYS:
+        if any(c in WS or c == "=" for c in ad[k]):
+            return "env_name_malformed"
+    if ad["secret_env"].encode("utf-8") in (ad["endpoint_env"].encode("utf-8"), ad["client_id_env"].encode("utf-8")):
+        return "secret_env_shared"
+    for path, default in SHARED_WITH:
+        v = get(doc, path)
+        name = default if v is ABSENT else v
+        if isinstance(name, str) and name.encode("utf-8") == ad["secret_env"].encode("utf-8"):
+            return "secret_env_shared"
+    return None
+
+
+def cf(name: str, note: str, edit, expected: str | None) -> None:
+    doc = copy.deepcopy(BASE_DOC)
+    edit(doc)
+    got = config_verdict(doc)
+    assert got == expected, (name, got, expected)
+    ad = doc["alert_delivery"]
+    case = {"name": name, "note": note, "document": doc, "valid": expected is None}
+    if expected is not None:
+        case["rule"] = expected
+    elif ad["enabled"]:
+        case["forwarding"] = all(ad.get(k, "") != "" for k in ENV_KEYS)
+    CONFIG_CASES.append(case)
+
+
+def ad_set(**kv):
+    def edit(doc: dict) -> None:
+        for k, v in kv.items():
+            if v is ABSENT:
+                doc["alert_delivery"].pop(k, None)
+            else:
+                doc["alert_delivery"][k] = v
+    return edit
+
+
+def at(path: tuple, value: object):
+    def edit(doc: dict) -> None:
+        d = doc
+        for p in path[:-1]:
+            d = d.setdefault(p, {})
+        if value is ABSENT:
+            d.pop(path[-1], None)
+        else:
+            d[path[-1]] = value
+    return edit
+
+
+def both(*edits):
+    def edit(doc: dict) -> None:
+        for e in edits:
+            e(doc)
+    return edit
+
+
+NO_FORWARDING = {k: ABSENT for k in ENV_KEYS}
+
+
+def config_corpus() -> None:
+    # Accepted.
+    cf("accepted_base", "Enabled, a separate absolute queue, three distinct well-formed forwarding names, none "
+       "shared with another credential's variable.", ad_set(), None)
+    cf("accepted_custody_without_forwarding", "Enabled with none of the three forwarding keys: custody is "
+       "configured without forwarding.", ad_set(**NO_FORWARDING), None)
+    cf("accepted_forwarding_keys_all_empty", "All three forwarding keys present and empty: none is present and not "
+       "empty, so custody is configured without forwarding.",
+       ad_set(endpoint_env="", client_id_env="", secret_env=""), None)
+    cf("accepted_forwarding_keys_absent_and_empty", "endpoint_env empty, the other two absent: no forwarding.",
+       ad_set(endpoint_env="", client_id_env=ABSENT, secret_env=ABSENT), None)
+    cf("accepted_lowercase_dotted_names", "Names in lower case with dots and hyphens: rules 6 to 8 impose no "
+       "pattern beyond White_Space and `=`.",
+       ad_set(endpoint_env="ori.alert-endpoint", client_id_env="ori.alert-client", secret_env="ori.alert-secret"),
+       None)
+    cf("accepted_shared_endpoint_and_client_names", "endpoint_env and client_id_env name the same variable: "
+       "rule 8 judges only secret_env.", ad_set(client_id_env="ORI_ALERT_DELIVERY_ENDPOINT"), None)
+    cf("accepted_other_credentials_absent", "gateway.auth.previous_shared_secret_env, gateway.custody.secret_env "
+       "and evidence.secret_env absent: the first defaults to empty and the other two have no default, so none "
+       "names a variable secret_env could share.",
+       both(at(("gateway", "auth", "previous_shared_secret_env"), ABSENT), at(("gateway", "custody"), ABSENT),
+            at(("evidence", "secret_env"), ABSENT)), None)
+    cf("accepted_case_differs", "secret_env differs from gateway.auth.shared_secret_env only in case: compared "
+       "byte for byte, a different name.", ad_set(secret_env="ori_gateway_shared_secret"), None)
+    cf("accepted_shared_secret_env_default_other", "gateway.auth.shared_secret_env absent, so its default "
+       "GATEWAY_SHARED_SECRET is in force, and secret_env names another variable.",
+       at(("gateway", "auth", "shared_secret_env"), ABSENT), None)
+    cf("accepted_disabled_bad_names", "Disabled: the forwarding keys are not validated, however they are formed.",
+       ad_set(enabled=False, endpoint_env="", client_id_env="BAD NAME", secret_env="ORI_GATEWAY_SHARED_SECRET"),
+       None)
+    cf("accepted_disabled_bad_types", "Disabled: rule 1 judges only enabled, so non-string forwarding keys are "
+       "not judged.", ad_set(enabled=False, endpoint_env=123, client_id_env=None, secret_env=True), None)
+    cf("accepted_zero_width_space", "secret_env with an interior U+200B ZERO WIDTH SPACE, which has no White_Space "
+       "property: not malformed.", ad_set(secret_env="ORI_ALERT\u200bSECRET"), None)
+    # Rule 1 on the forwarding keys.
+    for k in ENV_KEYS:
+        cf(f"rule1_{k}_number", f"{k} is a bare number where a string is required.", ad_set(**{k: 123}),
+           "type_mismatch")
+        cf(f"rule1_{k}_null", f"{k} is an explicit null, no value of the string type.", ad_set(**{k: None}),
+           "type_mismatch")
+    cf("rule1_secret_env_bool", "secret_env is a boolean.", ad_set(secret_env=True), "type_mismatch")
+    cf("rule1_endpoint_env_list", "endpoint_env is an array of one string.", ad_set(endpoint_env=["ORI_X"]),
+       "type_mismatch")
+    cf("rule1_client_id_env_object", "client_id_env is an object.", ad_set(client_id_env={"name": "ORI_X"}),
+       "type_mismatch")
+    cf("rule1_null_without_forwarding", "secret_env an explicit null, the other two absent: null is a type "
+       "mismatch, not an absent key.", ad_set(endpoint_env=ABSENT, client_id_env=ABSENT, secret_env=None),
+       "type_mismatch")
+    cf("precedence_rule1_over_rule6", "secret_env is a number and endpoint_env is absent: rule 1 precedes rule 6.",
+       ad_set(endpoint_env=ABSENT, secret_env=123), "type_mismatch")
+    cf("precedence_rule1_over_rule7", "client_id_env is null and endpoint_env holds a space: rule 1 precedes rule 7.",
+       ad_set(endpoint_env="ORI ENDPOINT", client_id_env=None), "type_mismatch")
+    # Rule 6.
+    for k in ENV_KEYS:
+        cf(f"rule6_only_{k}", f"Only {k} is present and not empty.",
+           ad_set(**{x: ABSENT for x in ENV_KEYS if x != k}), "forwarding_incomplete")
+        cf(f"rule6_{k}_absent", f"{k} absent, the other two present.", ad_set(**{k: ABSENT}), "forwarding_incomplete")
+        cf(f"rule6_{k}_empty", f"{k} empty, the other two present.", ad_set(**{k: ""}), "forwarding_incomplete")
+    cf("precedence_rule6_over_rule7", "endpoint_env holds `=` and secret_env is absent: rule 6 precedes rule 7.",
+       ad_set(endpoint_env="ORI=X", secret_env=ABSENT), "forwarding_incomplete")
+    cf("precedence_rule6_over_rule8", "secret_env names the gateway's shared-secret variable and endpoint_env is "
+       "empty: rule 6 precedes rule 8.", ad_set(endpoint_env="", secret_env="ORI_GATEWAY_SHARED_SECRET"),
+       "forwarding_incomplete")
+    cf("rule6_whitespace_counts_present", "secret_env of one space, the other two absent: a space is present and "
+       "not empty, so forwarding is incomplete.", ad_set(endpoint_env=ABSENT, client_id_env=ABSENT, secret_env=" "),
+       "forwarding_incomplete")
+    # Rule 7.
+    for k in ENV_KEYS:
+        cf(f"rule7_{k}_space", f"{k} holds an interior space.", ad_set(**{k: "ORI ALERT"}), "env_name_malformed")
+        cf(f"rule7_{k}_equals", f"{k} holds `=`.", ad_set(**{k: "ORI_ALERT=1"}), "env_name_malformed")
+    cf("rule7_leading_space", "secret_env with a leading space: names are not trimmed, so the space is in the name.",
+       ad_set(secret_env=" ORI_ALERT_DELIVERY_SECRET"), "env_name_malformed")
+    cf("rule7_trailing_tab", "client_id_env with a trailing tab.", ad_set(client_id_env="ORI_ALERT_CLIENT\t"),
+       "env_name_malformed")
+    cf("rule7_newline", "endpoint_env with an interior line feed.", ad_set(endpoint_env="ORI_ALERT\nENDPOINT"),
+       "env_name_malformed")
+    cf("rule7_no_break_space", "secret_env with an interior U+00A0 NO-BREAK SPACE, a White_Space character.",
+       ad_set(secret_env="ORI_ALERT\u00a0SECRET"), "env_name_malformed")
+    cf("rule7_ideographic_space", "endpoint_env with an interior U+3000 IDEOGRAPHIC SPACE, a White_Space character.",
+       ad_set(endpoint_env="ORI_ALERT\u3000ENDPOINT"), "env_name_malformed")
+    cf("rule7_whitespace_only", "secret_env of one space, the other two named: rule 6 holds, and rule 7 refuses it.",
+       ad_set(secret_env=" "), "env_name_malformed")
+    cf("precedence_rule7_over_rule8", "secret_env names evidence.secret_env's variable and endpoint_env holds a "
+       "space: rule 7 precedes rule 8.", ad_set(endpoint_env="ORI ENDPOINT", secret_env="ORI_EVIDENCE_INGEST_SECRET"),
+       "env_name_malformed")
+    # Rule 8.
+    names = {("gateway", "auth", "shared_secret_env"): "ORI_GATEWAY_SHARED_SECRET",
+             ("gateway", "auth", "previous_shared_secret_env"): "ORI_GATEWAY_PREVIOUS_SHARED_SECRET",
+             ("gateway", "custody", "secret_env"): "ORI_GATEWAY_CUSTODY_SECRET",
+             ("evidence", "secret_env"): "ORI_EVIDENCE_INGEST_SECRET"}
+    for path, value in names.items():
+        cf("rule8_" + "_".join(path), f"secret_env names the same variable as {'.'.join(path)}.",
+           ad_set(secret_env=value), "secret_env_shared")
+    cf("rule8_secret_is_endpoint_env", "secret_env names the same variable as this section's endpoint_env.",
+       ad_set(secret_env="ORI_ALERT_DELIVERY_ENDPOINT"), "secret_env_shared")
+    cf("rule8_secret_is_client_id_env", "secret_env names the same variable as this section's client_id_env.",
+       ad_set(secret_env="ORI_ALERT_DELIVERY_CLIENT_ID"), "secret_env_shared")
+    cf("rule8_shared_secret_env_default", "gateway.auth.shared_secret_env absent, so its default "
+       "GATEWAY_SHARED_SECRET is the name in force, and secret_env names it.",
+       both(at(("gateway", "auth", "shared_secret_env"), ABSENT), ad_set(secret_env="GATEWAY_SHARED_SECRET")),
+       "secret_env_shared")
+    cf("rule8_gateway_auth_absent", "No gateway.auth section: shared_secret_env's default GATEWAY_SHARED_SECRET is "
+       "in force, and secret_env names it.",
+       both(at(("gateway", "auth"), ABSENT), ad_set(secret_env="GATEWAY_SHARED_SECRET")), "secret_env_shared")
+    cf("rule8_evidence_disabled", "evidence.enabled is false but evidence.secret_env names a variable: it counts "
+       "whether or not evidence is enabled.",
+       both(at(("evidence", "enabled"), False), ad_set(secret_env="ORI_EVIDENCE_INGEST_SECRET")),
+       "secret_env_shared")
+
+
+# --- the corpus -----------------------------------------------------------------------------------------
+def build() -> dict:
+    REQUEST_CASES.clear()
+    RESPONSE_CASES.clear()
+    CONFIG_CASES.clear()
+    requests_corpus()
+    requests_corpus_refused()
+    responses_corpus()
+    config_corpus()
+    for group in (REQUEST_CASES, RESPONSE_CASES, CONFIG_CASES):
+        names = [c["name"] for c in group]
+        assert len(names) == len(set(names)), "case names are unique within a group"
+    return {
+        "contract": "alert-delivery-transport/v1",
+        "description": {
+            "key_ids": ("Test secrets, each the SHA-256 of the ASCII label `ori alert-delivery-transport/v1 <name> "
+                        "test secret` written as 64 lowercase hexadecimal characters, with the key_id derived by "
+                        "HKDF-SHA256 over the secret's UTF-8 bytes. The HMAC key is the same UTF-8 bytes. Test "
+                        "secrets only."),
+            "runtime_test_keys": ("Ed25519 report keys, each seeded by the SHA-256 of its `seed_label`, that sign "
+                                  "the record bodies. Test keys only."),
+            "registry": ("The receiver's own registry, shared by every request case: each client's key_ids, the "
+                         "devices it may forward for and the owners on whose behalf it may; and each report-key "
+                         "enrolment, binding a key to a device and to the owner it names, and `revoked` true for "
+                         "a key since revoked. Each key is its own epoch."),
+            "requests": ("Requests as an exact request line, every header received in order, and body, with the HMAC "
+                         "input as hex wherever X-Ori-Alert-Sent-At-Ms carries an integer's own spelling, and the "
+                         "receiver's verdict at checks 1 to 8 of Order. `receiver` gives the receiver's clock, the "
+                         "(client_id, key_id, nonce) triples it already holds, and the records it holds verified, "
+                         "each as stored or conflict. A verdict names its check (null when every check passes), "
+                         "HTTP status, whether the response is authenticated, and the exact response body; a "
+                         "refusal names its reason, and an accepted request check 8's verdict: stored, conflict, "
+                         "duplicate or lower_count. A case that fails more than one check declares `precedence`."),
+            "responses": ("A response to a request whose digest is `request_digest`, with the gateway's action. A "
+                          "case on a row of the table names it as `row`; a case that retires nothing names the way "
+                          "as `retires_nothing`: another_digest, unparsable, unpaired or unauthenticated."),
+            "config": ("gateway-config/v2 documents, judged under the alert_delivery load rules: rule 1 on the "
+                       "forwarding keys, rules 6 to 8, and accepted cases. Every case keeps rules 2 to 5 satisfied. "
+                       "A refused case names the rule; an accepted enabled case says whether forwarding is "
+                       "configured."),
+        },
+        "endpoint": {"method": METHOD, "path": PATH, "request_content_type": CONTENT_TYPE,
+                     "max_request_line_bytes": MAX_REQUEST_LINE, "max_headers": MAX_HEADERS,
+                     "max_header_bytes": MAX_HEADER_BYTES, "max_body_bytes": MAX_BODY, "skew_ms": SKEW_MS,
+                     "hmac_domain_hex": HMAC_DOMAIN.hex(),
+                     "key_id_salt": KEY_ID_SALT.decode("ascii"), "key_id_info": KEY_ID_INFO.decode("ascii")},
+        "key_ids": [{"name": n, "label": label(n), "secret": SECRETS[n], "key_id": KEY_IDS[n]}
+                    for n in SECRET_NAMES],
+        "runtime_test_keys": [{"name": s.name, "seed_label": s.seed_label, "public_key": s.public_key,
+                               "key_identity": s.identity} for s in SIGNERS.values()],
+        "registry": REGISTRY,
+        "requests": REQUEST_CASES,
+        "responses": RESPONSE_CASES,
+        "config": CONFIG_CASES,
+    }
+
+
+def render() -> bytes:
+    return (json.dumps(build(), indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def main(argv: list[str]) -> int:
+    data = render()
+    if argv[1:] == ["--check"]:
+        if not OUT.exists() or OUT.read_bytes() != data:
+            print(f"{OUT.relative_to(ROOT)} does not reproduce from its generator", file=sys.stderr)
+            return 1
+        print(f"{OUT.relative_to(ROOT)} reproduces byte for byte")
+        return 0
+    if argv[1:]:
+        print(__doc__, file=sys.stderr)
+        return 2
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_bytes(data)
+    print(f"wrote {OUT.relative_to(ROOT)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
