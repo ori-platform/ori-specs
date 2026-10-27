@@ -1,0 +1,2287 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the alert-delivery-transport/v1 corpus against the contract texts.
+
+Shares no code with scripts/generate-alert-delivery-transport-vectors-v1, and
+was written without reading it, from alert-delivery-transport/v1.md,
+gateway-mqtt-canonical-json/v1.md, alert-delivery/v1.md (the record tables,
+*Carriage and custody* checks 1 to 4 and *Verifying*), gateway-api/v2.md's
+payload bound, and gateway-config/v2.md `alert_delivery` alone. Every expected
+value is recomputed here.
+
+Held to:
+
+- the text: the sentences this checker relies on are pinned, and the values it
+  judges by are parsed from the text: the endpoint table, the header table and
+  each header's form, the key-id derivation (prefix, salt, info, length), the
+  HMAC input's prefix and its member object, the eight checks of *Order* with
+  their limits, skew and statuses, the response table (status, outcome,
+  meaning, gateway action), the two response forms and their reasons, the
+  digest-binding and rejection rules, and the config load rules with their
+  names, order, keys and the variables and defaults rule 8 compares, so an
+  edit to any of them fails here until it is re-pinned;
+- crypto: every test secret re-derived from its disclosed label; every
+  `key_id` with this script's own HMAC-SHA256 and HKDF-SHA256, cross-checked
+  against `cryptography`'s HKDF and the standard library's `hmac`; every body
+  digest, HMAC input and authorisation header recomputed, the canonical bytes
+  with this script's own serialiser, cross-checked against the Python
+  equivalent gateway-mqtt-canonical-json/v1 gives;
+- requests: the receiver's verdict at checks 1 to 8 of *Order*, each check
+  judged independently, so a reject case must fail its declared check and no
+  other (or exactly the checks its precedence declares), with the declared
+  status, authentication, reason and response body; check 6 by this script's
+  own reading of the record form and the payload member rule; check 8 by the
+  observation, class and detail tables and the held records, with Ed25519
+  through `cryptography`;
+- responses: the gateway's action, recomputed from the table and the
+  digest-binding rule;
+- config: the load verdict under every rule of gateway-config/v2.md
+  `alert_delivery`;
+- the corpus schema, closed at every level: a member this checker never reads
+  is a failure;
+- coverage: every case *Vectors* requires.
+
+    python3 scripts/check-alert-delivery-transport-vectors-v1
+    python3 scripts/check-alert-delivery-transport-vectors-v1 --mutations
+
+`--mutations` runs wrong judges, alters the corpus's expectations and alters
+the texts; every mutant must be refused, and the survivors are printed.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import hmac as std_hmac
+import json
+import pathlib
+import re
+import sys
+from typing import Callable
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CORPUS = ROOT / "alert-delivery-transport" / "vectors" / "alert-delivery-transport-v1.json"
+TEXT_FILES = {
+    "tr": ROOT / "alert-delivery-transport" / "v1.md",
+    "canonical": ROOT / "gateway-mqtt-canonical-json" / "v1.md",
+    "ad": ROOT / "alert-delivery" / "v1.md",
+    "gateway_config": ROOT / "gateway-config" / "v2.md",
+    "gateway_api": ROOT / "gateway-api" / "v2.md",
+}
+
+
+class Failure(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Pinned sentences, each held whitespace-normalised as a substring of its
+# document.
+# ---------------------------------------------------------------------------
+
+PINS: list[tuple[str, str]] = [
+    # Rule above every other
+    ("tr", "**a gateway retires a record only on a response that says the receiver holds it, bound to that record's digest.**"),
+    ("tr", "The receiver verifies every record under alert-delivery/v1.md *Verifying*."),
+    # Endpoint
+    ("tr", "A gateway sends the bytes it holds in custody, and never decodes and re-encodes them. One request carries one record."),
+    # Client authentication
+    ("tr", "Every request is authenticated with a dedicated symmetric secret whose sole purpose is `alert_delivery_forward`."),
+    ("tr", "The secret has at least 256 bits of entropy. Its identifier is derived, never configured:"),
+    ("tr", "A receiver refuses to hold two secrets that derive the same identifier."),
+    ("tr", "`sent_at_ms` is the integer the header carries. The signature is HMAC-SHA256 whose key is the selected secret's UTF-8 bytes, the same bytes HKDF takes as `ikm`."),
+    ("tr", "**Order.** A receiver judges each request in this order, and the first failure is the answer."),
+    ("tr", "A retry carries the same body and digest, under a fresh `sent_at_ms`, nonce and HMAC."),
+    ("tr", "**Enumeration resistance.** An unknown device and a known device outside the client's set are both refused at check 7, and get the same status, the same body apart from `record_digest`, and the same log code and timing class."),
+    # Response
+    ("tr", "A gateway classes a response in this order, and the first that holds is the answer; none of the first five retires anything:"),
+    ("tr", "A body is judged as the JSON it parses to, never by its bytes."),
+    ("tr", "**Bound to the digest.** An authenticated response names the request's `record_digest`, and a gateway acts on it only when it is that digest."),
+    ("tr", "A response that names another digest, does not parse, names an outcome or an HTTP status this table does not pair, or never arrives retires nothing, and the gateway keeps the record and retries."),
+    ("tr", "Unauthenticated responses omit `record_digest`, so the receiver is no membership oracle."),
+    ("tr", "A 401 or a 403 never rejects a record: credential and permission faults are repaired, and the records they hold back wait."),
+    ("tr", "`stored` and `duplicate` are idempotent: the same bytes under a fresh request get the same outcome, and never a different one."),
+    ("tr", "- **Nothing infers delivery.** A network success, a TLS handshake, or an HTTP status the table does not pair with a matching digest never means the receiver holds a record."),
+    # Configuration
+    ("tr", "A gateway's forwarding keys are gateway-config/v2.md `alert_delivery` `endpoint_env`, `client_id_env` and `secret_env`, under that section's load rules."),
+    # Vectors
+    ("tr", "accepted, or refused with its HTTP status."),
+    ("tr", "One case for each check, refused for it alone, and one case for each status and reason check 8 can give, the verification rules themselves being alert-delivery/v1's corpus's."),
+    ("tr", "A case lists, beside its refusing check, the later checks it would also fail among those whose inputs it holds: a request without a single value of each required header has no HMAC input, and a body that is not a record reaches neither check 7 nor check 8."),
+    ("tr", "The cases include a reused nonce, a body digest that does not match, a skew one past the bound and one at it, and an unknown and an unauthorised device answered alike."),
+    ("tr", "and the gateway's action: `retire`, `keep` or `reject`. One case for each row of the table, and for each way a response retires nothing: another digest, a body that does not parse, an outcome and a status the table does not pair, and an unauthenticated response."),
+    ("tr", "They are test secrets only."),
+    # Canonical JSON
+    ("canonical", "Keys are ordered by **Unicode scalar value** (code point), not by UTF-16 code unit."),
+    ("canonical", "Escape only `\"` and `\\`, plus C0 controls."),
+    ("canonical", "A **verifier** MUST reproduce the number token exactly as it appears on the wire, and MUST NOT re-format it."),
+    # alert-delivery/v1
+    ("ad", "1. Checks 1 to 4 of [Carriage and custody](#carriage-and-custody), and its own payload bound."),
+    ("ad", "3. Not the canonical bytes of the object it parses to: `not_canonical`."),
+    ("ad", "4. `v` is an integer under the integer rule of [Records](#records), other than `1`: `unsupported_version`. A `v` outside that rule, `0`, a negative or one above 2^53 − 1 among them, is `malformed`. Otherwise, not a record of either kind, with every member present, of its type and within its form: `malformed`."),
+    ("ad", "A record whose `kind` is neither value, or whose members are not exactly those its kind lists, is `malformed`."),
+    ("ad", "every integer a JSON integer token from `1` to 2^53 − 1 with no sign, fraction, exponent or leading zero, and every string ASCII matching its pattern, so that no string needs a JSON escape."),
+    ("ad", "A code no row lists is outside `detail`'s form, and is `malformed`."),
+    ("ad", "The signing input is the ASCII bytes `ori.alert_delivery.v1`, one NUL byte, then the canonical bytes of the record without its `signature` member."),
+    # Config
+    ("gateway_config", "A configuration is refused at load for the first of these it breaks, in this order, and the refusal names the rule."),
+    ("gateway_config", "A loader never coerces one: a bare `123` where a string is required, or `64.0` where an integer is, is refused here, and so is an explicit `null`, which is no value of any of those types. A key that is absent takes its default and is not judged here."),
+    ("gateway_config", "`enabled` is judged whenever the section is present; the others only when `enabled` is true;"),
+    ("gateway_config", "Surrounding whitespace, every character with the Unicode `White_Space` property, is removed from `queue_directory` before these rules apply, and the gateway uses the trimmed path."),
+    ("gateway_config", "Rules 6 to 8 judge names only."),
+    ("gateway_config", "repeated and trailing `/` and `.` components are removed, each `..` removes the component before it, and a `..` at the root stays at the root."),
+    ("gateway_config", "The state directory counts when it is present after trimming, whether or not authentication is enabled, and the two evidence queue directories count while `evidence.enabled` is true;"),
+]
+
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def section(text: str, title: str) -> str:
+    """The body under the first heading whose text is `title`, up to the next
+    heading of the same or a higher level."""
+    m = re.search(r"^(#+) " + re.escape(title) + r"\s*$", text, re.M)
+    if not m:
+        raise Failure(f"text: heading {title!r} not found")
+    level = len(m.group(1))
+    rest = text[m.end():]
+    n = re.search(r"^#{1,%d} " % level, rest, re.M)
+    return rest[: n.start()] if n else rest
+
+
+def table_rows(body: str, first_header: str) -> list[list[str]]:
+    lines = body.splitlines()
+    for i, ln in enumerate(lines):
+        cells = cells_of(ln)
+        if cells and cells[0] == first_header:
+            rows = []
+            for ln2 in lines[i + 2:]:
+                if not ln2.strip().startswith("|"):
+                    break
+                rows.append(cells_of(ln2))
+            return rows
+    raise Failure(f"text: table headed {first_header!r} not found")
+
+
+def cells_of(ln: str) -> list[str]:
+    ln = ln.strip()
+    if not ln.startswith("|"):
+        return []
+    return [c.strip() for c in re.split(r"(?<!\\)\|", ln.strip("|"))]
+
+
+def numbered(body: str) -> list[str]:
+    """The items of the first numbered list in body, whitespace-normalised."""
+    items: list[list[str]] = []
+    for ln in body.splitlines():
+        m = re.match(r"^(\d+)\. (.*)$", ln)
+        if m:
+            if int(m.group(1)) != len(items) + 1:
+                raise Failure(f"text: list item {m.group(1)} out of sequence")
+            items.append([m.group(2)])
+        elif items and ln.startswith("   ") and ln.strip():
+            items[-1].append(ln.strip())
+        elif items:
+            break
+    return [norm(" ".join(x)) for x in items]
+
+
+def ticks(s: str) -> list[str]:
+    return re.findall(r"`([^`]*)`", s)
+
+
+def one(pattern: str, text: str, where: str) -> re.Match:
+    m = re.search(pattern, text)
+    if not m:
+        raise Failure(f"text: {where}: pattern not found")
+    return m
+
+
+def load_texts() -> dict[str, str]:
+    return {k: p.read_text(encoding="utf-8") for k, p in TEXT_FILES.items()}
+
+
+def build_model(texts: dict[str, str]) -> dict:
+    for key, sentence in PINS:
+        if norm(sentence) not in norm(texts[key]):
+            raise Failure(f"text: pinned sentence missing from {key}: {sentence[:80]!r}")
+    tr = texts["tr"]
+    model: dict = {}
+
+    # Endpoint.
+    ep = {r[0]: r[1] for r in table_rows(section(tr, "Endpoint"), "Property")}
+    if set(ep) != {"Method", "Path", "Request content type", "Response content type", "Transport", "Body"}:
+        raise Failure(f"text: endpoint table rows {sorted(ep)}")
+    model["method"] = ticks(ep["Method"])[0]
+    model["path"] = ticks(ep["Path"])[0]
+    model["request_content_type"] = ticks(ep["Request content type"])[0]
+    model["response_content_type"] = ticks(ep["Response content type"])[0]
+    model["max_body"] = int(one(r"^Exactly one record's exact bytes, at most (\d+) bytes$", ep["Body"], "body bound").group(1))
+
+    # Key-id derivation.
+    auth = section(tr, "Client authentication")
+    kb = one(r"(?s)```text\n(key_id = .*?)\n```", auth, "key_id block").group(1)
+    m = one(r'^key_id = "([^"]+)" \|\| lowercase_hex\(HKDF-SHA256\(\n'
+            r'  ikm = secret UTF-8,\n'
+            r'  salt = "([^"]+)",\n'
+            r'  info = "([^"]+)",\n'
+            r'  length = (\d+)\n'
+            r'\)\)$', kb, "key_id derivation")
+    model["kid_prefix"], model["kid_salt"], model["kid_info"] = m.group(1), m.group(2), m.group(3)
+    model["kid_len"] = int(m.group(4))
+
+    # Header table and forms.
+    rows = table_rows(auth, "Header")
+    hdr = {ticks(r[0])[0]: r[1] for r in rows}
+    model["headers"] = [ticks(r[0])[0] for r in rows]
+    if len(model["headers"]) != 6:
+        raise Failure("text: header table does not have six rows")
+    forms: dict[str, str] = {}
+    client_h, kid_h, sent_h, nonce_h, dig_h, auth_h = model["headers"]
+    mm = one(r"^The gateway's stable opaque client identifier; (\d+) to (\d+) printable ASCII characters\.$", hdr[client_h], "client form")
+    forms[client_h] = r"[\x20-\x7e]{%d,%d}" % (int(mm.group(1)), int(mm.group(2)))
+    one(r"^The derived identifier above, compared byte for byte\.$", hdr[kid_h], "key-id form")
+    forms[kid_h] = re.escape(model["kid_prefix"]) + "[0-9a-f]{%d}" % (2 * model["kid_len"])
+    mm = one(r"^The gateway's wall clock at sending: a decimal integer from (\d+) to (\d+), with no sign and no leading zero\.$", hdr[sent_h], "sent-at form")
+    model["sent_range"] = (int(mm.group(1)), int(mm.group(2)))
+    forms[sent_h] = r"[1-9][0-9]*" if model["sent_range"][0] >= 1 else r"0|[1-9][0-9]*"
+    mm = one(r"^Exactly (\d+) lowercase hexadecimal characters from (\d+) random bytes\.$", hdr[nonce_h], "nonce form")
+    if int(mm.group(1)) != 2 * int(mm.group(2)):
+        raise Failure("text: nonce length is not twice its random bytes")
+    forms[nonce_h] = "[0-9a-f]{%d}" % int(mm.group(1))
+    mm = one(r"^`([a-z0-9]+:)` and (\d+) lowercase hexadecimal characters, over the exact body bytes\.$", hdr[dig_h], "digest form")
+    model["digest_prefix"] = mm.group(1)
+    if mm.group(1) != "sha256:" or mm.group(2) != "64":
+        raise Failure("text: the digest is not SHA-256 hex")
+    forms[dig_h] = re.escape(mm.group(1)) + "[0-9a-f]{%s}" % mm.group(2)
+    mm = one(r"^`(Ori-Alert-HMAC hmac-sha256:)` and (\d+) lowercase hexadecimal characters\.$", hdr[auth_h], "authorization form")
+    model["auth_prefix"] = mm.group(1)
+    if mm.group(2) != "64":
+        raise Failure("text: the HMAC is not 64 hex characters")
+    forms[auth_h] = re.escape(mm.group(1)) + "[0-9a-f]{64}"
+    model["forms"] = forms
+    model["h"] = dict(client=client_h, kid=kid_h, sent=sent_h, nonce=nonce_h, digest=dig_h, auth=auth_h)
+
+    # HMAC input.
+    mm = one(r"The HMAC input is the ASCII bytes `([^`]+)`, one\s+NUL byte, then the canonical bytes, under\s+\[gateway-mqtt-canonical-json/v1\.md\]", auth, "HMAC prefix")
+    model["hmac_prefix"] = mm.group(1).encode("ascii") + b"\x00"
+    jb = one(r"(?s)```json\n(\{.*?\})\n```", auth, "HMAC object").group(1)
+    obj = json.loads(jb)
+    members: list[tuple[str, str, str]] = []
+    for k, v in obj.items():
+        if isinstance(v, str) and v.startswith("<") and v.endswith(">"):
+            if v[1:-1] not in model["headers"]:
+                raise Failure(f"text: HMAC member {k} names no header")
+            members.append((k, "header", v[1:-1]))
+        elif isinstance(v, str):
+            members.append((k, "const", v))
+        elif v == 0 and not isinstance(v, bool):
+            if k != "sent_at_ms":
+                raise Failure(f"text: integer HMAC member {k} unpinned")
+            members.append((k, "int", sent_h))
+        else:
+            raise Failure(f"text: HMAC member {k}")
+    model["hmac_members"] = members
+    consts = {k: s for k, kind, s in members if kind == "const"}
+    if consts != {"method": model["method"], "path": model["path"]}:
+        raise Failure(f"text: HMAC constants {consts} are not the endpoint's")
+    if [k for k, _, _ in members] != sorted(k for k, _, _ in members):
+        raise Failure("text: HMAC object not shown in canonical key order")
+
+    # Order.
+    after = auth.split("**Order.**", 1)[1]
+    mm = one(r"^ A receiver judges each request in this order, and the first failure\s+is the answer\. Checks 1 to (\d+) authenticate the request, and a response to a\s+request refused at one of them is \*\*unauthenticated\*\*: it omits\s+`record_digest`\. From check (\d+) on, every response names the request's\s+`record_digest`\.", after, "Order preamble")
+    model["auth_checks"] = int(mm.group(1))
+    model["auth_checks_passed_at"] = int(mm.group(2))
+    if model["auth_checks_passed_at"] != model["auth_checks"] + 1:
+        raise Failure("text: the authenticated checks and the digest-naming checks leave a gap")
+    order = numbered(after)
+    model["order"] = order
+    if len(order) != 8:
+        raise Failure(f"text: *Order* has {len(order)} checks")
+    mm = one(r"^\*\*Limits\.\*\* A request line of at most (\d+) bytes; at most (\d+) headers in all, every header received counted, `Host` and `Content-Length` among them; "
+             r"each header at most (\d+) bytes, counted as its name, `: ` and its value; a body of at most (\d+) bytes; and a `Content-Length` header, present, equal to the body's length\. Otherwise (\d+)\.$", order[0], "check 1")
+    model["limits"] = dict(request_line=int(mm.group(1)), headers=int(mm.group(2)), header_bytes=int(mm.group(3)), body=int(mm.group(4)))
+    if model["limits"]["body"] != model["max_body"]:
+        raise Failure("text: the body bound of check 1 is not the endpoint's")
+    status = {1: int(mm.group(5))}
+    mm = one(r"^\*\*Header forms\.\*\* The method is `([A-Z]+)`, compared byte for byte as HTTP compares methods, and the request target is exactly the path, with no query\. Each required header present exactly once, header names compared without regard to case as HTTP compares them and values byte for byte, and each in its form; "
+             r"`Content-Type` the media type `([^`]+)`, compared without regard to case and with no parameters; and the body's SHA-256 equal to `X-Ori-Alert-Record-Digest`\. Otherwise (\d+)\.$", order[1], "check 2")
+    if mm.group(1) != model["method"]:
+        raise Failure("text: check 2's method is not the endpoint's")
+    mm = type("M", (), {"group": lambda self, i, g=mm.groups(): g[i]})()
+    if mm.group(1) != model["request_content_type"]:
+        raise Failure("text: check 2's content type is not the endpoint's")
+    status[2] = int(mm.group(2))
+    mm = one(r"^\*\*The credential\.\*\* The held credential whose client identifier is `X-Ori-Alert-Client` and whose `key_id` is `X-Ori-Alert-Key-Id`, both compared byte for byte, selected without trial verification: a `key_id` held for another client selects nothing\. Otherwise (\d+)\.$", order[2], "check 3")
+    status[3] = int(mm.group(1))
+    mm = one(r"^\*\*The HMAC\*\*, compared in constant time\. Otherwise (\d+)\. The HMAC input is built only from a request that holds exactly one of each required header, which check 2 has ensured\.$", order[3], "check 4")
+    status[4] = int(mm.group(1))
+    mm = one(r"^\*\*Freshness\.\*\* `sent_at_ms` within (\d+) ms of the receiver's clock, either way, and `\(([a-z_, ]+)\)` reserved atomically\. "
+             r"A nonce is kept for at least twice that window, and a reused one is a transport replay\. Otherwise (\d+)\.$", order[4], "check 5")
+    model["skew"] = int(mm.group(1))
+    model["nonce_key"] = tuple(x.strip() for x in mm.group(2).split(","))
+    status[5] = int(mm.group(3))
+    hm_ = {k: s for k, kind, s in members}
+    if any(k not in hm_ for k in model["nonce_key"]):
+        raise Failure("text: the nonce key names a member the HMAC does not bind")
+    mm = one(r"^\*\*The body is a record\*\*, under alert-delivery/v1\.md \*Verifying\* check 1: `([a-z_]+)` or `([a-z_]+)`, (\d+); `([a-z_]+)`, (\d+) `([a-z_]+)`\. "
+             r"A body that is not one JSON object, names a member twice, or breaks the Payload Member Rule is `([a-z_]+)` here\.$", order[5], "check 6")
+    model["member_rule_reason"] = mm.group(7)
+    model["form_reasons"] = {mm.group(1): int(mm.group(3)), mm.group(2): int(mm.group(3)), mm.group(4): int(mm.group(5))}
+    model["form_outcome"] = {mm.group(1): "refused", mm.group(2): "refused", mm.group(4): mm.group(6)}
+    mm = one(r"^\*\*Forwarding permission\*\*, under \*Verifying\* check 2, for the authenticated client, on behalf of the owner the record key's enrolment names when the key is enrolled: `([a-z_]+)`, (\d+)\.$", order[6], "check 7")
+    model["permission_reason"] = mm.group(1)
+    status[7] = int(mm.group(2))
+    mm = one(r"^\*\*\*Verifying\* checks 3 to 6\*\*: `([a-z_]+)`, (\d+) `([a-z_]+)`; `([a-z_]+)`, `([a-z_]+)`, `([a-z_]+)` or `([a-z_]+)`, (\d+); "
+             r"and check 6's verdicts, (\d+), as the table below pairs them\.$", order[7], "check 8")
+    model["verify_status"] = {mm.group(1): (int(mm.group(2)), mm.group(3))}
+    for i in (4, 5, 6, 7):
+        model["verify_status"][mm.group(i)] = (int(mm.group(8)), "refused")
+    model["held_status"] = int(mm.group(9))
+    model["check_status"] = status
+
+    # Response table.
+    resp = section(tr, "Response")
+    rows = table_rows(resp, "HTTP")
+    table: list[dict] = []
+    for r in rows:
+        if len(r) != 4:
+            raise Failure(f"text: response row {r}")
+        statuses = [int(x) for x in re.split(r",\s*", r[0])]
+        outcome = ticks(r[1])
+        if len(outcome) != 1:
+            raise Failure(f"text: response row outcome {r[1]}")
+        act = r[3]
+
+        def word(s: str) -> str:
+            for w in ("retire", "keep", "reject"):
+                if s.lower().startswith(w):
+                    return w
+            raise Failure(f"text: response row action {s!r}")
+        m2 = re.fullmatch(r"Unauthenticated: (.*?) Authenticated: (.*)", act)
+        if m2:
+            una, aut = word(m2.group(1)), word(m2.group(2))
+        else:
+            una = aut = word(act)
+        if "Never retire" in act and aut == "retire":
+            raise Failure("text: a never-retire row retires")
+        table.append({"statuses": statuses, "outcome": outcome[0], "meaning": r[2],
+                      "reasons": ticks(r[2]), "action": aut, "unauthenticated_action": una})
+    model["table"] = table
+    pairs: dict[tuple[int, str], str] = {}
+    for row in table:
+        for s in row["statuses"]:
+            if (s, row["outcome"]) in pairs:
+                raise Failure(f"text: response pair {s} {row['outcome']} listed twice")
+            pairs[(s, row["outcome"])] = row["action"]
+    model["pairs"] = pairs
+    if any(row["unauthenticated_action"] == "retire" or row["unauthenticated_action"] == "reject" for row in table):
+        # Unauthenticated responses omit record_digest, so nothing acts on them.
+        model["unauth_acts"] = True
+    model["outcomes"] = sorted({row["outcome"] for row in table})
+    # Verifying check 6's verdicts, as the 200 rows pair them.
+    held_outcome = {}
+    for row in table:
+        if model["held_status"] in row["statuses"]:
+            held_outcome[row["outcome"]] = row["outcome"]
+            for t in row["reasons"]:
+                held_outcome[t] = row["outcome"]
+    model["held_outcome"] = {k: v for k, v in held_outcome.items() if k in ("stored", "duplicate", "conflict", "lower_count")}
+    if sorted(model["held_outcome"]) != ["conflict", "duplicate", "lower_count", "stored"]:
+        raise Failure(f"text: the 200 rows pair {sorted(model['held_outcome'])}, not check 6's four verdicts")
+    # Statuses per check must be ones the table pairs with the check's outcome.
+    for c, st in status.items():
+        if (st, "refused") not in pairs:
+            raise Failure(f"text: check {c}'s status {st} is not a refused row")
+    for reason, st in model["form_reasons"].items():
+        if (st, model["form_outcome"][reason]) not in pairs:
+            raise Failure(f"text: check 6 {reason} {st} is not a table row")
+    rej = sorted(s for (s, _), a in pairs.items() if a == "reject")
+    mm = one(r"A gateway rejects a record only on an\s+authenticated (\d+) or (\d+) response bound to its digest\.", resp, "rejection")
+    if rej != sorted([int(mm.group(1)), int(mm.group(2))]):
+        raise Failure(f"text: rejecting statuses {rej} differ from the rejection rule")
+    mm = one(r"A (\d+) or a (\d+) never rejects a record", resp, "never rejects")
+    for s in (int(mm.group(1)), int(mm.group(2))):
+        if any(a != "keep" for (st, _), a in pairs.items() if st == s):
+            raise Failure(f"text: status {s} does not keep")
+    # The response form.
+    mm = one(r"A response to a request refused at checks 1 to (\d+) is one JSON object with\s+exactly `([a-z_]+)`, `([a-z_]+)` and `([a-z_]+)`, `outcome` `([a-z_]+)` and `reason` `\"\"`,\s+sent with status (\d+) or (\d+): it is unauthenticated\.", resp, "unauthenticated form")
+    model["unauth_outcome"] = mm.group(5)
+    model["unauth_statuses"] = {int(mm.group(6)), int(mm.group(7))}
+    if any((st, mm.group(5)) not in pairs for st in model["unauth_statuses"]):
+        raise Failure("text: the unauthenticated form's statuses are not refused rows")
+    if int(mm.group(1)) != model["auth_checks"]:
+        raise Failure("text: the unauthenticated form's checks are not the authenticating ones")
+    model["unauth_members"] = sorted(mm.group(2, 3, 4))
+    shape = json.loads(one(r"(?s)Every other response is one JSON object with exactly these members:\n\n```json\n(\{.*?\})\n```", resp, "response body").group(1))
+    model["response_members"] = sorted(shape)
+    mm = one(r"`v` is `(\d+)`, `outcome` is one of the table's, `record_digest` is `sha256:` and 64\s+lowercase hexadecimal characters, and `reason` is `\"\"` for `stored` and\s+`duplicate`, `lower_count` for `superseded`, the refusing check's reason for a\s+`refused` from check (\d+) on, the reason for a 202 of check 6 or 8, and `\"\"` for a\s+429 or 503\.", resp, "response form")
+    model["response_v"] = int(mm.group(1))
+    classes = numbered(resp.split("none of the first five retires anything:", 1)[1])
+    want = ["**Does not parse:** not one JSON object of one of the two forms above, by its members, `v`, `outcome` and `record_digest`'s form.",
+            "**Unauthenticated:** the first form.",
+            "**Another digest:** `record_digest` is not the request's.",
+            "**Unpaired:** the table pairs its HTTP status with no row of its `outcome`.",
+            "**Does not parse:** its `reason` is not one that row names.",
+            "Otherwise, the row's gateway action."]
+    if classes != want:
+        raise Failure(f"text: the response classes are {classes}")
+    model["response_classes"] = ["unparsable", "unauthenticated", "another_digest", "unpaired", "unparsable_reason"]
+    if int(mm.group(2)) != model["auth_checks_passed_at"]:
+        raise Failure("text: refused reasons start at another check than the digest")
+    reasons: dict[tuple[int, str], set] = {}
+    for row in table:
+        for s in row["statuses"]:
+            if row["outcome"] in ("stored", "duplicate"):
+                reasons[(s, row["outcome"])] = {""}
+            elif row["outcome"] == "superseded":
+                if row["reasons"] != ["lower_count"]:
+                    raise Failure("text: superseded's reason")
+                reasons[(s, row["outcome"])] = {"lower_count"}
+            elif s in (429, 503):
+                reasons[(s, row["outcome"])] = {""}
+            else:
+                reasons[(s, row["outcome"])] = set(row["reasons"]) - {"conflict"}
+    # The reasons a refused row carries from check 6 on are its checks' reasons.
+    reasons[(400, "refused")] = {r for r, st in model["form_reasons"].items() if st == 400}
+    reasons[(status[7], "refused")] = {model["permission_reason"]}
+    model["response_reasons"] = reasons
+    model["held_reason"] = {}
+    for hv, oc in model["held_outcome"].items():
+        rs = reasons[(model["held_status"], oc)]
+        if len(rs) != 1:
+            raise Failure(f"text: {oc} has no single reason")
+        model["held_reason"][hv] = next(iter(rs))
+
+    # Vectors.
+    vec = section(tr, "Vectors")
+    model["secret_label"] = one(r"the SHA-256 of the ASCII label\s+`([^`]+)`\s+written as 64 lowercase\s+hexadecimal characters",
+                                vec, "secret label").group(1)
+    if "<name>" not in model["secret_label"]:
+        raise Failure("text: secret label has no <name>")
+    model["actions"] = ticks(one(r"the gateway's action: (`[a-z]+`, `[a-z]+` or `[a-z]+`)\.", vec, "actions").group(1))
+    if sorted(model["actions"]) != sorted({row["action"] for row in table}):
+        raise Failure("text: the action vocabulary differs from the table's")
+    mm = one(r"cases for load rules (\d+) to (\d+),\s+and for rule (\d+) on the forwarding keys, and accepted cases, among them custody\s+with no forwarding keys at all\.", vec, "config coverage")
+    model["cfg_cover"] = (int(mm.group(1)), int(mm.group(2)), int(mm.group(3)))
+    mm = one(r"verdict at checks (\d+) to (\d+) of\s+\*Order\*, for the forwarding permissions and owners the case names:", vec, "request coverage")
+    model["req_checks"] = list(range(int(mm.group(1)), int(mm.group(2)) + 1))
+
+    # alert-delivery/v1 record forms, for check 6.
+    ad = texts["ad"]
+    model["record_prefix"] = one(r"The signing input is the ASCII bytes `([^`]+)`, one NUL byte", ad, "record prefix").group(1).encode() + b"\x00"
+    kinds: dict[str, dict[str, str]] = {}
+    for title in ("Submission observation", "Withholding tally"):
+        rows = table_rows(section(ad, title), "Member")
+        kinds[title] = {ticks(r[0])[0]: r[1] for r in rows}
+    sub, tal = kinds["Submission observation"], kinds["Withholding tally"]
+    for k, v in tal.items():
+        if v.startswith("As above"):
+            tal[k] = sub[k] + (" or `null`" if v == "As above, or `null`." else "")
+    model["kinds"] = {ticks(sub["kind"])[0].strip('"'): sub, ticks(tal["kind"])[0].strip('"'): tal}
+    det = table_rows(section(ad, "Detail codes"), "`outcome`")
+    model["detail_codes"] = sorted({t for r in det for t in ticks(r[1]) if t != "null"})
+    mm = one(r"\| `ori/\{device_id\}/runtime/alert-delivery` \| Runtime -> Gateway \| (\d+) \|", texts["gateway_api"], "payload size")
+    model["payload_size"] = int(mm.group(1))
+    model["ad_rules"] = ad_rules(texts)
+
+    # Config.
+    gcfg = texts["gateway_config"]
+    gc = section(gcfg, "`alert_delivery`")
+    crow = {ticks(r[0])[0]: r for r in table_rows(gc, "Key")}
+    model["cfg_types"] = {k: ticks(r[1])[0] for k, r in crow.items()}
+    model["cfg_defaults"] = {k: r[2] for k, r in crow.items()}
+    rules = numbered(gc.split("**Load rules.**", 1)[1])
+    names = [ticks(r)[0] for r in rules]
+    model["cfg_rules"] = names
+    if names != ["type_mismatch", "queue_directory_required", "queue_directory_absolute", "queue_directory_separate",
+                 "max_records_per_device_range", "forwarding_incomplete", "env_name_malformed", "secret_env_shared"]:
+        model["cfg_rules_unknown"] = True
+    mm = one(r"`enabled` is not a boolean, (.*?) is not a string, or `max_records_per_device` is not an integer", rules[0], "rule 1")
+    model["cfg_string_keys"] = ticks(mm.group(1))
+    mm = one(r"^`forwarding_incomplete`: some, but not all, of (`[a-z_]+`), (`[a-z_]+`) and (`[a-z_]+`) are present and not empty\. "
+             r"With none of them, custody is configured without forwarding;$", rules[5], "rule 6")
+    model["env_keys"] = [ticks(x)[0] for x in mm.groups()]
+    mm = one(r"^`env_name_malformed`: one of them contains a character with the Unicode `White_Space` property or `(.)`, judged in that order;$", rules[6], "rule 7")
+    model["env_bad_char"] = mm.group(1)
+    mm = one(r"^`secret_env_shared`: `secret_env` names the same variable as (.*?), each as the name in force after defaults, compared byte for byte; "
+             r"a key with no default that is absent names nothing, and `evidence\.secret_env` counts whether or not `evidence\.enabled` is true; "
+             r"so the forwarding secret is never another credential\. The refusal names the rule, not which variable matched\.$", rules[7], "rule 8")
+    model["shared_with"] = ticks(mm.group(1))
+    defaults: dict[str, str | None] = {}
+    for dotted in model["shared_with"]:
+        parts = dotted.split(".")
+        title = "`" + ".".join(parts[:-1]) + "`"
+        rows = table_rows(section(gcfg, title), "Key")
+        row = next((r for r in rows if ticks(r[0]) and ticks(r[0])[0] == parts[-1]), None)
+        if row is None:
+            raise Failure(f"text: {dotted} has no row")
+        d = ticks(row[2])
+        defaults[dotted] = (d[0].strip('"') if d[0] in ('""',) or not d[0].startswith('"') else d[0].strip('"')) if d else None
+        if d and d[0] == '""':
+            defaults[dotted] = ""
+    model["shared_defaults"] = defaults
+    mm = one(r"is not from (\d+) to\s+(\d+)\.", rules[4], "rule 5")
+    model["cfg_range"] = (int(mm.group(1)), int(mm.group(2)))
+    model["cfg_default_max"] = int(ticks(model["cfg_defaults"]["max_records_per_device"])[0])
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Crypto: this script's own HMAC-SHA256 and HKDF-SHA256 (RFC 2104, RFC 5869),
+# each cross-checked against an independent implementation.
+# ---------------------------------------------------------------------------
+
+def my_hmac(key: bytes, msg: bytes) -> bytes:
+    if len(key) > 64:
+        key = hashlib.sha256(key).digest()
+    key = key.ljust(64, b"\x00")
+    inner = hashlib.sha256(bytes(b ^ 0x36 for b in key) + msg).digest()
+    return hashlib.sha256(bytes(b ^ 0x5C for b in key) + inner).digest()
+
+
+def my_hkdf(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    prk = my_hmac(salt, ikm)
+    out, t, i = b"", b"", 1
+    while len(out) < length:
+        t = my_hmac(prk, t + info + bytes([i]))
+        out += t
+        i += 1
+    return out[:length]
+
+
+def lib_hkdf(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    return HKDF(algorithm=hashes.SHA256(), length=length, salt=salt, info=info).derive(ikm)
+
+
+def hmac256(key: bytes, msg: bytes) -> bytes:
+    a = my_hmac(key, msg)
+    b = std_hmac.new(key, msg, hashlib.sha256).digest()
+    if a != b:
+        raise Failure("crypto: own HMAC disagrees with the standard library")
+    return a
+
+
+def key_id_of(secret: str, model: dict, mut: frozenset) -> str:
+    ikm = secret.encode("utf-8")
+    if "kid_raw_ikm" in mut:
+        try:
+            ikm = bytes.fromhex(secret)
+        except ValueError:
+            pass
+    salt, info = model["kid_salt"].encode(), model["kid_info"].encode()
+    if "kid_salt_info_swapped" in mut:
+        salt, info = info, salt
+    n = model["kid_len"] * (2 if "kid_len_32" in mut else 1)
+    a = my_hkdf(ikm, salt, info, n)
+    if a != lib_hkdf(ikm, salt, info, n):
+        raise Failure("crypto: own HKDF disagrees with cryptography")
+    return model["kid_prefix"] + a.hex()
+
+
+# ---------------------------------------------------------------------------
+# Canonical JSON for the HMAC object: this script's own serialiser, held to
+# the Python equivalent gateway-mqtt-canonical-json/v1 gives.
+# ---------------------------------------------------------------------------
+
+def canon_str(s: str) -> str:
+    out = ['"']
+    short = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    for ch in s:
+        if ch in short:
+            out.append(short[ch])
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def canon(v: object) -> str:
+    if isinstance(v, dict):
+        return "{" + ",".join(canon_str(k) + ":" + canon(v[k]) for k in sorted(v)) + "}"
+    if isinstance(v, str):
+        return canon_str(v)
+    if isinstance(v, bool) or v is None:
+        return json.dumps(v)
+    if isinstance(v, int):
+        return str(v)
+    raise Failure(f"canonical: unexpected value {v!r}")
+
+
+def canon_bytes(v: dict) -> bytes:
+    a = canon(v).encode("utf-8")
+    b = json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    if a != b:
+        raise Failure("canonical: own serialiser disagrees with the Python equivalent")
+    return a
+
+
+# ---------------------------------------------------------------------------
+# Requests.
+# ---------------------------------------------------------------------------
+
+def header_map(headers: list) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for name, value in headers:
+        out.setdefault(name.lower(), []).append(value)
+    return out
+
+
+LAST_WINS: list = []  # a wrong judge that reads the last of repeated headers
+
+
+def hval(hm: dict[str, list[str]], name: str) -> str | None:
+    v = hm.get(name.lower())
+    if v and LAST_WINS:
+        return v[-1]
+    return v[0] if v and len(v) == 1 else None
+
+
+def hmac_object(hm: dict, model: dict, mut: frozenset) -> dict | None:
+    # Built only from a request that holds exactly one of each required header.
+    if "hmac_partial_headers" not in mut and any(len(hm.get(h.lower(), [])) != 1 for h in model["headers"]):
+        return None
+    obj: dict = {}
+    for k, kind, src in model["hmac_members"]:
+        if kind == "const":
+            obj[k] = src if not ("method_lower" in mut and k == "method") else src.lower()
+        else:
+            v = hval(hm, src)
+            if v is None:
+                return None
+            if kind == "int":
+                # "the integer the header carries": a header that is an
+                # integer's own spelling, whatever its range; a leading zero
+                # or a sign spells no JSON integer token.
+                if not re.fullmatch(r"0|[1-9][0-9]*" if "hmac_any_digits" not in mut else r"[0-9]+", v):
+                    return None
+                obj[k] = v if "sent_at_as_string" in mut else int(v)
+            else:
+                # A wrong judge that writes a digits-only string as a number token.
+                obj[k] = int(v) if ("num_for_string_hmac" in mut and re.fullmatch(r"[1-9][0-9]*", v)) else v
+    if "hmac_drop_path" in mut:
+        obj.pop("path", None)
+    return obj
+
+
+def hmac_input(hm: dict, model: dict, mut: frozenset) -> bytes | None:
+    obj = hmac_object(hm, model, mut)
+    if obj is None:
+        return None
+    prefix = model["hmac_prefix"]
+    if "hmac_no_nul" in mut:
+        prefix = prefix[:-1]
+    if "num_for_string_hmac" in mut or "sent_at_as_string" in mut:
+        return prefix + json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    return prefix + canon_bytes(obj)
+
+
+def authorization(secret: str, msg: bytes, model: dict, mut: frozenset) -> str:
+    key = secret.encode("utf-8")
+    if "hmac_raw_key" in mut:
+        try:
+            key = bytes.fromhex(secret)
+        except ValueError:
+            pass
+    return model["auth_prefix"] + hmac256(key, msg).hex()
+
+
+def body_digest(body: bytes, model: dict, mut: frozenset) -> str:
+    if "digest_of_hex" in mut:
+        return model["digest_prefix"] + hashlib.sha256(body.hex().encode()).hexdigest()
+    return model["digest_prefix"] + hashlib.sha256(body).hexdigest()
+
+
+def strict_json(raw: bytes) -> object:
+    def pairs(ps):
+        d = {}
+        for k, v in ps:
+            if k in d:
+                raise ValueError(f"duplicate member {k}")
+            d[k] = v
+        return d
+
+    def const(c):
+        raise ValueError(f"constant {c}")
+
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=const)
+
+
+class Receiver:
+    """The receiver's state a request case is judged against."""
+
+    def __init__(self, now_ms: int, registry: dict[str, dict], held: set, secrets: dict[str, str],
+                 enrolments: dict | None = None, records: list | None = None):
+        self.now_ms = now_ms
+        self.registry = registry        # client_id -> {"key_ids", "devices", "owners"}
+        self.held = held                # reserved (client_id, key_id, nonce) triples
+        self.secrets = secrets          # every test secret by the key_id it derives
+        self.enrolments = enrolments or {}  # device_id -> {key_identity: (raw public key, owner)}
+        self.records = records or []    # [(parsed record, exact bytes, held_as)]
+
+
+# ---------------------------------------------------------------------------
+# Check 6: the body is a record, under alert-delivery/v1.md *Verifying* check
+# 1 (Carriage and custody checks 1 to 4): this script's own reading of the
+# member tables, the canonical form and the payload member rule.
+# ---------------------------------------------------------------------------
+
+class Tok:
+    """A JSON number token, kept as spelled."""
+
+    def __init__(self, raw: str, integer: bool):
+        self.raw, self.integer = raw, integer
+
+    def __eq__(self, other):
+        return isinstance(other, Tok) and other.raw == self.raw
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class MemberRule(Exception):
+    pass
+
+
+def parse_record(body: bytes) -> object:
+    """Parse under the payload member rule; raises MemberRule(reason)."""
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        raise MemberRule("invalid_unicode")
+    if re.search(r"\\u[dD][89abAB][0-9a-fA-F]{2}(?!\\u[dD][c-fC-F][0-9a-fA-F]{2})", text) or \
+            re.search(r"(?<!\\u[dD][89abAB][0-9a-fA-F]{2})\\u[dD][c-fC-F][0-9a-fA-F]{2}", text):
+        raise MemberRule("invalid_unicode")
+
+    def pairs(ps):
+        d = {}
+        folded: dict[str, str] = {}
+        for k, v in ps:
+            if k in d:
+                raise MemberRule("duplicate_member")
+            f = k.casefold()
+            if f in folded:
+                raise MemberRule("case_variant_member")
+            folded[f] = k
+            d[k] = v
+        return d
+
+    def const(c):
+        raise MemberRule("malformed_json")
+
+    dec = json.JSONDecoder(object_pairs_hook=pairs, parse_int=lambda s: Tok(s, True),
+                           parse_float=lambda s: Tok(s, False), parse_constant=const)
+    ws = " \t\n\r"
+    i = 0
+    while i < len(text) and text[i] in ws:
+        i += 1
+    try:
+        obj, end = dec.raw_decode(text, i)
+    except MemberRule:
+        raise
+    except ValueError:
+        raise MemberRule("malformed_json")
+    if text[end:].strip(ws):
+        raise MemberRule("trailing_data")
+    if not isinstance(obj, dict):
+        raise MemberRule("not_an_object")
+    return obj
+
+
+def canon_tok(v: object) -> str:
+    if isinstance(v, dict):
+        return "{" + ",".join(canon_str(k) + ":" + canon_tok(v[k]) for k in sorted(v)) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(canon_tok(x) for x in v) + "]"
+    if isinstance(v, Tok):
+        return v.raw
+    if isinstance(v, str):
+        return canon_str(v)
+    return json.dumps(v)
+
+
+MAX_INT = 2 ** 53 - 1
+
+
+def member_ok(name: str, rule: str, v: object, model: dict, mut: frozenset) -> bool:
+    def integer(x):
+        return isinstance(x, Tok) and x.integer and re.fullmatch(r"[1-9][0-9]*", x.raw) and int(x.raw) <= MAX_INT
+
+    nullable = "or `null`" in rule or rule.startswith("`null`")
+    if v is None:
+        return nullable
+    if rule.startswith("The integer `"):
+        return integer(v) and v.raw == ticks(rule)[0]
+    if rule.startswith('`"'):
+        return isinstance(v, str) and v == ticks(rule)[0].strip('"')
+    m = re.search(r"[Mm]atch(?:es|ing) `(\^.*?\$)`", rule)
+    if m:
+        return isinstance(v, str) and v.isascii() and re.fullmatch(m.group(1).replace("\\|", "|"), v) is not None
+    if name == "key_identity":
+        return isinstance(v, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", v) is not None
+    if name == "signature":
+        import base64
+        if not isinstance(v, str) or not re.fullmatch(r"[A-Za-z0-9+/]{86}==", v):
+            return False
+        return base64.b64encode(base64.b64decode(v)).decode() == v
+    if name == "detail":
+        return isinstance(v, str) and v in model["detail_codes"]
+    if "at least `1`" in rule or "signing-clock value" in rule or "signing time" in rule:
+        return integer(v)
+    vocab = ticks(re.split(r"[:;]", rule)[0])
+    if vocab and all(re.fullmatch(r"[0-9]+", t) for t in vocab):
+        return integer(v) and v.raw in vocab
+    if vocab:
+        return isinstance(v, str) and v in [t for t in vocab if t != "null"]
+    raise Failure(f"text: member {name}'s form {rule!r} is not one this checker reads")
+
+
+def record_reason(body: bytes, model: dict, mut: frozenset) -> tuple[str | None, object]:
+    """The reason check 6 refuses the body for, or None; and the parsed record."""
+    try:
+        obj = parse_record(body)
+    except MemberRule as e:
+        return (model["member_rule_reason"] if "member_rule_own_reason" not in mut else str(e)), None
+    if canon_tok(obj).encode("utf-8") != body and "skip_canonical" not in mut:
+        return "not_canonical", obj
+    v = obj.get("v")
+    rule_int = isinstance(v, Tok) and v.integer and re.fullmatch(r"[1-9][0-9]*", v.raw) and int(v.raw) <= MAX_INT
+    if "version_any_integer" in mut:
+        rule_int = isinstance(v, Tok) and v.integer
+    if rule_int and v.raw != "1" and "version_malformed" not in mut:
+        return "unsupported_version", obj
+    kind = obj.get("kind")
+    spec = model["kinds"].get(kind) if isinstance(kind, str) else None
+    if spec is None or set(obj) != set(spec):
+        return "malformed", obj
+    for name, rule in spec.items():
+        if not member_ok(name, rule, obj[name], model, mut):
+            return "malformed", obj
+    return None, obj
+
+
+# ---------------------------------------------------------------------------
+# Check 8: alert-delivery/v1.md *Verifying* checks 3 to 5, on the record
+# alone, from this script's reading of the observation, class and detail
+# tables. The signature is verified through `cryptography` (OpenSSL).
+# ---------------------------------------------------------------------------
+
+def ad_rules(texts: dict[str, str]) -> dict:
+    ad = texts["ad"]
+    obs = table_rows(section(ad, "Observations of one attempt"), "`observation_seq`")
+    allowed = {}
+    for r in obs:
+        seq, prior = ticks(r[0])[0], ticks(r[1])[0]
+        allowed[(seq, prior)] = set(ticks(r[2]))
+    det = table_rows(section(ad, "Detail codes"), "`outcome`")
+    detail = {ticks(r[0])[0]: set(ticks(r[1])) for r in det}
+    mand = one(r"`([a-z_]+)` and `([a-z_]+)` are \*\*mandatory\*\*\.", section(ad, "Notices"), "mandatory").groups()
+    one(r"- In a submission observation, a mandatory notice with a non-`null` class is\s+refused as `class_refused`\.", ad, "class rule 1")
+    one(r"- In a tally, `reason: \"disabled\"` with `class: null` is refused as\s+`class_refused`", ad, "class rule 2")
+    one(r"and also when `prior_outcome` is `accepted` and the code is not\s+`provider_reported_failure` or `null`, or `prior_outcome` is not `accepted` and\s+the code is `provider_reported_failure`\.", ad, "detail rule")
+    order = one(r"5\. The rules that relate members, in this order: the observation table,\s+`([a-z_]+)`; the class rules of \[Class\]\(#class\), `([a-z_]+)`;\s+the detail table, `([a-z_]+)`\.", ad, "Verifying check 5").groups()
+    v3 = one(r"3\. \*\*Key binding\.\*\* `key_identity` names a report key enrolled for `device_id`,\s+for report signing, and not revoked, under \[Key trust\]\(#key-trust\):\s+`([a-z_]+)`\. A revoked key is not enrolled\.", ad, "Verifying check 3").group(1)
+    v4 = one(r"4\. The signature fails under that key: `([a-z_]+)`\.", ad, "Verifying check 4").group(1)
+    return {"obs": allowed, "detail": detail, "mandatory": set(mand), "v5": order, "v3": v3, "v4": v4}
+
+
+def jv(x: object) -> object:
+    """A member's value as text: a number token's spelling, null as 'null'."""
+    if isinstance(x, Tok):
+        return x.raw
+    return "null" if x is None else x
+
+
+def verify_faults(obj: dict, enrolled: dict[str, bytes] | None, model: dict, mut: frozenset) -> list[str]:
+    """The reasons of *Verifying* checks 3, 4 and 5 the record fails, in order;
+    `enrolled` maps each key_identity enrolled for the record's device to its
+    raw public key."""
+    import base64
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    rules = model["ad_rules"]
+    out = []
+    pub = (enrolled or {}).get(obj.get("key_identity"))
+    if pub is None and "skip_key_binding" not in mut:
+        out.append(rules["v3"])
+    if pub is not None:
+        unsigned = {k: v for k, v in obj.items() if k != "signature"}
+        try:
+            Ed25519PublicKey.from_public_bytes(pub).verify(base64.b64decode(obj["signature"]),
+                                                          model["record_prefix"] + canon_tok(unsigned).encode("utf-8"))
+        except Exception:
+            if "skip_signature" not in mut:
+                out.append(rules["v4"])
+    trans, cls, det = rules["v5"]
+    if obj.get("kind") == "submission":
+        seq, prior, outcome = jv(obj["observation_seq"]), jv(obj["prior_outcome"]), jv(obj["outcome"])
+        if outcome not in rules["obs"].get((seq, prior), set()) and "skip_transition" not in mut:
+            out.append(trans)
+        if obj["notice"] in rules["mandatory"] and obj["class"] is not None and "skip_class" not in mut:
+            out.append(cls)
+        code = jv(obj["detail"])
+        bad_detail = code not in rules["detail"].get(outcome, set())
+        if prior == "accepted" and code not in ("provider_reported_failure", "null"):
+            bad_detail = True
+        if prior != "accepted" and code == "provider_reported_failure":
+            bad_detail = True
+        if bad_detail and "skip_detail" not in mut:
+            out.append(det)
+    else:
+        if obj.get("reason") == "disabled" and obj.get("class") is None and "skip_class" not in mut:
+            out.append(cls)
+    return out
+
+
+def request_faults(headers: list, body: bytes, rcv: Receiver, model: dict, mut: frozenset, line: str = "") -> dict[int, str]:
+    """Every check of *Order* 1 to 7, each judged on its own; the map holds the
+    checks that fail and why. Where an earlier check leaves a later one
+    without its input (no credential selected, no integer to sign), the later
+    one is judged on what it can see: check 4 under the test secret the
+    header's key_id derives from, failing when there is none or no HMAC
+    input."""
+    f: dict[int, str] = {}
+    HOLD[:] = []
+    VF[:] = []
+    H = model["h"]
+    hm = header_map(headers)
+    L = model["limits"]
+    # 1. Limits.
+    why = []
+    bound = L["body"] + (1 if "body_bound_plus_one" in mut else 0)
+    if len(body) > bound and "skip_body_bound" not in mut:
+        why.append("body over its bound")
+    if len(headers) > L["headers"] and "skip_header_limits" not in mut:
+        why.append("too many headers")
+    size = (lambda n, v: len(v.encode("utf-8"))) if "header_bytes_value_only" in mut else (lambda n, v: len(f"{n}: {v}".encode("utf-8")))
+    if any(size(n, v) > L["header_bytes"] for n, v in headers) and "skip_header_limits" not in mut:
+        why.append("a header over its bound")
+    if len(line.encode("utf-8")) > L["request_line"] and "skip_request_line" not in mut:
+        why.append("request line over its bound")
+    cl = hm.get("content-length")
+    if (not cl or len(cl) != 1 or cl[0] != str(len(body))) and "skip_content_length" not in mut:
+        why.append("Content-Length is not the body's length")
+    if why:
+        f[1] = "; ".join(why)
+    # 2. Header forms, the request target, the content type and the body digest.
+    why = []
+    parts = line.split(" ")
+    if (len(parts) != 3 or parts[0] != model["method"]) and "skip_method" not in mut:
+        why.append("method is not POST")
+    if (len(parts) != 3 or parts[1] != model["path"]) and "target_prefix_ok" not in mut:
+        if not ("target_query_ok" in mut and len(parts) == 3 and parts[1].split("?", 1)[0] == model["path"]):
+            why.append("request target is not the path")
+    for name in model["headers"]:
+        vals = hm.get(name.lower())
+        if not vals:
+            why.append(f"missing {name}")
+        elif len(vals) != 1:
+            why.append(f"repeated {name}")
+        elif not re.fullmatch(form_of(name, model, mut), vals[0]) or (name == H["sent"] and sent_integer(hm, model, mut) is None):
+            why.append(f"malformed {name}")
+    ct = hm.get("content-type")
+    ct_ok = bool(ct) and len(ct) == 1 and (ct[0].lower() == model["request_content_type"].lower() if "content_type_exact" not in mut
+                                            else ct[0] == model["request_content_type"])
+    if "content_type_params_ok" in mut and ct and len(ct) == 1:
+        ct_ok = ct_ok or ct[0].split(";")[0].strip().lower() == model["request_content_type"]
+    if not ct_ok and "skip_content_type" not in mut:
+        why.append("Content-Type")
+    d = hval(hm, H["digest"])
+    if d is not None and d != body_digest(body, model, mut) and "skip_digest_check" not in mut:
+        why.append("digest mismatch")
+    if why:
+        f[2] = "; ".join(why)
+    # 3. The credential: (client_id, key_id), both byte for byte.
+    client = hval(hm, H["client"])
+    kid = hval(hm, H["kid"])
+    entry = rcv.registry.get(client) if client is not None else None
+    held_kids = set(entry["key_ids"]) if entry else set()
+    if "key_any_client" in mut:
+        held_kids = set().union(*[set(e["key_ids"]) for e in rcv.registry.values()])
+    msg = hmac_input(hm, model, mut)
+    got = hval(hm, H["auth"])
+    selected = kid in held_kids
+    tried = False
+    if not selected and "trial_verification" in mut and msg is not None and got is not None:
+        for k in held_kids:
+            if k in rcv.secrets and std_hmac.compare_digest(got, authorization(rcv.secrets[k], msg, model, frozenset())):
+                selected = tried = True
+    # A check is judged only when the request holds its inputs.
+    if not selected and (client is not None and kid is not None or "judge_without_inputs" in mut):
+        f[3] = "no held credential for (client_id, key_id)"
+    # 4. The HMAC.
+    secret = rcv.secrets.get(kid) if kid is not None else None
+    if "skip_hmac" not in mut and not tried and (msg is not None or "judge_without_inputs" in mut):
+        if secret is None or msg is None or got is None:
+            f[4] = "no secret the key_id derives from"
+        elif not std_hmac.compare_digest(got, authorization(secret, msg, model, mut)):
+            f[4] = "HMAC does not verify"
+    # 5. Freshness: skew, then the nonce reservation.
+    sent = sent_integer(hm, model, mut)
+    if "skip_skew" not in mut:
+        if sent is None:
+            v_ = hval(hm, H["sent"])
+            if "judge_without_inputs" in mut or (v_ is not None and re.fullmatch(r"0|[1-9][0-9]*", v_)):
+                # an integer's own spelling out of range is still a time: never fresh
+                f[5] = "sent_at_ms outside its range"
+        else:
+            delta = rcv.now_ms - sent
+            skew = model["skew"]
+            if "skew_one_sided" in mut:
+                stale = delta > skew
+            elif "skew_strict" in mut:
+                stale = abs(delta) >= skew
+            elif "skew_plus_one" in mut:
+                stale = abs(delta) > skew + 1
+            else:
+                stale = abs(delta) > skew
+            if stale:
+                f[5] = "sent_at_ms outside the skew"
+    nk = nonce_key(hm, model, mut)
+    if nk is not None and nk in rcv.held and "accept_reused_nonce" not in mut:
+        f[5] = (f[5] + "; " if 5 in f else "") + "nonce reused"
+    # 6. The body is a record.
+    reason, obj = record_reason(body, model, mut)
+    if reason is not None and "skip_record_form" not in mut:
+        f[6] = reason
+    # 7. Forwarding permission for the record's device_id.
+    dev = obj.get("device_id") if isinstance(obj, dict) and isinstance(obj.get("device_id"), str) else None
+    allowed = set(entry["devices"]) if entry else set()
+    if "permission_any_client" in mut:
+        allowed = set().union(*[set(e["devices"]) for e in rcv.registry.values()])
+    if dev is not None and (client is not None or "judge_without_inputs" in mut) and (reason is None or "permission_on_non_record" in mut):
+        if dev not in allowed:
+            known = any(dev in e["devices"] for e in rcv.registry.values())
+            f[7] = "device outside the client's set" if known else "unknown device"
+        else:
+            enr = rcv.enrolments.get(dev, {}).get(obj.get("key_identity"))
+            if enr is not None and enr[1] not in (entry["owners"] if entry else set()) and "skip_owner" not in mut:
+                f[7] = "the enrolment's owner is not the client's"
+    # 8. Verifying checks 3 to 6, on a record.
+    if reason is None and isinstance(obj, dict):
+        keys = {k: v[0] for k, v in rcv.enrolments.get(dev, {}).items()} if dev is not None else {}
+        if "key_any_device" in mut:
+            keys = {k: v[0] for d in rcv.enrolments.values() for k, v in d.items()}
+        vf = verify_faults(obj, keys, model, mut)
+        if vf:
+            f[8] = vf[0] if "verify_last_reason" not in mut else vf[-1]
+            VF[:] = [vf]
+        else:
+            HOLD[:] = [held_verdict(obj, body, rcv.records, model, mut)]
+    return f
+
+
+HOLD: list = []  # the last request's Verifying check 6 verdict
+VF: list = []    # the last request's Verifying check 3 to 5 reasons, in order
+
+
+def held_verdict(obj: dict, raw: bytes, records: list, model: dict, mut: frozenset) -> str:
+    """alert-delivery/v1.md *Verifying* check 6, against the records held."""
+    if any(r == raw for _, r, _ in records) and "no_duplicate" not in mut:
+        return "duplicate"
+    if "duplicate_stored_only" in mut and any(r == raw for _, r, h in records if h == "conflict"):
+        pass
+    pool = [(o, r) for o, r, h in records if h == "stored" or "conflict_is_earlier" in mut]
+    dev = obj["device_id"]
+    if obj["kind"] == "submission":
+        same_dev = [o for o, r in pool if o.get("device_id") == dev and o.get("kind") == "submission"]
+        for o, r in pool:
+            if o.get("kind") == "submission" and o.get("device_id") == dev and r != raw and \
+                    o["delivery_attempt_id"] == obj["delivery_attempt_id"] and jv(o["observation_seq"]) == jv(obj["observation_seq"]):
+                return "conflict"
+        for o in same_dev:
+            if o["delivery_attempt_id"] == obj["delivery_attempt_id"]:
+                if any(jv(o[k]) != jv(obj[k]) for k in ("alert_id", "notice", "class", "channel", "attempt_seq", "attempted_at_ms")):
+                    return "conflict"
+                a, b = int(jv(o["observation_seq"])), int(jv(obj["observation_seq"]))
+                if a == b - 1 and jv(obj["prior_outcome"]) != jv(o["outcome"]):
+                    return "conflict"
+                if b == a - 1 and jv(o["prior_outcome"]) != jv(obj["outcome"]):
+                    return "conflict"
+            if o["alert_id"] == obj["alert_id"] and (jv(o["notice"]), jv(o["class"])) != (jv(obj["notice"]), jv(obj["class"])):
+                return "conflict"
+            if jv(o["attempt_seq"]) == jv(obj["attempt_seq"]) and o["delivery_attempt_id"] != obj["delivery_attempt_id"]:
+                return "conflict"
+        return "stored"
+    key = lambda o: (o.get("device_id"), o.get("key_identity"), o.get("channel"), o.get("class"), o.get("reason"), o.get("month"))  # noqa: E731
+    same = [(o, r) for o, r in pool if o.get("kind") == obj["kind"] and key(o) == key(obj)]
+    n = int(jv(obj["count"]))
+    if any(int(jv(o["count"])) == n and r != raw for o, r in same) and "lower_before_conflict" not in mut:
+        return "conflict"
+    if same and n < max(int(jv(o["count"])) for o, _ in same) and "skip_lower_count" not in mut:
+        return "lower_count"
+    if any(int(jv(o["count"])) == n and r != raw for o, r in same):
+        return "conflict"
+    return "stored"
+
+
+def form_of(name: str, model: dict, mut: frozenset) -> str:
+    H = model["h"]
+    form = model["forms"][name]
+    if "hex_any_case" in mut:
+        form = form.replace("[0-9a-f]", "[0-9a-fA-F]")
+    if "client_any_length" in mut and name == H["client"]:
+        form = r"[\x20-\x7e]*"
+    if "client_any_char" in mut and name == H["client"]:
+        form = r"[^\r\n]{1,128}"
+    if "sent_any_integer" in mut and name == H["sent"]:
+        form = r"[0-9]+"
+    return form
+
+
+def sent_integer(hm: dict, model: dict, mut: frozenset) -> int | None:
+    """The integer X-Ori-Alert-Sent-At-Ms carries, when it is of its form."""
+    v = hval(hm, model["h"]["sent"])
+    if v is None or not re.fullmatch(form_of(model["h"]["sent"], model, mut), v):
+        return None
+    n = int(v)
+    lo, hi = model["sent_range"]
+    if not lo <= n <= hi and "sent_unbounded" not in mut:
+        return None
+    return n
+
+
+def nonce_key(hm: dict, model: dict, mut: frozenset) -> tuple | None:
+    src = {k: s for k, kind, s in model["hmac_members"]}
+    key = model["nonce_key"]
+    if "nonce_key_nonce_only" in mut:
+        key = ("nonce",)
+    vals = tuple(hval(hm, src[k]) for k in key)
+    return None if any(v is None for v in vals) else vals
+
+
+def held_key(triple: list, model: dict, mut: frozenset) -> tuple:
+    if "nonce_key_nonce_only" in mut:
+        return (triple[model["nonce_key"].index("nonce")],)
+    return tuple(triple)
+
+
+def request_verdict(faults: dict[int, str], headers: list, model: dict, mut: frozenset) -> dict:
+    """The receiver's answer: the first failing check of *Order*, its status,
+    its outcome, its reason from check 6 on, and whether the response names the
+    record digest."""
+    if not faults:
+        hv = HOLD[0] if HOLD else "stored"
+        outcome = model["held_outcome"][hv]
+        return {"outcome": "accepted", "check": None, "status": 200, "response_names_digest": True,
+                "response_outcome": outcome, "reason": model["held_reason"][hv], "receiver_verdict": hv}
+    order = list(range(1, 9))
+    for a, b in (("order_2_before_1", (0, 1)), ("order_3_before_2", (1, 2)), ("order_4_before_3", (2, 3)),
+                 ("order_5_before_4", (3, 4)), ("order_6_before_5", (4, 5)), ("order_8_before_7", (6, 7))):
+        if a in mut:
+            order[b[0]], order[b[1]] = order[b[1]], order[b[0]]
+    first = next(c for c in order if c in faults)
+    out = {"outcome": "refused", "check": first}
+    if first == 6:
+        reason = faults[6]
+        out["status"] = model["form_reasons"].get(reason, model["form_reasons"]["malformed"])
+        out["response_outcome"] = model["form_outcome"].get(reason, "refused")
+        out["reason"] = reason
+        if reason == "unsupported_version" and "version_refused" in mut:
+            out["status"], out["response_outcome"] = 400, "refused"
+    elif first == 8:
+        reason = faults[8]
+        out["status"], out["response_outcome"] = model["verify_status"][reason]
+        out["reason"] = reason
+        if reason == model["ad_rules"]["v3"] and "key_not_enrolled_422" in mut:
+            out["status"], out["response_outcome"] = 422, "refused"
+    elif first == 7:
+        out["response_outcome"] = "refused"
+        out["status"] = model["check_status"][7]
+        out["reason"] = model["permission_reason"]
+        if faults[7] == "unknown device" and "unknown_device_differs" in mut:
+            out["status"] = 404
+        if "permission_401" in mut:
+            out["status"] = 401
+    else:
+        out["response_outcome"] = "refused"
+        out["reason"] = ""
+        out["status"] = model["check_status"][first]
+        if first in (3, 4, 5) and "auth_fail_400" in mut:
+            out["status"] = 400
+        if first == 5 and "replay_409" in mut and "nonce reused" in faults[5]:
+            out["status"] = 409
+        if first in (1, 2) and "malformed_401" in mut:
+            out["status"] = 401
+    out["response_names_digest"] = first >= model["auth_checks_passed_at"] or "digest_on_unauthenticated" in mut
+    if first == 7 and "permission_unauthenticated" in mut:
+        out["response_names_digest"] = False
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Responses.
+# ---------------------------------------------------------------------------
+
+def response_judgement(status: int, body: bytes, request_digest: str, model: dict,
+                       mut: frozenset) -> tuple[str, str | None, str | None]:
+    """(gateway action, the way it retires nothing or None, the outcome named),
+    classed in the text's order: does not parse (members, `v`, `outcome`,
+    `record_digest`'s form), unauthenticated, another digest, unpaired, a
+    reason the row does not name (does not parse), else the row's action."""
+    try:
+        obj = strict_json(body)
+    except (ValueError, UnicodeDecodeError):
+        return "keep", "unparsable", None
+    if isinstance(obj, list) and obj and "unwrap_array" in mut:
+        obj = obj[0]
+    if not isinstance(obj, dict):
+        return "keep", "unparsable", None
+    outcome = obj.get("outcome") if isinstance(obj.get("outcome"), str) else None
+    keys = set(obj)
+    unauth = keys == set(model["unauth_members"])
+    # 1. Does not parse.
+    if not unauth and keys != set(model["response_members"]) and "open_response_form" not in mut:
+        return "keep", "unparsable", outcome
+    v = obj.get("v")
+    if not (is_int(v) and v == model["response_v"]) and "skip_v" not in mut:
+        return "keep", "unparsable", outcome
+    if unauth:
+        # The first form is whole: `outcome` refused, `reason` "", status 400 or 401.
+        if (outcome != model["unauth_outcome"] or obj.get("reason") != "" or status not in model["unauth_statuses"]) \
+                and "unauth_any" not in mut:
+            return "keep", "unparsable", outcome
+    elif outcome not in model["outcomes"]:
+        return "keep", "unparsable", outcome
+    rd = obj.get("record_digest")
+    if not unauth and not (isinstance(rd, str) and re.fullmatch(model["forms"][model["h"]["digest"]], rd)):
+        if not ("digest_case_insensitive" in mut and isinstance(rd, str) and rd.lower() == request_digest):
+            return "keep", "unparsable", outcome
+    # 2. Unauthenticated.
+    if unauth and "act_unauthenticated" not in mut:
+        return "keep", "unauthenticated", outcome
+    # 3. Another digest.
+    if not unauth and rd != request_digest:
+        if "retire_on_mismatched_digest" in mut:
+            pass
+        elif "digest_case_insensitive" in mut and isinstance(rd, str) and rd.lower() == request_digest.lower():
+            pass
+        else:
+            return "keep", "another_digest", outcome
+    # 4. Unpaired.
+    if "outcome_only" in mut:
+        acts = sorted({a for (s_, o), a in model["pairs"].items() if o == outcome})
+        return (acts[-1], None, outcome) if acts else ("keep", "unpaired", outcome)
+    act = model["pairs"].get((status, outcome))
+    if act is None:
+        if "status_class_only" in mut and 200 <= status < 300 and outcome in ("stored", "duplicate", "superseded"):
+            return "retire", None, outcome
+        return "keep", "unpaired", outcome
+    # 5. A reason the row does not name.
+    if obj.get("reason") not in model["response_reasons"][(status, outcome)] and "skip_reason" not in mut:
+        return "keep", "unparsable", outcome
+    if "reason_before_pair" in mut:
+        pass
+    if status in (401, 403) and "retire_on_401_403" in mut:
+        act = "retire"
+    if status in (401, 403) and "reject_on_401_403" in mut:
+        act = "reject"
+    if status == 202 and "retire_on_202" in mut:
+        act = "retire"
+    if act == "reject" and "keep_on_reject" in mut:
+        act = "keep"
+    if status == 422 and "retire_on_422" in mut:
+        act = "retire"
+    if status in (429, 503) and "reject_on_backpressure" in mut:
+        act = "reject"
+    return act, None, outcome
+
+
+def response_judgement_mut(status, body, request_digest, model, mut):
+    """A wrong judge that checks the reason against every reason its outcome
+    can carry before it pairs the status: unpaired cases then do not parse."""
+    act, way, outcome = response_judgement(status, body, request_digest, model, frozenset(m for m in mut if m != "reason_before_pair"))
+    if "reason_before_pair" in mut and way == "unpaired":
+        try:
+            obj = strict_json(body)
+            by_status = set().union(*[r for (s_, o), r in model["response_reasons"].items() if s_ == status])
+            if obj.get("reason") not in by_status:
+                return "keep", "unparsable", outcome
+        except Exception:
+            pass
+    return act, way, outcome
+
+
+# ---------------------------------------------------------------------------
+# Config: gateway-config/v2.md `alert_delivery` load rules.
+# ---------------------------------------------------------------------------
+
+WHITE_SPACE = set("\u0009\u000a\u000b\u000c\u000d \u0085  "
+                  "           "
+                  "    　")
+
+
+def ws_trim(s: str) -> str:
+    i, j = 0, len(s)
+    while i < j and s[i] in WHITE_SPACE:
+        i += 1
+    while j > i and s[j - 1] in WHITE_SPACE:
+        j -= 1
+    return s[i:j]
+
+
+def clean(path: str) -> list[str]:
+    parts: list[str] = []
+    for c in path.split("/"):
+        if c in ("", "."):
+            continue
+        if c == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(c)
+    return parts
+
+
+def related(a: list[str], b: list[str]) -> bool:
+    n = min(len(a), len(b))
+    return a[:n] == b[:n]
+
+
+ABSENT = object()
+
+
+def dig(cfg: dict, dotted: str) -> object:
+    v: object = cfg
+    for p in dotted.split("."):
+        if not isinstance(v, dict) or p not in v:
+            return ABSENT
+        v = v[p]
+    return v
+
+
+def load_verdict(cfg: dict, model: dict, mut: frozenset) -> tuple[str | None, bool | None]:
+    """(the first rule broken or None, whether forwarding is configured when
+    loaded and enabled, else None)."""
+    ad = cfg.get("alert_delivery")
+    if not isinstance(ad, dict):
+        return None, None
+    if model.get("cfg_rules_unknown"):
+        return "<text rules changed>", None
+    R = model["cfg_rules"]
+
+    def is_str(v):
+        if "num_for_string_config" in mut and isinstance(v, (int, float)) and not isinstance(v, bool):
+            return True
+        return isinstance(v, str)
+
+    if "enabled" in ad and not isinstance(ad["enabled"], bool):
+        return R[0], None
+    if ad.get("enabled", False) is not True and "validate_disabled" not in mut:
+        return None, None
+    for k in ["queue_directory", "max_records_per_device"] + model["env_keys"]:
+        if k not in ad:
+            continue
+        v = ad[k]
+        if v is None and "null_as_absent" in mut:
+            continue
+        if k in model["env_keys"] and ("env_types_unchecked" in mut or k not in model["cfg_string_keys"]):
+            continue
+        ok = is_int(v) if model["cfg_types"][k] == "int" else is_str(v)
+        if not ok:
+            return R[0], None
+
+    def val(k):
+        v = ad.get(k)
+        if v is None:
+            return None
+        return v if isinstance(v, str) else str(v)
+
+    qd = val("queue_directory")
+    tq = ws_trim(qd) if qd is not None else ""
+    if not tq:
+        return R[1], None
+    if not tq.startswith("/"):
+        return R[2], None
+    others = []
+    sd = dig(cfg, "gateway.state_directory")
+    if isinstance(sd, str) and ws_trim(sd):
+        others.append(ws_trim(sd))
+    if dig(cfg, "evidence.enabled") is True:
+        for k in ("evidence.queue_directory", "evidence.return_queue_directory"):
+            o = dig(cfg, k)
+            if isinstance(o, str) and ws_trim(o):
+                others.append(ws_trim(o))
+    if any(related(clean(tq), clean(o)) for o in others):
+        return R[3], None
+    mr = ad.get("max_records_per_device", model["cfg_default_max"])
+    lo, hi = model["cfg_range"]
+    if not lo <= mr <= hi:
+        return R[4], None
+    keys = list(model["env_keys"])
+    if "env_order_reversed" in mut:
+        keys.reverse()
+    present = [k for k in keys if val(k) or ("whitespace_is_empty" in mut and val(k) and ws_trim(val(k)))]
+    if "whitespace_is_empty" in mut:
+        present = [k for k in keys if val(k) and ws_trim(val(k))]
+    rules = [R[5], R[6], R[7]]
+    if "rules_6_7_swapped" in mut:
+        rules[0], rules[1] = rules[1], rules[0]
+    for rule in rules:
+        if f"drop:{rule}" in mut:
+            continue
+        if rule == R[5]:
+            if 0 < len(present) < len(keys) and not ("incomplete_needs_secret" in mut and "secret_env" not in present):
+                return rule, None
+            if "absent_means_incomplete" in mut and len(present) < len(keys):
+                return rule, None
+        elif rule == R[6]:
+            for k in keys:
+                v = val(k)
+                if not v:
+                    continue
+                ws = set(" \t\r\n") if "ascii_whitespace" in mut else set(WHITE_SPACE)
+                if "zero_width_is_space" in mut:
+                    ws.add("​")
+                if any(c in ws for c in v) or (model["env_bad_char"] in v and "allow_equals" not in mut):
+                    return rule, None
+        else:
+            s = val("secret_env")
+            if not s:
+                continue
+            for other in model["shared_with"]:
+                if f"shared_skip:{other}" in mut:
+                    continue
+                if other.startswith("evidence.") and "shared_evidence_needs_enabled" in mut \
+                        and dig(cfg, "evidence.enabled") is not True:
+                    continue
+                o = dig(cfg, other)
+                if o is ABSENT and "shared_no_defaults" not in mut:
+                    o = model["shared_defaults"][other]
+                if "shared_case_insensitive" in mut and isinstance(o, str) and o.lower() == s.lower() and o:
+                    return rule, None
+                if isinstance(o, str) and o != "" and o == s:
+                    return rule, None
+    return None, len(present) == len(keys)
+
+
+# ---------------------------------------------------------------------------
+# Corpus schema: a corpus object records which members the checker reads.
+# ---------------------------------------------------------------------------
+
+class Seen(dict):
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.read: set = set()
+
+    def __getitem__(self, k):
+        self.read.add(k)
+        return super().__getitem__(k)
+
+    def get(self, k, default=None):
+        self.read.add(k)
+        return super().get(k, default)
+
+    def __contains__(self, k):
+        self.read.add(k)
+        return super().__contains__(k)
+
+    def __iter__(self):
+        self.read.update(super().keys())
+        return super().__iter__()
+
+    def items(self):
+        self.read.update(super().keys())
+        return [(k, super(Seen, self).__getitem__(k)) for k in super().keys()]
+
+    def keys(self):
+        self.read.update(super().keys())
+        return super().keys()
+
+    def values(self):
+        return [self[k] for k in super().keys()]
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+def watch(v: object) -> object:
+    if isinstance(v, dict):
+        return Seen({k: watch(x) for k, x in v.items()})
+    if isinstance(v, list):
+        return [watch(x) for x in v]
+    return v
+
+
+def plain(v: object) -> object:
+    """A plain copy, which reads every member of it."""
+    if isinstance(v, Seen):
+        return {k: plain(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [plain(x) for x in v]
+    return v
+
+
+def unread(v: object, path: str, out: list[str]) -> None:
+    """The corpus schema is closed at every level: each member of each object
+    must be one this checker read there."""
+    if isinstance(v, Seen):
+        for k in dict.keys(v):
+            if k not in v.read:
+                out.append(f"schema: {path}.{k} is a member this checker never reads")
+            unread(dict.__getitem__(v, k), f"{path}.{k}", out)
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            unread(x, f"{path}[{i}]", out)
+
+
+# ---------------------------------------------------------------------------
+# The corpus.
+# ---------------------------------------------------------------------------
+
+def is_int(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def runtime_keys_check(keys: list, bad: Callable[[str], None]) -> dict[str, bytes]:
+    """The runtime test keys the bodies are signed under, by key_identity:
+    alert-delivery/v1's matter rather than this contract's, checked with
+    OpenSSL through `cryptography`."""
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    out: dict[str, bytes] = {}
+    names = set()
+    for rk in keys:
+        if rk["name"] in names:
+            bad(f"runtime_test_keys: {rk['name']} repeated")
+        names.add(rk["name"])
+        if rk["seed_label"] != f"ori alert-delivery-transport/v1 {rk['name']} test key":
+            bad(f"runtime_test_keys.{rk['name']}: seed_label does not name the key")
+        seed = hashlib.sha256(rk["seed_label"].encode("ascii")).digest()
+        pub = Ed25519PrivateKey.from_private_bytes(seed).public_key()
+        raw = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        if rk["public_key"] != "ed25519:" + base64.b64encode(raw).decode():
+            bad(f"runtime_test_keys.{rk['name']}: public_key is not the key its seed label's SHA-256 derives")
+        der = pub.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        if rk["key_identity"] != "sha256:" + hashlib.sha256(der).hexdigest():
+            bad(f"runtime_test_keys.{rk['name']}: key_identity is not SHA-256 over the SPKI DER")
+        out[rk["key_identity"]] = raw
+    return out
+
+
+def check(corpus: object, model: dict, mut: frozenset = frozenset()) -> list[str]:
+    errs: list[str] = []
+    if not isinstance(corpus, dict):
+        return ["fatal: corpus root is not an object"]
+    w = watch(corpus)
+    LAST_WINS[:] = [True] if "header_last_wins" in mut else []
+    try:
+        _check(w, model, mut, errs.append)
+        unread(w, "corpus", errs)
+    except Failure as e:
+        errs.append(f"fatal: {e}")
+    except (KeyError, TypeError, AttributeError, ValueError, IndexError) as e:
+        errs.append(f"fatal: corpus shape: {type(e).__name__}: {e}")
+    finally:
+        LAST_WINS[:] = []
+    return errs
+
+
+LAST_COVERAGE: dict[str, list[str]] = {}
+
+
+def _check(c: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> None:
+    if c["contract"] != "alert-delivery-transport/v1":
+        bad("contract: not alert-delivery-transport/v1")
+    desc = c["description"]
+    if not set(desc.keys()) <= set(dict.keys(c)) - {"contract", "description"} or not all(isinstance(v, str) for v in desc.values()):
+        bad("description: not one string for each of some of the corpus's sections")
+
+    L = model["limits"]
+    ep = c["endpoint"]
+    want = {"method": model["method"], "path": model["path"], "request_content_type": model["request_content_type"],
+            "max_request_line_bytes": L["request_line"], "max_headers": L["headers"], "max_header_bytes": L["header_bytes"],
+            "max_body_bytes": model["max_body"], "skew_ms": model["skew"],
+            "hmac_domain_hex": model["hmac_prefix"].hex(), "key_id_salt": model["kid_salt"], "key_id_info": model["kid_info"]}
+    for k, v in want.items():
+        if k not in ep or ep[k] != v or type(ep[k]) is not type(v):
+            bad(f"endpoint.{k}: {ep.get(k)!r} is not the text's {v!r}")
+    for k in ep.keys():
+        if k not in want:
+            bad(f"endpoint.{k}: a member the text gives no value for")
+
+    # Test secrets and their key_ids.
+    secrets: dict[str, str] = {}
+    names = set()
+    for i, k in enumerate(c["key_ids"]):
+        where = f"key_ids[{i}] {k['name']}"
+        if k["name"] in names:
+            bad(f"{where}: name repeated")
+        names.add(k["name"])
+        label = model["secret_label"].replace("<name>", k["name"])
+        if k["label"] != label:
+            bad(f"{where}: label is not the text's label")
+        if k["secret"] != hashlib.sha256(label.encode("ascii")).hexdigest():
+            bad(f"{where}: secret is not the SHA-256 of its label as 64 lowercase hex")
+        kid = key_id_of(k["secret"], model, mut)
+        if k["key_id"] != kid:
+            bad(f"{where}: key_id {k['key_id']} is not the derived {kid}")
+        if kid in secrets:
+            bad(f"{where}: two secrets derive one key_id")
+        secrets[k["key_id"]] = k["secret"]
+
+    import base64
+    rkeys = runtime_keys_check(c["runtime_test_keys"], bad)
+
+    registry: dict[str, dict] = {}
+    for client, e in c["registry"]["clients"].items():
+        kids, devs, owners = list(e["key_ids"]), list(e["devices"]), list(e["owners"])
+        for kid in kids:
+            if kid not in secrets:
+                bad(f"registry.{client}: key_id {kid} is no test secret's")
+        if any(kid in r["key_ids"] for r in registry.values() for kid in kids):
+            bad(f"registry.{client}: a key_id held for two clients")
+        registry[client] = {"key_ids": set(kids), "devices": set(devs), "owners": set(owners)}
+    enrolments: dict[str, dict] = {}
+    for e in c["registry"]["enrolments"]:
+        ki = e["key_identity"]
+        if rkeys.get(ki) is None or e["public_key"] != "ed25519:" + base64.b64encode(rkeys[ki]).decode():
+            bad(f"registry.enrolments: {ki} is not a runtime test key")
+        if ki in enrolments.get(e["device_id"], {}):
+            bad(f"registry.enrolments: {ki} enrolled twice for {e['device_id']}")
+        enrolments.setdefault(e["device_id"], {})[ki] = (rkeys.get(ki, b""), e["owner"])
+
+    cov: dict[str, list[str]] = {}
+
+    def cover(item: str, name: str) -> None:
+        cov.setdefault(item, []).append(name)
+
+    # Requests.
+    seen_names: set = set()
+    judged: dict[str, dict] = {}
+    for case in c["requests"]:
+        name = case["name"]
+        where = f"requests.{name}"
+        if name in seen_names:
+            bad(f"{where}: name repeated")
+        seen_names.add(name)
+        if not isinstance(case["note"], str):
+            bad(f"{where}: note is not a string")
+        r = case["request"]
+        line = r["request_line"]
+        m = re.fullmatch(r"(\S+) (\S+) HTTP/1\.1", line) if isinstance(line, str) else None
+        if not m:
+            bad(f"{where}: request line is not an HTTP/1.1 request line")
+        headers = []
+        for h in r["headers"]:
+            if not (isinstance(h, list) and len(h) == 2 and all(isinstance(x, str) for x in h)):
+                bad(f"{where}: a header is not a [name, value] pair")
+                continue
+            headers.append((h[0], h[1]))
+        body = r["body"].encode("utf-8")
+        if r["body_length"] != len(body):
+            bad(f"{where}: body_length is not the body's")
+        if r["body_sha256"] != "sha256:" + hashlib.sha256(body).hexdigest():
+            bad(f"{where}: body_sha256 is not the body's")
+        hm = header_map(headers)
+        msg = hmac_input(hm, model, mut)
+        if "hmac_input_hex" in case:
+            if msg is None or case["hmac_input_hex"] != msg.hex():
+                bad(f"{where}: hmac_input_hex is not the HMAC input of its headers")
+        elif msg is not None:
+            bad(f"{where}: no hmac_input_hex, though its headers define one")
+        rv = case["receiver"]
+        if not is_int(rv["now_ms"]):
+            bad(f"{where}: now_ms is not an integer")
+        held = set()
+        for t in rv["held_nonces"]:
+            if not (isinstance(t, list) and len(t) == len(model["nonce_key"]) and all(isinstance(x, str) for x in t)):
+                bad(f"{where}: a held nonce is not a {model['nonce_key']} triple")
+                continue
+            held.add(held_key(t, model, mut))
+        records = []
+        for hrec in rv["held"]:
+            hb = hrec["body"].encode("utf-8")
+            hr, ho = record_reason(hb, model, frozenset())
+            if hr is not None or hrec["held_as"] not in ("stored", "conflict"):
+                bad(f"{where}: a held record is not a record held as stored or conflict")
+                continue
+            hk = {k: v_[0] for k, v_ in enrolments.get(ho["device_id"], {}).items()}
+            if verify_faults(ho, hk, model, frozenset()):
+                bad(f"{where}: a held record the receiver could not have verified")
+            records.append((ho, hb, hrec["held_as"]))
+        rcv = Receiver(rv["now_ms"], registry, held, secrets, enrolments, records)
+        faults = request_faults(headers, body, rcv, model, mut, line if isinstance(line, str) else "")
+        got = request_verdict(faults, headers, model, mut)
+        v = case["verdict"]
+        judged[name] = {"faults": faults, "got": got}
+        if v["outcome"] != got["outcome"]:
+            bad(f"{where}: declared {v['outcome']}, judged {got} on {faults}")
+            continue
+        for k, gk in (("check", "check"), ("status", "status"), ("authenticated", "response_names_digest")):
+            if v[k] != got[gk] or type(v[k]) is not type(got[gk]):
+                bad(f"{where}: declared {k} {v[k]!r}, judged {got[gk]!r} on {faults}")
+        want_body = {"outcome": got["response_outcome"], "reason": got["reason"], "v": model["response_v"]}
+        if got["response_names_digest"]:
+            want_body["record_digest"] = hval(hm, model["h"]["digest"])
+        try:
+            declared_body = strict_json(v["response_body"].encode("utf-8"))
+        except ValueError:
+            declared_body = None
+        if declared_body != want_body:
+            bad(f"{where}: response_body {v['response_body']!r} is not {want_body}")
+        else:
+            act, way, _ = response_judgement(got["status"], v["response_body"].encode("utf-8"),
+                                             hval(hm, model["h"]["digest"]) or "", model, mut)
+            cover(f"request answer {got['status']} {got['response_outcome']} {act} {way}", name)
+        if got["outcome"] == "accepted":
+            if v["receiver_verdict"] != got["receiver_verdict"]:
+                bad(f"{where}: receiver_verdict {v['receiver_verdict']!r}, judged {got['receiver_verdict']!r}")
+            cover("request accepted", name)
+            cover(f"request accepted {got['receiver_verdict']}", name)
+            if any(h == "conflict" for _, _, h in records) and got["receiver_verdict"] == "stored":
+                cover("request accepted beside a held conflict", name)
+            if got["receiver_verdict"] == "conflict" and obj_is_tally(records):
+                cover("request tally conflict beside a greater count", name)
+            sent = sent_integer(hm, model, frozenset())
+            if sent is not None and abs(rv["now_ms"] - sent) == model["skew"]:
+                cover("request skew at the bound", name)
+            continue
+        if v["reason"] != got["reason"]:
+            bad(f"{where}: declared reason {v['reason']!r}, judged {got['reason']!r}")
+        vf = list(VF[0]) if VF and got["check"] == 8 else []
+        if "reason_precedence" in v:
+            rp = v["reason_precedence"]
+            if rp["wins"] != got["reason"] or rp["also_fails"] != [r_ for r_ in vf if r_ != got["reason"]]:
+                bad(f"{where}: reason_precedence {plain(rp)} is not wins {got['reason']} also_fails {vf[1:]}")
+            elif len(vf) > 1:
+                cover(f"request check 8 {vf[0]} over {vf[1]}", name)
+                cover("request check 8 over a later Verifying reason", name)
+        elif len(vf) > 1:
+            bad(f"{where}: fails Verifying {vf} but declares no reason_precedence")
+        others = sorted(set(faults) - {got["check"]})
+        if "precedence" in v:
+            p = v["precedence"]
+            if p["wins"] != got["check"] or p["also_fails"] != others:
+                bad(f"{where}: precedence {plain(p)} is not wins {got['check']} also_fails {others}")
+            if not others:
+                bad(f"{where}: declares precedence but fails one check")
+            for o in others:
+                cover(f"request precedence {got['check']} over {o}", name)
+        elif others:
+            bad(f"{where}: refused at {got['check']} but also fails {others}: not refused for it alone")
+        else:
+            cover(f"request check {got['check']} alone", name)
+            reason = faults[got["check"]]
+            if got["check"] == 2 and reason == "digest mismatch":
+                cover("request digest mismatch", name)
+            if got["check"] == 5 and reason == "nonce reused":
+                cover("request reused nonce", name)
+            sent = sent_integer(hm, model, frozenset())
+            if got["check"] == 5 and sent is not None and abs(rv["now_ms"] - sent) == model["skew"] + 1:
+                cover("request skew one past the bound", name)
+            if got["check"] in (6, 8):
+                cover(f"request check {got['check']} {reason}", name)
+            pass
+        if got["check"] == 7:
+            cover(f"request {faults[7]}", name)
+        if "answered_alike_with" in v:
+            judged[name]["alike"] = v["answered_alike_with"]
+    for name, j in judged.items():
+        if "alike" not in j:
+            continue
+        o = j["alike"]
+        if o not in judged or judged[o].get("alike") != name:
+            bad(f"requests.{name}: answered_alike_with {o} is not mutual")
+            continue
+        a, b = j["got"], judged[o]["got"]
+        reasons = {j["faults"].get(7), judged[o]["faults"].get(7)}
+        if a.get("check") != 7 or b.get("check") != 7 or reasons != {"unknown device", "device outside the client's set"}:
+            bad(f"requests.{name}: answered_alike_with {o} is not an unknown and an unauthorised device")
+            continue
+        if a != b:
+            bad(f"requests.{name}: answered unlike {o}: {a} and {b}")
+        else:
+            cover("request unknown and unauthorised device alike", name)
+
+    # Responses.
+    seen_names = set()
+    for case in c["responses"]:
+        name = case["name"]
+        where = f"responses.{name}"
+        if name in seen_names:
+            bad(f"{where}: name repeated")
+        seen_names.add(name)
+        if not isinstance(case["note"], str):
+            bad(f"{where}: note is not a string")
+        rd = case["request_digest"]
+        if not re.fullmatch(model["forms"][model["h"]["digest"]], rd):
+            bad(f"{where}: request_digest is not of its form")
+        rs = case["response"]
+        st = rs["status"]
+        if not is_int(st):
+            bad(f"{where}: status is not an integer")
+            continue
+        for hn, hv in rs["headers"].items():
+            if hn == "Content-Type":
+                if hv != model["response_content_type"]:
+                    bad(f"{where}: Content-Type is not the endpoint's")
+            elif hn == "Retry-After":
+                if st not in (429, 503) or not re.fullmatch(r"[0-9]+", hv):
+                    bad(f"{where}: Retry-After outside a 429 or 503")
+            else:
+                bad(f"{where}: response header {hn} the contract does not name")
+        act, way, outcome = response_judgement_mut(st, rs["body"].encode("utf-8"), rd, model, mut)
+        if case["action"] != act:
+            bad(f"{where}: declared {case['action']}, judged {act} ({way})")
+        if "row" in case:
+            row = case["row"]
+            if (st, outcome) not in model["pairs"] or row != f"{st} {outcome}" or way not in (None, "unauthenticated"):
+                bad(f"{where}: row {row!r} is not an acted-on or unauthenticated response of the table row {st} {outcome}")
+            else:
+                cover(f"response row {row}", name)
+                if way:
+                    cover(f"response row {row} unauthenticated", name)
+        if "retires_nothing" in case:
+            if case["retires_nothing"] != way:
+                bad(f"{where}: retires_nothing {case['retires_nothing']!r}, judged {way!r}")
+            else:
+                cover(f"response retires nothing: {way}", name)
+        elif way is not None:
+            bad(f"{where}: judged {way} but names no way")
+        if "row" not in case and "retires_nothing" not in case:
+            bad(f"{where}: names neither a row nor a way it retires nothing")
+
+    # Config.
+    seen_names = set()
+    for case in c["config"]:
+        name = case["name"]
+        where = f"config.{name}"
+        if name in seen_names:
+            bad(f"{where}: name repeated")
+        seen_names.add(name)
+        if not isinstance(case["note"], str):
+            bad(f"{where}: note is not a string")
+        doc = plain(case["document"])
+        rule, fwd = load_verdict(doc, model, mut)
+        if case["valid"] is True:
+            if rule is not None:
+                bad(f"{where}: declared valid, refused {rule}")
+                continue
+            if fwd is None:
+                if "forwarding" in case:
+                    bad(f"{where}: forwarding declared for a disabled section")
+                cover("config accepted disabled", name)
+            else:
+                if case.get("forwarding") is not fwd:
+                    bad(f"{where}: forwarding declared {case.get('forwarding')!r}, judged {fwd}")
+                cover("config accepted with forwarding" if fwd else "config accepted without forwarding", name)
+            continue
+        if case["valid"] is not False:
+            bad(f"{where}: valid is not a boolean")
+            continue
+        if case["rule"] != rule:
+            bad(f"{where}: declared {case['rule']}, judged {rule}")
+            continue
+        cover(f"config {rule}", name)
+        ad = doc.get("alert_delivery", {})
+        R = model["cfg_rules"]
+        if rule == R[0]:
+            for k in model["env_keys"]:
+                if k in ad and not isinstance(ad[k], str):
+                    cover(f"config {rule} {k} {'null' if ad[k] is None else 'number' if is_int(ad[k]) or isinstance(ad[k], float) else 'other'}", name)
+        if rule == R[5]:
+            vals = {k: ad.get(k) for k in model["env_keys"]}
+            for k, x in vals.items():
+                if not x:
+                    cover(f"config {rule} without {k}", name)
+        if rule == R[6]:
+            for k in model["env_keys"]:
+                x = ad.get(k)
+                if isinstance(x, str) and x and (any(ch in WHITE_SPACE for ch in x) or model["env_bad_char"] in x):
+                    cover(f"config {rule} {k}", name)
+                    if any(ch in WHITE_SPACE and ord(ch) > 127 for ch in x):
+                        cover(f"config {rule} non-ASCII white space", name)
+                    break
+        if rule == R[7]:
+            s = ad.get("secret_env")
+            for other in model["shared_with"]:
+                o = dig(doc, other)
+                if o == s:
+                    cover(f"config {rule} with {other}", name)
+                elif o is ABSENT and model["shared_defaults"][other] == s:
+                    cover(f"config {rule} with {other} by default", name)
+
+    for item in sorted(required_coverage(model)):
+        if item not in cov:
+            bad(f"coverage: no case for {item}")
+    LAST_COVERAGE.clear()
+    LAST_COVERAGE.update(cov)
+
+
+def obj_is_tally(records: list) -> bool:
+    counts = sorted(int(jv(o["count"])) for o, _, _ in records if o.get("kind") == "withheld_tally")
+    return len(counts) >= 2 and counts[0] != counts[-1]
+
+
+def required_coverage(model: dict) -> set[str]:
+    req = {"request accepted", "request digest mismatch", "request reused nonce", "request skew at the bound",
+           "request skew one past the bound", "request unknown device", "request device outside the client's set",
+           "request unknown and unauthorised device alike"}
+    # Vectors names checks 1 to 6, and also the device cases of check 7.
+    req |= {f"request check {k} alone" for k in model["req_checks"]}
+    req |= {f"request check 6 {r}" for r in model["form_reasons"]}
+    req |= {f"request check 8 {r}" for r in model["verify_status"]}
+    req |= {f"request accepted {hv}" for hv in model["held_outcome"]}
+    req.add("request the enrolment's owner is not the client's")
+    # A body that is not a record reaches neither check 7 nor 8, so 6 over 7 has no case.
+    req |= {f"request precedence {k} over {k + 1}" for k in range(1, 8) if k != 6}
+    req |= {"request check 8 over a later Verifying reason", "request accepted beside a held conflict",
+            "request tally conflict beside a greater count"}
+    req.add("response row 400 refused unauthenticated")
+    req |= {f"response row {s} {o}" for (s, o) in model["pairs"]}
+    req |= {f"response retires nothing: {w}" for w in ("another_digest", "unparsable", "unpaired", "unauthenticated")}
+    lo, hi, typ = model["cfg_cover"]
+    R = model["cfg_rules"]
+    for n in range(lo, hi + 1):
+        req.add(f"config {R[n - 1]}")
+    req |= {f"config {R[5]} without {k}" for k in model["env_keys"]}
+    req |= {f"config {R[6]} {k}" for k in model["env_keys"]}
+    req.add(f"config {R[6]} non-ASCII white space")
+    req |= {f"config {R[7]} with {o}" for o in model["shared_with"]}
+    req |= {f"config {R[7]} with {o} by default" for o, d in model["shared_defaults"].items() if d}
+    req |= {f"config {R[typ - 1]} {k} {kind}" for k in model["env_keys"] for kind in ("null", "number")}
+    req |= {"config accepted with forwarding", "config accepted without forwarding", "config accepted disabled"}
+    return req
+
+
+# ---------------------------------------------------------------------------
+# Mutations.
+# ---------------------------------------------------------------------------
+
+JUDGE_MUTANTS = [
+    # key_id, HMAC input and digest
+    "kid_raw_ikm", "kid_salt_info_swapped", "kid_len_32", "hmac_raw_key", "hmac_no_nul", "method_lower",
+    "hmac_drop_path", "num_for_string_hmac", "sent_at_as_string", "digest_of_hex", "hmac_any_digits",
+    # Order
+    "body_bound_plus_one", "skip_body_bound", "skip_header_limits", "skip_request_line", "header_bytes_value_only",
+    "hex_any_case", "client_any_length", "client_any_char", "sent_any_integer", "sent_unbounded",
+    "skip_content_type", "skip_digest_check", "header_last_wins", "key_any_client", "trial_verification",
+    "skip_hmac", "skip_skew", "skew_one_sided", "skew_strict", "skew_plus_one", "accept_reused_nonce",
+    "nonce_key_nonce_only", "skip_record_form", "skip_canonical", "version_malformed", "version_refused",
+    "permission_any_client", "order_2_before_1", "order_3_before_2", "order_4_before_3", "order_5_before_4",
+    "order_6_before_5", "unknown_device_differs", "auth_fail_400", "replay_409",
+    "permission_401", "malformed_401", "digest_on_unauthenticated", "permission_unauthenticated",
+    # Responses
+    "retire_on_mismatched_digest", "digest_case_insensitive", "unwrap_array", "act_unauthenticated",
+    "open_response_form", "skip_v", "skip_reason", "reason_before_pair", "target_prefix_ok", "target_query_ok",
+    "member_rule_own_reason", "permission_on_non_record", "version_any_integer", "hmac_partial_headers",
+    "judge_without_inputs", "skip_content_length", "skip_method", "content_type_exact", "content_type_params_ok",
+    "unauth_any", "skip_owner", "key_any_device", "verify_last_reason", "no_duplicate", "conflict_is_earlier",
+    "lower_before_conflict", "skip_lower_count", "key_not_enrolled_422", "order_8_before_7", "skip_key_binding",
+    "skip_signature", "skip_transition", "skip_class", "skip_detail", "outcome_only", "status_class_only", "retire_on_401_403",
+    "reject_on_401_403", "retire_on_202", "keep_on_reject", "retire_on_422", "reject_on_backpressure",
+    # Config
+    "validate_disabled", "null_as_absent", "num_for_string_config", "env_types_unchecked",
+    "rules_6_7_swapped", "absent_means_incomplete", "incomplete_needs_secret", "whitespace_is_empty",
+    "ascii_whitespace", "zero_width_is_space", "allow_equals", "shared_evidence_needs_enabled",
+    "shared_no_defaults", "shared_case_insensitive",
+]
+
+
+def judge_mutants(model: dict) -> list[str]:
+    return JUDGE_MUTANTS + [f"drop:{r}" for r in model["cfg_rules"][5:]] + [f"shared_skip:{o}" for o in model["shared_with"]]
+
+
+def corpus_mutants(corpus: dict, model: dict) -> list[tuple[str, dict]]:
+    out: list[tuple[str, dict]] = []
+
+    def mk(label: str, f: Callable[[dict], None]) -> None:
+        x = copy.deepcopy(corpus)
+        f(x)
+        out.append((label, x))
+
+    def flip_hex(s: str) -> str:
+        return s[:-1] + ("0" if s[-1] != "0" else "1")
+
+    mk("unknown root member", lambda x: x.__setitem__("extra", 1))
+    for k in list(corpus["endpoint"]):
+        mk(f"endpoint.{k} altered", lambda x, k=k: x["endpoint"].__setitem__(
+            k, x["endpoint"][k] + 1 if is_int(x["endpoint"][k]) else x["endpoint"][k] + "x"))
+    mk("endpoint unknown member", lambda x: x["endpoint"].__setitem__("extra", 1))
+    mk("description unknown member", lambda x: x["description"].__setitem__("extra", "x"))
+    for i, k in enumerate(corpus["key_ids"]):
+        mk(f"key_ids[{i}] key_id altered", lambda x, i=i: x["key_ids"][i].__setitem__("key_id", flip_hex(x["key_ids"][i]["key_id"])))
+        mk(f"key_ids[{i}] secret altered", lambda x, i=i: x["key_ids"][i].__setitem__("secret", flip_hex(x["key_ids"][i]["secret"])))
+        mk(f"key_ids[{i}] label altered", lambda x, i=i: x["key_ids"][i].__setitem__("label", x["key_ids"][i]["label"] + " "))
+        mk(f"key_ids[{i}] unknown member", lambda x, i=i: x["key_ids"][i].__setitem__("extra", 1))
+    for i, k in enumerate(corpus["runtime_test_keys"]):
+        mk(f"runtime_test_keys[{i}] key_identity altered", lambda x, i=i: x["runtime_test_keys"][i].__setitem__("key_identity", flip_hex(x["runtime_test_keys"][i]["key_identity"])))
+        mk(f"runtime_test_keys[{i}] seed label altered", lambda x, i=i: x["runtime_test_keys"][i].__setitem__("seed_label", x["runtime_test_keys"][i]["seed_label"] + " "))
+        mk(f"runtime_test_keys[{i}] unknown member", lambda x, i=i: x["runtime_test_keys"][i].__setitem__("extra", 1))
+    mk("registry unknown member", lambda x: x["registry"].__setitem__("extra", 1))
+    for client in corpus["registry"]["clients"]:
+        for mem in ("devices", "key_ids", "owners"):
+            mk(f"registry.{client} loses its {mem}", lambda x, c=client, mem=mem: x["registry"]["clients"][c].__setitem__(mem, []))
+        mk(f"registry.{client} unknown member", lambda x, c=client: x["registry"]["clients"][c].__setitem__("extra", 1))
+    for i, e in enumerate(corpus["registry"]["enrolments"]):
+        owners = sorted({o for e2 in corpus["registry"]["clients"].values() for o in e2["owners"]} - {e["owner"]})
+        for o in owners:
+            mk(f"enrolment[{i}] owner moved to {o}", lambda x, i=i, o=o: x["registry"]["enrolments"][i].__setitem__("owner", o))
+        mk(f"enrolment[{i}] dropped", lambda x, i=i: x["registry"]["enrolments"].pop(i))
+        mk(f"enrolment[{i}] unknown member", lambda x, i=i: x["registry"]["enrolments"][i].__setitem__("extra", 1))
+    for i, case in enumerate(corpus["requests"]):
+        n = case["name"]
+        v = case["verdict"]
+        R = lambda x, i=i: x["requests"][i]  # noqa: E731
+        mk(f"request {n}: outcome flipped", lambda x, R=R: R(x)["verdict"].__setitem__(
+            "outcome", "refused" if R(x)["verdict"]["outcome"] == "accepted" else "accepted"))
+        mk(f"request {n}: unknown member", lambda x, R=R: R(x).__setitem__("extra", 1))
+        mk(f"request {n}: unknown request member", lambda x, R=R: R(x)["request"].__setitem__("extra", 1))
+        mk(f"request {n}: unknown receiver member", lambda x, R=R: R(x)["receiver"].__setitem__("extra", 1))
+        mk(f"request {n}: unknown verdict member", lambda x, R=R: R(x)["verdict"].__setitem__("extra", 1))
+        if "skew" in n:
+            sent = int(dict((h[0], h[1]) for h in case["request"]["headers"])["X-Ori-Alert-Sent-At-Ms"])
+            away = 1 if sent <= case["receiver"]["now_ms"] else -1
+            step = away if v["outcome"] == "accepted" else -away
+            mk(f"request {n}: clock moved 1 ms", lambda x, R=R, step=step: R(x)["receiver"].__setitem__("now_ms", R(x)["receiver"]["now_ms"] + step))
+        mk(f"request {n}: body altered", lambda x, R=R: R(x)["request"].__setitem__("body", R(x)["request"]["body"][:-1] + "x"))
+        if "hmac_input_hex" in case:
+            mk(f"request {n}: hmac_input_hex altered", lambda x, R=R: R(x).__setitem__("hmac_input_hex", flip_hex(R(x)["hmac_input_hex"])))
+            mk(f"request {n}: hmac_input_hex dropped", lambda x, R=R: R(x).pop("hmac_input_hex"))
+        if case["receiver"]["held_nonces"] and v["outcome"] != "accepted":
+            mk(f"request {n}: held nonces dropped", lambda x, R=R: R(x)["receiver"].__setitem__("held_nonces", []))
+        mk(f"request {n}: response body altered", lambda x, R=R: R(x)["verdict"].__setitem__("response_body", R(x)["verdict"]["response_body"].replace('"v":1', '"v":2')))
+        if case["receiver"]["held"] and v.get("receiver_verdict") != "duplicate":
+            mk(f"request {n}: held records dropped", lambda x, R=R: R(x)["receiver"].__setitem__("held", []))
+            def flip_all(x, R=R):
+                for hrec in R(x)["receiver"]["held"]:
+                    hrec["held_as"] = "conflict" if hrec["held_as"] == "stored" else "stored"
+            mk(f"request {n}: held_as flipped", flip_all)
+        if v["outcome"] == "accepted":
+            mk(f"request {n}: receiver verdict moved", lambda x, R=R: R(x)["verdict"].__setitem__("receiver_verdict", "stored" if R(x)["verdict"]["receiver_verdict"] != "stored" else "conflict"))
+        if v["outcome"] != "accepted":
+            mk(f"request {n}: check moved", lambda x, R=R: R(x)["verdict"].__setitem__("check", R(x)["verdict"]["check"] % 8 + 1))
+            mk(f"request {n}: status moved", lambda x, R=R: R(x)["verdict"].__setitem__("status", {400: 401, 401: 403, 403: 401, 202: 400, 422: 400}[R(x)["verdict"]["status"]]))
+            mk(f"request {n}: authenticated flipped", lambda x, R=R: R(x)["verdict"].__setitem__("authenticated", not R(x)["verdict"]["authenticated"]))
+            mk(f"request {n}: reason renamed", lambda x, R=R: R(x)["verdict"].__setitem__("reason", "malformed" if R(x)["verdict"]["reason"] != "malformed" else "not_canonical"))
+            if "precedence" in v:
+                mk(f"request {n}: precedence dropped", lambda x, R=R: R(x)["verdict"].pop("precedence"))
+                mk(f"request {n}: also_fails trimmed", lambda x, R=R: R(x)["verdict"]["precedence"].__setitem__("also_fails", R(x)["verdict"]["precedence"]["also_fails"][1:] or [9]))
+                mk(f"request {n}: precedence unknown member", lambda x, R=R: R(x)["verdict"]["precedence"].__setitem__("extra", 1))
+            else:
+                mk(f"request {n}: precedence invented", lambda x, R=R: R(x)["verdict"].__setitem__("precedence", {"wins": R(x)["verdict"]["check"], "also_fails": [9]}))
+            if "answered_alike_with" in v:
+                mk(f"request {n}: alike partner renamed", lambda x, R=R: R(x)["verdict"].__setitem__("answered_alike_with", "accepted_submission"))
+    for i, case in enumerate(corpus["responses"]):
+        n = case["name"]
+        R = lambda x, i=i: x["responses"][i]  # noqa: E731
+        mk(f"response {n}: action moved", lambda x, R=R: R(x).__setitem__("action", {"retire": "keep", "keep": "reject", "reject": "retire"}[R(x)["action"]]))
+        if "retires_nothing" not in case:
+            mk(f"response {n}: request digest altered", lambda x, R=R: R(x).__setitem__("request_digest", flip_hex(R(x)["request_digest"])))
+        elif case["retires_nothing"] == "another_digest":
+            named = json.loads(case["response"]["body"])["record_digest"]
+            mk(f"response {n}: request digest made the named one", lambda x, R=R, d=named: R(x).__setitem__("request_digest", d))
+        mk(f"response {n}: unknown member", lambda x, R=R: R(x).__setitem__("extra", 1))
+        mk(f"response {n}: unknown response member", lambda x, R=R: R(x)["response"].__setitem__("extra", 1))
+        mk(f"response {n}: unknown header", lambda x, R=R: R(x)["response"]["headers"].__setitem__("X-Extra", "1"))
+        if "row" in case:
+            mk(f"response {n}: row renamed", lambda x, R=R: R(x).__setitem__("row", "200 stored" if R(x)["row"] != "200 stored" else "200 duplicate"))
+        if "retires_nothing" in case:
+            mk(f"response {n}: way renamed", lambda x, R=R: R(x).__setitem__("retires_nothing", "unpaired" if R(x)["retires_nothing"] != "unpaired" else "unparsable"))
+    for i, case in enumerate(corpus["config"]):
+        n = case["name"]
+        R = lambda x, i=i: x["config"][i]  # noqa: E731
+        mk(f"config {n}: valid flipped", lambda x, R=R: R(x).__setitem__("valid", not R(x)["valid"]))
+        mk(f"config {n}: unknown member", lambda x, R=R: R(x).__setitem__("extra", 1))
+        if case["valid"] and "forwarding" in case:
+            mk(f"config {n}: forwarding flipped", lambda x, R=R: R(x).__setitem__("forwarding", not R(x)["forwarding"]))
+        if not case["valid"]:
+            mk(f"config {n}: rule moved", lambda x, R=R: R(x).__setitem__("rule", "env_name_malformed" if R(x)["rule"] != "env_name_malformed" else "forwarding_incomplete"))
+    # Every coverage item, with every case that witnesses it removed.
+    check(corpus, model)
+    if True:
+        required = required_coverage(model)
+        for item, names in sorted(dict(LAST_COVERAGE).items()):
+            if item not in required:
+                continue
+            ns = set(names)
+
+            def drop(x, ns=ns):
+                for sec in ("requests", "responses", "config"):
+                    x[sec] = [cs for cs in x[sec] if cs["name"] not in ns]
+            mk(f"coverage: {item} removed", drop)
+    return out
+
+
+def _sub(texts: dict[str, str], key: str, old: str, new: str) -> dict[str, str] | None:
+    t = dict(texts)
+    pattern = r"\s+".join(re.escape(w) for w in old.split())
+    t[key], n = re.subn(pattern, lambda _m: new, t[key], count=1)
+    return t if n and t[key] != texts[key] else None
+
+
+TEXT_EDITS: list[tuple[str, str, str, str]] = [
+    ("skew 300001", "tr", "within 300000 ms", "within 300001 ms"),
+    ("skew 299999", "tr", "within 300000 ms", "within 299999 ms"),
+    ("nonce key loses key_id", "tr", "`(client_id, key_id, nonce)` reserved", "`(client_id, nonce)` reserved"),
+    ("body bound 4097", "tr", "at most 4096 bytes |", "at most 4097 bytes |"),
+    ("check 1 body bound 4097", "tr", "body of at most 4096 bytes; and a", "body of at most 4097 bytes; and a"),
+    ("check 1 headers 33", "tr", "at most 32 headers", "at most 33 headers"),
+    ("check 1 header bytes 1025", "tr", "each header at most 1024 bytes", "each header at most 1025 bytes"),
+    ("check 1 request line 1025", "tr", "A request line of at most 1024 bytes", "A request line of at most 1025 bytes"),
+    ("check 1 status 401", "tr", "the body's length. Otherwise 400.", "the body's length. Otherwise 401."),
+    ("check 1 Content-Length dropped", "tr", "; and a `Content-Length` header, present, equal to the body's length.", "."),
+    ("check 2 status 401", "tr", "equal to `X-Ori-Alert-Record-Digest`. Otherwise 400.", "equal to `X-Ori-Alert-Record-Digest`. Otherwise 401."),
+    ("check 2 content type", "tr", "the media type `application/octet-stream`, compared", "the media type `application/json`, compared"),
+    ("check 2 method", "tr", "The method is `POST`, compared", "The method is `PUT`, compared"),
+    ("check 3 status 403", "tr", "held for another client selects nothing. Otherwise 401.", "held for another client selects nothing. Otherwise 403."),
+    ("check 5 status 400", "tr", "is a transport replay.\n   Otherwise 401.", "is a transport replay.\n   Otherwise 400."),
+    ("check 6 status 422", "tr", "`not_canonical` or `malformed`, 400;", "`not_canonical` or `malformed`, 422;"),
+    ("check 6 unsupported_version refused", "tr", "`unsupported_version`, 202\n   `retry_later`.", "`unsupported_version`, 400\n   `refused`."),
+    ("check 7 status 401", "tr", "`not_owned`, 403.", "`not_owned`, 401."),
+    ("check 8 key_not_enrolled 422", "tr", "`key_not_enrolled`, 202 `retry_later`;", "`key_not_enrolled`, 422 `refused`;"),
+    ("unauthenticated statuses", "tr", "sent with status 400 or 401", "sent with status 400 or 403"),
+    ("authenticated from check 7", "tr", "From check 6 on, every response names", "From check 7 on, every response names"),
+    ("authenticated checks 1 to 4", "tr", "Checks 1 to 5 authenticate the request", "Checks 1 to 4 authenticate the request"),
+    ("sent_at_ms upper bound", "tr", "a decimal integer from 1 to 9007199254740991", "a decimal integer from 1 to 9007199254740992"),
+    ("sent_at_ms lower bound", "tr", "a decimal integer from 1 to 9007199254740991", "a decimal integer from 0 to 9007199254740991"),
+    ("key_id salt", "tr", 'salt = "ori.alert_delivery_forward_key_id.v1"', 'salt = "ori.alert_delivery_forward_key_id.v2"'),
+    ("key_id info", "tr", 'info = "alert_delivery_forward"', 'info = "alert_delivery_forwarding"'),
+    ("key_id length", "tr", "length = 16", "length = 32"),
+    ("key_id prefix", "tr", 'key_id = "hkdf-sha256:"', 'key_id = "hkdf:"'),
+    ("HMAC prefix", "tr", "`ori.alert_delivery_forward_request.v1`, one", "`ori.alert_delivery_forward_request.v2`, one"),
+    ("client bound 127", "tr", "1 to 128 printable ASCII", "1 to 127 printable ASCII"),
+    ("client bound 129", "tr", "1 to 128 printable ASCII", "1 to 129 printable ASCII"),
+    ("nonce length", "tr", "Exactly 32 lowercase hexadecimal characters from 16 random bytes", "Exactly 30 lowercase hexadecimal characters from 15 random bytes"),
+    ("authorization scheme", "tr", "`Ori-Alert-HMAC hmac-sha256:` and 64", "`Ori-Alert-Hmac hmac-sha256:` and 64"),
+    ("HMAC object loses path", "tr", '"path": "/v1/runtime/alert-delivery-records",\n', ""),
+    ("HMAC object loses nonce", "tr", '"nonce": "<X-Ori-Alert-Nonce>",\n', ""),
+    ("401 retires", "tr", "| Keep; repair the credential and back off. Never retire. |", "| Retire. |"),
+    ("403 rejects", "tr", "| Keep; report it in site health. Never retire. |", "| Reject (below). |"),
+    ("202 retires", "tr", "| Keep, and retry with long back-off. |", "| Retire. |"),
+    ("422 keeps", "tr", "`detail_refused`. | Reject (below). |", "`detail_refused`. | Keep. |"),
+    ("authenticated 400 keeps", "tr", "Authenticated: reject (below). |", "Authenticated: keep. |"),
+    ("duplicate keeps", "tr", "these exact bytes durably. | Retire. |", "these exact bytes durably. | Keep. |"),
+    ("superseded keeps", "tr", "and has counted this one. | Retire. |", "and has counted this one. | Keep. |"),
+    ("stored keeps", "tr", "beside another. | Retire. |", "beside another. | Keep. |"),
+    ("503 dropped", "tr", "| 429, 503 | `retry_later` |", "| 429 | `retry_later` |"),
+    ("200 stored becomes 201", "tr", "| 200 | `stored` |", "| 201 | `stored` |"),
+    ("duplicate renamed", "tr", "| 200 | `duplicate` |", "| 200 | `held` |"),
+    ("202 loses unsupported_version", "tr", "`key_not_enrolled`, `unsupported_version`. |", "`key_not_enrolled`. |"),
+    ("422 loses detail_refused", "tr", "`class_refused`, `detail_refused`. | Reject", "`class_refused`. | Reject"),
+    ("superseded reason renamed", "tr", "`lower_count` for `superseded`", "`lower` for `superseded`"),
+    ("response v 2", "tr", "`v` is `1`, `outcome` is one of the table's", "`v` is `2`, `outcome` is one of the table's"),
+    ("response member dropped", "tr", '  "reason": "",\n  "record_digest": "sha256:...",', '  "record_digest": "sha256:...",'),
+    ("rejection on 409", "tr", "authenticated 400 or 422 response", "authenticated 400 or 409 response"),
+    ("Order 3 and 4 swapped", "tr", "3. **The credential.**", "3. **The HMAC.**"),
+    ("secret label", "tr", "`ori alert-delivery-transport/v1 <name> test secret`", "`ori alert-delivery-transport/v2 <name> test secret`"),
+    ("config cover 5 to 7", "tr", "cases for load rules 6 to 8,", "cases for load rules 5 to 7,"),
+    ("config rules 6 and 7 swapped", "gateway_config", "6. `forwarding_incomplete`:", "6. `env_name_malformed`:"),
+    ("config rule 7 character", "gateway_config", "`White_Space` property or `=`, judged", "`White_Space` property or `:`, judged"),
+    ("config rule 8 loses evidence", "gateway_config", "`gateway.custody.secret_env` or `evidence.secret_env`, each", "or `gateway.custody.secret_env`, each"),
+    ("config rule 8 loses previous", "gateway_config", "`gateway.auth.shared_secret_env`, `gateway.auth.previous_shared_secret_env`,", "`gateway.auth.shared_secret_env`,"),
+    ("config rule 8 renamed", "gateway_config", "8. `secret_env_shared`:", "8. `secret_env_reused`:"),
+    ("config shared_secret_env default", "gateway_config", "| `shared_secret_env`          | `string` | `GATEWAY_SHARED_SECRET` |", "| `shared_secret_env`          | `string` | `GATEWAY_SECRET` |"),
+    ("config rule 1 loses a forwarding key", "gateway_config", "`queue_directory`,\n   `endpoint_env`, `client_id_env` or `secret_env` is not a string", "`queue_directory`,\n   `endpoint_env` or `client_id_env` is not a string"),
+    ("record: v 2", "ad", "| `v` | The integer `1`. |\n| `kind` | `\"submission\"`. |", "| `v` | The integer `2`. |\n| `kind` | `\"submission\"`. |"),
+    ("record: notice set", "ad", "| `notice` | `optional`, `tier_d` or `protection_degraded`;", "| `notice` | `routine`, `tier_d` or `protection_degraded`;"),
+    ("record: mandatory set", "ad", "`tier_d` and `protection_degraded` are **mandatory**.", "`optional` and `protection_degraded` are **mandatory**."),
+    ("record: observation row 1 loses accepted", "ad", "| `1` | `null` | `accepted`, `failed`, `unconfirmed` |", "| `1` | `null` | `failed`, `unconfirmed` |"),
+    ("record: detail accepted admits provider_refused", "ad", "| `accepted` | `null` |", "| `accepted` | `provider_refused`, or `null` |"),
+    ("record prefix", "ad", "The signing input is the ASCII bytes `ori.alert_delivery.v1`, one NUL byte", "The signing input is the ASCII bytes `ori.alert_delivery.v2`, one NUL byte"),
+]
+
+
+def text_mutants(texts: dict[str, str]) -> list[tuple[str, dict[str, str] | None]]:
+    out: list[tuple[str, dict[str, str] | None]] = []
+    for key, sentence in PINS:
+        words = sentence.split()
+        pattern = r"\s+".join(re.escape(w) for w in words)
+        t = dict(texts)
+        t[key], n = re.subn(pattern, lambda _m: " ".join(words[:-1]) + " XX", t[key], count=1)
+        out.append((f"text cut: {key}: {sentence[:60]}", t if n == 1 else None))
+    for label, key, old, new in TEXT_EDITS:
+        out.append((f"text edit: {label}", _sub(texts, key, old, new)))
+    return out
+
+
+def run_mutations(corpus: dict, model: dict, texts: dict[str, str]) -> int:
+    survivors: list[str] = []
+    total = 0
+    baseline = set(check(corpus, model))
+    for m in judge_mutants(model):
+        total += 1
+        errs = set(check(corpus, model, frozenset([m]))) - baseline
+        if not [e for e in errs if not e.startswith("coverage:")]:
+            survivors.append(f"judge mutant {m}")
+    for name, x in corpus_mutants(corpus, model):
+        total += 1
+        if not (set(check(x, model)) - baseline):
+            survivors.append(f"corpus mutant {name}")
+    for name, t in text_mutants(texts):
+        total += 1
+        if t is None:
+            survivors.append(f"{name} (did not apply)")
+            continue
+        try:
+            mm = build_model(t)
+        except Failure:
+            continue
+        if not (set(check(corpus, mm)) - baseline):
+            survivors.append(name)
+    for s in survivors:
+        print(f"SURVIVED: {s}", file=sys.stderr)
+    if survivors:
+        print(f"check-alert-delivery-transport-vectors-v1 --mutations: {len(survivors)} of {total} mutants survived", file=sys.stderr)
+        return 1
+    print(f"check-alert-delivery-transport-vectors-v1 --mutations: all {total} mutants refused")
+    return 0
+
+
+def self_test() -> None:
+    """RFC 5869 test case 1 and RFC 4231 test case 2, for this script's own HKDF and HMAC."""
+    okm = my_hkdf(bytes.fromhex("0b" * 22), bytes.fromhex("000102030405060708090a0b0c"),
+                  bytes.fromhex("f0f1f2f3f4f5f6f7f8f9"), 42)
+    if okm.hex() != ("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
+                     "34007208d5b887185865"):
+        raise Failure("crypto: own HKDF fails RFC 5869 test case 1")
+    if my_hmac(b"Jefe", b"what do ya want for nothing?").hex() != \
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843":
+        raise Failure("crypto: own HMAC fails RFC 4231 test case 2")
+
+
+def main(argv: list[str]) -> int:
+    args = argv[1:]
+    if args not in ([], ["--mutations"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+
+    def pairs(ps):
+        d = {}
+        for k, v in ps:
+            if k in d:
+                raise ValueError(f"duplicate member {k}")
+            d[k] = v
+        return d
+
+    try:
+        self_test()
+        texts = load_texts()
+        model = build_model(texts)
+        corpus = json.loads(CORPUS.read_text(encoding="utf-8"), object_pairs_hook=pairs)
+    except (Failure, OSError, ValueError) as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    errs = check(corpus, model)
+    for e in errs:
+        print(f"FAIL: {e}", file=sys.stderr)
+    if errs:
+        print(f"check-alert-delivery-transport-vectors-v1: {len(errs)} failures", file=sys.stderr)
+    else:
+        print(f"check-alert-delivery-transport-vectors-v1: {len(corpus['key_ids'])} key_ids, "
+              f"{len(corpus['requests'])} requests, {len(corpus['responses'])} responses and "
+              f"{len(corpus['config'])} config cases hold against the text; {len(PINS)} sentences pinned")
+    if args == ["--mutations"]:
+        rc = run_mutations(corpus, model, texts)
+        return 1 if errs else rc
+    return 1 if errs else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
