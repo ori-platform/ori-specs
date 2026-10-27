@@ -58,6 +58,7 @@ SEVERITY = {
     "tier_c_records_degraded": D,
     "tier_c_recovery_failed": D,
     "subsystem_state_unknown_critical": C,
+    "gateway_publication_clock_refused": D,
 }
 CRITICAL_CAPABLE = ("safety_registry", "alert_outbox", "action_log_records", "skill_hooks",
                     "firmware_liveness")
@@ -65,7 +66,7 @@ INVALID = "health_snapshot_invalid"  # the heartbeat's alone; never in a snapsho
 VOCAB = sorted([*SEVERITY, UMBRELLA, INVALID])
 SNAPSHOT_VOCAB = [x for x in VOCAB if x != INVALID]
 RANK = {"ok": 0, D: 1, C: 2}
-MAX_REASONS = 32
+MAX_REASONS = len(SNAPSHOT_VOCAB)  # derived: every token but the heartbeat's
 INT_MAX = 2**53 - 1
 
 
@@ -159,6 +160,9 @@ def holding(v: dict) -> list[str]:
         out.append("community_skills_refused")
     if avail(v["config_authority"]) and v["config_authority"]["unsigned_value_source"]:
         out.append("config_unsigned_value_source")
+    gp = v["gateway_publication"]
+    if avail(gp) and (gp["heartbeat_clock_out_of_range"] or gp["signing_clock_refusing"]):
+        out.append("gateway_publication_clock_refused")
     if ev["posture_problems"]:
         out.append("evidence_posture_problem")
     if ev.get("delivery_ledger_available") and ev["courier_answer_faults"] > 0:
@@ -244,6 +248,8 @@ def baseline() -> dict:
                         "optional_unavailable": 0},
         "community_skills": {"state": "available", "refused_skills": 0},
         "config_authority": {"state": "available", "unsigned_value_source": False},
+        "gateway_publication": {"state": "available", "heartbeat_clock_out_of_range": False,
+                                "signing_clock_refusing": False},
         "commissioning": {"state": "available", "problems": [], "zones": [
             {"zone_id": "zone-a", "sensor_id": "zone-a-current", "state": "in_force",
              "availability": "available"}]},
@@ -313,6 +319,8 @@ SINGLE = {
     "sensor_measurement_degraded": [(("sensors", 0, "measurement_degraded"), True)],
     "community_skills_refused": [(("community_skills", "refused_skills"), 2)],
     "config_unsigned_value_source": [(("config_authority", "unsigned_value_source"), True)],
+    "gateway_publication_clock_refused": [(("gateway_publication", "signing_clock_refusing"),
+                                           True)],
     "evidence_posture_problem": [((EV, "posture_problems"), ["custody_unconfigured"])],
     "evidence_courier_answer_unrecognised": [((EV, "courier_answer_faults"), 1)],
     "evidence_contributor_link_unresolved": [((EV, "contributor_links_unresolved"), 1)],
@@ -610,6 +618,15 @@ def snapshot_specs() -> list[tuple[str, list, str]]:
          "an unreadable block that decides no severity contributes no condition"),
         ("telemetry_export_unavailable", [(("telemetry_export",), {"state": "unavailable"})],
          "an unreadable block that decides no severity contributes no condition"),
+        ("publication_heartbeat_clock",
+         [(("gateway_publication", "heartbeat_clock_out_of_range"), True)],
+         "a wall clock out of range alone names the token"),
+        ("publication_both_clocks",
+         [(("gateway_publication", "heartbeat_clock_out_of_range"), True),
+          (("gateway_publication", "signing_clock_refusing"), True)],
+         "both causes name the one token once"),
+        ("publication_disabled", [(("gateway_publication",), {"state": "disabled"})],
+         "no gateway connection configured contributes no condition"),
         ("posture_problem_while_disabled", [((EV, "state"), "disabled"),
                                             ((EV, "attestation_summary_available"), False),
                                             ((EV, "delivery_ledger_available"), False),
@@ -759,7 +776,7 @@ def served_cases() -> list[dict]:
     ok = view()
     good_c = fold(holding(crit))
     good_d = fold(holding(deg))
-    many = [VOCAB[i % len(VOCAB)] for i in range(33)]
+    many = [VOCAB[i % len(VOCAB)] for i in range(MAX_REASONS + 1)]
     specs = [
         ("consistent_critical", crit, good_c, "the served triple is the fold"),
         ("consistent_degraded", deg, good_d, "one degraded condition"),
@@ -794,7 +811,7 @@ def served_cases() -> list[dict]:
                                         ["sensor_disconnected"]},
          "a token outside the vocabulary"),
         ("reasons_over_bound", deg, {**good_d, "degradation_reasons": many},
-         "thirty-three entries"),
+         "one entry past the bound"),
         ("reasons_heartbeat_token", deg, {"status": C, "critical": True,
                                           "degradation_reasons": [INVALID]},
          "the heartbeat's token is never a snapshot's"),
@@ -927,8 +944,8 @@ def heartbeat_cases() -> list[dict]:
          "a known critical wins over starting"),
         ("snapshot_carries_invalid_token", t(C, True, [INVALID]),
          "a snapshot never carries the heartbeat's token"),
-        ("reasons_over_bound", t(C, True, [f"t{i:02d}" for i in range(33)]),
-         "thirty-three entries"),
+        ("reasons_over_bound", t(C, True, [f"t{i:02d}" for i in range(MAX_REASONS + 1)]),
+         "one entry past the bound"),
         ("reasons_duplicate", t(D, False, ["sensor_unconnected", "sensor_unconnected"]),
          "a token twice"),
         ("reasons_null", t("ok", False, None), "null is not the empty set"),
@@ -987,7 +1004,7 @@ def gateway_cases() -> list[dict]:
                                    ["firmware_liveness_degraded",
                                     "firmware_liveness_over_capacity"]}, "two tokens"),
         ("every_token", {"status": C, "degradation_reasons": list(SNAPSHOT_VOCAB)},
-         f"all {len(SNAPSHOT_VOCAB)} snapshot tokens, within the bound of thirty-two"),
+         f"all {len(SNAPSHOT_VOCAB)} snapshot tokens: the bound, derived from the vocabulary"),
         ("snapshot_invalid", {"status": C, "degradation_reasons": [INVALID]},
          "a runtime whose snapshot was malformed"),
         ("snapshot_invalid_degraded", {"status": D, "degradation_reasons": [INVALID]},
@@ -1015,11 +1032,11 @@ def gateway_cases() -> list[dict]:
          "starting is not a runtime node status"),
         ("empty", {"status": D, "degradation_reasons": []}, "present-empty is malformed"),
         ("over_bound", {"status": C, "degradation_reasons":
-                        [f"t{i:02d}" for i in range(33)]},
-         "thirty-three entries fail length before anything else"),
+                        [f"t{i:02d}" for i in range(MAX_REASONS + 1)]},
+         "one past the bound fails length before anything else"),
         ("at_bound_duplicates", {"status": C, "degradation_reasons":
-                                 ["sensor_unconnected"] * 32},
-         "thirty-two entries pass length and fail uniqueness"),
+                                 ["sensor_unconnected"] * MAX_REASONS},
+         "entries at the bound pass length and fail uniqueness"),
         ("seventeen_duplicates", {"status": C, "degradation_reasons":
                                   ["sensor_unconnected"] * 17},
          "past the old bound of sixteen, inside the new one"),
@@ -1258,6 +1275,7 @@ def full_health() -> dict:
         "skill_hooks": {"state": "disabled"},
         "telemetry_export": {"state": "disabled"},
         "mqtt_ingress": {"state": "disabled"},
+        "gateway_publication": {"state": "disabled"},
         "diagnostics": {},
     }
 
@@ -1284,6 +1302,11 @@ def ingress_block(family: str = "ori/{device_id}/export/request", count=14) -> d
     return {"state": "available", "families": {
         "ori/gateway/health": {"payload_too_large": 0, "volume_dropped": 0, "member_refused": 0},
         family: {"payload_too_large": 1, "volume_dropped": count, "member_refused": 2}}}
+
+
+def publication_block(heartbeat: bool = False, signing: bool = False) -> dict:
+    return {"state": "available", "heartbeat_clock_out_of_range": heartbeat,
+            "signing_clock_refusing": signing}
 
 
 def liveness_block(undeclared: list[str], expiring: list[str] | None = None) -> dict:
@@ -1541,6 +1564,29 @@ def response_cases() -> list[dict]:
         ("ingress_count_negative", envelope_text(edited(
             ("mqtt_ingress",), ingress_block(count=-1))),
          "integer_invalid", "a count is at least 0"),
+        ("publication_available", envelope_text(edited(
+            ("gateway_publication",), publication_block())),
+         "accept", "available says the diagnostic was read; neither clock refuses"),
+        ("publication_refused_named", envelope_text(served(
+            [(("gateway_publication",), publication_block(heartbeat=True, signing=True))],
+            D, ["gateway_publication_clock_refused"])),
+         "accept", "both causes, one token"),
+        ("publication_refused_unnamed", envelope_text(served(
+            [(("commissioning", "problems"), ["binding_missing"]),
+             (("gateway_publication",), publication_block(signing=True))],
+            "degraded", ["commissioning_problem"])),
+         "reasons_mismatch", "a refusing clock named by no token, under a degraded it does not "
+         "change"),
+        ("publication_members_while_disabled", envelope_text(edited(
+            ("gateway_publication",), {"state": "disabled", "signing_clock_refusing": False})),
+         "shape_invalid", "a disabled block carries only state"),
+        ("publication_unavailable", envelope_text(edited(
+            ("gateway_publication",), {"state": "unavailable"})),
+         "shape_invalid", "the flags are in-process: the block takes no unavailable state"),
+        ("publication_flag_not_bool", envelope_text(edited(
+            ("gateway_publication",), {"state": "available", "heartbeat_clock_out_of_range": 0,
+                                       "signing_clock_refusing": False})),
+         "type_invalid", "a flag is a boolean"),
         ("undeclared_device", envelope_text(served(
             [(("firmware_liveness",), liveness_block(undeclared=["ori-fw-1d2e3f40"]))],
             "degraded", ["firmware_signing_domains_undeclared"])),
@@ -1734,6 +1780,7 @@ def rich_health() -> dict:
         "worst_case_device_latency_ms": 5000, "consecutive_tick_failures": 0,
         "last_successful_tick_age_ms": 1000, "expiring_device_ids": [SUBORDINATE],
         "undeclared_device_ids": [UNDECLARED], "degraded": True}
+    h["gateway_publication"] = publication_block()
     h["mqtt_ingress"] = {"state": "available", "families": {
         "ori/gateway/health": {"payload_too_large": 0, "volume_dropped": 0, "member_refused": 0},
         "ori/{device_id}/evidence/inbound": {"payload_too_large": 2, "volume_dropped": 0,
@@ -1789,6 +1836,7 @@ BLOCK_MEMBERS = {
     "config_authority": ["state", "signature_required", "signature_verified", "dotenv_loaded",
                          "unsigned_value_source"],
     "skill_hooks": ["state", "required_unavailable", "optional_unavailable"],
+    "gateway_publication": ["state", "heartbeat_clock_out_of_range", "signing_clock_refusing"],
     "telemetry_export": ["state", "transport_available", "suspended", "queued_events",
                          "retained_events", "dropped_events", "unconfirmed_events",
                          "declined_events", "refused_events"],
@@ -1936,6 +1984,10 @@ def heartbeat_snapshot_cases() -> list[dict]:
          "nothing local-only reaches the heartbeat"),
         ("integer_the_socket_refuses", over, True,
          "a snapshot the socket would refuse is malformed for the heartbeat too"),
+        ("clock_refused_before_recovery", served(
+            [(("gateway_publication",), publication_block(heartbeat=True))],
+            D, ["gateway_publication_clock_refused"]), False,
+         "a snapshot taken before the clock recovered: the heartbeat names the token"),
     ]
     out = []
     for name, h, unservable, note in specs:
