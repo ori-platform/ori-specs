@@ -33,6 +33,31 @@ because an earlier check already refused the input.
 
 A claim survives when the join is exercised, not when nothing contradicts it.
 
+### Four lenses
+
+Weigh a change and each finding through four lenses, each a question:
+
+- **PATF (the Physical Actuation Trust Framework).** Does it preserve who may
+  authorise, decide, execute and prove physical action; keep evidence and
+  ancillary work from gating authorised Tier C dispatch or Tier D execution;
+  and preserve operator decisions and required evidence custody? Approval
+  expiry, commissioning and restart without replay are required refusals, not
+  violations. *Does this reach physical authority?* below holds the detail.
+- **Security.** What can each hostile or faulty party do with it, and which way
+  does each failure err? Who learns what, and what can each component reach?
+- **Maintainability.** Does it keep one authoritative statement of each rule,
+  and what does it add in surface, state and operational load?
+- **Extensibility.** Does it keep compatibility and a clear owner for future
+  change? It does not mean adding abstractions for hypothetical needs.
+
+Apply them by relevance. Every review asks which lenses apply, and a finding
+explains only the material ones; a routine change needs no four paragraphs.
+Never trade authority or security for simplicity or flexibility: state a
+tradeoff explicitly, and take any change to an accepted guarantee to the
+maintainer. The lenses guide the questions and replace no proof obligation:
+correctness checks, independent oracles, class sweeps, mutation and the
+stopping rule all still apply.
+
 ## Does this reach physical authority?
 
 Ori acts on the world, so one boundary sits above the rest: **the reviewed
