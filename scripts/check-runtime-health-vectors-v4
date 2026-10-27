@@ -168,6 +168,7 @@ V4_SECTIONS = (
     ('## Health Payload > ### `skill_hooks` object', True),
     ('## Health Payload > ### `telemetry_export` object', False),
     ('## Health Payload > ### `mqtt_ingress` object', True),
+    ('## Health Payload > ### `gateway_publication` object', True),
     ('## Health Payload > ### Diagnostics', True),
     ('## Remote Health Projection', True),
     ('## Consumers', True),
@@ -467,6 +468,11 @@ PREDICATES: dict[str, tuple[str, Callable[[dict, dict], bool]]] = {
         "`config_authority.unsigned_value_source` is `true`.",
         lambda s, m: (b := _blk(s, "config_authority")) is not None
         and b["unsigned_value_source"] is True),
+    "gateway_publication_clock_refused": (
+        ("`gateway_publication.heartbeat_clock_out_of_range` or "
+         "`gateway_publication.signing_clock_refusing` is `true`."),
+        lambda s, m: (b := _blk(s, "gateway_publication")) is not None
+        and True in (b["heartbeat_clock_out_of_range"], b["signing_clock_refusing"])),
     "evidence_posture_problem": (
         "`evidence.posture_problems` is non-empty. Holds in every evidence state.",
         lambda s, m: (len(s["evidence"]["posture_problems"]) > 0
@@ -543,6 +549,7 @@ BLOCK_SECTIONS = {
     "telemetry_export": "## Health Payload > ### `telemetry_export` object",
     "skill_hooks": "## Health Payload > ### `skill_hooks` object",
     "mqtt_ingress": "## Health Payload > ### `mqtt_ingress` object",
+    "gateway_publication": "## Health Payload > ### `gateway_publication` object",
     "safety_zones": "## Health Payload > ### `safety_zones[]` object",
 }
 STATELESS = ("sensors", "last_alert_timestamps", "safety_zones")
@@ -567,6 +574,7 @@ READ_MEMBERS = {
     "skill_hooks": ("required_unavailable", "optional_unavailable"),
     "community_skills": ("refused_skills",),
     "config_authority": ("unsigned_value_source",),
+    "gateway_publication": ("heartbeat_clock_out_of_range", "signing_clock_refusing"),
     "commissioning": ("problems", "zones"),
     "safety_registry": ("trip_verification_deadline_ms",),
     "sensors": ("id", "connection", "connected", "stale", "measurement_degraded"),
@@ -1083,24 +1091,14 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     extra = set(m["vocabulary"]) - set(m["severity"]) - {m["umbrella"], m["heartbeat_only"]}
     if extra or m["vocabulary"].get(m["umbrella"], "x") is not None:
         raise Failure(f"gateway vocabulary holds tokens no condition names: {extra}")
-    count = re.search(r"The vocabulary holds (\d+) tokens\. A conforming heartbeat names either "
-                      r"`(\w+)` alone, or a combination of the other (\d+)\. Not all (\d+) can hold "
-                      r"at once, because a block that names `subsystem_state_unknown_critical` cannot "
-                      r"also name its own conditions, but the bound admits all (\d+) together\.",
-                      flat(gw["## Runtime Node Heartbeat Payload > ### `degradation_reasons`"]))
-    if count is None or int(count.group(1)) != len(m["vocabulary"]) \
-            or count.group(2) != m["heartbeat_only"] \
-            or len({int(count.group(i)) for i in (3, 4, 5)} | {len(m["vocabulary"]) - 1}) != 1:
-        raise Failure("the gateway's stated token counts disagree with its table")
-    room = re.search(r"The bound of (\d+) admits every such combination and leaves (no room: a "
-                     r"further token changes the bound|room for one addition without a change "
-                     r"to the bound);",
-                     flat(gw["## Runtime Node Heartbeat Payload > ### `degradation_reasons`"]))
-    spare = len(m["vocabulary"]) - 1
-    if room is None or int(room.group(1)) != spare + (0 if room.group(2).startswith("no") else 1):
-        raise Failure(f"the gateway's stated bound and its room disagree with the {spare} tokens "
-                      "a heartbeat can name beside each other")
-    m["room_bound"] = int(room.group(1))
+    # The bound is stated as the vocabulary less its heartbeat-only token, never as a number,
+    # so a receiver derives it from the vocabulary it supports.
+    stated = re.search(r"Tokens are unique, in byte order, and number at most the tokens of the "
+                       r"vocabulary other than `(\w+)`\.",
+                       flat(gw["## Runtime Node Heartbeat Payload > ### `degradation_reasons`"]))
+    if stated is None or stated.group(1) != m["heartbeat_only"]:
+        raise Failure("the gateway's bound is not its vocabulary less the heartbeat-only token")
+    m["derived_bound"] = len(m["vocabulary"]) - 1
     # The topics mqtt_ingress may name: the Gateway -> Runtime rows of Payload Size, which
     # GATEWAY_SECTIONS does not own, read from the section's own table.
     size = re.search(r"^## Payload Size\n(.*?)^## ", texts["gw"], re.MULTILINE | re.DOTALL)
@@ -1120,10 +1118,13 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     if t5 is None:
         raise Failure("T5 reworded")
     m["t5_steps"] = list(range(int(t5.group(1)), int(t5.group(2)) + 1))
-    bound = re.search(r"an array of at most (\d+) strings", t_rows[2][1])
-    if bound is None:
-        raise Failure("T3 states no bound")
-    m["max_reasons"] = int(bound.group(1))
+    # T3 bounds the reasons only as a set of the vocabulary without the heartbeat-only token.
+    if not re.fullmatch(
+            r"`degradation_reasons` is an array of strings, unique, sorted by byte order, each "
+            r"in the gateway-api/v2 vocabulary and none `(\w+)`", t_rows[2][1]) or \
+            not t_rows[2][1].endswith(f"`{m['heartbeat_only']}`"):
+        raise Failure("T3 states a bound other than the vocabulary's set")
+    m["max_reasons"] = m["derived_bound"]
     mapping = table(v4["## Heartbeat Mapping"],
                     ["Snapshot", "Heartbeat `status`", "Heartbeat `degradation_reasons`"])
     m["mapping"] = {}
@@ -1168,11 +1169,12 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     if row8 is None:
         raise Failure("the status row names no statuses")
     m["reason_statuses"] = list(row8.group(1, 2))
-    glen = next(re.fullmatch(r"length is `(\d+) \.\. (\d+)`", r[1]) for r in gw_rows
+    glen = next(re.fullmatch(r"length is at least (\d+) and at most the number of vocabulary "
+                             r"tokens other than `(\w+)`", r[1]) for r in gw_rows
                 if r[1].startswith("length is"))
-    if glen is None:
-        raise Failure("the gateway length row is not a range")
-    m["gateway_length"] = (int(glen.group(1)), int(glen.group(2)))
+    if glen is None or glen.group(2) != m["heartbeat_only"]:
+        raise Failure("the gateway length row is not derived from the vocabulary")
+    m["gateway_length"] = (int(glen.group(1)), m["derived_bound"])
     m["gateway_order"] = [s_ for s_, _, _ in m["gateway_steps"]]
 
     req = v4["## Request"]
@@ -2376,7 +2378,8 @@ GATEWAY_CHECKS: dict[str, Callable[[dict, dict], bool]] = {
     and hb["status"] in m["runtime_statuses"],
     PRESENCE: lambda hb, m: True,
     "value is an array": lambda hb, m: isinstance(hb.get("degradation_reasons"), list),
-    "length is `1 .. 32`": lambda hb, m: m["gateway_length"][0] <= len(_reasons(hb))
+    ("length is at least 1 and at most the number of vocabulary tokens other than "
+     "`health_snapshot_invalid`"): lambda hb, m: m["gateway_length"][0] <= len(_reasons(hb))
     <= m["gateway_length"][1],
     "every element is a string": lambda hb, m: all(isinstance(t, str) for t in _reasons(hb)),
     "elements are unique": lambda hb, m: len({json.dumps(t) for t in _reasons(hb)})
@@ -2697,6 +2700,14 @@ def coverage(corpus: dict, m: dict,
             gaps.append(f"snapshot: {t} alone")
     if set() not in holds:
         gaps.append("snapshot: nothing holds")
+    publication = [b for s_, _ in snaps if isinstance(b := s_.get("gateway_publication"), dict)]
+    for clocks in itertools.product((False, True), repeat=2):
+        if not any(b.get("state") == "available" and (
+                b.get("heartbeat_clock_out_of_range"), b.get("signing_clock_refusing")) == clocks
+                for b in publication):
+            gaps.append(f"snapshot: gateway_publication available with clocks {clocks}")
+    if not any(b.get("state") == "disabled" for b in publication):
+        gaps.append("snapshot: gateway_publication disabled")
     # A block that names subsystem_state_unknown_critical cannot also raise its own conditions.
     if set(conds) - {"subsystem_state_unknown_critical"} not in holds:
         gaps.append("snapshot: every condition but the unknown-critical one at once")
@@ -3593,6 +3604,14 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("T1 skipped", model_mutant(skip_t="T1")),
         ("T3 bound one higher", model_mutant(max_reasons=model["max_reasons"] + 1)),
         ("T3 bound one lower", model_mutant(max_reasons=model["max_reasons"] - 1)),
+        ("the clock token read from the heartbeat clock alone", model_mutant(pred={
+            "gateway_publication_clock_refused": lambda s, m: available(
+                s["gateway_publication"])
+            and s["gateway_publication"]["heartbeat_clock_out_of_range"] is True})),
+        ("the clock token read from the signing clock alone", model_mutant(pred={
+            "gateway_publication_clock_refused": lambda s, m: available(
+                s["gateway_publication"])
+            and s["gateway_publication"]["signing_clock_refusing"] is True})),
         ("ok maps to an empty reasons array", model_mutant(ok_reasons_present=True)),
         ("fallback carries the snapshot's fields", model_mutant(fallback_from_snapshot=True)),
         ("the heartbeat's token admitted in a snapshot",
@@ -3759,6 +3778,9 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("corpus: the umbrella out of step with liveness", corpus_mutant(
             lambda c: named(c, "snapshot_cases", "nothing_wrong")["snapshot"][
                 "firmware_liveness"].update(degraded=True))),
+        ("corpus: the heartbeat clock cleared under its token", corpus_mutant(
+            lambda c: named(c, "snapshot_cases", "publication_heartbeat_clock")["snapshot"][
+                "gateway_publication"].update(heartbeat_clock_out_of_range=False))),
         ("corpus: a duplicate member", lambda: run(corpus_bytes.replace(
             b'"version": 4', b'"version": 4, "version": 4', 1), model)),
         ("corpus: Tier C lost not the sum", corpus_mutant(
@@ -3793,8 +3815,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "v4", "is not `null` and `> stall_bound_ms`", "is not `null` and `≥ stall_bound_ms`")),
         ("text: request bound", text_mutant(
             "v4", "longer than 1024 bytes, counting its LF", "longer than 1023 bytes, counting its LF")),
-        ("text: T3 bound", text_mutant("v4", "an array of at most 32 strings",
-                                       "an array of at most 31 strings")),
+        ("text: T3 bound", text_mutant("v4", "an array of strings, unique",
+                                       "an array of at most 31 strings, unique")),
         ("text: gateway severity", text_mutant(
             "gw", "| `sensor_unconnected` | `degraded` |", "| `sensor_unconnected` | `critical` |")),
         ("text: gateway row 8", text_mutant(
@@ -3929,13 +3951,25 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("text: the token dropped from the gateway table", both(
             f"gateway-api/v2 gives {undeclared} severity missing", (
                 "gw", f"| `{undeclared}` | `degraded` | A device's", "| `x` | `degraded` | A"))),
-        ("text: the gateway count left at 32 tokens", both(
-            "the gateway's stated token counts disagree with its table", (
-                "gw", "The vocabulary holds 33 tokens.", "The vocabulary holds 32 tokens."))),
-        ("text: the old room for one addition restored", both(
-            "the gateway's stated bound and its room disagree", (
-                "gw", "leaves no room: a further token\nchanges the bound;",
-                "leaves room for one addition\nwithout a change to the bound;"))),
+        ("text: the gateway bound read as a number", both(
+            "the gateway's bound is not its vocabulary less the heartbeat-only token", (
+                "gw", ("number at most\nthe tokens of the vocabulary other than "
+                       "`health_snapshot_invalid`."), "number at most **33**."))),
+        ("text: the gateway bound less another token", both(
+            "the gateway's bound is not its vocabulary less the heartbeat-only token", (
+                "gw", ("number at most\nthe tokens of the vocabulary other than "
+                       "`health_snapshot_invalid`."),
+                ("number at most\nthe tokens of the vocabulary other than "
+                 "`firmware_liveness_degraded`.")))),
+        ("text: gateway step 4 restored to a number", both(
+            "no model for gateway step 4", (
+                "gw", ("| 4 | length is at least 1 and at most the number of vocabulary "
+                       "tokens other than `health_snapshot_invalid` |"),
+                "| 4 | length is `1 .. 33` |"))),
+        ("text: gateway_publication not projected", both(
+            "payload members neither projected nor listed as local: {'gateway_publication'}",
+            ("v4", "`mqtt_ingress`, `gateway_publication` | The snapshot's",
+             "`mqtt_ingress` | The snapshot's"))),
         ("text: the device list projected", both(
             "the projection row for firmware_liveness changed", (
                 "v4", ("every listed member except `expiring_device_ids` and "
@@ -3945,8 +3979,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
                  "`expiring_device_count` (`int`) in its place.")))),
         ("text: mqtt_ingress not projected", both(
             "payload members neither projected nor listed as local: {'mqtt_ingress'}",
-            ("v4", "`skill_hooks`, `telemetry_export`, `mqtt_ingress` | The snapshot's",
-             "`skill_hooks`, `telemetry_export` | The snapshot's"))),
+            ("v4", "`telemetry_export`, `mqtt_ingress`, `gateway_publication` | The snapshot's",
+             "`telemetry_export`, `gateway_publication` | The snapshot's"))),
         ("text: member_refused dropped from the families value", because(
             "sentence changed in v4 ## Health Payload > ### `mqtt_ingress` object", text_mutant(
                 "v4", ("| `member_refused` | `int` | Payloads refused under the Payload "
@@ -4425,6 +4459,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `skill_hooks` | `object` | |',
             '| `telemetry_export` | `object` | |',
             '| `mqtt_ingress` | `object` | |',
+            '| `gateway_publication` | `object` | |',
             '| `diagnostics` | `object` | See [Diagnostics](#diagnostics). |',
         ),
         '## Health Payload > ### `sensors[]` object': (
@@ -5156,6 +5191,44 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              " the runtime has built, under `families` beside its `state`, and it counts Payload "
              "Member Rule refusals, which the gateway's posture does not."),
         ),
+        '## Health Payload > ### `gateway_publication` object': (
+            'Whether a clock is keeping the runtime from publishing to its gateway.',
+            'States:',
+            '`disabled` (the runtime has no gateway MQTT connection configured), `available`.',
+            ('The flags are held in the process, so they are always readable, and the block '
+             'takes no other state.'),
+            '`available` means that this diagnostic was read, not that the runtime can publish.',
+            '| Field | Type | Present | Notes |',
+            '| `state` | `string` | always | |',
+            ('| `heartbeat_clock_out_of_range` | `bool` | available | `true` from a heartbeat '
+             'tick whose wall clock gave a `last_seen_ms` outside the range gateway-api/v2 '
+             '[Runtime Node Heartbeat Payload](../gateway-api/v2.md#runtime-node-heartbeat-payload)'
+             ' admits, so that heartbeat was not published, until the first later tick whose '
+             "clock is in range, which clears it whether or not that tick's heartbeat is then "
+             'published.'),
+            'The ordinary and fallback heartbeats alike.',
+            'While the node heartbeat is disabled no tick runs, and it is `false`. |',
+            ('| `signing_clock_refusing` | `bool` | available | `true` while the clock from which '
+             'the runtime takes the `signed_at_ms` of its gateway envelopes refuses to issue a '
+             'signing time, so no envelope signed from it is published: the heartbeat, reasoning '
+             'requests, export responses and inbound acknowledgements alike.'),
+            ('`false` while gateway authentication is disabled, because no signing clock is then '
+             'in use. |'),
+            'The two members name different reaches.',
+            ('A wall clock out of range stops the heartbeat alone; a refusing signing clock stops '
+             'every envelope signed from it.'),
+            ('Each refusal stays fail-closed: the runtime neither clamps a clock nor publishes '
+             'unsigned to deliver this report.'),
+            'What the gateway sees does not change.',
+            ('It judges the node by the authenticated publications it receives, under '
+             'gateway-api/v2 [Site Health HTTP Projection]'
+             '(../gateway-api/v2.md#site-health-http-projection).'),
+            ('While the signing clock refuses, no publication that could carry the token goes '
+             'out, and a token a gateway received says only what held when its snapshot was '
+             'taken.'),
+            ('Neither member says whether a clock fault came from a malfunction or from '
+             'tampering.'),
+        ),
         '## Health Payload > ### Diagnostics': (
             '`diagnostics` is an object, always present, possibly empty.',
             'It is the only place a producer may report uncontracted local state.',
@@ -5187,7 +5260,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              "`gateway_broker_posture`, `state_store_encryption`, `evidence`, "
              "`action_log_records`, `commissioning`, `safety_registry`, `safety_zones`, "
              "`community_skills`, `config_authority`, `skill_hooks`, `telemetry_export`, "
-             "`mqtt_ingress` | The snapshot's block, with only its present members that this "
+             "`mqtt_ingress`, `gateway_publication` | The snapshot's block, with only its present members that this "
              "version's tables list, nested ones included, and every member of a map such as "
              "`mqtt_ingress.families`, whose names are data, except `commissioning.last_verdict`,"
              " which is projected as `{binding_seq, at_ms}`. |"),
@@ -5259,6 +5332,13 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('Its snapshot then fails snapshot checks 9 and 10 for that condition alone, so it is'
              ' a partial implementation of this version, and its `status` can read `ok` while the'
              ' count is non-zero.'),
+            ('**`gateway_publication_clock_refused` is adopted gateway first,** for the same '
+             'reason.'),
+            ('Until the gateways a runtime reports to accept it, the runtime may serve '
+             '`gateway_publication` without the token.'),
+            ('Its snapshot then fails snapshot checks 9 and 10 for that condition alone, as '
+             'above.'),
+            'In neither case does a runtime report `degraded` without naming a token.',
         ),
         '## Severity': (
         ),
@@ -5319,6 +5399,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `community_skills_refused` | `degraded` | `community_skills.refused_skills > 0`. |',
             ('| `config_unsigned_value_source` | `degraded` | '
              '`config_authority.unsigned_value_source` is `true`. |'),
+            ('| `gateway_publication_clock_refused` | `degraded` | '
+             '`gateway_publication.heartbeat_clock_out_of_range` or '
+             '`gateway_publication.signing_clock_refusing` is `true`. |'),
             '| `evidence_posture_problem` | `degraded` | `evidence.posture_problems` is non-empty.',
             'Holds in every evidence state. |',
             ('| `evidence_courier_answer_unrecognised` | `degraded` | '
@@ -5523,7 +5606,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| T1 | The snapshot is a JSON object, and `status` is the string `ok`, '
              '`degraded` or `critical` | `status_invalid` |'),
             '| T2 | `critical` is a boolean equal to `status == "critical"` | `critical_mismatch` |',
-            ('| T3 | `degradation_reasons` is an array of at most 32 strings, unique, '
+            ('| T3 | `degradation_reasons` is an array of strings, unique, '
              'sorted by byte order, each in the gateway-api/v2 vocabulary and none '
              '`health_snapshot_invalid` | `reasons_malformed` |'),
             ('| T4 | The triple is self-consistent: the reasons are empty exactly when '
@@ -5619,7 +5702,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'rule](#consistency-rules) holds | `shape_invalid` |'),
             '| 6 | `status` is `ok`, `degraded` or `critical` | `status_invalid` |',
             '| 7 | `critical` is a boolean equal to `status == "critical"` | `critical_mismatch` |',
-            ('| 8 | `degradation_reasons` is a set of at most 32 tokens of the '
+            ('| 8 | `degradation_reasons` is a set of tokens of the '
              'gateway-api/v2 vocabulary other than `health_snapshot_invalid` | '
              '`reasons_malformed` |'),
             ('| 9 | `degradation_reasons` equals the reasons recomputed from the '
@@ -5706,6 +5789,22 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              '| The fallback heartbeat, failing step `snapshot_unservable`. |'),
             ('| A negative or oversized number inside `diagnostics` | The snapshot is '
              'served; the heartbeat is mapped normally. |'),
+            ('| A heartbeat tick whose wall clock gives `last_seen_ms` `0`, and one that gives '
+             '`9007199254740992`, on the ordinary and the fallback path | No heartbeat is '
+             'published;'),
+            ('`gateway_publication.heartbeat_clock_out_of_range` is `true` and the snapshot names '
+             '`gateway_publication_clock_refused`, `degraded`.'),
+            ('The first later tick at `1` or `9007199254740991` returns the member to `false` and '
+             'attempts the heartbeat; whether it is published depends on the other causes, not on '
+             'this member. |'),
+            ('| A heartbeat tick whose wall clock returns into range while the signing clock still '
+             'refuses | `heartbeat_clock_out_of_range` returns to `false`, '
+             '`signing_clock_refusing` stays `true`, the snapshot still names '
+             '`gateway_publication_clock_refused`, and no heartbeat is published. |'),
+            ('| A signing clock that refuses to issue a signing time | No gateway envelope signed '
+             'from it is published;'),
+            ('`gateway_publication.signing_clock_refusing` is `true` while it refuses, and the '
+             'snapshot names `gateway_publication_clock_refused`, `degraded`. |'),
             ('| An eligible zone refused at activation, in development posture | '
              '`safety_zone_activation_refused`, `degraded`. |'),
             ('| A commanded trip refused by the driver; one whose effect is `mismatched`; '
@@ -5978,6 +6077,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ("| `firmware_signing_domains_undeclared` | `degraded` | A device's accepted manifest"
              " does not declare the signing domains, so the runtime signs no command or liveness "
              "message for it and its runtime-commanded actions are unavailable. |"),
+            ("| `gateway_publication_clock_refused` | `degraded` | A clock kept the runtime from "
+             "publishing to its gateway: its wall clock gave a `last_seen_ms` outside this "
+             "contract's range, or its signing clock refused to issue a signing time. |"),
             ("| `safety_zone_activation_refused` | `degraded` | An eligible zone's "
              'profile was refused at activation, so the zone is not protected. |'),
             ('| `safety_zone_active_unprotected` | `degraded` | A zone the device has '
@@ -6033,19 +6135,21 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('If present it carries at least one token; an empty array is **malformed**, '
              'because two encodings of one state is a difference implementations resolve '
              'inconsistently.'),
-            ('Tokens are unique, in byte order, and number at most **32** — an exact '
-             'bound rather than "bounded", so conformance is checkable without judgement.'),
-            'The vocabulary holds 33 tokens.',
+            ('Tokens are unique, in byte order, and number at most the tokens of the vocabulary '
+             'other than `health_snapshot_invalid`.'),
+            'That bound is exact rather than "bounded", so conformance is checkable without judgement.',
+            ('A receiver takes it from the vocabulary it supports, never from the heartbeat or '
+             'from a vocabulary a runtime adopted on its own, so a token added to the vocabulary '
+             'moves the bound in the same adoption and no bound text changes.'),
             ('A conforming heartbeat names either `health_snapshot_invalid` alone, or a '
-             'combination of the other 32.'),
-            ('Not all 32 can hold at once, because a block that names '
+             'combination of the other tokens.'),
+            ('Not all of them can hold at once, because a block that names '
              '`subsystem_state_unknown_critical` cannot also name its own conditions, but the '
-             'bound admits all 32 together.'),
+             'bound admits them all together.'),
             ('A conforming runtime never emits `firmware_liveness_degraded` alone, '
              'because its local triple check refuses that snapshot (runtime-health/v4 '
              'step T4), though a receiver accepts it.'),
-            ('The bound of 32 admits every such combination and leaves no room: a further token '
-             'changes the bound; step 9 refuses `health_snapshot_invalid` beside any other token.'),
+            'Step 9 refuses `health_snapshot_invalid` beside any other token.',
             ('**Validation order is normative.** It applies after authentication and '
              'generic JSON syntax parsing, but **before typed decoding or normalisation** '
              '— otherwise a typed decoder would already have rejected the array-type and '
@@ -6057,7 +6161,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| 2 | presence of `degradation_reasons` — absent is valid and terminates '
              'validation | — |'),
             '| 3 | value is an array | `degradation_reasons_not_array` |',
-            '| 4 | length is `1 .. 32` | `degradation_reasons_length_invalid` |',
+            ('| 4 | length is at least 1 and at most the number of vocabulary tokens other than '
+             '`health_snapshot_invalid` | `degradation_reasons_length_invalid` |'),
             '| 5 | every element is a string | `degradation_reason_not_string` |',
             '| 6 | elements are unique | `degradation_reasons_not_unique` |',
             ('| 7 | elements are in byte order of their UTF-8 encoding | '
