@@ -174,7 +174,8 @@ PINS: list[tuple[str, str]] = [
     ("ad", "each with the verdict a gateway gives it at checks 1 and 3 to 6 of [Carriage and custody](#carriage-and-custody), for the topic device and configured devices the case names, and the verdict a receiver gives it at checks 1 to 5 of [Verifying](#verifying), for the enrolments and forwarding permissions the case names."),
     ("ad", "Every refusal reason of both lists, other than those of the Payload Member Rule and Payload Volume, which gateway-api/v2's corpora hold, has a case refused for that reason alone; every outcome, every row of the observation table, every detail code and both record kinds have an accepted case; and `delivered` is `malformed`."),
     ("ad", "Accepted cases hold the longest record of each kind the rules permit together, each string at the longest and each integer at the largest its rules allow alongside the others, and the longest submission whose `notice` is mandatory. Each is under the 1024 bytes gateway-api/v2.md *Payload Size* claims for the record topic."),
-    ("ad", "They cover a duplicate, a conflict under one identity, a breach of each rule of [Consistency across records](#consistency-across-records), a lower count, a later failure of an accepted attempt, a failed retry after an accepted attempt, failover to the other channel, and tallies of two epochs kept apart."),
+    ("ad", "They cover a duplicate, a conflict under one identity, a breach of each rule of [Consistency across records](#consistency-across-records), every impossible history of one attempt's observations in every subset and arrival order, a lower count, a later failure of an accepted attempt, a failed retry after an accepted attempt, failover to the other channel, and tallies of two epochs kept apart."),
+    ("ad", "- **The observations of one attempt** that a receiver holds admit at least one complete path through the table of [Observations of one attempt](#observations-of-one-attempt), even where they are not adjacent. A record whose holding would leave them none, as an observation 3 beside an observation 1 that was `failed` or `accepted`, is a `conflict`. Missing records may leave a path uncertain; they never make an impossible one consistent."),
     ("ad", "messages in arrival order with the gateway's custody verdict: `queued`, `replayed`, both records of a pair with one identity and different bytes queued, and `queue_full` at `max_records_per_device`."),
     ("ad", "with a case for each refusal reason of *The enrolment proof* that fails that check alone wherever the order allows one; and enrolment sequences, proofs judged in order against what earlier ones left held, so that a proof refused at any check holds nothing and the same key's later valid proof passes."),
     ("ad", "gateway-config/v2 `alert_delivery` load-rule cases, one for each rule and accepted cases."),
@@ -1342,6 +1343,13 @@ class Receiver:
                     return k
                 if oseq == seq + 1 and o["prior_outcome"] != obj["outcome"] and "prior_one_way" not in mut:
                     return k
+        # The observations of one attempt held, with this one, must admit at
+        # least one complete path through the observation table, adjacent or not.
+        if "no_path_rule" not in mut:
+            same = [k for k in pool if k[1]["kind"] == model["kind_submission"] and k[4] == lineage
+                    and k[1]["delivery_attempt_id"] == obj["delivery_attempt_id"]]
+            if same and not admits_path([k[1] for k in same] + [obj], model):
+                return same[0]
         return None
 
     def tally_key(self, obj: dict, epoch: bytes, mut: frozenset) -> tuple:
@@ -1457,6 +1465,39 @@ class Custody:
         if verdict in reasons_acked or verdict in (qf, su, model["gw_replayed"]):
             return {"outcome": refused, "reason": verdict, "record_digest": digest, "device_id": dev}
         return None
+
+
+def legal_paths(model: dict) -> list[tuple]:
+    """Every legal history of one attempt: sequences of outcomes, each step a
+    row of the observation table, of any length the table allows (an attempt
+    may stop at any observation, as an unresolved `unconfirmed` does)."""
+    rows = model["obs_table"]
+    paths: list[tuple] = []
+    frontier = [(o,) for s, p, perm, _ in rows if s == 1 and p is None for o in perm]
+    while frontier:
+        paths += frontier
+        nxt = []
+        for path in frontier:
+            for s, p, perm, _ in rows:
+                if s == len(path) + 1 and p == path[-1]:
+                    nxt += [path + (o,) for o in perm]
+        frontier = nxt
+    return paths
+
+
+def admits_path(observations: list, model: dict) -> bool:
+    """Whether one legal history contains every observation, each at its own
+    `observation_seq` with its own `prior_outcome` and `outcome`."""
+    for path in legal_paths(model):
+        ok = True
+        for o in observations:
+            n = int(o["observation_seq"].text)
+            if len(path) < n or path[n - 1] != o["outcome"] or (path[n - 2] if n > 1 else None) != o["prior_outcome"]:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
 
 
 def identity_of(obj: dict, model: dict) -> tuple:
@@ -2279,12 +2320,31 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
         if sorted(tal, key=k) != sorted(seq.get("expected_tallies", []), key=k):
             bad(f"{where}: tallies held {json.dumps(sorted(tal, key=k))} but corpus says {json.dumps(sorted(seq.get('expected_tallies', []), key=k))}")
         shape_coverage(rcv, verdicts, model, cov)
+        objs = [json.loads(ev["record"]) for ev in seq["records"]]
+        if len(objs) == 2 and all(o.get("kind") == model["kind_submission"] for o in objs) \
+                and objs[0]["delivery_attempt_id"] == objs[1]["delivery_attempt_id"] \
+                and objs[0]["observation_seq"] != objs[1]["observation_seq"]:
+            cov.setdefault("pairs", set()).add(
+                (tuple((o["observation_seq"], o["prior_outcome"], o["outcome"]) for o in objs), tuple(verdicts)))
     for v in model["rx6"] + (model["stored"],):
         if v not in cov["rx6"]:
             bad(f"coverage: no receiver sequence gives {v}")
-    for r in ("identity", "attempt_fields", "alert", "attempt_seq", "prior"):
+    for r in ("identity", "attempt_fields", "alert", "attempt_seq", "prior", "path"):
         if r not in cov["rules"]:
             bad(f"coverage: no receiver sequence breaches the {r} rule of Consistency across records")
+    # Every history of two observations at different positions, each a row the
+    # table permits, in both arrival orders: impossible ones conflict on the
+    # second, possible ones are both stored.
+    rows = [(sq, pr, o) for sq, pr, perm, _ in model["obs_table"] for o in perm]
+    mkobs = lambda r: {"observation_seq": Tok(str(r[0])), "prior_outcome": r[1], "outcome": r[2]}
+    for ra in rows:
+        for rb in rows:
+            if ra[0] == rb[0]:
+                continue
+            want = (model["stored"], model["stored"]) if admits_path([mkobs(ra), mkobs(rb)], model) \
+                else (model["stored"], model["rx6"][1])
+            if (((ra[0], ra[1], ra[2]), (rb[0], rb[1], rb[2])), want) not in cov.get("pairs", set()):
+                bad(f"coverage: no receiver sequence of observations {ra} then {rb}, judged {want}")
     for s in ("later_failure", "failed_retry", "failover", "tally_epochs"):
         if s not in cov["seq_shapes"]:
             bad(f"coverage: no receiver sequence shows {s}")
@@ -2439,11 +2499,12 @@ def _check(corpus: dict, model: dict, mut: frozenset, bad: Callable[[str], None]
 
 def conflict_rule(rcv: Receiver, raw: bytes, obj: dict, epoch: bytes, model: dict, lineage: tuple = ()) -> str:
     """Which rule of Consistency (or the identity rule) made this record conflict."""
-    for rule, m in (("identity", {"no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule"}),
-                    ("attempt_fields", {"no_identity_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule"}),
-                    ("alert", {"no_identity_rule", "no_attempt_fields_rule", "no_attempt_seq_rule", "no_prior_rule"}),
-                    ("attempt_seq", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_prior_rule"}),
-                    ("prior", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule"})):
+    for rule, m in (("identity", {"no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule", "no_path_rule"}),
+                    ("attempt_fields", {"no_identity_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule", "no_path_rule"}),
+                    ("alert", {"no_identity_rule", "no_attempt_fields_rule", "no_attempt_seq_rule", "no_prior_rule", "no_path_rule"}),
+                    ("attempt_seq", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_prior_rule", "no_path_rule"}),
+                    ("prior", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule", "no_path_rule"}),
+                    ("path", {"no_identity_rule", "no_attempt_fields_rule", "no_alert_rule", "no_attempt_seq_rule", "no_prior_rule"})):
         pool = [k for k in rcv.kept[:-1]]
         if obj["kind"] == model["kind_submission"] and rcv._submission(raw, obj, epoch, pool, model, frozenset(m), lineage) is not None:
             return rule
@@ -2502,7 +2563,10 @@ JUDGE_MUTANTS = [
     "detail_any_outcome", "detail_prior_any", "detail_after_accepted_any", "no_detail_rule", "rx5_reversed",
     # receiver check 6 and the reading
     "no_duplicate", "conflicts_in_pool", "no_identity_rule", "no_attempt_fields_rule", "attempt_fields_short", "no_alert_rule",
-    "no_attempt_seq_rule", "no_prior_rule", "prior_one_way",
+    "no_attempt_seq_rule", "no_path_rule",
+    # The path rule implies the prior rule, so a wrong prior rule shows only
+    # with the path rule off as well.
+    "no_prior_rule+no_path_rule", "prior_one_way+no_path_rule",
     "tally_no_epoch", "tally_key_no_class", "no_tally_conflict", "no_lower_count",
     "reading_with_conflicts", "reading_across_keys", "channels_merged", "latest_by_issued", "latest_by_arrival", "latest_first_obs",
     "ever_latest_only", "some_channel_sms_only", "settled_always",
@@ -2630,7 +2694,7 @@ def run_mutations(corpus: dict, model: dict, texts: dict[str, str]) -> int:
     baseline = set(check(corpus, model))
     for m in JUDGE_MUTANTS:
         total += 1
-        errs = set(check(corpus, model, frozenset([m]))) - baseline
+        errs = set(check(corpus, model, frozenset(m.split("+")))) - baseline
         if not [e for e in errs if not e.startswith("coverage:")]:
             survivors.append(f"judge mutant {m}")
     for name, x in corpus_mutants(corpus):

@@ -892,12 +892,24 @@ def breaks(h: dict, o: dict) -> bool:
         return True
     if h["alert_id"] == o["alert_id"] and (h["notice"], h["class"]) != (o["notice"], o["class"]):
         return True
-    if not same_attempt and h["attempt_seq"] == o["attempt_seq"]:
-        return True
-    if same_attempt and hs == os_ - 1:
-        return h["outcome"] != o["prior_outcome"]
-    if same_attempt and hs == os_ + 1:
-        return h["prior_outcome"] != o["outcome"]
+    # The prior_outcome rule is judged over the whole attempt, by legal_path.
+    return not same_attempt and h["attempt_seq"] == o["attempt_seq"]
+
+
+# Every complete legal path through the observation table, as outcomes in observation order.
+LEGAL_PATHS = (("accepted",), ("failed",), ("unconfirmed",), ("unconfirmed", "accepted"),
+               ("unconfirmed", "failed"), ("accepted", "failed"), ("unconfirmed", "accepted", "failed"))
+
+
+def legal_path(observations: list) -> bool:
+    """Whether the held observations of one attempt admit at least one complete legal path, adjacent or not."""
+    for path in LEGAL_PATHS:
+        if all(integer(o["observation_seq"]) <= len(path)
+               and path[integer(o["observation_seq"]) - 1] == o["outcome"]
+               and o["prior_outcome"] == (path[integer(o["observation_seq"]) - 2]
+                                          if integer(o["observation_seq"]) > 1 else None)
+               for o in observations):
+            return True
     return False
 
 
@@ -915,8 +927,12 @@ class Receiver:
             return "duplicate", []
         stored = [k for k in self.kept if k["verdict"] == "stored"]  # never judged against a conflict record
         if o["kind"] == "submission":
-            hit = [k for k in stored if k["obj"]["kind"] == "submission" and k["epoch"] == epoch
-                   and breaks(k["obj"], o)]  # consistency holds within one device and one epoch
+            mine = [k for k in stored if k["obj"]["kind"] == "submission" and k["epoch"] == epoch
+                    and k["obj"]["device_id"] == o["device_id"]]  # consistency holds within one device and epoch
+            hit = [k for k in mine if breaks(k["obj"], o)]
+            attempt = [k for k in mine if k["obj"]["delivery_attempt_id"] == o["delivery_attempt_id"]]
+            if not legal_path([k["obj"] for k in attempt] + [o]):
+                hit += [k for k in attempt if k not in hit]
             return ("conflict", hit) if hit else ("stored", [])
         same = [k for k in stored if k["obj"]["kind"] == "withheld_tally" and tally_key(k["obj"]) == tally_key(o)]
         hit = [k for k in same if integer(k["obj"]["count"]) == integer(o["count"])]
@@ -982,6 +998,8 @@ RECEIVER_SEQUENCES: list[dict] = []
 
 
 def rseq(name: str, note: str, recs: list, ctx: dict | None = None) -> None:
+    if any(c["name"] == name for c in RECEIVER_SEQUENCES):
+        raise AssertionError(f"duplicate sequence name {name}")
     ctx = ctx or fixture()
     ctx = {k: v for k, v in ctx.items() if k not in ("topic_device", "configured_devices")}
     datas = [r if isinstance(r, str) else text(r) for r in recs]
@@ -1074,6 +1092,26 @@ rseq("consistency_prior_outcome_seq3", "Consistency, prior_outcome at seq 3: seq
      "accepted, then seq 3 says its prior was accepted, but seq 2's outcome was failed. Conflict.",
      [obs(AL1, AT1, 1, 1, None, "accepted"), obs(AL1, AT1, 1, 2, "accepted", "failed"),
       obs(AL1, AT1, 1, 3, "accepted", "failed", "provider_reported_failure")])
+# Every pair of observation positions of one attempt, each record a row the table permits on its own, in both
+# arrival orders: the second is conflict exactly when no complete legal path holds both.
+ROWS = {1: (("accepted", None), ("failed", None), ("unconfirmed", None)),
+        2: (("accepted", "unconfirmed"), ("failed", "unconfirmed"), ("failed", "accepted")),
+        3: (("failed", "accepted"),)}
+SHORT = {"accepted": "a", "failed": "f", "unconfirmed": "u", None: "n"}
+for first_pos, second_pos in ((1, 2), (1, 3), (2, 3)):
+    for out1, pri1 in ROWS[first_pos]:
+        for out2, pri2 in ROWS[second_pos]:
+            r1 = obs(AL1, AT1, 1, first_pos, pri1, out1)
+            r2 = obs(AL1, AT1, 1, second_pos, pri2, out2)
+            possible = legal_path([parse(text(r1)), parse(text(r2))])
+            label = f"{first_pos}{SHORT[pri1]}{SHORT[out1]}_{second_pos}{SHORT[pri2]}{SHORT[out2]}"
+            for order, recs in (("in_order", [r1, r2]), ("reversed", [r2, r1])):
+                rseq(f"path_{label}_{order}",
+                     f"Observation {first_pos} {out1} (prior {pri1}) and observation {second_pos} {out2} (prior "
+                     f"{pri2}) of one attempt, arriving {'in observation order' if order == 'in_order' else 'in reverse'}: "
+                     + ("some complete legal path holds both, so both are stored."
+                        if possible else "no complete legal path holds both, so the second is conflict."),
+                     recs)
 rseq("gap_stored", "seq 2 of an attempt with no seq 1: the receiver does not hold the earlier and stores it; "
      "the reading says what the records held say, never that it is complete.",
      [obs(AL1, AT1, 1, 2, "unconfirmed", "accepted")])
@@ -1648,7 +1686,10 @@ def build() -> dict:
                                    "with the count of a stored one and other bytes is conflict even when a "
                                    "greater count is stored. An observation's identity is (device_id, "
                                    "delivery_attempt_id, observation_seq), and every consistency rule, attempt_seq "
-                                   "uniqueness among them, holds within one device_id and one epoch; a tally's identity is its tally key, its epoch and its count. "
+                                   "uniqueness among them, holds within one device_id and one epoch. The prior_outcome rule "
+                                   "is judged over every held observation of the attempt: a record whose holding "
+                                   "would leave no complete legal path through the observation table is conflict, "
+                                   "adjacent or not; a tally's identity is its tally key, its epoch and its count. "
                                    "`expected_reading` is Reading a notice over the `stored` records, for each "
                                    "device_id, epoch (the key_identity) and alert_id: per channel the latest attempt state and ever "
                                    "accepted, and accepted on some channel; `settled` is false for every notice a "
