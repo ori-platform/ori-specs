@@ -37,13 +37,14 @@ A claim survives when the join is exercised, not when nothing contradicts it.
 
 Weigh a change and each finding through four lenses, each a question:
 
-- **PATF (the Physical Actuation Trust Framework).** Does it let anything
-  delay or block a Tier D act, or a Tier C act after approval; supply an act's
-  licence from evidence; discard or silently stall evidence; or lose an
-  operator decision? *Does this reach physical authority?* below holds the
-  detail.
+- **PATF (the Physical Actuation Trust Framework).** Does it preserve who may
+  authorise, decide, execute and prove physical action; keep evidence and
+  ancillary work from gating authorised Tier C dispatch or Tier D execution;
+  and preserve operator decisions and required evidence custody? Approval
+  expiry, commissioning and restart without replay are required refusals, not
+  violations. *Does this reach physical authority?* below holds the detail.
 - **Security.** What can each hostile or faulty party do with it, and which way
-  does each failure err?
+  does each failure err? Who learns what, and what can each component reach?
 - **Maintainability.** Does it keep one authoritative statement of each rule,
   and what does it add in surface, state and operational load?
 - **Extensibility.** Does it keep compatibility and a clear owner for future
