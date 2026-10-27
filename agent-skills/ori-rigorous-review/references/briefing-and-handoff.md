@@ -49,6 +49,11 @@ paragraph against the receiver. Send a draft to every implementer, not only
 to a reader. The run costs one pass against a checkout the implementer
 already has open; the same finding after merge is a migration.
 
+Brief the independent review once the design is frozen: after one adversarial
+round and its narrow fixes, not after same-model passes have come back clean.
+Codex and the implementers are the oracles that round cannot be; waiting for a
+clean pass before using them spends rounds on what they find in one.
+
 Ask for the report in the shape the main skill defines: decision first, each
 finding with its class, its sweep, and whether it was reproduced or reasoned.
 
@@ -80,6 +85,28 @@ enumerates every producer-supplied timestamp on the surface, requires each to
 be classified as a producer fact or excluded from receiver ordering, and
 refuses to start on one it does not recognise would have made the blocker
 unwritable, at no cost on any later change.
+
+**A second instance means fix the class, never the instance.** When a defect
+occurs a second time, stop fixing instances: sweep the entire surface for the
+class, in every phrasing and position it can take, and fix it once with a
+structural rule that covers all of them. The instances found become that fix's
+test cases, not its work list.
+
+**Fix by narrowing, never by inventing.** Answer a finding by narrowing the text
+or code, deleting what is wrong, or, only where narrowing cannot fix it,
+stating a limit with an owner. Never answer one with a new mechanism in the
+thing under review: a new state, record, identity, derivation or ordering
+rule, or field. A guard that fails closed on the class, a test or a checker on
+the product, is the structural fix above, not a mechanism. A fix that adds a
+mechanism is a design change. Take it to the maintainer as a decision, with
+the alternatives and a recommendation, before writing it. A class that keeps
+recurring inside your own fixes says the same: the design is the problem, and
+the answer is a simplification, never another patch. In a contract, specify
+what a reader or caller can observe; producer internals belong to the
+implementing repository, and every one specified is new surface to attack.
+One contract ran thirteen review rounds because each round's fix invented a
+mechanism the next round broke; the simplification that ended it came at
+round seven, and an implementer's single pass found what the rounds had not.
 
 The guard must fail for the property it names. Mutate the property and watch
 the named test fail for that reason, not through a crash or an earlier refusal.
