@@ -126,6 +126,7 @@ PINS: list[tuple[str, str]] = [
     ("ad", "1. Checks 2 to 4 of [Carriage and custody](#carriage-and-custody), and, in place of check 1's MQTT bounds, its own bound of 4096 bytes on the record: `payload_too_large`."),
     ("ad", "and, when the receiver holds the record's key enrolled, revoked or not, on behalf of the owner its enrolment names, as the receiver's own authenticated registry holds it"),
     ("ad", "A record whose key is not enrolled for the device passes this check on the device alone, and check 3 refuses it."),
+    ("ad", "A record whose holding would leave them none, as an observation 3 beside an observation 1 that was `failed` or `accepted`, is a `conflict`. Missing records may leave a path uncertain; they never make an impossible one consistent."),
     ("ad", "Observation identity, `attempt_seq` uniqueness, the rules of [Consistency across records](#consistency-across-records), tallies, and [Reading a notice](#reading-a-notice) all hold within one `device_id` and one epoch."),
     ("tr", "A record answered 202 `key_not_enrolled` or 403 `not_owned` is kept and sent again with the long back-off, for at most 7 days from the first of those answers."),
     ("tr", "At the deadline the record is rejected, as below, with the reason of its last such answer."),
@@ -1106,6 +1107,31 @@ HOLD: list = []  # the last request's Verifying check 6 verdict
 VF: list = []    # the last request's Verifying check 3 to 5 reasons, in order
 
 
+def table_paths(model: dict) -> list[list[tuple[str, str, str]]]:
+    """Every path through the observation table, from observation_seq 1, as
+    (observation_seq, prior_outcome, outcome) steps; a path may stop after
+    any step."""
+    rows = model["ad_rules"]["obs"]
+    paths: list[list[tuple[str, str, str]]] = []
+
+    def walk(path: list, seq: int, prior: str) -> None:
+        for out in sorted(rows.get((str(seq), prior), ())):
+            step = path + [(str(seq), prior, out)]
+            paths.append(step)
+            walk(step, seq + 1, out)
+    walk([], 1, "null")
+    return paths
+
+
+def legal_path_exists(observations: list, model: dict) -> bool:
+    held = {(jv(o["observation_seq"]), jv(o["prior_outcome"]), jv(o["outcome"])) for o in observations}
+    for path in table_paths(model):
+        steps = set(path)
+        if held <= steps:
+            return True
+    return False
+
+
 def held_verdict(obj: dict, raw: bytes, records: list, model: dict, mut: frozenset) -> str:
     """alert-delivery/v1.md *Verifying* check 6, against the records held."""
     if any(r == raw for _, r, _ in records) and "no_duplicate" not in mut:
@@ -1130,6 +1156,11 @@ def held_verdict(obj: dict, raw: bytes, records: list, model: dict, mut: frozens
                     return "conflict"
                 if b == a - 1 and jv(o["prior_outcome"]) != jv(obj["outcome"]):
                     return "conflict"
+        # Every observation held for the attempt, with this one, admits at
+        # least one complete path through the observation table, adjacent or not.
+        same_attempt = [o for o in same_dev if o["delivery_attempt_id"] == obj["delivery_attempt_id"]]
+        if "adjacent_only" not in mut and not legal_path_exists(same_attempt + [obj], model):
+            return "conflict"
             if o["alert_id"] == obj["alert_id"] and (jv(o["notice"]), jv(o["class"])) != (jv(obj["notice"]), jv(obj["class"])):
                 return "conflict"
             if jv(o["attempt_seq"]) == jv(obj["attempt_seq"]) and o["delivery_attempt_id"] != obj["delivery_attempt_id"]:
@@ -1771,6 +1802,14 @@ def _check(c: dict, model: dict, mut: frozenset, bad: Callable[[str], None]) -> 
                 bad(f"{where}: receiver_verdict {v['receiver_verdict']!r}, judged {got['receiver_verdict']!r}")
             cover("request accepted", name)
             cover(f"request accepted {got['receiver_verdict']}", name)
+            _, body_obj = record_reason(body, model, frozenset())
+            if isinstance(body_obj, dict) and body_obj.get("kind") == "submission":
+                gaps = [abs(int(jv(o["observation_seq"])) - int(jv(body_obj["observation_seq"]))) for o, _, h in records
+                        if h == "stored" and o.get("kind") == "submission"
+                        and o.get("delivery_attempt_id") == body_obj.get("delivery_attempt_id")
+                        and o.get("key_identity") == body_obj.get("key_identity")]
+                if gaps and min(gaps) >= 2:
+                    cover(f"request path not adjacent {got['receiver_verdict']}", name)
             if any(h == "conflict" for _, _, h in records) and got["receiver_verdict"] == "stored":
                 cover("request accepted beside a held conflict", name)
             if got["receiver_verdict"] == "conflict" and obj_is_tally(records):
@@ -1971,6 +2010,7 @@ def required_coverage(model: dict) -> set[str]:
     req.add("request the enrolment's owner is not the client's")
     # A body that is not a record reaches neither check 7 nor 8, so 6 over 7 has no case.
     req |= {f"request precedence {k} over {k + 1}" for k in range(1, 8) if k != 6}
+    req |= {"request path not adjacent conflict", "request path not adjacent stored"}
     req |= {"request check 8 over a later Verifying reason", "request accepted beside a held conflict",
             "request tally conflict beside a greater count"}
     req.add("response row 400 refused unauthenticated")
@@ -2011,7 +2051,7 @@ JUDGE_MUTANTS = [
     "retire_on_mismatched_digest", "digest_case_insensitive", "unwrap_array", "act_unauthenticated",
     "open_response_form", "skip_v", "skip_reason", "reason_before_pair", "target_prefix_ok", "target_query_ok",
     "member_rule_own_reason", "permission_on_non_record", "revoked_is_enrolled", "revoked_not_enrolled",
-    "consistency_across_epochs", "version_any_integer", "hmac_partial_headers",
+    "consistency_across_epochs", "adjacent_only", "version_any_integer", "hmac_partial_headers",
     "judge_without_inputs", "skip_content_length", "skip_method", "content_type_exact", "content_type_params_ok",
     "unauth_any", "skip_owner", "key_any_device", "verify_last_reason", "no_duplicate", "conflict_is_earlier",
     "lower_before_conflict", "skip_lower_count", "key_not_enrolled_422", "order_8_before_7", "skip_key_binding",
