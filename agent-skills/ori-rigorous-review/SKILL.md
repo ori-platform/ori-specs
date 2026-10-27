@@ -266,6 +266,12 @@ wrote. Neither reaches what you did not think of, so an implementation is not
 ready to hand off until it has also been attacked from outside — see
 *Attack the implementation, not only its tests*.
 
+Fix what the pass finds by narrowing or deleting, never by inventing a new
+mechanism; a limit never discharges an unmet requirement. A defect seen twice
+means the class fix fell short. `references/briefing-and-handoff.md` *What
+you do with a finding* states both, how to tell a guard from a design change,
+and what to do when a fix would need one.
+
 Briefing that attack is your job, and it is done badly more often than
 the attack itself. Read `references/briefing-and-handoff.md` before briefing
 the reviewer: what it receives and what you withhold, what a finding must

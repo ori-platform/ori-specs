@@ -49,6 +49,15 @@ paragraph against the receiver. Send a draft to every implementer, not only
 to a reader. The run costs one pass against a checkout the implementer
 already has open; the same finding after merge is a migration.
 
+Brief the independent review once the design is frozen: after one adversarial
+round and its narrow fixes, not after same-model passes have come back clean.
+Codex and the implementers are the oracles that round cannot be; waiting for a
+clean pass before using them spends rounds on what they find in one. This
+sets when independent review starts, not when review ends: the repairs, the
+class sweeps, the further holistic pass and the depth a change's tier requires
+remain owed under the stopping rule in `adversarial-review.md`, as do
+independent checker authorship and attack through the real entry point.
+
 Ask for the report in the shape the main skill defines: decision first, each
 finding with its class, its sweep, and whether it was reproduced or reasoned.
 
@@ -80,6 +89,39 @@ enumerates every producer-supplied timestamp on the surface, requires each to
 be classified as a producer fact or excluded from receiver ordering, and
 refuses to start on one it does not recognise would have made the blocker
 unwritable, at no cost on any later change.
+
+**A second instance means the class fix was not enough.** Sweep the class on
+the first finding, under *Report the class and sweep it in the same round* in
+`adversarial-review.md`, which is the procedure. A second instance shows the
+earlier repair or guard did not cover the class: stop fixing instances,
+reassess its structural coverage, and fix it once with a rule that covers every
+phrasing and position. The instances found become that fix's test cases, not
+its work list.
+
+**Fix by narrowing, never by inventing.** Answer a finding by narrowing the text
+or code, or by deleting what is wrong. Never answer one with a new mechanism in
+the thing under review. Classify a change by its effect, not by its form:
+
+- A test or checker that detects a violation of an existing requirement is a
+  guard, and is the structural fix above.
+- A runtime check that enforces a refusal already required is a conformance
+  repair.
+- A change that introduces new authority, protocol semantics, state, records,
+  identities, ordering or compatibility rules, or obligations is a design
+  change, even when it is built as a guard or a check.
+
+Take a design change to the maintainer as a decision, with the alternatives and
+a recommendation, before writing it. A limit does not discharge an unmet
+requirement or clear a blocker: it records only what a requirement never
+asked for. If preserving a requirement needs a design change, that is the
+maintainer's decision, and weakening an accepted guarantee needs an explicit
+ruling. A class that keeps recurring inside your own fixes says the same: the
+design is the problem, and the answer is a simplification taken to the
+maintainer, never another patch. In a contract, specify what a reader or
+caller can observe. Durability, atomicity and ordering are contract
+requirements when a consumer relies on them; the machinery that provides them
+belongs to the implementing repository, and every piece of it specified is new
+surface to attack.
 
 The guard must fail for the property it names. Mutate the property and watch
 the named test fail for that reason, not through a crash or an earlier refusal.
