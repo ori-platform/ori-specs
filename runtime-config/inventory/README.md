@@ -28,6 +28,10 @@ rather than transcribed, and the extraction is the artifact.
 
 **177 configuration paths across 19 parse functions**, 37 required.
 
+> **Current location.** This section names `ori/config.py` as it stood at
+> `8adf3f7`. That module is now the package `ori/config/`, with the loader in
+> `ori/config/_config.py`.
+
 ### Receivers are tracked, because a key is not a path
 
 A first attempt recorded every `.get()` and subscript inside a parse function,
@@ -121,6 +125,9 @@ review is for.
 The walk covers `ori/config.py`'s parse functions. It does **not** cover keys
 read elsewhere: `runtime.py` assembles the dict handed to `adapter.connect()`,
 and adapters read from it directly.
+
+> **Current location.** `config.py` and `runtime.py` are named as they stood
+> at `8adf3f7`. They are now the packages `ori/config/` and `ori/runtime/`.
 
 Of the shipped example's leaf paths, **78 are not parsed by `config.py`**.
 

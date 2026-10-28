@@ -92,14 +92,14 @@ without reading runtime SQLite directly.
 
 ## G-18 — Runtime/gateway MQTT hardening contract
 
-Resolved: `gateway-api/v1.md`, `runtime-config/v1.md`, and `gateway-config/v1.md`
+Resolved: `gateway-api/v1.md`, `runtime-config/v2.md`, and `gateway-config/v1.md`
 document runtime-gateway HMAC envelopes, verify-only previous secrets, AES-GCM
 sensitive export encryption, runtime node heartbeat auth, gateway heartbeat auth,
 and production broker posture attestation.
 
 ## G-19 — SMS webhook public-ingress hardening
 
-Resolved: `runtime-config/v1.md` documents raw-body HMAC verification, nonce
+Resolved: `runtime-config/v2.md` documents raw-body HMAC verification, nonce
 replay protection, source CIDR requirements, no query-token fallback, and sender
 allowlisting for runtime SMS webhook ingress. `gateway-config/v1.md` documents the
 gateway SMS webhook signing bridge for providers that cannot sign webhooks.
@@ -113,7 +113,7 @@ ori-cloud identity ownership rules for report persistence.
 
 ## G-21 — Runtime public integration boundary
 
-Resolved: `runtime-config/v1.md` documents the typed `ori.integration` rule
+Resolved: `runtime-config/v2.md` documents the typed `ori.integration` rule
 evaluation boundary and `py.typed` package marker used by product/demo consumers
 such as product/demo API consumers.
 
