@@ -673,8 +673,8 @@ accurate description of what a repo implements.
   lifetime from the trigger.
 
 - **`signing_key` and the previous provisioning anchor are contract text only**
-  ([runtime-config-signing/v1.md](../runtime-config-signing/v1.md)): the
-  design-target section adds them so that `wrong_authority` is reachable for
+  ([runtime-config-orchestration/v1.md](../runtime-config-orchestration/v1.md#key-naming-and-anchor-rotation)):
+  its Key Naming And Anchor Rotation section adds them so that `wrong_authority` is reachable for
   the provisioning document and the provisioning key can rotate. The runtime's
   signature path neither reads `signing_key` nor configures a previous anchor.
 
