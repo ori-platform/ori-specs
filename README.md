@@ -10,6 +10,12 @@ Each contract version's status lives in its record under [`status/`](status/),
 and [VERSIONING.md](VERSIONING.md#status-records) defines the fields. The rows
 below are checked against those records.
 
+The rows do not show proof. Each record's `proof` says what end-to-end,
+hardware-in-the-loop and production evidence exists, and
+[Proof Levels](VERSIONING.md#proof-levels) defines what each level and state
+requires. A `partial` level shows part of a contract on the hardware its
+evidence names, never the whole contract.
+
 | Contract | File | Maturity | Adoption | Compatibility |
 | --- | --- | --- | --- | --- |
 | Alert delivery report | [alert-delivery/v1.md](alert-delivery/v1.md) | `draft` | none recorded | `amendable` |
