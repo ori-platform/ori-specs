@@ -202,23 +202,23 @@ None of them implies another.
 
 ### Proof Levels
 
-Each proof field records one kind of evidence, with its own state. Passing CI,
-an implementation and a shipment are never proof.
+Each proof field records one kind of evidence, with its own state. An
+implementation and a shipment are never proof.
 
 - **Host** is not a proof level. Unit tests and CI runs describe where an
   implementation was built and tested. Whether it conforms is `conformance`,
   which needs a behavioural assessment.
 - **`end_to_end`**: the real components and interfaces the contract governs
-  ran together, scoped to that contract. The evidence names each component and
-  its revision, and every substitution made for a real component or interface,
-  such as a simulator, a replayed input, a loopback broker or a stub.
+  ran together, scoped to that contract. The evidence names every substitution
+  made for a real component or interface, such as a simulator, a replayed
+  input, a loopback broker or a stub.
 - **`hil`**: representative target hardware ran the implementation, with real
-  physical interfaces wherever the claim concerns them. The evidence names the
-  board, its revision and the rig. A development board with commodity modules
-  supports a claim for that configuration only; it never establishes the
-  behaviour of another board or board revision. A contract whose claim
-  concerns evidence handling rather than actuation may have target-hardware
-  evidence without moving an actuator, if its evidence says so.
+  physical interfaces wherever the claim concerns them. A development board
+  with commodity modules qualifies for a claim about that configuration only;
+  it never establishes the behaviour of another board or board revision. A
+  contract whose claim concerns evidence handling rather than actuation may
+  have target-hardware evidence without moving an actuator, if its evidence
+  says so.
 - **`production`**: a commissioned field deployment ran the implementation in
   the security posture the contract requires. The evidence records the site,
   the posture, the workload, the duration, how it was supervised and every
@@ -231,20 +231,22 @@ exclusion justified. `partial` means some of the matrix was shown at that
 level. `established` means everything in the matrix that the level can
 exercise was shown, against defined pass criteria and including its fault
 cases, with artifacts that let the run be reproduced. One successful run never
-establishes a level. The evidence names the matrix, or where it is kept.
+establishes a level.
 
-A proof state recorded before these definitions, whose evidence names no
-matrix, stays as recorded. It is raised only with an exact mapping of its
+A proof state recorded before these definitions stays as recorded, and is not
+thereby shown to meet them. It is raised only with an exact mapping of its
 evidence to the contract's clauses.
 
 A statement of proof made outside this repository, to an investor or anyone
-else, names the capability, the hardware and its revision, the security
-posture, the observed result and the limit that remains.
+else, names the capability, the implementation revision, the hardware and its
+revision, the security posture, the observed result and the limit that
+remains.
 
-`scripts/check-contract-status` checks the field names, the state vocabulary,
-and that a state other than `none` carries evidence that is not only a release
-or a commit. It cannot judge coverage, hardware equivalence, duration or
-truth; review does.
+`scripts/check-contract-status` checks the field names and the state
+vocabulary, that a state other than `none` carries non-empty evidence that is
+not just a bare release or commit identifier, and that prose does not claim a
+level its field leaves `none`. It cannot judge coverage, hardware equivalence,
+duration or truth; review does.
 
 Some words are descriptive only and carry no status:
 

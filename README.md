@@ -13,8 +13,8 @@ below are checked against those records.
 The rows do not show proof. Each record's `proof` says what end-to-end,
 hardware-in-the-loop and production evidence exists, and
 [Proof Levels](VERSIONING.md#proof-levels) defines what each level and state
-requires. A `partial` level shows part of a contract on the hardware its
-evidence names, never the whole contract.
+requires. A `partial` state shows part of a contract at that level, never the
+whole contract.
 
 | Contract | File | Maturity | Adoption | Compatibility |
 | --- | --- | --- | --- | --- |
