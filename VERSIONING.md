@@ -488,9 +488,9 @@ Validated against `status/`; the records carry adoption and proof in full.
 | device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
 | ed25519-key-admission | v1 | `draft` | `amendable` | — |
 | ed25519-verification | v1 | `draft` | `amendable` | — |
-| events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
+| events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
 | events | v2 | `draft` | `amendable` | — |
-| evidence | v1 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit pending |
+| evidence | v1 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit complete |
 | evidence | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
 | evidence | v3 | `draft` | `amendable` | — |
 | evidence-audit | v1 | `draft` | `amendable` | — |
@@ -518,13 +518,13 @@ Validated against `status/`; the records carry adoption and proof in full.
 | operator-socket | v1 | `draft` | `frozen` | claiming-merge, runtime `4078762`, 2026-09-29; audit complete |
 | operator-socket | v2 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
 | operator-socket | v3 | `draft` | `amendable` | — |
-| runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
+| runtime-config | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | runtime-config | v2 | `draft` | `amendable` | — |
 | runtime-config-orchestration | v1 | `draft` | `amendable` | — |
-| runtime-config-signing | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
+| runtime-config-signing | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit complete |
 | runtime-evidence-anchor | v1 | `draft` | `frozen` | claiming-merge, runtime `b5ab285`, 2026-08-23; audit complete |
 | runtime-evidence-anchor | v2 | `draft` | `frozen` | claiming-merge, runtime `01d614a`, 2026-09-26; audit complete |
-| runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit pending |
+| runtime-health | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | runtime-health | v2 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
 | runtime-health | v3 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
 | runtime-health | v4 | `draft` | `amendable` | — |

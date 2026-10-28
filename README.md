@@ -27,11 +27,11 @@ below are checked against those records.
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Device policy | [device-policy/v2.md](device-policy/v2.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, `unassessed` | `frozen` (2026-07-24), audit `complete` |
 | Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `pending` |
-| Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `pending` |
+| Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `complete` |
 | Event schema | [events/v2.md](events/v2.md) | `draft` | none recorded | `amendable` |
 | Ed25519 key admission | [ed25519-key-admission/v1.md](ed25519-key-admission/v1.md) | `draft` | verifier (runtime) `implemented-unreleased`, `unassessed` | `amendable` |
 | Ed25519 verification | [ed25519-verification/v1.md](ed25519-verification/v1.md) | `draft` | verifier (runtime) `implemented-unreleased`, `unassessed` | `amendable` |
-| Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | `draft` | runtime `shipped` in v2.1.0, `unassessed`, producer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-07-24), audit `pending` |
+| Evidence chain (previous) | [evidence/v1.md](evidence/v1.md) | `draft` | runtime `shipped` in v2.1.0, `unassessed`, producer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-07-24), audit `complete` |
 | Evidence chain | [evidence/v2.md](evidence/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, `unassessed`, verifier (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-08-25), audit `complete` |
 | Evidence chain | [evidence/v3.md](evidence/v3.md) | `draft` | none recorded | `amendable` |
 | Evidence Audit | [evidence-audit/v1.md](evidence-audit/v1.md) | `draft` | none recorded | `amendable` |
@@ -56,13 +56,13 @@ below are checked against those records.
 | LAN application API | [lan-app-api/v1.md](lan-app-api/v1.md) | `draft` | none recorded | `amendable` |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Offline Tier C tokens | [offline-tokens/v2.md](offline-tokens/v2.md) | `draft` | verifier (runtime) `shipped` in v2.5.0-rc.12, claimed, `unassessed` | `frozen` (2026-09-26), audit `complete` |
-| Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `pending` |
+| Runtime config surface | [runtime-config/v1.md](runtime-config/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Runtime config surface (closed) | [runtime-config/v2.md](runtime-config/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime configuration orchestration | [runtime-config-orchestration/v1.md](runtime-config-orchestration/v1.md) | `draft` | none recorded | `amendable` |
-| Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | `draft` | consumer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `pending` |
+| Runtime config signing/install | [runtime-config-signing/v1.md](runtime-config-signing/v1.md) | `draft` | consumer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `complete` |
 | Runtime evidence anchor | [runtime-evidence-anchor/v1.md](runtime-evidence-anchor/v1.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, claimed, `unassessed`, verifier (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed` | `frozen` (2026-08-23), audit `complete` |
 | Runtime evidence anchor | [runtime-evidence-anchor/v2.md](runtime-evidence-anchor/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.12, claimed, `unassessed` | `frozen` (2026-09-26), audit `complete` |
-| Runtime health socket RPC (previous) | [runtime-health/v1.md](runtime-health/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `pending` |
+| Runtime health socket RPC (previous) | [runtime-health/v1.md](runtime-health/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, consumer (sdk-python) `implemented-unreleased`, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Runtime health socket RPC | [runtime-health/v2.md](runtime-health/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.3, `non-conforming` at assessed current snapshot `d2aba48` (2 divergences), cli `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `complete` |
 | Runtime health socket RPC | [runtime-health/v3.md](runtime-health/v3.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.12, `non-conforming` at assessed current snapshot `a39d551` (2 divergences) | `frozen` (2026-10-01), audit `complete` |
 | Runtime health socket RPC (next) | [runtime-health/v4.md](runtime-health/v4.md) | `draft` | none recorded | `amendable` |
