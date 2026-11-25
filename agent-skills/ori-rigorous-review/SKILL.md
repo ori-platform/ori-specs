@@ -100,11 +100,9 @@ history before calling it new, duplicate, or partial.
 Review the exact revision under discussion. Treat repository state as current
 truth; use prior decisions only to identify what must be rechecked. That
 includes this skill: a loaded copy is a copy, and a session that loaded it
-hours ago is holding the text as it was then. One session ran a full
-implementation on the version it had loaded while two later ones were
-installed underneath it, and nothing told it. Before
-relying on the text for a decision that matters, re-verify the installed copy
-against the manifest with `scripts/install-agent-skills --check`. Preserve
+hours ago is holding the text as it was then. Before relying on the text for
+a decision that matters, re-verify the installed copy against the manifest
+with `scripts/install-agent-skills --check`. Preserve
 unrelated local changes. If a PR or merged change needs a clean inspection,
 use an isolated worktree rather than altering the maintainer's branch.
 
@@ -158,12 +156,7 @@ driven through the entry point a caller actually reaches.
 Mutation testing is necessary and it is not sufficient. Reverting a check and
 watching a named test fail proves the tests agree with the code; the same
 author wrote both, under the same assumptions, so it cannot find what was never
-considered. A commissioning bridge passed that pass cleanly while a read-only
-command created the runtime's state database — 324 KB, owned by whoever ran the
-query, on a device commissioned before its first start — and while refused
-documents were reported as successes with a zero exit, in a tool whose sibling
-command already answered an invalid document with a failure. Neither is subtle.
-Both were invisible from inside the assumptions that produced them.
+considered.
 
 The pass:
 
@@ -175,8 +168,9 @@ The pass:
   reaching a generic handler, no unintended side effect. A table of hostile
   inputs then either satisfies all of them or names the row that does not.
 - **Check side effects, not only return values.** List the directory, the
-  database, the environment before and after. Every assertion about the
-  returned payload above was correct; only the filesystem showed the defect.
+  database, the environment before and after. A read-only command once
+  created the state database while every assertion about its returned payload
+  held; only the filesystem showed the defect.
 - **Include the state before first use** — missing file, empty store, nothing
   configured, no prior run. For an installation-time tool that *is* the normal
   case, and no fixture sets it up by default.
@@ -216,9 +210,7 @@ document, which reaches whoever reads it; and not a gate on the process, which
 can only say a block is present. A test fails the suite for everyone,
 including the next person who never read any of it. This skill records the
 rule so it survives transit between sessions; it is never the guard, and
-writing the rule down here does not discharge writing the test there. Prose
-failed twice on the same class in one repository; the guards held everywhere
-the estate has them.
+writing the rule down here does not discharge writing the test there.
 
 A guard states its own limit in its failure message, not only in its
 docstring, because the message is what the next person meets. An
@@ -341,8 +333,8 @@ only when its intended consumer actually loads it; otherwise account for the
 gap explicitly with an owner, proof status, and tracking item.
 
 When a specs merge changes vendored vectors, perform a deliberate re-vendor in
-each consuming repository after the merge, pin the squash-merge commit where
-appropriate, and rerun drift and reproduction checks. A pin naming a commit
+each consuming repository after the merge, pin the merge commit, and
+rerun drift and reproduction checks. A pin naming a commit
 that is not on `main` looks authoritative and points at nothing. Do not
 silently refresh a consumer while the contract is still pending. After any
 merged PR, sync the affected local `main` in every repository it touches before
