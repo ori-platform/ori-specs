@@ -2,13 +2,9 @@
 
 ## Scope
 
-`ori-specs` is a documentation-only repository that defines versioned contracts for:
-
-- `ori-runtime`
-- `ori-gateway`
-- `ori-cli`
-- `ori-skills`
-- `ori-sdk-python`
+`ori-specs` is a documentation-only repository that defines versioned contracts
+for every repository named in the `repository` vocabulary of
+[VERSIONING.md](VERSIONING.md#status-records).
 
 A contract change can break multiple repositories. Treat every PR as potentially breaking until proven otherwise.
 

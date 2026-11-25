@@ -36,18 +36,12 @@ boundary. A deviation that survives belongs in the contract as an amendment,
 not as one implementation's private liberty; otherwise the next implementer
 writes the version the contract still describes.
 
-A draft contract gets a second kind of review that no reader can give: each
-implementer runs the draft against the code they own and reports where it
-forbids something they do, permits something they refuse, or says two things.
-Textual review is necessary and finds a different class. One amendment went
-through two textual rounds, which found a missing replacement rule, an
-ambiguity, a self-contradicting example, and two missing obligations, all
-real and all about the text; the five defects about the world, including a
-sentence that would have regressed staleness detection for every phone that
-buffers offline, were found only by the receiver's implementer running the
-paragraph against the receiver. Send a draft to every implementer, not only
-to a reader. The run costs one pass against a checkout the implementer
-already has open; the same finding after merge is a migration.
+Send a draft contract to every implementer, not only to a reader. Each runs
+the draft against the code they own, the second review the main skill's
+*Contracts, vectors, and cross-repository work* requires; textual review is
+necessary and finds a different class. The run costs one pass against a
+checkout the implementer already has open; the same finding after merge is a
+migration.
 
 Brief the independent review once the design is frozen: after one adversarial
 round and its narrow fixes, not after same-model passes have come back clean.
@@ -125,16 +119,12 @@ surface to attack.
 
 The guard must fail for the property it names. Mutate the property and watch
 the named test fail for that reason, not through a crash or an earlier refusal.
-A guard has matched its own comment; a guard has scanned only JSON while the
-seed it was built to refuse sat in a Python literal; a guard claimed to read
-every tracked file and skipped four extensions. Each passed its tests.
 
 No gate may exist only on a release path. Before any tag, merge-only step, or
 hosted-runner check is trusted, document the ordinary invocation and test that
 it runs, on an input carrying the same hazardous property as the real one,
-asserted two-sided. Three release tags were spent learning this, and the third
-was spent by a check whose ordinary run used a probe term that could not
-exercise the defect the real document carried.
+asserted two-sided; `adversarial-review.md` *A gate that exists only on a
+release path* records what that cost.
 
 ## What leaves the PR body
 

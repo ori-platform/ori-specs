@@ -28,10 +28,14 @@ proceed in parallel, keep the implementation PR explicitly blocked and reconcile
 it against the merged contract before merge.
 
 **A merge here breaks consuming repositories, including ones you did not
-touch.** Their drift checks compare a pinned `source_commit` against this
-repository's `main`, and a squash merge rewrites that commit even when every
-vendored byte is identical. After any merge, re-vendor and re-pin in each
-consumer before pushing anything from it.
+touch.** The runtime's drift check (`scripts/refresh-evidence-vectors.sh` in
+`ori-runtime`) compares vendored bytes with this repository's `main`, and
+requires the pinned `source_commit` to be reachable from it and to hold those
+bytes. This repository now merges with merge commits only, so a pin taken
+after the merge names a commit that landed. Earlier merges were squashed: a
+pin taken from a branch before its squash merge names a commit that never
+reached `main`, and points at nothing. After a merge that changes a vendored
+file, re-vendor and re-pin in each consumer before pushing anything from it.
 
 **Vectors are the proof, and the tool that produces them is under review too.**
 Keep a generator and an independent verifier that share no code, and confirm
