@@ -89,7 +89,7 @@ whole contract.
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | `draft` | consumer (runtime) `shipped` in v2.4.0-rc.3, `unassessed` | `frozen` (2026-08-17), audit `pending` |
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
-| Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `pending` |
+| Tier C Approval | [tier-c-approval/v1.md](tier-c-approval/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.12, `unassessed` | `frozen` (2026-10-01), audit `complete` |
 | Tier C approver registry | [tier-c-approvers/v1.md](tier-c-approvers/v1.md) | `draft` | runtime `implemented-unreleased`, `unassessed` | `amendable` |
 
 Companion documents carry no record of their own; see
