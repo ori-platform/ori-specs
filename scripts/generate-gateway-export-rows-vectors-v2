@@ -21,6 +21,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / "gateway-api" / "vectors" / "export-rows-v2.json"
 
 BASES = ("reported", "not_reported", "unknown")
+COMPACTION = ("raw", "5min", "hourly", "daily")
 KINDS = ("dispatch", "contributor", "contributor_legacy")
 T0 = 1717000000000
 B0 = 1716998400000  # a multiple of every bucket width used below
@@ -130,23 +131,32 @@ def bucket(rows: list[dict], bucket_ms: int) -> list[dict]:
     return out
 
 
-def traverse(stored: list[dict], page_size: int, between: list[dict]) -> list[list[str]]:
-    """Keyset paging by (timestamp desc, stored order desc). `between[i]` changes the store before page i+1."""
+def position(order: str, r: dict) -> tuple:
+    """A row's position under Page Order, as a key that sorts in the export's order."""
+    if order == "descending":
+        return (-r["timestamp"], -r["stored"])
+    if order == "ascending":
+        return (r["timestamp"], COMPACTION.index(r["tier"]), BASES.index(r["producer_time"]), r["stored"])
+    return (r["start_ms"], BASES.index(r["producer_time"]))
+
+
+def traverse(order: str, stored: list[dict], page_size: int, between: list[dict]) -> list[list[str]]:
+    """Keyset paging in the export's order. `between[i]` changes the store before page i+1."""
     store = list(stored)
     pages: list[list[str]] = []
     cursor = None
     i = 0
     while True:
-        # A stored refusal of an unknown tier is not exported and holds no position.
-        carried = [r for r in store if not disregarded(r)]
-        ordered = sorted(carried, key=lambda r: (r["timestamp"], r["stored"]), reverse=True)
+        # action_log: a stored refusal of an unknown tier is not exported and holds no position.
+        carried = [r for r in store if order != "descending" or not disregarded(r)]
+        ordered = sorted(carried, key=lambda r: position(order, r))
         if cursor is not None:
-            ordered = [r for r in ordered if (r["timestamp"], r["stored"]) < cursor]
+            ordered = [r for r in ordered if position(order, r) > cursor]
         page = ordered[:page_size]
         if not page:
             break
         pages.append([r["id"] for r in page])
-        cursor = (page[-1]["timestamp"], page[-1]["stored"])
+        cursor = position(order, page[-1])
         if i < len(between):
             ch = between[i]
             store = [r for r in store if r["id"] not in ch.get("remove", [])] + ch.get("store", [])
@@ -377,8 +387,42 @@ def paging_cases() -> list[dict]:
             {**a("p", T0 + 3, 7), "tier": "Q", "action_taken": "refused_unknown_tier", "executed": False},
             {**a("q", T0 + 2, 8), "tier": "Q"}], 2, []),
     ]
-    return [{"name": n, "stored": s, "page_size": p, "between_pages": bt,
-             "expected_pages": traverse(s, p, bt)} for n, s, p, bt in cases]
+    def h(i, ts, tier, pt, stored):
+        return {"id": i, "timestamp": ts, "tier": tier, "producer_time": pt, "stored": stored}
+
+    def b(i, start, pt):
+        return {"id": i, "start_ms": start, "producer_time": pt}
+
+    H = 3600000
+    raw = [h("r1", B0, "raw", "reported", 1), h("r2", B0 + 7, "raw", "reported", 2),
+           h("r3", B0 + H + 1, "raw", "not_reported", 3)]
+    out = [("descending", n, s, p, bt) for n, s, p, bt in cases]
+    out += [
+        ("ascending", "ties broken by tier, then basis, then stored order, earliest first", [
+            h("s1", B0, "hourly", "reported", 5), h("s2", B0, "raw", "not_reported", 6),
+            h("s3", B0, "5min", "unknown", 2), h("s4", B0, "raw", "reported", 7),
+            h("s5", B0, "raw", "reported", 3), h("s6", B0, "5min", "reported", 4),
+            h("s7", B0 - 1, "daily", "unknown", 8), h("s8", B0 + 1, "raw", "unknown", 1)], 3, []),
+        ("ascending", "a row stored ahead of the cursor during the traversal is returned", raw, 1,
+         [{"store": [h("r4", B0 + H, "raw", "reported", 4)]}]),
+        ("ascending", "a raw row returned, then compacted: the reading is returned again in its compacted row",
+         raw, 1, [{"remove": ["r1", "r2"], "store": [h("c1", B0, "5min", "reported", 4)]}]),
+        ("ascending", "a raw row compacted before its page, its compacted row behind the cursor: the reading "
+         "is returned in neither", [h("r1", B0, "raw", "reported", 1), h("r0", B0 + 3, "raw", "reported", 2),
+                                    h("r2", B0 + 7, "raw", "reported", 3)], 2,
+         [{"remove": ["r1", "r0", "r2"], "store": [h("c2", B0, "5min", "reported", 4)]}]),
+        ("bucketed", "a bucket's bases split across pages", [
+            b("k1", B0, "unknown"), b("k2", B0, "reported"), b("k3", B0 + H, "reported"),
+            b("k4", B0, "not_reported")], 2, []),
+        ("bucketed", "a basis that appears behind the cursor during the traversal is not returned", [
+            b("k1", B0, "reported"), b("k2", B0 + H, "not_reported"), b("k3", B0 + 2 * H, "reported")], 2,
+         [{"store": [b("k4", B0, "unknown")]}]),
+        ("bucketed", "a basis that appears ahead of the cursor during the traversal is returned", [
+            b("k1", B0, "reported"), b("k2", B0, "unknown"), b("k3", B0 + H, "reported")], 2,
+         [{"store": [b("k4", B0 + H, "not_reported")]}]),
+    ]
+    return [{"name": n, "order": o, "stored": s, "page_size": p, "between_pages": bt,
+             "expected_pages": traverse(o, s, p, bt)} for o, n, s, p, bt in out]
 
 
 def resolution_cases() -> list[dict]:
@@ -486,7 +530,7 @@ def corpus() -> dict:
     return {
         "vector_set": "gateway-api/v2 export rows",
         "contract": "gateway-api/v2.md",
-        "sections": ["Producer Time", "sensor_history", "action_log"],
+        "sections": ["Producer Time", "sensor_history", "action_log", "Page Order"],
         "conventions": {
             "readings.where": "sensor_history row, history_point of a Tier 3 request, or reasoning_reading: "
                               "the Tier 3 request's own reading",
@@ -497,6 +541,10 @@ def corpus() -> dict:
             "expected.disregarded": "whether a consumer disregards the row, as a refusal the tier domain omits",
             "paging.between_pages": "entry i changes the store after page i+1 is returned and before the next "
                                     "is requested; stored is the order the runtime stored the rows",
+            "paging.order": "descending: action_log, reasoning_log, and tier_c_decision_log, whose timestamp "
+                            "here is its created_at; ascending: unbucketed sensor_history, where tier is the "
+                            "row's compaction tier; bucketed: bucketed sensor_history, whose rows are named by "
+                            "start_ms and producer_time",
             "paging.stored.tier": "a stored row's tier, action_taken and executed where a case gives them; a row "
                                   "without a tier is one the export carries",
             "tokens.gateway.answers": "the runtime's answers to one traversal's requests in order: rows with "
