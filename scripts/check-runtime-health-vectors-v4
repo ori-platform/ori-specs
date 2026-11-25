@@ -7,7 +7,11 @@ Shares no code with scripts/generate-runtime-health-vectors-v4, and was written
 without reading it. Every expected value is recomputed by this script's own
 model, built from runtime-health/v4.md and the runtime node heartbeat sections
 of gateway-api/v2.md: the condition table and its fold, the snapshot's shape
-for the blocks the table reads, the startup deadline, snapshot checks 5 to 9,
+for the blocks the table reads, the two mandatory alert kinds (Tier D and
+protection-degraded notifications, both judged against Tier D's attempt
+threshold and age bound, as the alert_outbox section states), the
+critical-capable blocks with the critical conditions each decides, the startup
+deadline, snapshot checks 5 to 9,
 the triple check T1 to T4 and the heartbeat mapping, the fallback heartbeat,
 whole served responses through snapshot checks 1 to 10 (the payload's members,
 JSON types at every depth, value vocabularies, diagnostics namespaces, states,
@@ -33,6 +37,8 @@ Held to:
   condition alone and every ordered pair in the fold, every condition raised
   by a snapshot alone, every disjunct of every predicate alone, every
   boundary the predicates and the startup deadline name at and either side,
+  each mandatory alert kind at Tier D's threshold and bound, one under each, at a
+  lowered threshold, absent, and both kinds at once,
   every subsystem starting and unread, every check step's failure, every
   gateway verdict, every refused byte class the request text lists, split
   writes, discarded bytes, the 1024 boundary, an unfinished request, and
@@ -380,6 +386,27 @@ UNKNOWN_DEGRADED = ("Any of `commissioning`, `community_skills`, `config_authori
                     "`evidence.action_records` has ")
 
 
+def pd_unconfirmed(s: dict, m: dict) -> bool:
+    """The protection-degraded row: its own count, attempts and age, judged against the
+    threshold and bound its wording names (m["pd_threshold"], m["pd_bound"]), which the
+    alert_outbox section says are Tier D's: neither kind has its own."""
+    b = _blk(s, "alert_outbox")
+    if b is None or b["protection_degraded_unresolved_count"] <= 0:
+        return False
+
+    def limit(key: Any) -> int:
+        return b[key] if isinstance(key, str) else key
+
+    attempts, age = b["protection_degraded_max_attempts"], b["protection_degraded_oldest_age_ms"]
+    return ((attempts is not None and m["pd_reached"](attempts, limit(m["pd_threshold"])))
+            or (age is not None and m["pd_reached"](age, limit(m["pd_bound"]))))
+
+
+PD_HOLDS = ("`alert_outbox.protection_degraded_unresolved_count > 0`, and "
+            "`protection_degraded_max_attempts ≥ tier_d_critical_warning_threshold` or "
+            "`protection_degraded_oldest_age_ms ≥ tier_d_age_bound_ms`.")
+
+
 def unknown_critical(s: dict, m: dict) -> bool:
     return any(isinstance(block_named(s, n), dict) and block_named(s, n).get("state")
                == "unavailable" for n in m["critical_capable"])
@@ -450,6 +477,7 @@ PREDICATES: dict[str, tuple[str, Callable[[dict, dict], bool]]] = {
                 b["tier_d_max_attempts"], b["tier_d_critical_warning_threshold"]))
             or (b["tier_d_oldest_age_ms"] is not None and m["reached"](
                 b["tier_d_oldest_age_ms"], b["tier_d_age_bound_ms"])))),
+    "protection_degraded_alert_delivery_unconfirmed": (PD_HOLDS, pd_unconfirmed),
     "alert_delivery_overdue": (
         ("`alert_outbox.oldest_non_tier_d_age_ms` is not `null` and `≥ overdue_bound_ms`."),
         lambda s, m: (b := _blk(s, "alert_outbox")) is not None
@@ -570,6 +598,8 @@ READ_MEMBERS = {
                                 "recovery_failed"),
     "alert_outbox": ("tier_d_unresolved_count", "tier_d_max_attempts", "tier_d_oldest_age_ms",
                      "tier_d_age_bound_ms", "tier_d_critical_warning_threshold",
+                     "protection_degraded_unresolved_count", "protection_degraded_max_attempts",
+                     "protection_degraded_oldest_age_ms",
                      "oldest_non_tier_d_age_ms", "overdue_bound_ms"),
     "skill_hooks": ("required_unavailable", "optional_unavailable"),
     "community_skills": ("refused_skills",),
@@ -1055,21 +1085,15 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     # available: the registry decides the pairs' conditions (safety_zones[] object section)
     need(v4["## Health Payload > ### `safety_zones[]` object"], "It is `[]` unless "
          "`safety_registry.state` is `available`", "safety_zones")
-    capable = []
+    capable: dict[str, list[str]] = {}
     for token, sev in m["severity"].items():
         if sev != m["order"][-1] or token == "subsystem_state_unknown_critical":
             continue
         first = re.search(r"`([a-z_]+)", PREDICATES[token][0])
         if first is None:
             raise Failure(f"{token}: no block named first")
-        block = owners.get(first.group(1), first.group(1))
-        if block not in capable:
-            capable.append(block)
-    m["critical_capable"] = capable
-    listed = re.search(r"The rule yields exactly (.+?)\. Every other block",
-                       flat(v4["## Severity > ### Unknown critical visibility"]))
-    if listed is None or sorted(re.findall(r"`([a-z_]+)` \(", listed.group(1))) != sorted(capable):
-        raise Failure(f"the listed critical-capable blocks differ from the rule's {capable}")
+        capable.setdefault(owners.get(first.group(1), first.group(1)), []).append(token)
+    m["critical_capable"] = list(capable)
     starting = flat(PREDICATES["subsystem_starting"][0]).split(" has ")[0]
     m["starting_blocks"] = re.findall(r"`([\w.]+)`", starting)
     unknown = flat(PREDICATES["subsystem_state_unknown"][0]).split(" has ")[0]
@@ -1091,6 +1115,17 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     extra = set(m["vocabulary"]) - set(m["severity"]) - {m["umbrella"], m["heartbeat_only"]}
     if extra or m["vocabulary"].get(m["umbrella"], "x") is not None:
         raise Failure(f"gateway vocabulary holds tokens no condition names: {extra}")
+    # Judged after the severities agree, so a severity changed in one text is named as such.
+    listed = re.search(r"The rule yields exactly (.+?)\. Every other block",
+                       flat(v4["## Severity > ### Unknown critical visibility"]))
+    # Each listed block with the critical conditions it decides; `_x` abbreviates the
+    # block's name followed by `_x`.
+    named = {} if listed is None else {
+        block: sorted(block + t if t.startswith("_") else t
+                      for t in re.findall(r"`([a-z_]+)`", conds))
+        for block, conds in re.findall(r"`([a-z_]+)` \(([^)]*)\)", listed.group(1))}
+    if named != {b: sorted(ts) for b, ts in capable.items()}:
+        raise Failure(f"the listed critical-capable blocks differ from the rule's {capable}")
     # The bound is stated as the vocabulary less its heartbeat-only token, never as a number,
     # so a receiver derives it from the vocabulary it supports.
     stated = re.search(r"Tokens are unique, in byte order, and number at most the tokens of the "
@@ -1301,10 +1336,42 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     for key, default in ALERT_DEFAULTS.items():
         need(v4["## Health Payload > ### `alert_outbox` object"], f"Default `{default}`",
              f"alert_outbox {key}")
+    # The protection-degraded row is judged against the threshold and bound its wording
+    # names; the section says they are Tier D's, and that this kind has none of its own.
+    need(v4["## Health Payload > ### `alert_outbox` object"], "`tier_d_critical_warning_threshold` "
+         "and `tier_d_age_bound_ms` decide both: neither kind has a threshold or bound of its own.",
+         "alert_outbox")
+    pd = re.fullmatch(r"`alert_outbox\.protection_degraded_unresolved_count > 0`, and "
+                      r"`protection_degraded_max_attempts ≥ (\w+)` or "
+                      r"`protection_degraded_oldest_age_ms ≥ (\w+)`\.", PD_HOLDS)
+    if pd is None or pd.groups() != ("tier_d_critical_warning_threshold", "tier_d_age_bound_ms"):
+        raise Failure("the protection-degraded row names a threshold or bound other than Tier D's")
+    m["pd_threshold"], m["pd_bound"] = pd.groups()
+    m["pd_reached"] = lambda a, b: a >= b
+    # oldest_non_tier_d_age_ms counts every unresolved alert but Tier D notifications, so
+    # an unresolved protection-degraded notification is among the alerts it ages.
+    need(v4["## Health Payload > ### `alert_outbox` object"], "| `oldest_non_tier_d_age_ms` | "
+         "`int \\| null` | available | Snapshot time less when the oldest unresolved alert other "
+         "than a Tier D notification was queued; `null` when there is none. |", "alert_outbox")
+    need(v4["## Health Payload > ### `alert_outbox` object"], "**A protection-degraded "
+         "notification** is a queued notice whose `notice` is `protection_degraded`.",
+         "alert_outbox")
+    m["pd_in_non_tier_d"] = True
     need(v4["## Health Payload > ### `safety_registry` object"], "Release-owned: `10000` in this "
          "release, and never above `60000` in any.", "safety_registry")
     payload = table(v4["## Health Payload"], ["Field", "Type", "Notes"])
     m["payload"] = {unquote(f): _types(t)[0] for f, t, _ in payload}
+    for name, read in READ_MEMBERS.items():
+        missing = [f for f in read if f not in m["schema"][name]]
+        if missing:
+            raise Failure(f"{name}: the conditions read members its table does not list: {missing}")
+    ao_rows = m["schema"]["alert_outbox"]
+    for prefix in ("tier_d", "protection_degraded"):
+        got = [(ao_rows[f"{prefix}_{k}"]["types"], ao_rows[f"{prefix}_{k}"]["present"])
+               for k in ("unresolved_count", "max_attempts", "oldest_age_ms")]
+        if got != [({"int"}, "available"), ({"int", "null"}, "available"),
+                   ({"int", "null"}, "available")]:
+            raise Failure(f"alert_outbox {prefix} members typed {got}")
     need(v4["## Representation"], "**Floats.** A member typed `float` is a finite JSON number, at "
          "least `0`.", "Representation")
     for name in m["states"]:
@@ -1542,6 +1609,16 @@ def shape(m: dict, s: dict, startup: dict | None) -> list[str]:
         if (ao["tier_d_max_attempts"] is None) is not none \
                 or (ao["tier_d_oldest_age_ms"] is None) is not none:
             bad.append("alert_outbox Tier D members null exactly when none is unresolved")
+        none = ao["protection_degraded_unresolved_count"] == 0
+        if (ao["protection_degraded_max_attempts"] is None) is not none \
+                or (ao["protection_degraded_oldest_age_ms"] is None) is not none:
+            bad.append("alert_outbox protection-degraded members null exactly when none is "
+                       "unresolved")
+        elif m["pd_in_non_tier_d"] and not none and (
+                ao["oldest_non_tier_d_age_ms"] is None
+                or ao["oldest_non_tier_d_age_ms"] < ao["protection_degraded_oldest_age_ms"]):
+            bad.append("alert_outbox oldest_non_tier_d_age_ms younger than an unresolved "
+                       "protection-degraded notification")
     reg = s["safety_registry"]
     bad += [f"consistency rule {r}" for r in consistency_faults(m, s)]
     if available(reg) and reg["trip_verification_deadline_ms"] != m["trip_deadline"]:
@@ -2770,6 +2847,31 @@ def coverage(corpus: dict, m: dict,
          and ao(s)["tier_d_oldest_age_ms"] == ao(s)["tier_d_age_bound_ms"])
     some("Tier D age one under its bound", lambda s, _: ao(s).get("tier_d_unresolved_count", 0)
          and ao(s)["tier_d_oldest_age_ms"] == ao(s)["tier_d_age_bound_ms"] - 1)
+    # Protection-degraded notifications, against Tier D's threshold and bound.
+    def pd(s: dict) -> int:
+        return ao(s).get("protection_degraded_unresolved_count", 0)
+
+    some("protection-degraded attempts at the Tier D threshold, young", lambda s, _: pd(s)
+         and ao(s)["protection_degraded_max_attempts"] == ao(s)["tier_d_critical_warning_threshold"]
+         and ao(s)["protection_degraded_oldest_age_ms"] < ao(s)["tier_d_age_bound_ms"])
+    some("protection-degraded attempts one under the Tier D threshold, young", lambda s, _: pd(s)
+         and ao(s)["protection_degraded_max_attempts"]
+         == ao(s)["tier_d_critical_warning_threshold"] - 1
+         and ao(s)["protection_degraded_oldest_age_ms"] < ao(s)["tier_d_age_bound_ms"])
+    some("protection-degraded age at the Tier D bound, under the threshold", lambda s, _: pd(s)
+         and ao(s)["protection_degraded_oldest_age_ms"] == ao(s)["tier_d_age_bound_ms"]
+         and ao(s)["protection_degraded_max_attempts"] < ao(s)["tier_d_critical_warning_threshold"])
+    some("protection-degraded age one under the Tier D bound", lambda s, _: pd(s)
+         and ao(s)["protection_degraded_oldest_age_ms"] == ao(s)["tier_d_age_bound_ms"] - 1)
+    some("protection-degraded at a Tier D threshold lowered below its default", lambda s, _: pd(s)
+         and ao(s)["protection_degraded_max_attempts"] == ao(s)["tier_d_critical_warning_threshold"]
+         < ALERT_DEFAULTS["tier_d_critical_warning_threshold"])
+    some("no protection-degraded notification while Tier D is unconfirmed", lambda s, _: available(
+        s["alert_outbox"]) and pd(s) == 0
+         and "tier_d_alert_delivery_unconfirmed" in holding(m, s))
+    some("both mandatory kinds unconfirmed at once", lambda s, _: {
+        "tier_d_alert_delivery_unconfirmed", "protection_degraded_alert_delivery_unconfirmed"}
+         <= set(holding(m, s)))
     some("an overdue age at its bound", lambda s, _: ao(s).get("oldest_non_tier_d_age_ms")
          == ao(s).get("overdue_bound_ms", -1))
     some("an overdue age one under its bound", lambda s, _: ao(s).get("oldest_non_tier_d_age_ms")
@@ -4204,6 +4306,79 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             "c's domain", text_mutant("ee", "satisfy `|n| <= 9007199254740991`",
                                       "satisfy `|n| <= 9007199254740992`"))),
     ]
+    # The protection-degraded condition, judged against Tier D's threshold and bound.
+    pdt = "protection_degraded_alert_delivery_unconfirmed"
+
+    def pdo(c: dict, name: str) -> dict:
+        return named(c, "snapshot_cases", name)["snapshot"]["alert_outbox"]
+
+    def pd_dropped(c: dict) -> None:
+        reasons = named(c, "snapshot_cases", "mandatory_alerts_both_unconfirmed")["expected"][
+            "degradation_reasons"]
+        reasons.remove(pdt)
+
+    cases += [
+        ("protection-degraded: the threshold comparison exclusive (≥ read as >)", because(
+            f"snapshot alone_{pdt}:", model_mutant(pd_reached=lambda a, b: a > b))),
+        ("protection-degraded: the condition degraded", because(
+            f"snapshot alone_{pdt}:", model_mutant(severity={pdt: "degraded"}))),
+        ("protection-degraded: the condition dropped", because(
+            f"snapshot alone_{pdt}:", model_mutant(pred={pdt: never}))),
+        ("protection-degraded: aged against the overdue bound, not Tier D's", because(
+            "snapshot protection_degraded_alert_at_age_bound:", model_mutant(
+                pd_bound="overdue_bound_ms"))),
+        ("protection-degraded: attempts against the default, not the threshold in force", because(
+            "snapshot protection_degraded_at_lowered_threshold:", model_mutant(
+                pd_threshold=ALERT_DEFAULTS["tier_d_critical_warning_threshold"]))),
+        ("corpus: the condition dropped from a case's expected reasons", because(
+            "snapshot mandatory_alerts_both_unconfirmed:", corpus_mutant(pd_dropped))),
+        ("corpus: none unresolved, expected critical", because(
+            f"snapshot alone_{pdt}: corpus", corpus_mutant(lambda c: pdo(c, f"alone_{pdt}").update(
+                protection_degraded_unresolved_count=0, protection_degraded_max_attempts=None,
+                protection_degraded_oldest_age_ms=None)))),
+        ("corpus: none unresolved with attempts and an age", because(
+            "protection-degraded members null exactly when none is unresolved", corpus_mutant(
+                lambda c: pdo(c, f"alone_{pdt}").update(protection_degraded_unresolved_count=0)))),
+        ("corpus: a protection-degraded member missing", because(
+            "condition members missing: ['protection_degraded_max_attempts']", corpus_mutant(
+                lambda c: pdo(c, f"alone_{pdt}").pop("protection_degraded_max_attempts")))),
+        ("corpus: the non-Tier-D age null while protection-degraded is unresolved", because(
+            "oldest_non_tier_d_age_ms younger than an unresolved protection-degraded",
+            corpus_mutant(lambda c: pdo(c, f"alone_{pdt}").update(
+                oldest_non_tier_d_age_ms=None)))),
+        ("corpus: the non-Tier-D age under the protection-degraded age", because(
+            "oldest_non_tier_d_age_ms younger than an unresolved protection-degraded",
+            corpus_mutant(lambda c: pdo(c, f"alone_{pdt}").update(
+                oldest_non_tier_d_age_ms=pdo(c, f"alone_{pdt}")[
+                    "protection_degraded_oldest_age_ms"] - 1)))),
+        ("text: the token dropped from the gateway table", both(
+            f"gateway-api/v2 gives {pdt} severity missing", (
+                "gw", f"| `{pdt}` | `critical` | A protection-degraded",
+                "| `x` | `critical` | A protection-degraded"))),
+        ("text: the token degraded in the gateway table", both(
+            f"gateway-api/v2 gives {pdt} severity degraded", (
+                "gw", f"| `{pdt}` | `critical` |", f"| `{pdt}` | `degraded` |"))),
+        ("text: the token degraded in runtime-health", both(
+            f"gateway-api/v2 gives {pdt} severity critical", (
+                "v4", f"| `{pdt}` | `critical` |", f"| `{pdt}` | `degraded` |"))),
+        ("text: the condition aged against its own bound", both(
+            f"no model for condition '{pdt}'", (
+                "v4", "`protection_degraded_oldest_age_ms ≥ tier_d_age_bound_ms`",
+                "`protection_degraded_oldest_age_ms ≥ overdue_bound_ms`"))),
+        ("text: the condition left off alert_outbox's critical list", both(
+            "the listed critical-capable blocks differ", (
+                "v4", "(`tier_d_alert_delivery_unconfirmed` and\n"
+                "`protection_degraded_alert_delivery_unconfirmed`)",
+                "(`tier_d_alert_delivery_unconfirmed`)"))),
+        ("text: protection-degraded given a bound of its own", both(
+            "alert_outbox no longer says", (
+                "v4", "neither kind has a threshold or bound of its own",
+                "each kind has a threshold and bound of its own"))),
+        ("text: a protection-degraded member untyped as nullable", both(
+            "alert_outbox protection_degraded members typed", (
+                "v4", "| `protection_degraded_max_attempts` | `int \\| null` |",
+                "| `protection_degraded_max_attempts` | `int` |"))),
+    ]
     for kind in SETS:
         for c in base[kind]:
             if "name" in c:
@@ -4535,8 +4710,16 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'when the oldest unresolved Tier D notification was queued;'),
             '`null` when there is none. |',
             ('| `tier_d_age_bound_ms` | `int` | always | The age at or past which an '
-             'unresolved Tier D notification is critical.'),
+             'unresolved Tier D or protection-degraded notification is critical.'),
             'Default `300000`. |',
+            ('| `protection_degraded_unresolved_count` | `int` | available | '
+             'Protection-degraded notifications queued and unresolved. |'),
+            ('| `protection_degraded_max_attempts` | `int \\| null` | available | The most '
+             'delivery attempts made for any unresolved protection-degraded notification;'),
+            '`null` when there is none. |',
+            ('| `protection_degraded_oldest_age_ms` | `int \\| null` | available | Snapshot '
+             'time less when the oldest unresolved protection-degraded notification was queued;'),
+            '`null` when there is none. |',
             ('| `oldest_non_tier_d_age_ms` | `int \\| null` | available | Snapshot time '
              'less when the oldest unresolved alert other than a Tier D notification was queued;'),
             '`null` when there is none. |',
@@ -4556,7 +4739,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             '| `retry_interval_minutes` | `float` | always | |',
             '| `max_non_tier_d_attempts` | `int` | always | |',
             ('| `tier_d_critical_warning_threshold` | `int` | always | The attempt count '
-             'at or past which an unresolved Tier D notification is critical.'),
+             'at or past which an unresolved Tier D or protection-degraded notification is '
+             'critical.'),
             'Default `3`; at least `1`. |',
             '| `batch_size` | `int` | always | |',
             ('**A Tier D notification** is a queued notice whose '
@@ -4566,6 +4750,17 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('The action tier a notice was dispatched at never decides it, so a notice a notify-only '
              'Tier D trigger sends as a Tier A act is a Tier D notification.'),
             'Every member and condition here that names Tier D notifications counts exactly these.',
+            ('**A protection-degraded notification** is a queued notice whose `notice` is '
+             '`protection_degraded`.'),
+            ('Both kinds are mandatory under alert-delivery/v1, and '
+             '`tier_d_critical_warning_threshold` and `tier_d_age_bound_ms` decide both: neither '
+             'kind has a threshold or bound of its own.'),
+            ('An unresolved mandatory notification means that no configured channel has '
+             'confirmed provider acceptance of it under the resolution rule below.'),
+            'It does not mean that no operator learned of the event.',
+            ('A mandatory notification is never abandoned, so one that never resolves keeps its '
+             'condition raised for as long as it stays unresolved.'),
+            'No condition here grants authority, or gates or delays a physical act.',
             ("The two bounds and the threshold are configuration, so like the outbox's "
              'other configured members they are present in every state.'),
             'Each is finite and at least `1`, and the runtime reports the value in force.',
@@ -4578,7 +4773,7 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              'provider did not accept.'),
             ("What the conditions report is that delivery is unconfirmed: a provider's "
              'acceptance can be lost and another channel may have reached the operator, '
-             'so neither condition says the operator was never told.'),
+             'so no condition here says the operator was never told.'),
             'Notification failure never blocks, delays or retries a physical act.',
             'The protective act has already been attempted when its notification is queued.',
         ),
@@ -5397,6 +5592,10 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
              '`alert_outbox.tier_d_unresolved_count > 0`, and `tier_d_max_attempts ≥ '
              'tier_d_critical_warning_threshold` or `tier_d_oldest_age_ms ≥ '
              'tier_d_age_bound_ms`. |'),
+            ('| `protection_degraded_alert_delivery_unconfirmed` | `critical` | '
+             '`alert_outbox.protection_degraded_unresolved_count > 0`, and '
+             '`protection_degraded_max_attempts ≥ tier_d_critical_warning_threshold` or '
+             '`protection_degraded_oldest_age_ms ≥ tier_d_age_bound_ms`. |'),
             ('| `alert_delivery_overdue` | `degraded` | '
              '`alert_outbox.oldest_non_tier_d_age_ms` is not `null` and `≥ overdue_bound_ms`. |'),
             ('| `skill_required_hooks_unavailable` | `critical` | '
@@ -5508,7 +5707,8 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('A block is **critical-capable** when one of the conditions it decides is '
              'critical in the table above.'),
             ('The rule yields exactly `safety_registry` (`safety_zone_trip_unresolved`), '
-             '`alert_outbox` (`tier_d_alert_delivery_unconfirmed`), `action_log_records` '
+             '`alert_outbox` (`tier_d_alert_delivery_unconfirmed` and '
+             '`protection_degraded_alert_delivery_unconfirmed`), `action_log_records` '
              '(`decision_record_lost`), `skill_hooks` '
              '(`skill_required_hooks_unavailable`) and `firmware_liveness` '
              '(`firmware_liveness_stopped`, `_tick_stale`, `_device_expired`).'),
@@ -5823,6 +6023,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| A Tier D notification unconfirmed at its attempt threshold, and one at its '
              'age bound | `tier_d_alert_delivery_unconfirmed`, `critical`; the physical act '
              'was neither delayed nor retried. |'),
+            ('| A protection-degraded notification unconfirmed at the Tier D attempt threshold, '
+             'and one at the Tier D age bound | `protection_degraded_alert_delivery_unconfirmed`, '
+             '`critical`. |'),
             ('| A Tier D notification confirmed by its failover channel | Resolved: no '
              'condition. |'),
             ('| Another alert unconfirmed past `overdue_bound_ms`; a large backlog of young '
@@ -6131,6 +6334,9 @@ HELD_SENTENCES: dict[str, dict[str, tuple[str, ...]]] = {
             ('| `tier_d_alert_delivery_unconfirmed` | `critical` | A Tier D notification '
              'is unresolved at or past its attempt or age threshold: its delivery is '
              'unconfirmed. |'),
+            ('| `protection_degraded_alert_delivery_unconfirmed` | `critical` | A '
+             'protection-degraded notification is unresolved at or past the Tier D attempt or '
+             'age threshold: its delivery is unconfirmed. |'),
             ('`firmware_liveness_degraded` means "one or more" of the liveness '
              'conditions: they differ in blast radius, and a consumer that reads only the '
              'umbrella learns that liveness is at risk without being told it is total.'),
