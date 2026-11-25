@@ -6,7 +6,8 @@
 Shares no code with scripts/generate-gateway-export-rows-vectors-v2, and was
 written without reading it. Every expected value is recomputed by this
 script's own model, built from gateway-api/v2.md: `## Producer Time`,
-the `sensor_history` and `action_log` export sections.
+the `sensor_history` and `action_log` export sections, and the typed envelope
+of `## Runtime Export Response Payload` (its type table is parsed).
 
 Read from the text, not from literals here: the `producer_time` and
 `record_kind` vocabularies (their tables), the `tier` domain, the refusal's
@@ -23,7 +24,7 @@ Held to:
   and time basis, an action_log row's verdict, reading, tier read and act
   count and whether it is disregarded, every bucketed row, every page of a
   traversal (a stored refusal the tier domain omits holds no position), every
-  contributor's holder;
+  contributor's holder, every envelope case's refusal and the members that cause it;
 - a reject case's verdict is the first failing step in the contract's order;
 - coverage, as properties of the cases: every verdict, every step-order pair
   inside a family (a case whose first failure is step i and that also fails
@@ -79,6 +80,7 @@ SEC_T3 = "## Tier 3 Reasoning Request Payload"
 SEC_SH = "### `sensor_history`"
 SEC_AL = "### `action_log`"
 SEC_PO = "### Page Order"
+SEC_RESP = "## Runtime Export Response Payload"
 SETS = ("readings", "action_log", "buckets", "paging", "resolution")
 WHERE = ("sensor_history", "history_point", "reasoning_reading")
 
@@ -257,10 +259,10 @@ HELD = {
         # bound, the refusal token) are held by their parsers instead.
         "Returns bounded action-log rows for the runtime device.",
         "Optional request `params`:",
-        "Response items include action name, tier, execution status, approval status, action taken, operator response, proposal ID, safe-default usage, device ID, sensor ID, sensor type, trigger name, timestamp, `attestation_status`, `attestation_seq`, `input_attestation_grade`, and `input_posture`.",
+        "Response items carry these members:",
         "The `input_attestation_grade`/`input_posture` pair follows the evidence contract:",
         "`attested` requires `sealed_flash` or `hardware_key`, `attested_dev` requires `development`, and `unattested` uses an empty posture.",
-        "Each item also carries `record_kind`, `record_key` and `contributed_to`, under the members `executed` and `action_taken` already name:",
+        "An item's `record_kind`, `record_key` and `contributed_to` sit beside its `executed` and `action_taken`, for example:",
         "with the item's other members omitted here for brevity.",
         "**What a row records.** A request can act, or join an act another request already holds: the runtime then records the joining request as a *contributor* of that act, not as an act of its own.",
         "The runtime assigns each key to one row, but a store can hold keys duplicated before keys were constrained, and the runtime exports them as they are.",
@@ -372,7 +374,46 @@ HELD = {
         "can issue the same token for the same position again; a second `page_token_invalid` in one "
         "traversal, or any other error, fails the export, and a failed export yields no rows.",
     ],
+    SEC_RESP: [
+        # The envelope's refusal; its type table is parsed.
+        "Every response, including validation failures, includes the envelope fields above.",
+        "When `error` is non-null, `items` is empty and `complete` is true.",
+        "A gateway refuses a response in which any of these four members is absent or is of a JSON "
+        "type other than the table gives it; a member present as JSON `null` has the type `null`.",
+        "It reads an encrypted response's members from its decrypted plaintext, and while "
+        "`gateway.auth.enabled` is true judges a response this way only once it has verified under "
+        "[Export Auth Envelope](#export-auth-envelope), which drops one that is not verified.",
+        "A response it refuses yields no rows and fails the export, as an error does under "
+        "[Page Order](#page-order).",
+    ],
 }
+
+
+# Each JSON type phrase the envelope table may use, and what it admits.
+TYPE_PHRASES = ("array", "object", "string", "boolean", "number", "`null`", "a non-empty string")
+
+
+def envelope_types(body: str) -> dict[str, list[str]]:
+    """The response envelope's type table: member -> the type phrases its cell allows."""
+    out: dict[str, list[str]] = {}
+    for row in table(body, ["Field", "JSON type", "Notes"], SEC_RESP):
+        name = token(row[0], SEC_RESP)
+        alts = row[1].split(", or ")
+        for alt in alts:
+            if alt not in TYPE_PHRASES:
+                raise Failure(f"{SEC_RESP}: `{name}` has type {alt!r}, which this checker has no model for")
+        if name in out:
+            raise Failure(f"{SEC_RESP}: `{name}` is typed twice")
+        out[name] = alts
+    if len(out) != 4:
+        raise Failure(f"{SEC_RESP}: the type table holds {len(out)} members, the refusal names four")
+    return out
+
+
+def envelope_object_elements(body: str) -> set[str]:
+    """The array members whose Notes cell says every element is an object."""
+    return {token(row[0], SEC_RESP) for row in table(body, ["Field", "JSON type", "Notes"], SEC_RESP)
+            if "Each element is an object." in row[2]}
 
 
 def contract_model(text: str | None = None) -> dict:
@@ -380,7 +421,7 @@ def contract_model(text: str | None = None) -> dict:
     # gateway-api/v2.md uses `---` thematic breaks, so it is not held to
     # contract-markdown's restriction; only its canonical headings are read.
     try:
-        bodies = {s: markdown.own_body(text, s) for s in (SEC_PT, SEC_SH, SEC_AL, SEC_T3, SEC_PO)}
+        bodies = {s: markdown.own_body(text, s) for s in (SEC_PT, SEC_SH, SEC_AL, SEC_T3, SEC_PO, SEC_RESP)}
     except ValueError as error:
         raise Failure(str(error)) from None
     for section, sentences in HELD.items():
@@ -519,6 +560,8 @@ def contract_model(text: str | None = None) -> dict:
         raise Failure(f"bucket basis order {bucket_order} is not the vocabulary {pt_vocab}")
 
     orders = page_orders(bodies[SEC_PO])
+    envelope = envelope_types(bodies[SEC_RESP])
+    object_elements = envelope_object_elements(bodies[SEC_RESP])
     tiers_shown = re.search(r'"tier": "([a-z0-9]+(?:\|[a-z0-9]+)*)"', bodies[SEC_SH])
     if tiers_shown is None:
         raise Failure(f"{SEC_SH}: the unbucketed row's tier values are no longer shown")
@@ -553,6 +596,7 @@ def contract_model(text: str | None = None) -> dict:
         "unknown_margin": None,
         "seen_check": True, "reset_seen": True,
         "holder_kinds": ("dispatch",), "duplicates": "unresolved", "resolve_scope": "traversal",
+        "envelope": envelope, "object_elements": object_elements, "absent_ok": False, "int_is_bool": False,
     }
 
 
@@ -869,6 +913,8 @@ CONVENTIONS = {
                                "with whether a next page follows and, where given, the "
                                "next_page_token issued, or an error envelope's error"],
     "buckets.expected": ["every member of a bucketed row except sensor_id, sensor_type and unit"],
+    "envelopes.expected.members": ["the members of the response's typed envelope that are absent or of "
+                                   "another JSON type", "in the order the contract's table lists them"],
 }
 
 SHAPES = {
@@ -894,11 +940,12 @@ def same(a: Any, b: Any) -> bool:
 
 def check(corpus: dict, m: dict) -> list[str]:
     problems: list[str] = []
-    if set(corpus) != {"vector_set", "contract", "sections", "conventions", "tokens", *SETS}:
+    if set(corpus) != {"vector_set", "contract", "sections", "conventions", "tokens", "envelopes", *SETS}:
         problems.append(f"corpus members {sorted(corpus)}")
     if corpus.get("contract") != "gateway-api/v2.md":
         problems.append(f"corpus names contract {corpus.get('contract')!r}")
-    if corpus.get("sections") != ["Producer Time", "sensor_history", "action_log", "Page Order"]:
+    if corpus.get("sections") != ["Producer Time", "sensor_history", "action_log", "Page Order",
+                                  "Runtime Export Response Payload"]:
         problems.append(f"corpus names sections {corpus.get('sections')!r}")
     conv = corpus.get("conventions")
     if not isinstance(conv, dict) or set(conv) != set(CONVENTIONS):
@@ -993,6 +1040,56 @@ def check(corpus: dict, m: dict) -> list[str]:
             problems.append(f"resolution {case['name']!r}: holders declared {case['expected']}, "
                             f"recomputed {got}")
     problems += check_tokens(corpus, m)
+    problems += check_envelopes(corpus, m)
+    return problems
+
+
+def admits(m: dict, phrase: str, value: Any) -> bool:
+    """Whether a JSON value is of the type a table phrase names; JSON true is no number, 1 no boolean."""
+    is_bool = isinstance(value, bool) or (m["int_is_bool"] and type(value) is int and value in (0, 1))
+    return {
+        "array": isinstance(value, list),
+        "object": isinstance(value, dict),
+        "string": isinstance(value, str),
+        "a non-empty string": isinstance(value, str) and value != "",
+        "boolean": is_bool,
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "`null`": value is None,
+    }[phrase]
+
+
+def envelope_outcome(m: dict, response: dict) -> dict:
+    """Runtime Export Response Payload: refused when a typed member is absent or of another type."""
+    bad = []
+    for name, phrases in m["envelope"].items():
+        if name not in response:
+            if not m["absent_ok"]:
+                bad.append(name)
+        elif not any(admits(m, ph, response[name]) for ph in phrases):
+            bad.append(name)
+        elif name in m["object_elements"] and isinstance(response[name], list) and not all(
+                isinstance(e, dict) for e in response[name]):
+            bad.append(name)
+    return {"refused": bool(bad), "members": bad}
+
+
+def check_envelopes(corpus: dict, m: dict) -> list[str]:
+    problems: list[str] = []
+    cases = corpus["envelopes"]
+    if not isinstance(cases, list):
+        return ["corpus envelopes is not a list"]
+    names = [c.get("name") for c in cases]
+    if len(set(names)) != len(names):
+        problems.append("envelopes: case names repeat")
+    for case in cases:
+        if set(case) != {"name", "response", "expected"} or not isinstance(case.get("response"), dict) \
+                or not isinstance(case.get("expected"), dict) or set(case["expected"]) != {"refused", "members"}:
+            problems.append(f"envelopes {case.get('name')!r}: members {sorted(case)}")
+            continue
+        got = envelope_outcome(m, case["response"])
+        if not same(case["expected"], got):
+            problems.append(f"envelopes {case['name']!r}: envelope outcome declared {case['expected']}, "
+                            f"recomputed {got}")
     return problems
 
 
@@ -1373,6 +1470,53 @@ def coverage(corpus: dict, m: dict) -> list[str]:
                  "an error that begins with the refusal"):
         if want not in kinds:
             gaps.append(f"tokens.gateway: no case with {want}")
+    gaps += envelope_coverage(corpus, m)
+    return gaps
+
+
+def envelope_coverage(corpus: dict, m: dict) -> list[str]:
+    """Each typed member absent alone, null alone where null is not its type, of another type alone,
+    the empty string where a non-empty string is required, 1 where a boolean is, each allowed
+    type in an accepted case, and two members wrong at once."""
+    gaps = []
+    cases = [c for c in corpus["envelopes"] if isinstance(c, dict) and isinstance(c.get("response"), dict)]
+    accepted = [c["response"] for c in cases if not envelope_outcome(m, c["response"])["refused"]]
+    alone = {}
+    for c in cases:
+        bad = envelope_outcome(m, c["response"])["members"]
+        if len(bad) == 1:
+            alone.setdefault(bad[0], []).append(c["response"])
+    for name, phrases in m["envelope"].items():
+        mine = alone.get(name, [])
+        if not any(name not in r for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` absent alone")
+        if "`null`" not in phrases and not any(name in r and r[name] is None for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` null alone")
+        if not any(name in r and r[name] is not None for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` of another non-null type alone")
+        if "string" in " ".join(phrases) and not any(name in r and not isinstance(r[name], str)
+                                                     and r[name] is not None for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` of a non-string type alone")
+        if "a non-empty string" in phrases and not any(r.get(name) == "" for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` the empty string alone")
+        if "boolean" in phrases and not any(type(r.get(name)) is int and r.get(name) == 1 for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` the number 1 alone")
+        if "boolean" in phrases and not any(r.get(name) == "true" for r in mine):
+            gaps.append(f"envelopes: no case with `{name}` the string true alone")
+        for ph in phrases:
+            if not any(admits({**m, "int_is_bool": False}, ph, r.get(name)) for r in accepted if name in r):
+                gaps.append(f"envelopes: no accepted case with `{name}` of type {ph}")
+    if "array" in m["envelope"].get("items", []) and not any(
+            isinstance(r.get("items"), dict) for r in alone.get("items", [])):
+        gaps.append("envelopes: no case with `items` an object alone")
+    for name in m["object_elements"]:
+        if not any(isinstance(r.get(name), list) and any(not isinstance(e, dict) for e in r[name])
+                   for r in alone.get(name, [])):
+            gaps.append(f"envelopes: no case with `{name}` holding a non-object element alone")
+        if not any(isinstance(r.get(name), list) and r[name] for r in accepted):
+            gaps.append(f"envelopes: no accepted case with `{name}` holding an element")
+    if not any(len(envelope_outcome(m, c["response"])["members"]) > 1 for c in cases):
+        gaps.append("envelopes: no case with two members wrong at once")
     return gaps
 
 
@@ -1890,6 +2034,52 @@ def mutations(corpus_bytes: bytes, model: dict, baseline: list[str]) -> tuple[in
             "is read as `dispatch` when its `action_taken` is\n`coalesced`", "no longer says")),
     ]
 
+    # The export response's typed envelope.
+    def env_set(name: str, expected: dict) -> Callable[[dict], None]:
+        def edit(c: dict) -> None:
+            next(x for x in c["envelopes"] if x["name"] == name)["expected"] = expected
+        return edit
+
+    for case in base["envelopes"]:
+        e = case["expected"]
+        flipped = {"refused": False, "members": []} if e["refused"] else {"refused": True, "members": ["items"]}
+        cases.append((f"envelope outcome flipped: {case['name']}",
+                      corpus_mutant(env_set(case["name"], flipped), "envelope outcome")))
+        if len(e["members"]) > 1:
+            cases.append((f"envelope members reordered: {case['name']}", corpus_mutant(env_set(
+                case["name"], {"refused": True, "members": list(reversed(e["members"]))}), "envelope outcome")))
+    for name in ("items absent", "items an object", "items with a non-object element", "error the empty string", "complete the number 1",
+                 "items null and complete a string"):
+        cases.append((f"envelope case dropped: {name}", corpus_mutant(
+            lambda c, n=name: c.__setitem__("envelopes", [x for x in c["envelopes"] if x["name"] != n]),
+            "envelopes: no ")))
+    cases += [
+        ("model: an absent envelope member passes", model_mutant("envelope outcome", absent_ok=True)),
+        ("model: 1 read as a boolean", model_mutant("envelope outcome", int_is_bool=True)),
+        ("model: items elements unchecked", model_mutant("envelope outcome", object_elements=set())),
+        ("text: items elements no longer objects", text_mutant(
+            "Never `null`. Each element is an object. |", "Never `null`. |", "envelope outcome")),
+        ("text: complete may be null", text_mutant(
+            "| `complete` | boolean |", "| `complete` | boolean, or `null` |", "envelope outcome")),
+        ("text: items may be null", text_mutant(
+            "| `items` | array | Never `null`. Each element is an object. |",
+            "| `items` | array, or `null` | Each element is an object. |", "envelope outcome")),
+        ("text: error may be the empty string", text_mutant(
+            "| `error` | `null`, or a non-empty string |", "| `error` | `null`, or string |",
+            "envelope outcome")),
+        ("text: next_page_token typed as a number", text_mutant(
+            "| `next_page_token` | string |", "| `next_page_token` | integer |", "no model")),
+        ("text: the error row dropped", text_mutant(
+            "| `error` | `null`, or a non-empty string | |\n", "", "the refusal names four")),
+        ("text: the refusal sentence removed", text_mutant(
+            "A gateway refuses a response in which any of these four members is absent or\nis of a JSON",
+            "A gateway reads a response in which any of these four members is absent or\nis of a JSON",
+            "no longer says")),
+        ("text: a refused response keeps the request waiting", text_mutant(
+            "A response it refuses yields no rows and fails the export",
+            "A response it refuses yields no rows and leaves the request waiting", "no longer says")),
+    ]
+
     survived = 0
     for name, go in cases:
         try:
@@ -1923,7 +2113,7 @@ def main(argv: list[str]) -> int:
     corpus_bytes = CORPUS.read_bytes()
     corpus = json.loads(corpus_bytes)
     total = sum(len(corpus.get(k, [])) for k in SETS) + sum(
-        len(v) for v in corpus.get("tokens", {}).values())
+        len(v) for v in corpus.get("tokens", {}).values()) + len(corpus.get("envelopes", []))
     problems = problems_of(corpus_bytes, model)
     status = 0
     if problems:
