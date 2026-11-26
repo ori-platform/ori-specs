@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+# Copyright 2026 Ori Nexus Systems LTD
+# SPDX-License-Identifier: Apache-2.0
+"""Check the gateway-api/v2 runtime node heartbeat evidence-block corpus.
+
+Each member's type and bound are read from the evidence table of
+gateway-api/v2.md's Runtime Node Heartbeat Payload, and every case is judged
+here from them. Nothing is shared with the generator.
+
+    python3 scripts/check-gateway-heartbeat-evidence-vectors-v2              # check
+    python3 scripts/check-gateway-heartbeat-evidence-vectors-v2 --mutations  # and prove it fires
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CONTRACT = ROOT / "gateway-api" / "v2.md"
+CORPUS = ROOT / "gateway-api" / "vectors" / "heartbeat-evidence-v2.json"
+MEMBERS = ("chain_head_hash", "attestation_gap_count", "available", "action_event_type")
+
+
+class Failure(Exception):
+    pass
+
+
+def flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def need(text: str, sentence: str) -> None:
+    if flat(sentence) not in flat(text):
+        raise Failure(f"gateway-api/v2.md no longer says: {sentence!r}")
+
+
+def section(text: str) -> str:
+    start = text.find("\n## Runtime Node Heartbeat Payload\n")
+    if start < 0:
+        raise Failure("gateway-api/v2.md has no Runtime Node Heartbeat Payload section")
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end > 0 else len(text)]
+
+
+def bounds(text: str) -> dict:
+    """Each member's type and bound, read from the evidence table."""
+    body = section(text)
+    lines = body.splitlines()
+    header = [i for i, line in enumerate(lines)
+              if re.fullmatch(r"\|\s*Field\s*\|\s*Type\s*\|\s*Notes\s*\|", line.strip())]
+    if len(header) != 1:
+        raise Failure("the section has no single Field | Type | Notes table")
+    rows = {}
+    for line in lines[header[0] + 2:]:
+        if not line.startswith("|"):
+            break
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) != 3 or not re.fullmatch(r"`[a-z_]+`", cells[0]):
+            raise Failure(f"the evidence table has a row it cannot read: {line!r}")
+        rows[cells[0].strip("`")] = (cells[1].strip("`"), cells[2])
+    if sorted(rows) != sorted(MEMBERS):
+        raise Failure(f"the evidence table's members are {sorted(rows)}")
+    out = {m: {"type": rows[m][0]} for m in MEMBERS}
+    hash_len = re.search(r"empty string \([^)]*\) or (\d+) lowercase hex chars\.", rows["chain_head_hash"][1])
+    if hash_len is None:
+        raise Failure("chain_head_hash's bound is not read as empty or N lowercase hex")
+    out["chain_head_hash"]["hex_length"] = int(hash_len.group(1))
+    floor = re.search(r"Must be `>= (\d+)`\.", rows["attestation_gap_count"][1])
+    if floor is None:
+        raise Failure("attestation_gap_count's floor is not read")
+    out["attestation_gap_count"]["min"] = int(floor.group(1))
+    event = re.search(r"Empty, or 1 to (\d+) characters, each `A`–`Z` or `_`\.",
+                      rows["action_event_type"][1])
+    if event is None:
+        raise Failure("action_event_type's bound is not read as empty or 1 to N of A-Z and _")
+    out["action_event_type"]["max"] = int(event.group(1))
+    need(body, "The gateway rejects heartbeats whose evidence block fails the bounds above")
+    need(body, "[vectors/heartbeat-evidence-v2.json](vectors/heartbeat-evidence-v2.json) holds "
+               "evidence blocks at and beyond each member's bounds")
+    return out
+
+
+def typed(value, kind: str) -> bool:
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "bool":
+        return isinstance(value, bool)
+    raise Failure(f"unknown type {kind!r} in the evidence table")
+
+
+def admits(block: dict, b: dict) -> bool:
+    for member in MEMBERS:
+        if member not in block or not typed(block[member], b[member]["type"]):
+            return False
+    head = block["chain_head_hash"]
+    if head and not (len(head) == b["chain_head_hash"]["hex_length"]
+                     and all(c in "0123456789abcdef" for c in head)):
+        return False
+    if block["attestation_gap_count"] < b["attestation_gap_count"]["min"]:
+        return False
+    event = block["action_event_type"]
+    if len(event) > b["action_event_type"]["max"] or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ_" for c in event):
+        return False
+    return True
+
+
+def _value(c: dict):
+    return c["evidence"].get(c["member"]) if c["member"] else None
+
+
+# What the corpus must hold, each a predicate over (case, bounds).
+COVERAGE = {
+    "an action_event_type of 0 characters admitted":
+        lambda c, b: c["member"] == "action_event_type" and _value(c) == "" and c["admitted"],
+    "an action_event_type at the maximum admitted":
+        lambda c, b: c["member"] == "action_event_type" and isinstance(_value(c), str)
+        and len(_value(c)) == b["action_event_type"]["max"] and c["admitted"],
+    "an action_event_type one over the maximum refused":
+        lambda c, b: c["member"] == "action_event_type" and isinstance(_value(c), str)
+        and len(_value(c)) == b["action_event_type"]["max"] + 1
+        and set(_value(c)) <= set("ABCDEFGHIJKLMNOPQRSTUVWXYZ_") and not c["admitted"],
+    "an action_event_type with a lowercase character refused":
+        lambda c, b: c["member"] == "action_event_type" and isinstance(_value(c), str)
+        and any(ch.islower() for ch in _value(c)) and not c["admitted"],
+    "an action_event_type with a digit refused":
+        lambda c, b: c["member"] == "action_event_type" and isinstance(_value(c), str)
+        and any(ch.isdigit() for ch in _value(c)) and not c["admitted"],
+    **{f"an action_event_type holding {ch!r}, just outside the alphabet, refused":
+       (lambda ch: lambda c, b: c["member"] == "action_event_type" and isinstance(_value(c), str)
+        and ch in _value(c) and not c["admitted"])(ch) for ch in "@[^`"},
+    "an empty chain_head_hash admitted":
+        lambda c, b: c["member"] == "chain_head_hash" and _value(c) == "" and c["admitted"],
+    "a chain_head_hash one short refused":
+        lambda c, b: c["member"] == "chain_head_hash" and isinstance(_value(c), str)
+        and len(_value(c)) == b["chain_head_hash"]["hex_length"] - 1 and not c["admitted"],
+    "a chain_head_hash one long refused":
+        lambda c, b: c["member"] == "chain_head_hash" and isinstance(_value(c), str)
+        and len(_value(c)) == b["chain_head_hash"]["hex_length"] + 1 and not c["admitted"],
+    "an uppercase chain_head_hash of full length refused":
+        lambda c, b: c["member"] == "chain_head_hash" and isinstance(_value(c), str)
+        and len(_value(c)) == b["chain_head_hash"]["hex_length"]
+        and any(ch.isupper() for ch in _value(c)) and not c["admitted"],
+    "an attestation_gap_count below the floor refused":
+        lambda c, b: c["member"] == "attestation_gap_count" and typed(_value(c), "int")
+        and _value(c) == b["attestation_gap_count"]["min"] - 1 and not c["admitted"],
+    "available false admitted":
+        lambda c, b: c["member"] == "available" and _value(c) is False and c["admitted"],
+    **{f"a {m} of the wrong type refused":
+       (lambda m: lambda c, b: c["member"] == m and not typed(_value(c), b[m]["type"])
+        and not c["admitted"])(m) for m in MEMBERS},
+}
+
+
+def check(text: str, corpus: dict) -> str:
+    b = bounds(text)
+    if corpus.get("contract") != "gateway-api/v2.md":
+        raise Failure("the corpus names another contract")
+    cases = corpus.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise Failure("the corpus holds no cases")
+    names = [c.get("name") for c in cases]
+    if len(set(names)) != len(names):
+        raise Failure("case names repeat")
+    base = [c for c in cases if c.get("member") is None]
+    if len(base) != 1 or not base[0]["admitted"] or not admits(base[0]["evidence"], b):
+        raise Failure("the corpus needs exactly one base case, admitted")
+    for c in cases:
+        block = c["evidence"]
+        if sorted(block) != sorted(MEMBERS):
+            raise Failure(f"{c['name']}: the block's members are {sorted(block)}")
+        differ = [m for m in MEMBERS if json.dumps(block[m]) != json.dumps(base[0]["evidence"][m])]
+        if c["member"] is not None and differ != [c["member"]]:
+            raise Failure(f"{c['name']}: differs from the base in {differ}, not {c['member']}")
+        verdict = admits(block, b)
+        if verdict != c["admitted"]:
+            raise Failure(f"{c['name']}: the corpus says admitted={c['admitted']}, "
+                          f"the contract's bounds give {verdict}")
+    for label, holds in COVERAGE.items():
+        if not any(holds(c, b) for c in cases):
+            raise Failure(f"the corpus holds no case for: {label}")
+    return f"{len(cases)} cases judged from the evidence table, {len(COVERAGE)} coverage requirements met"
+
+
+def mutants(text: str, corpus: dict):
+    for i, c in enumerate(corpus["cases"]):
+        m = copy.deepcopy(corpus)
+        m["cases"][i]["admitted"] = not c["admitted"]
+        yield f"verdict flipped: {c['name']}", text, m
+    b = bounds(text)
+    for label, holds in COVERAGE.items():
+        m = copy.deepcopy(corpus)
+        m["cases"] = [c for c in m["cases"] if not holds(c, b)]
+        yield f"coverage removed: {label}", text, m
+    for old, new in (
+        ("Empty, or 1 to 64 characters, each `A`–`Z` or `_`.",
+         "Empty, or 1 to 65 characters, each `A`–`Z` or `_`."),
+        ("Empty, or 1 to 64 characters, each `A`–`Z` or `_`.",
+         "Empty, or 1 to 64 characters, each `A`–`Z`, `0`–`9` or `_`."),
+        ("or 64 lowercase hex chars.", "or 63 lowercase hex chars."),
+        ("Must be `>= 0`.", "Must be `>= 1`."),
+        ("| `available`             | `bool`   |", "| `available`             | `int`    |"),
+        ("The gateway rejects heartbeats whose evidence block fails the bounds above",
+         "The gateway logs heartbeats whose evidence block fails the bounds above"),
+        ("[vectors/heartbeat-evidence-v2.json](vectors/heartbeat-evidence-v2.json)", "The corpus"),
+    ):
+        pattern = r"\s+".join(re.escape(w) for w in old.split())
+        if re.search(pattern, text) is None:
+            raise AssertionError(f"mutation target missing: {old!r}")
+        yield f"contract sentence held: {new[:50]}", re.sub(pattern, lambda _: new, text, count=1), corpus
+    m = copy.deepcopy(corpus)
+    m["cases"][1]["evidence"]["available"] = False
+    yield "a case differing in two members", text, m
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args not in ([], ["--mutations"]):
+        print(__doc__, file=sys.stderr)
+        return 2
+    text = CONTRACT.read_text(encoding="utf-8")
+    corpus = json.loads(CORPUS.read_text(encoding="utf-8"))
+    try:
+        summary = check(text, corpus)
+    except Failure as exc:
+        print(f"gateway-api/v2 heartbeat evidence corpus: {exc}", file=sys.stderr)
+        return 1
+    print(f"gateway-api/v2 heartbeat evidence corpus: {summary}")
+    if args == ["--mutations"]:
+        count = 0
+        for label, t, c in mutants(text, corpus):
+            count += 1
+            try:
+                check(t, c)
+            except Failure:
+                continue
+            print(f"mutant accepted: {label}", file=sys.stderr)
+            return 1
+        print(f"{count} mutants, every one refused")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
