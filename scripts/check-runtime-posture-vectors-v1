@@ -127,8 +127,8 @@ PINS: list[tuple[str, str]] = [
     ("posture", "Against gateway-api/v2's volume bound, a bucket that holds 5 records and gains one every 10 seconds, this leaves at least one record of room for the broker's redelivery of the retained record at a subscribe, while delivery does not bunch records; [Limits](#limits-and-later-versions) states what bunching does."),
     ("posture", "Coalescing bounds when the runtime publishes, not when the gateway receives: records published at 0, 1, 10002, 20003, 30004 and 60002 ms keep both of its limits, but delivered together from 60002 ms, each within check 10's bound, the sixth finds the bucket empty."),
     ("posture", "Volume drops leave no `last_refusal`."),
-    ("posture", "together can exceed it, so a genuine record is dropped. The runtime publishes its next record within 60 seconds, but when it arrives, and whether it is admitted, depend on delivery and on what else has spent the bound, so the gap a gateway sees can be longer."),
-    ("posture", "the device reads `unknown(lower_tuple_seen)` until the gateway accepts a higher record. The runtime publishes one within 60 seconds, but delivery delay or a volume drop can make the gateway accept it later."),
+    ("posture", "together can exceed it, so a genuine record is dropped. The runtime's next refresh is due within 60 seconds of its previous submission, but it can be submitted later, and when it arrives, and whether it is admitted, depend on delivery and on what else has spent the bound, so the gap a gateway sees can be longer."),
+    ("posture", "the device reads `unknown(lower_tuple_seen)` until the gateway accepts a higher record. The runtime's next refresh is due within 60 seconds, but a postponed submission, delivery delay or a volume drop can make the gateway accept it later."),
     ("posture", "- **A pause neither clock counts is not counted.** A gateway whose monotonic clock stops while its host is suspended, and whose wall clock is stepped back across the suspend, counts neither, so a record can stay `current` for longer than it is in fact old."),
     ("posture", "- **A release longer than 64 characters cannot be carried.** runtime-release-bundle/v1 bounds no `runtime_version` length, and `release` holds at most 64 characters, so a runtime installed from a verified bundle with a longer version publishes no record"),
     ("posture", "ori-runtime#782 enforces it at publication; `null` is never a substitute, since it says the code was not installed from a verified bundle."),
@@ -369,13 +369,14 @@ def build_model(texts: dict[str, str]) -> dict:
     if m["last_refusal_checks"] != [3, 10]:
         raise Failure("text: last_refusal no longer covers checks 3 to 10")
 
-    # Publication: the republish interval and coalescing, held against
+    # Publication: the refresh deadline and coalescing, held against
     # check 10's bound and gateway-api/v2's volume bound.
     pub = section(post, "Publication", 2)
-    m["republish_s"] = int(one(r"at least once every (\d+) seconds while it runs", pub, "When").group(1))
-    fifth = one(r"The republish interval is a fifth of check 10's (\d+) ms bound", pub, "When")
-    if int(fifth.group(1)) != m["skew"] or m["republish_s"] * 1000 * 5 != m["skew"]:
-        raise Failure("text: the republish interval is not a fifth of the skew bound")
+    m["republish_s"] = int(one(r"A refresh becomes due no later than (\d+) seconds after the preceding publication's submission", pub, "When").group(1))
+    fifth = one(r"The (\d+)-second refresh deadline is a fifth of check 10's (\d+) ms bound", pub, "When")
+    if (int(fifth.group(2)) != m["skew"] or int(fifth.group(1)) != m["republish_s"]
+            or m["republish_s"] * 1000 * 5 != m["skew"]):
+        raise Failure("text: the refresh deadline is not a fifth of the skew bound")
     co = one(r"A runtime publishes at most (\d+) records in any (\d+) seconds and at most (\d+) in any minute, both judged over sliding windows", pub, "Coalescing")
     m["coalesce"] = tuple(int(x) for x in co.groups())
     rm = one(r"a bucket that holds (\d+) records and gains one every (\d+) seconds, this leaves at least (one) record of room", pub, "Coalescing")
@@ -386,11 +387,11 @@ def build_model(texts: dict[str, str]) -> dict:
     if int(one(r"The signing clock runs at most (\d+) ms ahead of the runtime's wall clock", lim, "Delayed delivery").group(1)) != m["clock_ahead"]:
         raise Failure("text: Limits and Publication give different signing clock bounds")
     # The two limits bound publication, never arrival: each names the
-    # republish interval as when the runtime publishes.
-    for pat, where in ((r"The runtime publishes its next record within (\d+) seconds, but when it arrives", "honest traffic"),
-                       (r"The runtime publishes one within (\d+) seconds, but delivery delay or a volume drop can make the gateway accept it later", "honest reordering")):
+    # refresh deadline as when the runtime's next record is due.
+    for pat, where in ((r"The runtime's next refresh is due within (\d+) seconds of its previous submission, but it can be submitted later, and when it arrives", "honest traffic"),
+                       (r"The runtime's next refresh is due within (\d+) seconds, but a postponed submission, delivery delay or a volume drop can make the gateway accept it later", "honest reordering")):
         if int(one(pat, lim, where).group(1)) != m["republish_s"]:
-            raise Failure(f"text: the {where} limit and the republish interval differ")
+            raise Failure(f"text: the {where} limit and the refresh deadline differ")
     # Nothing may promise when a gateway receives or accepts a record.
     flat_post = norm(post)
     for pat in (r"arrives? within \d+ (?:ms|seconds?)", r"at most \d+ (?:ms|seconds?) later",
@@ -487,8 +488,8 @@ def build_model(texts: dict[str, str]) -> dict:
     ga2 = one(r"A conforming runtime publishes at most (\d+) records in any (\d+) seconds and (\d+) in any minute", vol, "posture volume runtime")
     if (int(ga2.group(1)), int(ga2.group(2)), int(ga2.group(3))) != (r_short, r_win, r_min):
         raise Failure("text: gateway-api/v2 quotes another coalescing limit than runtime-posture/v1's")
-    if f"at least every {m['republish_s']} seconds" not in vol:
-        raise Failure("text: gateway-api/v2's posture volume sentence names another republish interval")
+    if f"on each refresh, due at most {m['republish_s']} seconds after the previous submission" not in vol:
+        raise Failure("text: gateway-api/v2's posture volume sentence names another refresh deadline")
     for c in m["carriage"]:
         if f"`{c}`" not in one(r"\*\*The runtime posture record\.\*\*(.*?)A node's `posture_record`", hp, "posture_record").group(1):
             raise Failure(f"text: posture_record no longer names {c}")
@@ -2370,7 +2371,7 @@ def text_mutants(texts: dict[str, str]) -> list[tuple[str, dict[str, str]]]:
         t["posture"] = t["posture"].replace("Nothing false is shown.", "Nothing false is shown. " + promise, 1)
         out.append((f"text: arrival promise added: {promise}", t))
     t = dict(texts)
-    t["posture"] = re.sub(r"until\s+the\s+gateway\s+accepts\s+a\s+higher\s+record\.\s+The\s+runtime\s+publishes\s+one\s+within\s+60\s+seconds,\s+but\s+delivery\s+delay\s+or\s+a\s+volume\s+drop\s+can\s+make\s+the\s+gateway\s+accept\s+it\s+later\.",
+    t["posture"] = re.sub(r"until\s+the\s+gateway\s+accepts\s+a\s+higher\s+record\.\s+The\s+runtime's\s+next\s+refresh\s+is\s+due\s+within\s+60\s+seconds,\s+but\s+a\s+postponed\s+submission,\s+delivery\s+delay\s+or\s+a\s+volume\s+drop\s+can\s+make\s+the\s+gateway\s+accept\s+it\s+later\.",
                           "until the runtime's next record, at most 60 seconds later.", t["posture"])
     out.append(("text: the reordering limit's old arrival promise restored", t))
     t = dict(texts)
