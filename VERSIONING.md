@@ -598,7 +598,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | signing | v1 | `draft` | `frozen` | shipment, runtime `1411814`, 2026-06-12; audit complete |
 | signing | v2 | `draft` | `amendable` | — |
 | skill-hook-isolation | v1 | `draft` | `amendable` | — |
-| skills-package | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
+| skills-package | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
 | skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit complete |
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |

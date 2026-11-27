@@ -89,7 +89,7 @@ whole contract.
 | Skill signing contract | [signing/v1.md](signing/v1.md) | `draft` | verifier (runtime) `shipped` in v1.0.0, `non-conforming` at assessed implementation snapshot `1411814` (1 divergence); current `d2aba48` unassessed, issuer (skills-hub) `implemented-unreleased`, `unassessed`, verifier (sdk-python) `implemented-unreleased`, `unassessed` | `frozen` (2026-06-12), audit `complete` |
 | Skill signing contract | [signing/v2.md](signing/v2.md) | `draft` | none recorded | `amendable` |
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | `draft` | none recorded | `amendable` |
-| Skill package format (previous) | [skills-package/v1.md](skills-package/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.1, `unassessed`, producer (sdk-python) `implemented-unreleased`, `unassessed`, consumer (skills-hub) `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `pending` |
+| Skill package format (previous) | [skills-package/v1.md](skills-package/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.1, `unassessed`, producer (sdk-python) `implemented-unreleased`, `unassessed`, consumer (skills-hub) `implemented-unreleased`, `unassessed` | `frozen` (2026-05-08), audit `complete` |
 | Skill package format | [skills-package/v2.md](skills-package/v2.md) | `draft` | consumer (runtime) `shipped` in v2.4.0-rc.3, `unassessed` | `frozen` (2026-08-17), audit `complete` |
 | Skill package format (next) | [skills-package/v3.md](skills-package/v3.md) | `draft` | none recorded | `amendable` |
 | Supply transfer | [supply-transfer/v1.md](supply-transfer/v1.md) | `draft` | none recorded | `amendable` |
