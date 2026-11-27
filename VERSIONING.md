@@ -581,7 +581,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-posture | v1 | `draft` | `amendable` | — |
 | runtime-release-bundle | v1 | `draft` | `frozen` | shipment, runtime `cad2279`, 2026-08-13; audit pending |
 | runtime-telemetry | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
-| runtime-telemetry | v2 | `draft` | `frozen` | shipment, runtime `f87be13`, 2026-09-16; audit pending |
+| runtime-telemetry | v2 | `draft` | `frozen` | shipment, runtime `f87be13`, 2026-09-16; audit complete |
+| runtime-telemetry | v3 | `draft` | `amendable` | — |
 | safety-profile | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
 | safety-qualification-fixture | v1 | `draft` | `amendable` | — |
 | schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
