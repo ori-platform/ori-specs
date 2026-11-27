@@ -8,9 +8,8 @@
 
 [safety-profile/v2.md](v2.md) fixes that ratification is a contract change,
 that it flips `status` in `profiles.json`, that it moves every consumer's
-pinned digest, and that it is made "only when the questions recorded for that
-profile under Open Questions are closed". It does not say what closing one
-looks like, what evidence closes it, who decides, or what is retained
+pinned digest, and that it is made only when the profile's dossier is complete
+under this document. v2 does not say what completing one looks like, what evidence closes it, who decides, or what is retained
 afterwards. This document says those four things.
 
 It exists because the alternative is a ratification made the way software
