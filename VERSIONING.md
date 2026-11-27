@@ -585,7 +585,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | safety-profile | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
 | safety-qualification-fixture | v1 | `draft` | `amendable` | — |
 | schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
-| sensor-configuration | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit pending |
+| sensor-configuration | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
 | signing | v1 | `draft` | `frozen` | shipment, runtime `1411814`, 2026-06-12; audit complete |
 | signing | v2 | `draft` | `amendable` | — |
 | skill-hook-isolation | v1 | `draft` | `amendable` | — |

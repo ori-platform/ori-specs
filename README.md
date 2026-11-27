@@ -81,7 +81,7 @@ whole contract.
 | Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `pending` |
 | Safety qualification fixture | [safety-qualification-fixture/v1.md](safety-qualification-fixture/v1.md) | `draft` | none recorded | `amendable` |
 | Schema descriptor core | [schema-descriptor/v1.md](schema-descriptor/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.6, `unassessed` | `frozen` (2026-08-29), audit `complete` |
-| Sensor configuration | [sensor-configuration/v1.md](sensor-configuration/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.6, `unassessed` | `frozen` (2026-08-29), audit `pending` |
+| Sensor configuration | [sensor-configuration/v1.md](sensor-configuration/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.6, `unassessed` | `frozen` (2026-08-29), audit `complete` |
 | Skill signing contract | [signing/v1.md](signing/v1.md) | `draft` | verifier (runtime) `shipped` in v1.0.0, `non-conforming` at assessed implementation snapshot `1411814` (1 divergence); current `d2aba48` unassessed, issuer (skills-hub) `implemented-unreleased`, `unassessed`, verifier (sdk-python) `implemented-unreleased`, `unassessed` | `frozen` (2026-06-12), audit `complete` |
 | Skill signing contract | [signing/v2.md](signing/v2.md) | `draft` | none recorded | `amendable` |
 | Skill hook isolation | [skill-hook-isolation/v1.md](skill-hook-isolation/v1.md) | `draft` | none recorded | `amendable` |
