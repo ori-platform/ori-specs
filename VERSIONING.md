@@ -599,7 +599,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | signing | v2 | `draft` | `amendable` | — |
 | skill-hook-isolation | v1 | `draft` | `amendable` | — |
 | skills-package | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit pending |
-| skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit pending |
+| skills-package | v2 | `draft` | `frozen` | shipment, runtime `1b4c659`, 2026-08-17; audit complete |
 | skills-package | v3 | `draft` | `amendable` | — |
 | supply-transfer | v1 | `draft` | `amendable` | — |
 | tier-c-approval | v1 | `draft` | `frozen` | shipment, runtime `25e0d9c`, 2026-10-01; audit complete |
