@@ -123,11 +123,15 @@ HUNK_CLASSES = ("erratum", "additive", "semantic")
 # A frozen vector file admits one change in place: an erratum to these descriptive top-level members, every other
 # member structurally identical. It is not permission to alter a frozen vector.
 VECTOR_METADATA_MEMBERS = ("vector_set", "contract", "canonicalisation")
+# The one byte-level erratum: a single LF added after the file's complete JSON value, every earlier byte unchanged.
+# It is declared alone and never with a metadata member, so each recorded step proves one exact permitted change.
+VECTOR_TERMINATOR = "terminator"
 VECTOR_ERRATUM_KEYS = {"path", "classification", "from_sha256", "to_sha256", "commit", "members", "justification",
                        "revendor"}
 VECTOR_ERRATUM_LIMIT = (
     "A frozen vector file admits only a metadata erratum: the listed descriptive top-level members may change, and "
-    "every other member, case, input, expected result, signature and order must stay structurally identical. It is "
+    "every other member, case, input, expected result, signature and order must stay structurally identical; or a "
+    "terminator erratum, which adds exactly one LF after the complete JSON value and changes no other byte. It is "
     "not permission to alter a frozen vector; any other change needs a successor version."
 )
 HUNK_KEYS = {"hunk_sha256", "commit", "classification", "summary", "destination", "optional",
@@ -1378,9 +1382,11 @@ def check_audit_record(rec: dict, adoption: list, bad: Callable[[str, str], None
             bad("bad-value", f"{w} records distinct from_sha256 and to_sha256")
         if not is_hex(e["commit"]):
             bad("bad-value", f"{w}.commit is the ori-specs commit that introduced the change")
-        if not (isinstance(e["members"], list) and e["members"] and len(set(e["members"])) == len(e["members"])
-                and set(e["members"]) <= set(VECTOR_METADATA_MEMBERS)):
-            bad("bad-value", f"{w}.members lists the changed members, each one of {list(VECTOR_METADATA_MEMBERS)}")
+        if not (isinstance(e["members"], list) and (e["members"] == [VECTOR_TERMINATOR] or (
+                e["members"] and len(set(e["members"])) == len(e["members"])
+                and set(e["members"]) <= set(VECTOR_METADATA_MEMBERS)))):
+            bad("bad-value", f"{w}.members lists the changed members, each one of {list(VECTOR_METADATA_MEMBERS)}, "
+                             f"or is [{VECTOR_TERMINATOR!r}] alone")
         if not (isinstance(e["justification"], str) and e["justification"].strip()):
             bad("bad-value", f"{w}.justification states why no conforming consumer's accepted input changes")
         if not (isinstance(e["revendor"], list) and e["revendor"] and all(r in REPOSITORIES for r in e["revendor"])):
@@ -2094,6 +2100,21 @@ def _metadata_changes(old: bytes | None, new: bytes | None) -> set[str] | None:
     return changed
 
 
+def _terminator_only(old: bytes | None, new: bytes | None) -> bool:
+    """True when new is old with exactly one LF added after old's complete JSON value, and nothing else changed.
+
+    old must parse strictly as one JSON value and end at that value's last byte, with no trailing whitespace, so the
+    only difference is the terminator: whitespace, escapes and number spellings anywhere else are other byte changes.
+    """
+    if old is None or new is None or new != old + b"\n" or not old or old[-1:] in b" \t\r\n":
+        return False
+    try:
+        strict_json(old)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    return True
+
+
 def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, digest: str, chain: list[dict],
                         findings: list[Finding]) -> None:
     """A frozen vector file changed only by recorded metadata errata, each confirmed at its introducing commit."""
@@ -2127,12 +2148,17 @@ def check_vector_errata(path: str, baseline: bytes | None, now: bytes | None, di
                                     f"the commit {commit} does not change this file from {str(e.get('from_sha256'))[:12]} "
                                     f"to {str(e.get('to_sha256'))[:12]}; an erratum records the commit that "
                                     f"introduced it. {VECTOR_ERRATUM_LIMIT}"))
+        elif e.get("members") == [VECTOR_TERMINATOR]:
+            if not _terminator_only(before, after):
+                findings.append(Finding("vector-erratum-invalid", path,
+                                        f"the commit {commit} does more than add one LF after the file's complete "
+                                        f"JSON value, which is all a terminator erratum may do. {VECTOR_ERRATUM_LIMIT}"))
         elif _metadata_changes(before, after) != set(e.get("members") or []):
             findings.append(Finding("vector-erratum-invalid", path,
                                     f"the commit {commit} changes more than, or other than, the declared members "
                                     f"{sorted(e.get('members') or [])}, which are descriptive metadata only. "
                                     f"{VECTOR_ERRATUM_LIMIT}"))
-        declared |= set(e.get("members") or [])
+        declared |= set(e.get("members") or []) - {VECTOR_TERMINATOR}
         expected = str(e.get("to_sha256"))
     try:
         if now is not None:
@@ -2816,7 +2842,7 @@ def baseline_declares_own_version(rec: dict) -> bool:
     audit = rec["baseline_audit"]
     for path in audit["pinned_files"]:
         blob = git_blob(audit["freeze_revision"], path)
-        if blob is None or path in DECLARATION_EXEMPT:
+        if blob is None or path in DECLARATION_EXEMPT or not path.endswith(".json"):
             continue
         try:
             document = strict_json(blob)
@@ -2863,15 +2889,58 @@ def _call_one(i: int) -> Any:
     return _ONE(i)
 
 
+# The pending-audit cases need a frozen version whose audit is pending, with pinned files and real history at its
+# freeze revision. Once every real audit is complete no live record is pending, so the suite reopens one completed
+# record as pending, the same way in its baseline and in every scratch copy, and never in the repository. A pending
+# audit pins the state the version must hold while the audit is open, not its freeze, so the pins are the bytes the
+# pending check reads; the freeze revision and changes_since_freeze stay the real ones, and the cases that complete
+# the audit re-derive it from history.
+REOPEN_REL: str | None = None
+
+
+def reopened_record(root: pathlib.Path, rec: dict) -> dict:
+    """rec with its completed audit reopened as pending, pinned to the files under root."""
+    c, v = rec["contract"], rec["version"]
+    out = copy.deepcopy(rec)
+    ba = rec["baseline_audit"]
+    out["baseline_audit"] = {"status": "pending", "freeze_revision": ba["freeze_revision"],
+                             "changes_since_freeze": ba["changes_since_freeze"], "issue": ba["issue"],
+                             "pinned_sha256": normative_digest((root / f"{c}/{v}.md").read_text(encoding="utf-8")),
+                             "pinned_files": version_files(root, c, v, versions_in(root, c))}
+    return out
+
+
+def reopen_fixture(root: pathlib.Path) -> None:
+    """Install the reopened pending-audit fixture in a scratch tree, with its status line and rows rendered."""
+    if REOPEN_REL is None:
+        return
+    rec = json.loads((root / f"status/{REOPEN_REL}.json").read_text(encoding="utf-8"))
+    new = reopened_record(root, rec)
+    _edit_json(root, f"status/{REOPEN_REL}.json", lambda r: (r.clear(), r.update(new)))
+    write_status_lines(root)
+    write_rows(root)
+
+
 def mutations() -> int:
+    global REOPEN_REL
     findings: list[Finding] = []
     records = load_records(ROOT, findings)
     unshipped = _first(records, lambda r: r["compatibility"] == "amendable" and not r["adoption"])
+    try:
+        REOPEN_REL = _first(records, lambda r: r["compatibility"] == "frozen"
+                            and r.get("baseline_audit", {}).get("status") == "complete"
+                            and bool(r.get("companion_files")) and bool(r["baseline_audit"].get("vectors"))
+                            and bool(r["baseline_audit"].get("changes_since_freeze"))
+                            and not r["baseline_audit"].get("vector_errata")
+                            and not r["baseline_audit"].get("baseline_path") and not r.get("corrections"))
+    except SystemExit:
+        raise SystemExit("mutation precondition: no completed frozen version with companion files, vectors and "
+                         "changes since its freeze to reopen as the pending-audit fixture")
+    records[tuple(REOPEN_REL.split("/"))] = reopened_record(ROOT, records[tuple(REOPEN_REL.split("/"))])
     base = copy.deepcopy(records)
     shipped_frozen = _first(records, lambda r: r["compatibility"] == "frozen" and any(
         e["lifecycle"] == "shipped" for e in r["adoption"]))
-    vector_frozen = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
-                           and r["baseline_audit"].get("pinned_files"))
+    vector_frozen = REOPEN_REL
     pinned_frozen = _first(records, lambda r: r.get("frozen_by", {}).get("pinned_revision"))
     # The synthetic fixture, installed in every scratch copy and its baseline; never a live record.
     impl_only = FIXTURE_REL
@@ -2892,8 +2961,7 @@ def mutations() -> int:
         return lambda root: _edit_json(root, f"status/{rel}.json", edit)
 
     assessed = {"method": "compared with the contract", "assessed_at": "2026-09-25"}
-    frozen = _first(records, lambda r: r["compatibility"] == "frozen"
-                    and r.get("baseline_audit", {}).get("status") == "pending")
+    frozen = REOPEN_REL
     conservative = _first(records, lambda r: r.get("frozen_by", {}).get("event") == "conservative-baseline")
     protected = _first(records, lambda r: r.get("frozen_by", {}).get("branch_protection") == "protected")
 
@@ -2930,13 +2998,16 @@ def mutations() -> int:
     # baseline-path and transcription cases.
     CUT = _first(records, lambda r: bool(r.get("baseline_audit", {}).get("baseline_path"))
                  and any(c.get("class") == "transcription" for c in r.get("corrections") or []))
-    audited = _first(records, lambda r: r.get("baseline_audit", {}).get("status") == "pending"
+    audited = REOPEN_REL
+    if not (lambda r: r.get("baseline_audit", {}).get("status") == "pending"
                      and r["baseline_audit"].get("pinned_files")
                      and any(e["lifecycle"] != "unimplemented" for e in r["adoption"])
                      and r["baseline_audit"].get("changes_since_freeze")
                      and git_blob(r["baseline_audit"]["freeze_revision"], f'{r["contract"]}/{r["version"]}.md') is not None
                      and git_blob(r["baseline_audit"]["freeze_revision"], sorted(r["baseline_audit"]["pinned_files"])[0]) is not None
-                     and baseline_declares_own_version(r))
+                     and baseline_declares_own_version(r))(records[tuple(audited.split('/'))]):
+        raise SystemExit(f"mutation precondition: the reopened fixture {audited} does not meet the complete-audit "
+                         "cases' needs (pinned files at the freeze revision, a declared own version)")
     def complete_audit(root: pathlib.Path, adjust: Callable[[dict], None] | None = None, rel: str = "") -> None:
         """Complete the audit of one frozen record: every net hunk admitted, vectors restored to the baseline."""
         rel = rel or audited
@@ -3152,7 +3223,14 @@ def mutations() -> int:
             e["assessment"]["method"] = "rolled back"
         return fn
 
-    companion_rel = _first(records, lambda r: r["compatibility"] == "frozen" and r.get("companion_files"))
+    companion_rel = REOPEN_REL
+    # A contract with a frozen v1 and v2, both complete, for the case that lists one companion under two versions.
+    two_versions = next((c for c, v in sorted(records) if v == "v1" and (c, "v2") in records
+                         and records[(c, "v1")]["compatibility"] == records[(c, "v2")]["compatibility"] == "frozen"
+                         and records[(c, "v1")].get("baseline_audit", {}).get("status") == "complete"
+                         and records[(c, "v2")].get("baseline_audit", {}).get("status") == "complete"), None)
+    if two_versions is None:
+        raise SystemExit("mutation precondition: no contract with a frozen, completed v1 and v2")
     companion_docs = records[tuple(companion_rel.split("/"))]["companion_files"]  # type: ignore[index]
     companion_doc = companion_docs[0]
     # A companion present at the freeze revision, for the cases that complete the audit first.
@@ -3187,22 +3265,6 @@ def mutations() -> int:
             else:
                 r.pop("companion_files", None)
         _edit_json(root, f"status/{companion_rel}.json", edit)
-
-    def pending_then(fn: Callable[..., None]) -> Callable[[pathlib.Path], None]:
-        """Reopen the fixture's audit as pending, pinned to the tree as it stands, then apply fn."""
-        def mutate(root: pathlib.Path) -> None:
-            c, v = companion_rel.split("/")
-            def reopen(r: dict) -> None:
-                ba = r["baseline_audit"]
-                r["baseline_audit"] = {"status": "pending", "freeze_revision": ba["freeze_revision"],
-                                       "changes_since_freeze": ba["changes_since_freeze"], "issue": ba["issue"],
-                                       "pinned_sha256": normative_digest(
-                                           (root / f"{companion_rel}.md").read_text(encoding="utf-8")),
-                                       "pinned_files": version_files(root, c, v, versions_in(root, c))}
-            _edit_json(root, f"status/{companion_rel}.json", reopen)
-            write_status_lines(root)
-            fn(root)
-        return mutate
 
     def completed_then(fn: Callable[..., None]) -> Callable[[pathlib.Path], None]:
         def mutate(root: pathlib.Path) -> None:
@@ -3464,6 +3526,8 @@ def mutations() -> int:
         path.write_text("\n".join(lines), encoding="utf-8")
 
     anchor_rec, anchor_vec = "status/runtime-evidence-anchor/v2.json", "runtime-evidence-anchor/vectors/runtime-anchor-v2.json"
+    term_rec = "status/gateway-mqtt-canonical-json/v1.json"
+    term_vec = "gateway-mqtt-canonical-json/vectors/canonical-json.json"
 
     def vector_structure(fn: Callable[[dict], object]) -> Callable[[pathlib.Path], None]:
         """Edit the parsed anchor corpus and write it back; the erratum record is left as it stands."""
@@ -3608,16 +3672,16 @@ def mutations() -> int:
         ("history unavailable is refused, not skipped", "history-unavailable", lambda root: "no-history"),
         ("a record new in the change is not compared", None, new_record),
         ("a frozen version's vector file edited", "frozen-audit-pending", edit_vector),
-        ("pending: a frozen companion document edited", "frozen-audit-pending", pending_then(companion_edit)),
-        ("pending: a companion document added to a frozen version", "frozen-audit-pending", pending_then(companion_add)),
-        ("pending: a frozen companion document deleted", "frozen-audit-pending", pending_then(companion_delete)),
-        ("pending: a frozen companion document re-attributed", "frozen-audit-pending", pending_then(companion_reattribute)),
+        ("pending: a frozen companion document edited", "frozen-audit-pending", companion_edit),
+        ("pending: a companion document added to a frozen version", "frozen-audit-pending", companion_add),
+        ("pending: a frozen companion document deleted", "frozen-audit-pending", companion_delete),
+        ("pending: a frozen companion document re-attributed", "frozen-audit-pending", companion_reattribute),
         ("an unattributed companion document in a frozen directory", "companion-unattributed",
          companion_add_unlisted),
         ("a companion listed by two versions", "bad-value:more than one version",
-         lambda root: ((root / "skills-package" / "extra.md").write_text("# Extra\n"),
-                       *[_edit_json(root, f"status/skills-package/{v}.json",
-                                    lambda r: r.update(companion_files=["skills-package/extra.md"]))
+         lambda root: ((root / two_versions / "extra.md").write_text("# Extra\n"),
+                       *[_edit_json(root, f"status/{two_versions}/{v}.json",
+                                    lambda r: r.update(companion_files=[f"{two_versions}/extra.md"]))
                          for v in ("v1", "v2")])),
         ("companion_files naming a missing file", "bad-value:companion_files lists",
          rec_edit(companion_rel, lambda r: r["companion_files"].append(f"{companion_dir}/missing.md"))),
@@ -4144,6 +4208,13 @@ def mutations() -> int:
          erratum_edit(lambda e: e.update(justification="rewritten"))),
         ("an erratum naming no repository to re-vendor", "bad-value:revendor",
          erratum_edit(lambda e: e.update(revendor=[]))),
+        ("a terminator erratum declared with a metadata member", "bad-value:members lists",
+         lambda root: _edit_json(root, term_rec, lambda r: r["baseline_audit"]["vector_errata"][0]["members"].append(
+             "contract"))),
+        ("a metadata erratum declared as a terminator erratum", "vector-erratum-invalid:does more than add one LF",
+         erratum_edit(lambda e: e.update(members=["terminator"]))),
+        ("a frozen vector gaining a byte after its terminator erratum", "vector-drift:last recorded erratum",
+         lambda root: (root / term_vec).write_bytes((root / term_vec).read_bytes() + b" ")),
         ("an issue reference in README.md", "issue-reference:README.md",
          lambda root: (root / "README.md").write_text((root / "README.md").read_text() + "\nSee #12.\n")),
     ]
@@ -4325,6 +4396,7 @@ def mutations() -> int:
             root = pathlib.Path(tmp) / "specs"
             shutil.copytree(ROOT, root, ignore=shutil.ignore_patterns(".git", "__pycache__"))
             install_fixture(root)
+            reopen_fixture(root)
             for rel in sorted((root / "status").rglob("*.json")):
                 data = json.loads(rel.read_text(encoding="utf-8"))
                 if isinstance(data.get("baseline_audit"), dict) and data["baseline_audit"].get("issue") is None:
@@ -4367,6 +4439,28 @@ def mutations() -> int:
     # anchor the earlier parsing invented and the one GitHub renders are refused, the latter for its form.
     # A re-wrap amends nothing, and an item is found in a record however JSON escapes it.
     doc = "# D\n\nA receiver MUST refuse a\nstale envelope.\n"
+    # A terminator erratum admits one exact byte change. Every other change, including ones that leave the parsed
+    # JSON identical, is refused.
+    tj = b'{"a": "\\u00e9", "n": 1.0}'
+    for name, old, new, want in (
+            ("one LF after the value", tj, tj + b"\n", True),
+            ("CRLF after the value", tj, tj + b"\r\n", False),
+            ("two LFs after the value", tj, tj + b"\n\n", False),
+            ("a space then LF after the value", tj, tj + b" \n", False),
+            ("an LF added to a file already ending in one", tj + b"\n", tj + b"\n\n", False),
+            ("whitespace inside the value, plus LF", tj, tj.replace(b", ", b",") + b"\n", False),
+            ("an escape respelled, plus LF", tj, tj.replace(b"\\u00e9", "\u00e9".encode()) + b"\n", False),
+            ("a number respelled, plus LF", tj, tj.replace(b"1.0", b"1.00") + b"\n", False),
+            ("a byte removed, plus LF", tj, tj[:-1] + b"\n", False),
+            ("no change", tj, tj, False),
+            ("an LF after bytes that are not one JSON value", b'{"a": 1} {}', b'{"a": 1} {}\n', False),
+            ("an LF after a byte order mark and the value", b"\xef\xbb\xbf" + tj, b"\xef\xbb\xbf" + tj + b"\n", False),
+            ("an LF after a value followed by NUL", tj + b"\x00", tj + b"\x00\n", False),
+            ("an LF after invalid UTF-8", tj.replace(b"1.0", b"1.0\xff"), tj.replace(b"1.0", b"1.0\xff") + b"\n", False)):
+        good = _terminator_only(old, new) is want
+        print(f"{'ok  ' if good else 'FAIL'} a terminator erratum {'admits' if want else 'refuses'} {name}")
+        total += 1
+        failed += not good
     for name, good in (
             ("a re-wrap leaves the normative words unchanged",
              normative_words(doc) == normative_words(doc.replace("a\nstale", "a stale"))),
