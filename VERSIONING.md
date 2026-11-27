@@ -533,7 +533,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | device-configuration | v1 | `draft` | `amendable` | — |
 | device-policy | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | device-policy | v2 | `draft` | `frozen` | shipment, runtime `ee242ed`, 2026-07-24; audit complete |
-| device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit pending |
+| device-provisioning | v1 | `draft` | `frozen` | claiming-merge, runtime `2ed10df`, 2026-07-21; audit complete |
+| device-provisioning | v2 | `draft` | `amendable` | — |
 | ed25519-key-admission | v1 | `draft` | `amendable` | — |
 | ed25519-verification | v1 | `draft` | `amendable` | — |
 | events | v1 | `draft` | `frozen` | shipment, runtime `eee40d3`, 2026-05-08; audit complete |
