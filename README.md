@@ -76,7 +76,7 @@ whole contract.
 | Android runtime mobile payload | [runtime-mobile/v1.md](runtime-mobile/v1.md) | `draft` | producer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `complete` |
 | Android runtime payload publication | [runtime-mobile/v2.md](runtime-mobile/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.10, claimed, `unassessed`, verifier (runtime) `shipped` in v2.5.0-rc.10, claimed, `unassessed` | `frozen` (2026-09-16), audit `complete` |
 | Runtime posture record | [runtime-posture/v1.md](runtime-posture/v1.md) | `draft` | none recorded | `amendable` |
-| Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | `draft` | producer (runtime) `shipped` in v2.3.0, `unassessed`, consumer (runtime) `shipped` in v2.3.0, `unassessed` | `frozen` (2026-08-13), audit `pending` |
+| Runtime release bundle/install | [runtime-release-bundle/v1.md](runtime-release-bundle/v1.md) | `draft` | producer (runtime) `shipped` in v2.3.0, `unassessed`, consumer (runtime) `shipped` in v2.3.0, `unassessed` | `frozen` (2026-08-13), audit `complete` |
 | Runtime release bundle/install (next) | [runtime-release-bundle/v2.md](runtime-release-bundle/v2.md) | `draft` | none recorded | `amendable` |
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | `draft` | producer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `pending` |
 | Runtime telemetry HTTP export | [runtime-telemetry/v2.md](runtime-telemetry/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.10, `unassessed` | `frozen` (2026-09-16), audit `complete` |
