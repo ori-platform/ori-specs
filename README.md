@@ -32,7 +32,7 @@ whole contract.
 | Device configuration | [device-configuration/v1.md](device-configuration/v1.md) | `draft` | none recorded | `amendable` |
 | Device policy | [device-policy/v1.md](device-policy/v1.md) | `draft` | consumer (runtime) `shipped` in v0.9.0-beta.2, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Device policy | [device-policy/v2.md](device-policy/v2.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, `unassessed` | `frozen` (2026-07-24), audit `complete` |
-| Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `pending` |
+| Device provisioning lifecycle | [device-provisioning/v1.md](device-provisioning/v1.md) | `draft` | consumer (runtime) `shipped` in v2.1.0, claimed, `unassessed`, consumer (evidence-authority) `shipped` in ingest-v0.1.0, `unassessed`, producer (edge-firmware) `implemented-unreleased`, `unassessed` | `frozen` (2026-07-21), audit `complete` |
 | Device provisioning lifecycle (next) | [device-provisioning/v2.md](device-provisioning/v2.md) | `draft` | none recorded | `amendable` |
 | Event schema | [events/v1.md](events/v1.md) | `draft` | producer (runtime) `shipped` in v0.9.0-beta.1, `unassessed` | `frozen` (2026-05-08), audit `complete` |
 | Event schema | [events/v2.md](events/v2.md) | `draft` | none recorded | `amendable` |
