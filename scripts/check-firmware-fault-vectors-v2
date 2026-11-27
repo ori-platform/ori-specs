@@ -16,9 +16,9 @@ Held to:
 - each refusal: signature valid, refused for its declared reason, and accepted
   once that one rule is switched off, so no other rule refuses it;
 - coverage: every fault code and every closed-set token at v 2, a v 1 case,
-  and rate_limited at v 1 refused;
+  and rate_limited and orphaned at v 1 refused;
 - the telemetry v2 command_rejected row names exactly the firmware-commands/v2
-  verdicts, which are v1's plus rate_limited;
+  verdicts, which are v1's plus rate_limited and orphaned;
 - the digest firmware-telemetry/v2.md pins is the corpus's.
 
     python3 scripts/check-firmware-fault-vectors-v2
@@ -64,8 +64,8 @@ NORMATIVE_CLAUSES = (
     "These are complete. Under `v` `2` a consumer MUST reject a fault whose "
     "`detail` for one of these codes is outside its row, empty included, even "
     "when its signature verifies.",
-    "a consumer of this version MUST reject `rate_limited` in a `v` `1` fault, "
-    "because no conforming producer signs it there.",
+    "a consumer of this version MUST reject `rate_limited` or `orphaned` in a `v` "
+    "`1` fault, because no conforming producer signs either there.",
     "A consumer that implements this version accepts a fault object at `v` `1` "
     "or `v` `2`, applies the `detail` rules of the fault's own version, and "
     "rejects any other `v`, including a `v` of another JSON type.",
@@ -74,6 +74,8 @@ TIER_D_SENTENCES = (
     "**It never refuses an open.** A release's rate policy MUST NOT refuse or "
     "delay `relay_open`, and a device MUST NOT return `rate_limited` for it.",
     "`rate_limited` therefore answers only `relay_close`.",
+    "A device MUST NOT refuse `open_protected_circuit` for being orphaned.",
+    "**It answers `close_protected_circuit` only, and never an open.**",
     "**Tier D attempts are not reissues.** Zero automatic reissue applies to "
     "command-delivery recovery. It does not cancel the safety registry's existing "
     "obligation to make fresh `open_protected_circuit` attempts for a latched "
@@ -228,14 +230,15 @@ def contract_model(texts: dict[str, str] | None = None) -> dict:
     pin = re.search(r"Its SHA-256 is\s+`([0-9a-f]{64})`", t2)
     if pin is None:
         raise Failure("firmware-telemetry/v2.md pins no corpus digest")
-    if sorted(set(v2_verdicts)) != sorted(set(v1_verdicts) | {"rate_limited"}):
-        raise Failure("firmware-commands/v2 verdicts are not v1's plus rate_limited")
+    if sorted(set(v2_verdicts)) != sorted(set(v1_verdicts) | {"rate_limited", "orphaned"}):
+        raise Failure("firmware-commands/v2 verdicts are not v1's plus rate_limited and orphaned")
     if v2_sets["command_rejected"] != v2_verdicts:
         raise Failure(
             "telemetry v2 command_rejected row differs from firmware-commands/v2"
         )
-    if "rate_limited" in v1_sets["command_rejected"]:
-        raise Failure("rate_limited appears in v1's verdicts")
+    for added in ("rate_limited", "orphaned"):
+        if added in v1_sets["command_rejected"]:
+            raise Failure(f"{added} appears in v1's verdicts")
     # rate_limited answers relay_close only, and Tier D attempts are not
     # reissues. Each sentence carrying either rule must stand verbatim.
     flat = " ".join(c2.split())
@@ -360,11 +363,12 @@ def check(corpus: dict, model: dict, off: frozenset[str] = frozenset()) -> None:
                 raise Failure(f"coverage: no v 2 case for {code}/{token}")
     if not any(f["v"] == 1 for f in accepted):
         raise Failure("coverage: no v 1 case")
-    if not any(
-        c["input"]["v"] == 1 and c["input"]["detail"] == "rate_limited"
-        for c in corpus["reject_cases"]
-    ):
-        raise Failure("coverage: rate_limited at v 1 is not refused")
+    for added in ("rate_limited", "orphaned"):
+        if not any(
+            c["input"]["v"] == 1 and c["input"]["detail"] == added
+            for c in corpus["reject_cases"]
+        ):
+            raise Failure(f"coverage: {added} at v 1 is not refused")
     if not any(c["reason"] == "unsupported_version" for c in corpus["reject_cases"]):
         raise Failure("coverage: no unsupported version")
 
@@ -390,6 +394,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
 
     rate = find("cases", "v2_command_rejected_rate_limited")
     v1_rate = find("reject_cases", "reject_v1_command_rejected_rate_limited")
+    orphan = find("cases", "v2_command_rejected_orphaned")
+    v1_orphan = find("reject_cases", "reject_v1_command_rejected_orphaned")
 
     def flip_signature(c: dict) -> None:
         import base64
@@ -426,6 +432,10 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             lambda c: c["cases"].remove(rate(c)))),
         ("v1 rate_limited refusal dropped", corpus_mutant(
             lambda c: c["reject_cases"].remove(v1_rate(c)))),
+        ("orphaned case dropped", corpus_mutant(
+            lambda c: c["cases"].remove(orphan(c)))),
+        ("v1 orphaned refusal dropped", corpus_mutant(
+            lambda c: c["reject_cases"].remove(v1_orphan(c)))),
         ("seed swapped", corpus_mutant(lambda c: c.update(test_seed_hex="43" * 32))),
         ("refusal moved to cases", corpus_mutant(
             lambda c: c["cases"].append(dict(v1_rate(c), name="moved")))),
@@ -437,6 +447,17 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
             lambda m: m["sets"].__setitem__(1, m["sets"][2]))),
         ("rate_limited dropped from v2 set", model_mutant(
             lambda m: m["sets"][2]["command_rejected"].remove("rate_limited"))),
+        ("orphaned dropped from v2 set", model_mutant(
+            lambda m: m["sets"][2]["command_rejected"].remove("orphaned"))),
+        ("orphaned refusal widened to opens", text_mutant(
+            "c2", "only, and never an open.**", "and an open.**")),
+        ("orphaned open exemption removed", text_mutant(
+            "c2", "A device MUST NOT\n  refuse `open_protected_circuit` for being orphaned.", "")),
+        ("orphaned added to commands v1", text_mutant(
+            "c1", "| `storage_failure` |", "| `orphaned` | x |\n| `storage_failure` |")),
+        ("orphaned at v1 rule weakened", text_mutant(
+            "t2", "MUST reject `rate_limited` or `orphaned` in a `v` `1` fault",
+            "MUST reject `rate_limited` in a `v` `1` fault")),
         ("corpus digest pin wrong", model_mutant(lambda m: m.update(pin="0" * 64))),
         ("relay_open exemption removed", text_mutant(
             "c2", "a device MUST NOT return `rate_limited` for it", "")),
@@ -457,8 +478,8 @@ def mutations(corpus_bytes: bytes, model: dict) -> int:
         ("empty detail no longer refused", text_mutant(
             "t2", "outside its row, empty included,", "outside its row,")),
         ("rate_limited at v1 rule inverted", text_mutant(
-            "t2", "MUST reject `rate_limited` in a `v` `1` fault",
-            "MAY accept `rate_limited` in a `v` `1` fault")),
+            "t2", "MUST reject `rate_limited` or `orphaned` in a `v` `1` fault",
+            "MAY accept `rate_limited` or `orphaned` in a `v` `1` fault")),
         ("other versions accepted", text_mutant(
             "t2", "and rejects any\nother `v`", "and accepts any\nother `v`")),
         ("code vocabulary shrunk", model_mutant(
