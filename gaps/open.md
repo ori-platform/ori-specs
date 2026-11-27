@@ -170,7 +170,8 @@ accurate description of what a repo implements.
   rollback has been proven end to end on `v2.5.0-rc.7` on Trixie `aarch64`.
 
   Stock Raspberry Pi OS Trixie ships Python 3.13 only. Both 3.13 targets are
-  now published and the contract names them, and `v2.5.0-rc.7` was installed
+  now published and [runtime-release-bundle/v2.md](../runtime-release-bundle/v2.md)
+  names them, and `v2.5.0-rc.7` was installed
   and proven on Trixie `aarch64` under system Python 3.13.
 
   A third supported interpreter widens a separate gap rather than closing one:
