@@ -365,10 +365,10 @@ structurally identical. It is recorded in the audit's `vector_errata` with the
 old and new hashes, the introducing commit, the members it changed, a
 justification and the repositories that must re-vendor the corrected bytes. One
 byte-level change is also admitted, the **terminator erratum**: exactly one LF
-added after the file's complete JSON value, where the file ended at that value,
-with every earlier byte unchanged. It is recorded the same way, with `members`
-`["terminator"]` and no other member. This
-is not general permission to alter a frozen vector: a change to any other
+added after the file's complete JSON value, where the file parses strictly, with
+no member named twice, and ends at that value, every earlier byte unchanged. It
+is recorded the same way, with `members` `["terminator"]` and no other member.
+This is not general permission to alter a frozen vector: a change to any other
 member, or to a case, a result or their order, needs a successor version, and
 so does any other byte change, even one that leaves the parsed JSON identical.
 
