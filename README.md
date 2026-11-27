@@ -80,7 +80,8 @@ whole contract.
 | Runtime telemetry HTTP export | [runtime-telemetry/v1.md](runtime-telemetry/v1.md) | `draft` | producer (runtime) `shipped` in v2.0.0, `unassessed` | `frozen` (2026-07-10), audit `pending` |
 | Runtime telemetry HTTP export | [runtime-telemetry/v2.md](runtime-telemetry/v2.md) | `draft` | producer (runtime) `shipped` in v2.5.0-rc.10, `unassessed` | `frozen` (2026-09-16), audit `complete` |
 | Runtime telemetry HTTP export (next) | [runtime-telemetry/v3.md](runtime-telemetry/v3.md) | `draft` | none recorded | `amendable` |
-| Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `pending` |
+| Safety profile | [safety-profile/v1.md](safety-profile/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.8, `unassessed` | `frozen` (2026-09-07), audit `complete` |
+| Safety profile (next) | [safety-profile/v2.md](safety-profile/v2.md) | `draft` | none recorded | `amendable` |
 | Safety qualification fixture | [safety-qualification-fixture/v1.md](safety-qualification-fixture/v1.md) | `draft` | none recorded | `amendable` |
 | Schema descriptor core | [schema-descriptor/v1.md](schema-descriptor/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.6, `unassessed` | `frozen` (2026-08-29), audit `complete` |
 | Sensor configuration | [sensor-configuration/v1.md](sensor-configuration/v1.md) | `draft` | consumer (runtime) `shipped` in v2.5.0-rc.6, `unassessed` | `frozen` (2026-08-29), audit `complete` |
