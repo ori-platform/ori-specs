@@ -59,7 +59,7 @@ whole contract.
 | Gateway config surface | [gateway-config/v1.md](gateway-config/v1.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed current snapshot `4c28c93` (1 divergence) | `frozen` (2026-06-09), audit `complete` |
 | Gateway config surface | [gateway-config/v2.md](gateway-config/v2.md) | `draft` | gateway `implemented-unreleased`, `non-conforming` at assessed implementation snapshot `a0dd23c` (7 divergences); current `ec162f4` unassessed | `amendable` |
 | Gateway Evidence Carriage | [gateway-evidence-carriage/v1.md](gateway-evidence-carriage/v1.md) | `draft` | none recorded | `amendable` |
-| Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `pending` |
+| Gateway MQTT canonical JSON | [gateway-mqtt-canonical-json/v1.md](gateway-mqtt-canonical-json/v1.md) | `draft` | runtime `shipped` in v2.5.0-rc.3, `unassessed`, gateway `implemented-unreleased`, `unassessed` | `frozen` (2026-08-25), audit `complete` |
 | LAN application API | [lan-app-api/v1.md](lan-app-api/v1.md) | `draft` | none recorded | `amendable` |
 | Offline Tier C tokens | [offline-tokens/v1.md](offline-tokens/v1.md) | `draft` | verifier (runtime) `shipped` in v0.9.0-beta.2, `unassessed`, cli `implemented-unreleased`, `unassessed` | `frozen` (2026-05-11), audit `complete` |
 | Offline Tier C tokens | [offline-tokens/v2.md](offline-tokens/v2.md) | `draft` | verifier (runtime) `shipped` in v2.5.0-rc.12, claimed, `unassessed` | `frozen` (2026-09-26), audit `complete` |

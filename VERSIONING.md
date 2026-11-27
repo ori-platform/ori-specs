@@ -363,9 +363,14 @@ correcting only the descriptive top-level members `vector_set`,
 other member, case, input, expected result, signature and ordering stays
 structurally identical. It is recorded in the audit's `vector_errata` with the
 old and new hashes, the introducing commit, the members it changed, a
-justification and the repositories that must re-vendor the corrected bytes. This
-is not general permission to alter a frozen vector: a change to any other
-member, or to a case, a result or their order, needs a successor version.
+justification and the repositories that must re-vendor the corrected bytes. One
+byte-level change is also admitted, the **terminator erratum**: exactly one LF
+added after the file's complete JSON value, where the file parses strictly, with
+no member named twice, and ends at that value, every earlier byte unchanged. It
+is recorded the same way, with `members` `["terminator"]` and no other member.
+This is not general permission to alter a frozen vector: a change to any other
+member, or to a case, a result or their order, needs a successor version, and
+so does any other byte change, even one that leaves the parsed JSON identical.
 
 Consumers ignore unknown fields unless the contract explicitly forbids them.
 Where a contract forbids unknown fields, adding one is a breaking change for
@@ -399,7 +404,7 @@ pending audit is never shown as `amendable`.
 | `vectors` | When `complete`: `{path: sha256}` for each file of the version other than its `v<N>.md`, vectors and companion documents alike, at `freeze_revision`. The set of files attributed to the version must stay equal to it. |
 | `role_commits` | When `complete`: `{role, repository, commit}` for every adoption entry. |
 | `hunks` | When `complete`: every difference from `freeze_revision`, each with `hunk_sha256`, `classification` (`erratum`, `additive` or `semantic`), a `summary`, the introducing `commit` where known, `destination` (the successor version) for a semantic hunk, and `optional: true` and `unknown_field_compatible: true` for an additive one. |
-| `vector_errata` | When `complete`, optional: each metadata erratum to a file in `vectors`, in order, with `path`, `classification` (only `erratum` is admitted), `from_sha256` (the recorded bytes, or the previous erratum's result), `to_sha256`, the introducing `commit`, the changed `members` (each one of `vector_set`, `contract`, `canonicalisation`), a `justification` of why no conforming producer output or accepted input changes, and `revendor`, the repositories that must re-vendor the corrected bytes. |
+| `vector_errata` | When `complete`, optional: each metadata erratum to a file in `vectors`, in order, with `path`, `classification` (only `erratum` is admitted), `from_sha256` (the recorded bytes, or the previous erratum's result), `to_sha256`, the introducing `commit`, the changed `members` (each one of `vector_set`, `contract`, `canonicalisation`, or `terminator` alone), a `justification` of why no conforming producer output or accepted input changes, and `revendor`, the repositories that must re-vendor the corrected bytes. |
 | `appended_files` | When `complete`, optional: each file added to the version after its freeze, with `path`, its `sha256`, `classification` (only `additive` is admitted), a `justification` of why no conforming consumer's accepted input changes, the `clause` it exercises quoted exactly, and `clause_basis`: `freeze_revision`, the clause is in the contract at `freeze_revision`, or `additive_hunk`, it is in the recorded additive hunk named by `hunk_sha256`. A new negative vector for a frozen version cites a `freeze_revision` clause and introduces no new reason, precedence, vocabulary, canonicalisation or strictness. |
 
 While an audit is **pending**, the version takes no normative edit.
@@ -560,7 +565,7 @@ Validated against `status/`; the records carry adoption and proof in full.
 | gateway-config | v1 | `draft` | `frozen` | conservative-baseline, gateway `a2e462d`, 2026-06-09; audit complete |
 | gateway-config | v2 | `draft` | `amendable` | — |
 | gateway-evidence-carriage | v1 | `draft` | `amendable` | — |
-| gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit pending |
+| gateway-mqtt-canonical-json | v1 | `draft` | `frozen` | shipment, runtime `5a82b87`, 2026-08-25; audit complete |
 | lan-app-api | v1 | `draft` | `amendable` | — |
 | offline-tokens | v1 | `draft` | `frozen` | shipment, runtime `30bdcda`, 2026-05-11; audit complete |
 | offline-tokens | v2 | `draft` | `frozen` | claiming-merge, runtime `31ef157`, 2026-09-26; audit complete |
