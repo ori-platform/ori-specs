@@ -1,16 +1,15 @@
 # Safety Profile Ratification
 
 > Status: Companion to
-> [safety-profile/v1.md](v1.md), which owns what a profile is; this document
+> [safety-profile/v2.md](v2.md), which owns what a profile is; this document
 > owns what licenses one to become `ratified`. No profile has been ratified
 > under it. It has no status record of its own; see
 > [companion documents](../VERSIONING.md#companion-documents).
 
-[safety-profile/v1.md](v1.md) fixes that ratification is a contract change,
+[safety-profile/v2.md](v2.md) fixes that ratification is a contract change,
 that it flips `status` in `profiles.json`, that it moves every consumer's
-pinned digest, and that it is made "only when the questions recorded for that
-profile under Open Questions are closed". It does not say what closing one
-looks like, what evidence closes it, who decides, or what is retained
+pinned digest, and that it is made only when the profile's dossier is complete
+under this document. v2 does not say what completing one looks like, what evidence closes it, who decides, or what is retained
 afterwards. This document says those four things.
 
 It exists because the alternative is a ratification made the way software
@@ -148,7 +147,7 @@ Two halves, and both are needed:
 
 Where the two cannot be separated by a single instantaneous threshold, the
 argument closes only by adopting a time-current characteristic — which is a new
-condition kind, a change to [safety-profile/v1.md](v1.md), a change to the
+condition kind, a change to [safety-profile/v2.md](v2.md), a change to the
 profile set, and a change to every consumer's pinned digest. Discovering that
 during ratification is a normal outcome, not a failure of the dossier.
 
@@ -157,7 +156,7 @@ during ratification is a normal outcome, not a failure of the dossier.
 **Measured, on the target, through the real path.** The quantity is the total
 elapsed time from the credible reading that satisfies the condition to the
 driver accepting the command, and it includes the bounded pre-command
-trip-intent append that [safety-profile/v1.md](v1.md#trip-state) requires.
+trip-intent append that [safety-profile/v2.md](v2.md#trip-state) requires.
 
 The contract caps that append's deadline and explicitly refuses to call the cap
 a safety argument: a profile's ratification must demonstrate the declared
@@ -293,7 +292,7 @@ point would be unknown.
 
 ### The two Tier D removals
 
-[safety-profile/v1.md](v1.md#migration) migrates
+[safety-profile/v2.md](v2.md#migration) migrates
 `battery_emergency_cutoff` and `cpu_overheating` out of Tier D on the ground
 that neither reaches an actuator, and records both as needing ratification
 because removing `action_tier: D` changes what a shipping skill claims.
@@ -310,7 +309,7 @@ preserves the observation and the alert. It does not need arguments 1 through
 | Contract | Owns |
 | --- | --- |
 | This document | What licenses a profile to become `ratified`, and what is retained |
-| [safety-profile/v1.md](v1.md) | What a profile is, its evaluation, activation, and trip state |
+| [safety-profile/v2.md](v2.md) | What a profile is, its evaluation, activation, and trip state |
 | [safety-qualification-fixture/v1.md](../safety-qualification-fixture/v1.md) | How a candidate is exercised on hardware before ratification |
 | [safety-qualification-fixture/procedure.md](../safety-qualification-fixture/procedure.md) | How a session is run safely, and what it records |
 | [commissioned-safety-binding/v1.md](../commissioned-safety-binding/v1.md) | The zone, its capacity, its mapping, and their proof |

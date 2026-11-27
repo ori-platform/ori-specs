@@ -261,7 +261,7 @@ Some words are descriptive only and carry no status:
 Ratification of a safety profile under
 [safety-profile/ratification.md](safety-profile/ratification.md) is a fact
 about a profile in `profiles.json`. It is separate from the `maturity` of
-`safety-profile/v1`.
+`safety-profile/v2`, whose companion document it is.
 
 ## The Freeze Rule
 
@@ -583,7 +583,8 @@ Validated against `status/`; the records carry adoption and proof in full.
 | runtime-telemetry | v1 | `draft` | `frozen` | shipment, runtime `aa970be`, 2026-07-10; audit pending |
 | runtime-telemetry | v2 | `draft` | `frozen` | shipment, runtime `f87be13`, 2026-09-16; audit complete |
 | runtime-telemetry | v3 | `draft` | `amendable` | — |
-| safety-profile | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit pending |
+| safety-profile | v1 | `draft` | `frozen` | shipment, runtime `5d14895`, 2026-09-07; audit complete |
+| safety-profile | v2 | `draft` | `amendable` | — |
 | safety-qualification-fixture | v1 | `draft` | `amendable` | — |
 | schema-descriptor | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
 | sensor-configuration | v1 | `draft` | `frozen` | shipment, runtime `c90f94d`, 2026-08-29; audit complete |
